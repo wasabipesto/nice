@@ -46,10 +46,6 @@ jobs:
             os: ubuntu-latest
             target: arm-unknown-linux-musleabi
 
-          - build_name: Linux-riscv64gc
-            os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-
           - build_name: Windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
