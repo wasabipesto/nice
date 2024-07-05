@@ -3,6 +3,7 @@
 use super::*;
 
 /// Get the range of possible values for a base.
+/// TODO: Return Option
 pub fn get_base_range(base: u32) -> (Natural, Natural) {
     let b = Natural::from(base);
     let k = (base / 5) as u64;

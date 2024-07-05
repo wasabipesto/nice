@@ -79,7 +79,7 @@ fn main() {
         println!("Elapsed time: {:.3?}", before.elapsed());
         println!(
             "Hash rate:    {:.3e}",
-            f64::try_from(&claim_data.search_range).unwrap() / elapsed_seconds
+            claim_data.search_range as f64 / elapsed_seconds
         );
     }
 

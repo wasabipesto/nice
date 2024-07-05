@@ -29,23 +29,26 @@ impl Benchmarker for BenchmarkType {
             BenchmarkType::ExtraLarge => 40,
             BenchmarkType::HiBase => 80,
         };
-        let (search_start, range_end) = get_base_range(base);
-        let range: u128 = match self {
+        let start = match self {
+            BenchmarkType::Default => 1916284264916,
+            BenchmarkType::Large => 1916284264916,
+            BenchmarkType::ExtraLarge => 1916284264916,
+            BenchmarkType::HiBase => 653245554420798943087177909799,
+        };
+        let range = match self {
             BenchmarkType::Default => 100000,
             BenchmarkType::Large => 10000000,
             BenchmarkType::ExtraLarge => 1000000000,
             BenchmarkType::HiBase => 100000,
         };
-        let search_end = range_end.min(&search_start + &Natural::from(range));
-        let search_range = &search_end - &search_start;
 
         FieldClaim {
             id: 0,
             username: "benchmark".to_owned(),
             base,
-            search_start,
-            search_end,
-            search_range,
+            search_start: start,
+            search_end: start + range,
+            search_range: range,
         }
     }
 }

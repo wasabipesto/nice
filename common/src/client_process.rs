@@ -4,49 +4,53 @@
 
 use super::*;
 
-/// Get the count of unique digits in a number's sqube when represented in a specific base.
-pub fn get_num_uniques(num: u128, base: u32) -> u32 {
-    let num = Natural::from(num);
-
-    // create a boolean array that represents all possible digits
-    let mut digits_indicator: Vec<bool> = vec![false; base as usize];
-
-    // square the number, convert to base and save the digits
-    let squared = (&num).pow(2);
-    for digit in squared.to_digits_asc(&base) {
-        digits_indicator[digit as usize] = true;
-    }
-
-    // cube, convert to base and save the digits
-    let cubed = squared * num;
-    for digit in cubed.to_digits_asc(&base) {
-        digits_indicator[digit as usize] = true;
-    }
-
-    // output the number of unique digits
-    let mut unique_digits = 0;
-    for digit in digits_indicator {
-        if digit {
-            unique_digits += 1
-        }
-    }
-    return unique_digits;
-}
-
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
 pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
+    // get the basic parameters
     let base = claim_data.base;
-    let search_start = u128::try_from(&claim_data.search_start).unwrap();
-    let search_end = u128::try_from(&claim_data.search_end).unwrap();
+    let search_start = claim_data.search_start;
+    let search_end = claim_data.search_end;
+
+    // get the minimum cutoff (90% of the base)
+    let near_misses_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
+
+    // create an output result map
+    let mut result_map: HashMap<u128, u32> = HashMap::new();
 
     // process the range and collect num_uniques for each item in the range
-    let result_map: HashMap<u128, u32> = (search_start..search_end)
-        .into_iter()
-        .map(|num| (num, get_num_uniques(num, base)))
-        .collect();
+    for num_u128 in (search_start..search_end).into_iter() {
+        // create a boolean array that represents all possible digits
+        // tested allocating this outside of the loop and it didn't have any effect
+        let mut digits_indicator: Vec<bool> = vec![false; base as usize];
+
+        // convert u128 to natural
+        let num = Natural::from(num_u128);
+
+        // square the number, convert to base and save the digits
+        // tried using foiled out versions but malachite is already pretty good
+        let squared = (&num).pow(2);
+        for digit in squared.to_digits_asc(&base) {
+            digits_indicator[digit as usize] = true;
+        }
+
+        // cube, convert to base and save the digits
+        let cubed = squared * &num;
+        for digit in cubed.to_digits_asc(&base) {
+            digits_indicator[digit as usize] = true;
+        }
+
+        // output the number of unique digits
+        let mut unique_digits = 0;
+        for digit in digits_indicator {
+            if digit {
+                unique_digits += 1
+            }
+        }
+
+        result_map.insert(num_u128, unique_digits);
+    }
 
     // collect the near misses from the result map
-    let near_misses_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
     let near_misses: HashMap<String, u32> = result_map
         .clone()
         .into_iter()
@@ -115,8 +119,8 @@ pub fn get_residue_filter(base: u32) -> Vec<u32> {
 /// Implements several optimizations over the detailed search.
 pub fn process_niceonly(claim_data: &FieldClaim) -> FieldSubmit {
     let base = claim_data.base;
-    let search_start = u128::try_from(&claim_data.search_start).unwrap();
-    let search_end = u128::try_from(&claim_data.search_end).unwrap();
+    let search_start = claim_data.search_start;
+    let search_end = claim_data.search_end;
     let residue_filter = get_residue_filter(base);
 
     let nice_list = (search_start..search_end)
@@ -146,9 +150,9 @@ mod tests {
             id: 0,
             username: "benchmark".to_owned(),
             base: 10,
-            search_start: Natural::from(47 as u128),
-            search_end: Natural::from(100 as u128),
-            search_range: Natural::from(53 as u128),
+            search_start: 47,
+            search_end: 100,
+            search_range: 53,
         };
         let submit_data = FieldSubmit {
             id: claim_data.id.clone(),
@@ -178,9 +182,9 @@ mod tests {
             id: 0,
             username: "benchmark".to_owned(),
             base: 40,
-            search_start: Natural::from(916284264916 as u128),
-            search_end: Natural::from(916284264916 + 10000 as u128),
-            search_range: Natural::from(10000 as u128),
+            search_start: 916284264916,
+            search_end: 916284264916 + 10000,
+            search_range: 10000,
         };
         let submit_data = FieldSubmit {
             id: claim_data.id.clone(),
@@ -240,9 +244,9 @@ mod tests {
             id: 0,
             username: "benchmark".to_owned(),
             base: 80,
-            search_start: Natural::from(653245554420798943087177909799 as u128),
-            search_end: Natural::from(653245554420798943087177909799 + 10000 as u128),
-            search_range: Natural::from(10000 as u128),
+            search_start: 653245554420798943087177909799,
+            search_end: 653245554420798943087177909799 + 10000,
+            search_range: 10000,
         };
         let submit_data = FieldSubmit {
             id: claim_data.id.clone(),
@@ -342,9 +346,9 @@ mod tests {
             id: 0,
             username: "benchmark".to_owned(),
             base: 10,
-            search_start: Natural::from(47 as u128),
-            search_end: Natural::from(100 as u128),
-            search_range: Natural::from(53 as u128),
+            search_start: 47,
+            search_end: 100,
+            search_range: 53,
         };
         let submit_data = FieldSubmit {
             id: claim_data.id.clone(),
@@ -363,9 +367,9 @@ mod tests {
             id: 0,
             username: "benchmark".to_owned(),
             base: 40,
-            search_start: Natural::from(916284264916 as u128),
-            search_end: Natural::from(916284264916 + 10000 as u128),
-            search_range: Natural::from(10000 as u128),
+            search_start: 916284264916,
+            search_end: 916284264916 + 10000,
+            search_range: 10000,
         };
         let submit_data = FieldSubmit {
             id: claim_data.id.clone(),
@@ -384,9 +388,9 @@ mod tests {
             id: 0,
             username: "benchmark".to_owned(),
             base: 80,
-            search_start: Natural::from(653245554420798943087177909799 as u128),
-            search_end: Natural::from(653245554420798943087177909799 + 10000 as u128),
-            search_range: Natural::from(10000 as u128),
+            search_start: 653245554420798943087177909799,
+            search_end: 653245554420798943087177909799 + 10000,
+            search_range: 10000,
         };
         let submit_data = FieldSubmit {
             id: claim_data.id.clone(),

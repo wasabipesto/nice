@@ -6,10 +6,8 @@ pub mod client_api;
 pub mod client_process;
 pub mod residue_filter;
 
-use base_range::get_base_range;
-use client_api::deserialize_string_to_natural;
-
 use clap::ValueEnum;
+use client_api::deserialize_string_to_u128;
 use malachite::natural::Natural;
 use malachite::num::arithmetic::traits::{CeilingRoot, DivAssignRem, FloorRoot, Pow};
 use malachite::num::basic::traits::Zero;
@@ -36,12 +34,12 @@ pub struct FieldClaim {
     pub id: u32,
     pub username: String,
     pub base: u32,
-    #[serde(deserialize_with = "deserialize_string_to_natural")]
-    pub search_start: Natural,
-    #[serde(deserialize_with = "deserialize_string_to_natural")]
-    pub search_end: Natural,
-    #[serde(deserialize_with = "deserialize_string_to_natural")]
-    pub search_range: Natural,
+    #[serde(deserialize_with = "deserialize_string_to_u128")]
+    pub search_start: u128,
+    #[serde(deserialize_with = "deserialize_string_to_u128")]
+    pub search_end: u128,
+    #[serde(deserialize_with = "deserialize_string_to_u128")]
+    pub search_range: u128,
 }
 
 /// The compiled results sent to the server after processing. Options for both modes.
