@@ -1,0 +1,12 @@
+[package]
+name = "nice_client"
+version = "3.0.0"
+edition = "2021"
+authors = ["wasabipesto <nice@wasabipesto.com>"]
+description = "a client for distributed search of square-cube pandigitals"
+repository = "https://github.com/wasabipesto/nice"
+readme = "README.md"
+license-file = "../LICENSE"
+
+[dependencies]
+nice_common = { path = "../common" }

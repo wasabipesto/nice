@@ -1,0 +1,11 @@
+[package]
+name = "nice_common"
+version = "3.0.0"
+edition = "2021"
+authors = ["wasabipesto <nice@wasabipesto.com>"]
+description = "common utilities for dealing with square-cube pandigitals"
+repository = "https://github.com/wasabipesto/nice"
+readme = "README.md"
+license-file = "../LICENSE"
+
+[dependencies]
