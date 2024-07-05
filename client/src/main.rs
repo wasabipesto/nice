@@ -38,10 +38,6 @@ pub struct Cli {
     /// Run an offline benchmark
     #[arg(short, long)]
     benchmark: Option<BenchmarkType>,
-
-    /// Process the range in parallel, improving speed
-    #[arg(long)]
-    parallel: bool,
 }
 
 fn main() {
@@ -66,8 +62,8 @@ fn main() {
 
     // process range & compile results
     let submit_data: FieldSubmit = match cli.mode {
-        SearchMode::Detailed => process_detailed(&claim_data, cli.parallel),
-        SearchMode::Niceonly => process_niceonly(&claim_data, cli.parallel),
+        SearchMode::Detailed => process_detailed(&claim_data),
+        SearchMode::Niceonly => process_niceonly(&claim_data),
     };
 
     // stop the benchmarking timer

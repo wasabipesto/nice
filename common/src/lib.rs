@@ -14,7 +14,6 @@ use malachite::natural::Natural;
 use malachite::num::arithmetic::traits::{CeilingRoot, DivAssignRem, FloorRoot, Pow};
 use malachite::num::basic::traits::Zero;
 use malachite::num::conversion::traits::Digits;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::TryFrom;
