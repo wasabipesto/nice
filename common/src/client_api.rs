@@ -13,24 +13,6 @@ where
         .map_err(|_| serde::de::Error::custom(format!("invalid number: {}", s)))
 }
 
-/// Generate a field offline for benchmark testing.
-/// TODO: Make small/medium/large benchmarks, move to own utility
-pub fn get_field_benchmark() -> FieldClaim {
-    let base = BENCHMARK_DEFAULT_BASE;
-    let (search_start, range_end) = get_base_range(base);
-    let range = Natural::from(BUCNHMARK_DEFAULT_RANGE);
-    let search_end = range_end.min(&search_start + &range);
-    let search_range = &search_end - &search_start;
-    return FieldClaim {
-        id: 0,
-        username: "benchmark".to_owned(),
-        base,
-        search_start,
-        search_end,
-        search_range,
-    };
-}
-
 /// Build a field request url.
 fn get_claim_url(mode: &SearchMode, api_base: &str, username: &str) -> String {
     let mut query_url = api_base.to_owned();
