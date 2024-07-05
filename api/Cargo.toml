@@ -10,3 +10,4 @@ license-file = "../LICENSE"
 
 [dependencies]
 nice_common = { path = "../common" }
+rocket = { version = "0.5.1", features = ["json"] }

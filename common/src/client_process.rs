@@ -77,11 +77,12 @@ pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
 /// Quickly determine if a number is 100% nice.
 /// Assumes we have already done residue class filtering.
 pub fn get_is_nice(num: u128, base: u32) -> bool {
+    // convert u128 to natural
     let num = Natural::from(num);
     let base_natural = Natural::from(base);
 
     // create a boolean array that represents all possible digits
-    let mut digits_indicator = [false; MAX_SUPPORTED_BASE_NORMAL as usize];
+    let mut digits_indicator: Vec<bool> = vec![false; base as usize];
 
     // square the number and check those digits
     let squared = (&num).pow(2);
@@ -94,7 +95,7 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
         digits_indicator[remainder] = true;
     }
 
-    // cube the number and check those digit
+    // cube the number and check those digits
     let mut n = squared * num;
     while n > 0 {
         let remainder = usize::try_from(&(n.div_assign_rem(&base_natural))).unwrap();
@@ -106,22 +107,13 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
     return true;
 }
 
-/// Get a list of residue filters for a base.
-/// For more information: https://beautifulthorns.wixsite.com/home/post/progress-update-on-the-search-for-nice-numbers
-pub fn get_residue_filter(base: u32) -> Vec<u32> {
-    let target_residue = base * (base - 1) / 2 % (base - 1);
-    (0..(base - 1))
-        .filter(|num| (num.pow(2) + num.pow(3)) % (base - 1) == target_residue)
-        .collect()
-}
-
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
 pub fn process_niceonly(claim_data: &FieldClaim) -> FieldSubmit {
     let base = claim_data.base;
     let search_start = claim_data.search_start;
     let search_end = claim_data.search_end;
-    let residue_filter = get_residue_filter(base);
+    let residue_filter = residue_filter::get_residue_filter(&base);
 
     let nice_list = (search_start..search_end)
         .into_iter()

@@ -10,7 +10,7 @@ pub enum BenchmarkType {
     /// A large benchmark range: 1e7 @ base 40.
     Large,
     /// A very large benchmark range: 1e9 @ base 40.
-    /// This is the size of a normal field.
+    /// This is the size of a typical field from the server.
     ExtraLarge,
     /// A benchmark range at a higher range: 1e5 @ base 80.
     HiBase,
