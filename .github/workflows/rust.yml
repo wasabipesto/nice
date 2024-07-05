@@ -84,34 +84,3 @@ jobs:
           target: ${{ matrix.platform.target }}
           toolchain: stable
           args: "--locked --release"
-      
-      - name: Package as archive (Linux)
-        if: ${{ !contains(matrix.platform.os, 'windows') }}
-        id: archive_linux
-        shell: bash
-        run: |
-          version=$(cat Cargo.toml | grep -o 'version = "[^"]*' | sed 's/version = "//' | head -1)
-          filename="${{ env.OUTPUT_PREFIX }}-$version-${{ matrix.platform.build_name }}"
-          echo "filename=$filename" >> $GITHUB_OUTPUT
-          cd target/${{ matrix.platform.target }}/release
-          tar czvf ../../../$filename.tar.gz nice-rust
-          cd -
-      
-      - name: Package as archive (Windows)
-        if: ${{ contains(matrix.platform.os, 'windows') }}
-        id: archive_windows
-        shell: pwsh
-        run: |
-          $version = (Get-Content Cargo.toml | Select-String -Pattern 'version = "(.+)"').Matches.Groups[1].Value
-          $filename = "${{ env.OUTPUT_PREFIX }}-$version-${{ matrix.platform.build_name }}"
-          echo "filename=$filename" >> $env:GITHUB_OUTPUT
-          cd target/${{ matrix.platform.target }}/release
-          7z a ../../../$filename.zip nice-rust.exe
-          cd -
-      
-      - name: Publish release artifacts
-        uses: actions/upload-artifact@v3
-        with:
-          name: ${{ contains(matrix.platform.os, 'windows') && steps.archive_windows.outputs.filename || steps.archive_linux.outputs.filename }}
-          path: "${{ env.OUTPUT_PREFIX }}-*"
-          retention-days: 5
