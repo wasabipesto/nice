@@ -5,7 +5,7 @@ use super::*;
 /// Break a base range into smaller, searchable fields.
 /// Each field should be `size` in width, with the last one being smaller.
 /// If the base range is less than `size` it returns one field.
-pub fn break_range_into_fields(min: &Natural, max: &Natural, size_u128: u128) -> Vec<SearchField> {
+pub fn break_range_into_fields(min: &Natural, max: &Natural, size_u128: u128) -> Vec<FieldSize> {
     // create output vec
     let mut fields = Vec::new();
 
@@ -25,7 +25,7 @@ pub fn break_range_into_fields(min: &Natural, max: &Natural, size_u128: u128) ->
         let field_size = u128::try_from(&(field_end.clone() - field_start.clone())).unwrap();
 
         // build and push the field
-        let field = SearchField {
+        let field = FieldSize {
             start: field_start.clone(),
             end: field_end.clone(),
             size: field_size,
@@ -49,9 +49,11 @@ mod tests {
         let size = 1000000000;
         let base_range = base_range::get_base_range_natural(base).unwrap();
         let fields = break_range_into_fields(&base_range.0, &base_range.1, size);
+
+        // check against known field
         assert_eq!(
             fields,
-            vec![SearchField {
+            vec![FieldSize {
                 start: Natural::from(47u32),
                 end: Natural::from(100u32),
                 size: 53
@@ -94,6 +96,13 @@ mod tests {
                     } else {
                         let range_size = u128::try_from(&(range.1 - range.0)).unwrap();
                         assert_eq!(fields.first().unwrap().size, range_size);
+                    }
+
+                    // check the fields are in ascending order
+                    let mut last_start = Natural::from(0u32);
+                    for field in fields {
+                        assert!(field.start > last_start);
+                        last_start = field.start.clone()
                     }
                 }
             }

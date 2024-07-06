@@ -4,6 +4,7 @@ pub mod base_range;
 pub mod benchmark;
 pub mod client_api;
 pub mod client_process;
+pub mod generate_chunks;
 pub mod generate_fields;
 pub mod residue_filter;
 
@@ -12,7 +13,7 @@ use malachite::natural::Natural;
 use malachite::num::arithmetic::traits::{CeilingRoot, DivAssignRem, FloorRoot, Pow};
 use malachite::num::conversion::traits::Digits;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::env;
 use std::ops::Add;
@@ -31,8 +32,8 @@ pub enum SearchMode {
 }
 
 /// Information on searchable fields.
-#[derive(Debug, PartialEq)]
-pub struct SearchField {
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldSize {
     pub start: Natural,
     pub end: Natural,
     pub size: u128,
