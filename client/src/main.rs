@@ -1,7 +1,7 @@
 //! A simple CLI for the nice library.
 
 extern crate nice_common;
-use nice_common::benchmark::{BenchmarkType, Benchmarker};
+use nice_common::benchmark::{get_benchmark_field, BenchmarkMode};
 use nice_common::client_api::get_field_from_server;
 use nice_common::client_api::submit_field_to_server;
 use nice_common::client_process::process_detailed;
@@ -37,7 +37,7 @@ pub struct Cli {
 
     /// Run an offline benchmark
     #[arg(short, long)]
-    benchmark: Option<BenchmarkType>,
+    benchmark: Option<BenchmarkMode>,
 }
 
 fn main() {
@@ -46,7 +46,7 @@ fn main() {
 
     // check whether to query the server for a search range or use the benchmark
     let claim_data = if let Some(benchmark) = cli.benchmark {
-        benchmark.get_field()
+        get_benchmark_field(benchmark)
     } else {
         get_field_from_server(&cli.mode, &cli.api_base, &cli.username)
     };

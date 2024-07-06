@@ -4,7 +4,7 @@ use super::*;
 
 /// Different benchmark strategies.
 #[derive(Debug, Copy, Clone, ValueEnum)]
-pub enum BenchmarkType {
+pub enum BenchmarkMode {
     /// The default benchmark range: 1e5 @ base 40.
     Default,
     /// A large benchmark range: 1e7 @ base 40.
@@ -16,39 +16,40 @@ pub enum BenchmarkType {
     HiBase,
 }
 
-pub trait Benchmarker {
-    fn get_field(&self) -> FieldClaim;
+pub fn get_benchmark_field(mode: BenchmarkMode) -> FieldClaim {
+    let base = match mode {
+        BenchmarkMode::Default => 40,
+        BenchmarkMode::Large => 40,
+        BenchmarkMode::ExtraLarge => 40,
+        BenchmarkMode::HiBase => 80,
+    };
+    let (start, _) = base_range::get_base_range_u128(base).unwrap().unwrap();
+    let range = match mode {
+        BenchmarkMode::Default => 100000,
+        BenchmarkMode::Large => 10000000,
+        BenchmarkMode::ExtraLarge => 1000000000,
+        BenchmarkMode::HiBase => 100000,
+    };
+
+    FieldClaim {
+        id: 0,
+        username: "benchmark".to_owned(),
+        base,
+        search_start: start,
+        search_end: start + range,
+        search_range: range,
+    }
 }
 
-/// Generate a field offline for benchmark testing.
-impl Benchmarker for BenchmarkType {
-    fn get_field(&self) -> FieldClaim {
-        let base = match self {
-            BenchmarkType::Default => 40,
-            BenchmarkType::Large => 40,
-            BenchmarkType::ExtraLarge => 40,
-            BenchmarkType::HiBase => 80,
-        };
-        let start = match self {
-            BenchmarkType::Default => 1916284264916,
-            BenchmarkType::Large => 1916284264916,
-            BenchmarkType::ExtraLarge => 1916284264916,
-            BenchmarkType::HiBase => 653245554420798943087177909799,
-        };
-        let range = match self {
-            BenchmarkType::Default => 100000,
-            BenchmarkType::Large => 10000000,
-            BenchmarkType::ExtraLarge => 1000000000,
-            BenchmarkType::HiBase => 100000,
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        FieldClaim {
-            id: 0,
-            username: "benchmark".to_owned(),
-            base,
-            search_start: start,
-            search_end: start + range,
-            search_range: range,
-        }
+    #[test]
+    fn test_get_benchmark_field() {
+        get_benchmark_field(BenchmarkMode::Default);
+        get_benchmark_field(BenchmarkMode::Large);
+        get_benchmark_field(BenchmarkMode::ExtraLarge);
+        get_benchmark_field(BenchmarkMode::HiBase);
     }
 }

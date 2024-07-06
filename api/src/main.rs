@@ -3,7 +3,7 @@
 #[macro_use]
 extern crate rocket;
 
-use nice_common::benchmark::{BenchmarkType, Benchmarker};
+use nice_common::benchmark::{get_benchmark_field, BenchmarkMode};
 use rocket::serde::json::{json, Value};
 
 // TODO: Define error types (4xx, 5xx) and serialize them properly
@@ -15,13 +15,13 @@ fn claim() -> Result<Value, Value> {
 
 #[get("/claim/detailed")]
 fn claim_detailed() -> Result<Value, Value> {
-    let claim = BenchmarkType::Default.get_field();
+    let claim = get_benchmark_field(BenchmarkMode::Default);
     Ok(json!(claim))
 }
 
 #[get("/claim/niceonly")]
 fn claim_niceonly() -> Result<Value, Value> {
-    let claim = BenchmarkType::Default.get_field();
+    let claim = get_benchmark_field(BenchmarkMode::Default);
     Ok(json!(claim))
 }
 
