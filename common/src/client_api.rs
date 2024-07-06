@@ -11,7 +11,7 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) 
         SearchMode::Detailed => "/claim/detailed",
         SearchMode::Niceonly => "/claim/niceonly",
     };
-    query_url += &("?username=".to_owned() + &username.to_string());
+    query_url += &("?username=".to_owned() + username);
 
     // send it
     let response = reqwest::blocking::get(&query_url).unwrap_or_else(|e| panic!("Error: {}", e));
@@ -33,7 +33,7 @@ pub fn submit_field_to_server(mode: &SearchMode, api_base: &str, submit_data: Fi
 
     // send it
     let response = reqwest::blocking::Client::new()
-        .post(&url)
+        .post(url)
         .json(&submit_data)
         .send();
 

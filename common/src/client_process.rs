@@ -18,7 +18,7 @@ pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
     let mut result_map: HashMap<u128, u32> = HashMap::new();
 
     // process the range and collect num_uniques for each item in the range
-    for num_u128 in (search_start..search_end).into_iter() {
+    for num_u128 in search_start..search_end {
         // create a boolean array that represents all possible digits
         // tested allocating this outside of the loop and it didn't have any effect
         let mut digits_indicator: Vec<bool> = vec![false; base as usize];
@@ -60,18 +60,17 @@ pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
 
     // collect the distribution of uniqueness across the result map
     let unique_count: HashMap<u32, u32> = (1..=base)
-        .into_iter()
         .map(|i| (i, result_map.values().filter(|&&v| v == i).count() as u32))
         .collect();
 
-    return FieldSubmit {
+    FieldSubmit {
         id: claim_data.id,
         username: claim_data.username.clone(),
         client_version: CLIENT_VERSION.to_string(),
         unique_count: Some(unique_count),
         near_misses: Some(near_misses),
         nice_list: None,
-    };
+    }
 }
 
 /// Quickly determine if a number is 100% nice.
@@ -104,7 +103,7 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
         }
         digits_indicator[remainder] = true;
     }
-    return true;
+    true
 }
 
 /// Process a field by looking for completely nice numbers.
@@ -116,20 +115,19 @@ pub fn process_niceonly(claim_data: &FieldClaim) -> FieldSubmit {
     let residue_filter = residue_filter::get_residue_filter(&base);
 
     let nice_list = (search_start..search_end)
-        .into_iter()
         .filter(|num| residue_filter.contains(&((num % (base as u128 - 1)) as u32)))
         .filter(|num| get_is_nice(*num, base))
         .map(|num| num.to_string())
         .collect();
 
-    return FieldSubmit {
+    FieldSubmit {
         id: claim_data.id,
         username: claim_data.username.clone(),
         client_version: CLIENT_VERSION.to_string(),
         unique_count: None,
         near_misses: None,
         nice_list: Some(nice_list),
-    };
+    }
 }
 
 #[cfg(test)]
