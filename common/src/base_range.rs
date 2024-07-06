@@ -25,10 +25,13 @@ pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
 }
 
 /// Get the range of possible values for a base, but return u128.
+/// Returns None if there are no valid numbers in that base.
+/// Returns Err if the numbers are too large for u128.
 pub fn get_base_range_u128(base: u32) -> Result<Option<(u128, u128)>, String> {
     // get the natural results
     match get_base_range_natural(base) {
         Some((min, max)) => Ok(Some((
+            // convert to u128
             u128::try_from(&min).map_err(|_| format!("Failed to convert {min} to u128."))?,
             u128::try_from(&max).map_err(|_| format!("Failed to convert {max} to u128."))?,
         ))),
