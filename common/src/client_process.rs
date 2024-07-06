@@ -4,6 +4,43 @@
 
 use super::*;
 
+/// Calculate the number of unique digits in (n^2, n^3) represented in base b.
+/// A number is nice if the result of this is equal to b (means all digits are used once).
+/// If you're just checking if the number is 100% nice, there is a faster version below.
+pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+
+    // create a boolean array that represents all possible digits
+    // tested allocating this outside of the loop and it didn't have any effect
+    let mut digits_indicator: Vec<bool> = vec![false; base as usize];
+
+    // convert u128 to natural
+    let num = Natural::from(num_u128);
+
+    // square the number, convert to base and save the digits
+    // tried using foiled out versions but malachite is already pretty good
+    let squared = (&num).pow(2);
+    for digit in squared.to_digits_asc(&base) {
+        digits_indicator[digit as usize] = true;
+    }
+
+    // cube, convert to base and save the digits
+    let cubed = squared * &num;
+    for digit in cubed.to_digits_asc(&base) {
+        digits_indicator[digit as usize] = true;
+    }
+
+    // output the number of unique digits
+    let mut num_unique_digits = 0;
+    for digit in digits_indicator {
+        if digit {
+            num_unique_digits += 1
+        }
+    }
+
+    num_unique_digits
+}
+
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
 pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
     // get the basic parameters
@@ -12,70 +49,50 @@ pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
     let search_end = claim_data.search_end;
 
     // get the minimum cutoff (90% of the base)
-    let near_misses_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
+    let nice_list_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
 
-    // create an output result map
-    let mut result_map: HashMap<u128, u32> = HashMap::new();
+    // init the output maps
+    let mut unique_distribution: HashMap<u32, u32> = (1..=base).map(|i| (i, 0u32)).collect();
+    let mut nice_list: HashMap<u128, u32> = HashMap::new();
 
     // process the range and collect num_uniques for each item in the range
-    for num_u128 in search_start..search_end {
-        // create a boolean array that represents all possible digits
-        // tested allocating this outside of the loop and it didn't have any effect
-        let mut digits_indicator: Vec<bool> = vec![false; base as usize];
+    (search_start..search_end).into_iter().for_each(|num| {
+        // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
 
-        // convert u128 to natural
-        let num = Natural::from(num_u128);
+        // get the number of uniques
+        let num_unique_digits = get_num_unique_digits(num, base);
 
-        // square the number, convert to base and save the digits
-        // tried using foiled out versions but malachite is already pretty good
-        let squared = (&num).pow(2);
-        for digit in squared.to_digits_asc(&base) {
-            digits_indicator[digit as usize] = true;
+        // TODO: Break this up into chunks
+        // There's a tradeoff between allocating a bunch of memory upfront and
+        // aggregating stats (distribution, top nice numbers) later, or updating
+        // the stats as we go. Doing it for every number just wastes cycles but
+        // allocating everything at once takes, uh, a bit too much memory.
+
+        // increment the correct bin in the distribution
+        *unique_distribution.entry(num_unique_digits).or_insert(0) += 1;
+
+        // save if the number is sufficiently nice
+        if num_unique_digits > nice_list_cutoff {
+            nice_list.insert(num, num_unique_digits);
         }
-
-        // cube, convert to base and save the digits
-        let cubed = squared * &num;
-        for digit in cubed.to_digits_asc(&base) {
-            digits_indicator[digit as usize] = true;
-        }
-
-        // output the number of unique digits
-        let mut unique_digits = 0;
-        for digit in digits_indicator {
-            if digit {
-                unique_digits += 1
-            }
-        }
-
-        result_map.insert(num_u128, unique_digits);
-    }
-
-    // collect the near misses from the result map
-    let near_misses: HashMap<String, u32> = result_map
-        .clone()
-        .into_iter()
-        .filter(|&(_, value)| value > near_misses_cutoff)
-        .map(|(num, value)| (num.to_string(), value))
-        .collect();
-
-    // collect the distribution of uniqueness across the result map
-    let unique_count: HashMap<u32, u32> = (1..=base)
-        .map(|i| (i, result_map.values().filter(|&&v| v == i).count() as u32))
-        .collect();
+    });
 
     FieldSubmit {
         id: claim_data.id,
         username: claim_data.username.clone(),
         client_version: CLIENT_VERSION.to_string(),
-        unique_count: Some(unique_count),
-        near_misses: Some(near_misses),
-        nice_list: None,
+        unique_distribution: Some(unique_distribution),
+        nice_list,
     }
 }
 
-/// Quickly determine if a number is 100% nice.
+/// Quickly determine if a number is 100% nice in this base.
+/// A number is nice if (n^2, n^3), converted to base b, have all digits of base b.
 /// Assumes we have already done residue class filtering.
+/// Immediately stops if we hit a duplicate digit.
 pub fn get_is_nice(num: u128, base: u32) -> bool {
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+
     // convert u128 to natural
     let num = Natural::from(num);
     let base_natural = Natural::from(base);
@@ -117,16 +134,15 @@ pub fn process_niceonly(claim_data: &FieldClaim) -> FieldSubmit {
     let nice_list = (search_start..search_end)
         .filter(|num| residue_filter.contains(&((num % (base as u128 - 1)) as u32)))
         .filter(|num| get_is_nice(*num, base))
-        .map(|num| num.to_string())
+        .map(|num| (num, base))
         .collect();
 
     FieldSubmit {
         id: claim_data.id,
         username: claim_data.username.clone(),
         client_version: CLIENT_VERSION.to_string(),
-        unique_count: None,
-        near_misses: None,
-        nice_list: Some(nice_list),
+        unique_distribution: None,
+        nice_list,
     }
 }
 
@@ -148,7 +164,7 @@ mod tests {
             id: claim_data.id.clone(),
             username: claim_data.username.clone(),
             client_version: CLIENT_VERSION.to_string(),
-            unique_count: Some(HashMap::from([
+            unique_distribution: Some(HashMap::from([
                 (1, 0),
                 (2, 0),
                 (3, 0),
@@ -160,8 +176,7 @@ mod tests {
                 (9, 1),
                 (10, 1),
             ])),
-            near_misses: Some(HashMap::from([("69".to_string(), 10)])),
-            nice_list: None,
+            nice_list: HashMap::from([(69, 10)]),
         };
         assert_eq!(process_detailed(&claim_data), submit_data);
     }
@@ -180,7 +195,7 @@ mod tests {
             id: claim_data.id.clone(),
             username: claim_data.username.clone(),
             client_version: CLIENT_VERSION.to_string(),
-            unique_count: Some(HashMap::from([
+            unique_distribution: Some(HashMap::from([
                 (1, 0),
                 (2, 0),
                 (3, 0),
@@ -222,8 +237,7 @@ mod tests {
                 (39, 0),
                 (40, 0),
             ])),
-            near_misses: Some(HashMap::new()),
-            nice_list: None,
+            nice_list: HashMap::new(),
         };
         assert_eq!(process_detailed(&claim_data), submit_data);
     }
@@ -242,7 +256,7 @@ mod tests {
             id: claim_data.id.clone(),
             username: claim_data.username.clone(),
             client_version: CLIENT_VERSION.to_string(),
-            unique_count: Some(HashMap::from([
+            unique_distribution: Some(HashMap::from([
                 (1, 0),
                 (2, 0),
                 (3, 0),
@@ -324,8 +338,7 @@ mod tests {
                 (79, 0),
                 (80, 0),
             ])),
-            near_misses: Some(HashMap::new()),
-            nice_list: None,
+            nice_list: HashMap::new(),
         };
         assert_eq!(process_detailed(&claim_data), submit_data);
     }
@@ -344,9 +357,8 @@ mod tests {
             id: claim_data.id.clone(),
             username: claim_data.username.clone(),
             client_version: CLIENT_VERSION.to_string(),
-            unique_count: None,
-            near_misses: None,
-            nice_list: Some(Vec::from(["69".to_string()])),
+            unique_distribution: None,
+            nice_list: HashMap::from([(69, 10)]),
         };
         assert_eq!(process_niceonly(&claim_data), submit_data);
     }
@@ -365,9 +377,8 @@ mod tests {
             id: claim_data.id.clone(),
             username: claim_data.username.clone(),
             client_version: CLIENT_VERSION.to_string(),
-            unique_count: None,
-            near_misses: None,
-            nice_list: Some(Vec::new()),
+            unique_distribution: None,
+            nice_list: HashMap::new(),
         };
         assert_eq!(process_niceonly(&claim_data), submit_data);
     }
@@ -386,9 +397,8 @@ mod tests {
             id: claim_data.id.clone(),
             username: claim_data.username.clone(),
             client_version: CLIENT_VERSION.to_string(),
-            unique_count: None,
-            near_misses: None,
-            nice_list: Some(Vec::new()),
+            unique_distribution: None,
+            nice_list: HashMap::new(),
         };
         assert_eq!(process_niceonly(&claim_data), submit_data);
     }

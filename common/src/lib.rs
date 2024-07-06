@@ -57,7 +57,6 @@ pub struct FieldSubmit {
     pub id: u32,
     pub username: String,
     pub client_version: String, // TODO: user-agent with repo/version/build
-    pub unique_count: Option<HashMap<u32, u32>>,
-    pub near_misses: Option<HashMap<String, u32>>,
-    pub nice_list: Option<Vec<String>>,
+    pub unique_distribution: Option<HashMap<u32, u32>>,
+    pub nice_list: HashMap<u128, u32>,
 }
