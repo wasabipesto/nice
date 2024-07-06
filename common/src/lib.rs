@@ -4,6 +4,7 @@ pub mod base_range;
 pub mod benchmark;
 pub mod client_api;
 pub mod client_process;
+pub mod generate_fields;
 pub mod residue_filter;
 
 use clap::ValueEnum;
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::env;
+use std::ops::Add;
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
@@ -26,6 +28,14 @@ pub enum SearchMode {
     /// Implements optimizations to speed up the search, usually by a factor of around 20.
     /// Does not keep statistics and cannot be quickly verified.
     Niceonly,
+}
+
+/// Information on searchable fields.
+#[derive(Debug, PartialEq)]
+pub struct SearchField {
+    pub start: Natural,
+    pub end: Natural,
+    pub size: u128,
 }
 
 /// A field returned from the server. Used as input for processing.
