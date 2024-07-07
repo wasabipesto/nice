@@ -2,11 +2,16 @@
 //! ```cargo
 //! [dependencies]
 //! nice_common = { path = "../common" }
+//! read_input = "0.8"
 //! ```
 
+use read_input::prelude::*;
+
 fn main() {
-    let base = 40;
+    println!("Enter a base: ")
+    let base = input::<u32>().get();
     let field_size = 1000000000;
+    println!("Using default field size {}.", field_size)
 
     let base_range = nice_common::base_range::get_base_range_natural(base).unwrap();
     println!("Base Range:");

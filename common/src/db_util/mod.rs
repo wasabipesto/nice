@@ -2,6 +2,11 @@
 
 use super::*;
 
+use bigdecimal::{BigDecimal, ToPrimitive};
+use diesel::prelude::*;
+use diesel::table;
+
+mod conversions;
 mod field;
 
 /// Return the lowest field that has not been claimed recently and log the claim.
@@ -70,6 +75,12 @@ pub fn update_base_stats() -> Result<(), String> {
 
 /// Insert a bunch of fields and chunks for processing.
 /// Only called by admin scripts.
-pub fn insert_fields_and_chunks() -> Result<(), String> {
-    unimplemented!();
+pub fn insert_fields_and_chunks(
+    conn: &mut PgConnection,
+    fields: Vec<FieldRecord>,
+) -> Result<(), String> {
+    for field in fields {
+        field::insert_field(conn, field)?;
+    }
+    Ok(())
 }
