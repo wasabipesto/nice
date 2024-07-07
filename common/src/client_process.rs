@@ -56,7 +56,7 @@ pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
     let mut nice_list: HashMap<u128, u32> = HashMap::new();
 
     // process the range and collect num_uniques for each item in the range
-    (search_start..search_end).into_iter().for_each(|num| {
+    (search_start..search_end).for_each(|num| {
         // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
 
         // get the number of uniques

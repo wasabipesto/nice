@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod field;
+
 /// Return the lowest field that has not been claimed recently and log the claim.
 pub fn claim_next_field() -> Result<(), String> {
     unimplemented!();

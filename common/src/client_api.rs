@@ -7,7 +7,7 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) 
     // build the url
     // TODO: use an actual url building lib?
     let mut query_url = api_base.to_owned();
-    query_url += &match mode {
+    query_url += match mode {
         SearchMode::Detailed => "/claim/detailed",
         SearchMode::Niceonly => "/claim/niceonly",
     };

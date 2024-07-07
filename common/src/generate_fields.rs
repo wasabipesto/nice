@@ -5,35 +5,29 @@ use super::*;
 /// Break a base range into smaller, searchable fields.
 /// Each field should be `size` in width, with the last one being smaller.
 /// If the base range is less than `size` it returns one field.
-pub fn break_range_into_fields(min: &Natural, max: &Natural, size_u128: u128) -> Vec<FieldSize> {
+pub fn break_range_into_fields(min: u128, max: u128, size: u128) -> Vec<FieldSize> {
     // create output vec
     let mut fields = Vec::new();
 
-    // convert to natural for operation
-    let size = Natural::from(size_u128);
-
     // start the field bound counters
-    let mut field_start = min.clone();
-    let mut field_end = min.clone();
+    let mut start = min;
+    let mut end = min;
 
     // walk through base range
-    while &field_end < max {
+    while end < max {
         // calculate the end and size
-        field_end = field_start.clone().add(&size).min(max.clone());
-
-        // size should always fit in u128 since it's clamped to a value that fits in u128
-        let field_size = u128::try_from(&(field_end.clone() - field_start.clone())).unwrap();
+        end = start.add(&size).min(max);
 
         // build and push the field
         let field = FieldSize {
-            start: field_start.clone(),
-            end: field_end.clone(),
-            size: field_size,
+            start,
+            end,
+            size: end - start,
         };
         fields.push(field);
 
         // bump the start
-        field_start = field_end.clone();
+        start = end;
     }
     fields
 }
@@ -47,16 +41,16 @@ mod tests {
     fn test_break_range_into_fields_b10() {
         let base = 10;
         let size = 1000000000;
-        let base_range = base_range::get_base_range_natural(base).unwrap();
-        let fields = break_range_into_fields(&base_range.0, &base_range.1, size);
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let fields = break_range_into_fields(base_range.0, base_range.1, size);
 
         // check against known field
         assert_eq!(
             fields,
             vec![FieldSize {
-                start: Natural::from(47u32),
-                end: Natural::from(100u32),
-                size: 53
+                start: 47u128,
+                end: 100u128,
+                size: 53u128
             }]
         );
     }
@@ -65,10 +59,10 @@ mod tests {
     fn test_break_range_into_fields_general() {
         for base in [10, 11, 12, 13, 14, 15, 20, 30, 40] {
             for size in [100000000, 1000000000, 10000000000] {
-                let base_range = base_range::get_base_range_natural(base);
+                let base_range = base_range::get_base_range_u128(base).unwrap();
                 if let Some(range) = base_range {
                     // get the fields
-                    let fields = break_range_into_fields(&range.0, &range.1, size);
+                    let fields = break_range_into_fields(range.0, range.1, size);
 
                     // check the start and end are correct
                     assert_eq!(fields.first().unwrap().start, range.0);
@@ -81,25 +75,22 @@ mod tests {
 
                     // check there are the right number of fields
                     let (num_fields_mo, last_field_size) =
-                        (range.1.clone() - range.0.clone()).div_mod(Natural::from(size));
-                    assert_eq!(fields.len(), usize::try_from(&num_fields_mo).unwrap() + 1);
+                        (range.1.clone() - range.0.clone()).div_mod(size);
+                    assert_eq!(fields.len(), num_fields_mo as usize + 1);
 
                     // check the last field is the correct size
-                    assert_eq!(
-                        fields.last().unwrap().size,
-                        u128::try_from(&last_field_size).unwrap()
-                    );
+                    assert_eq!(fields.last().unwrap().size, last_field_size);
 
                     // check the first field is the correct size
                     if fields.len() > 1 {
                         assert_eq!(fields.first().unwrap().size, size);
                     } else {
-                        let range_size = u128::try_from(&(range.1 - range.0)).unwrap();
+                        let range_size = range.1 - range.0;
                         assert_eq!(fields.first().unwrap().size, range_size);
                     }
 
                     // check the fields are in ascending order
-                    let mut last_start = Natural::from(0u32);
+                    let mut last_start = 0u128;
                     for field in fields {
                         assert!(field.start > last_start);
                         last_start = field.start.clone()

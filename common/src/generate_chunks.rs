@@ -32,14 +32,10 @@ pub fn group_fields_into_chunks(fields: Vec<FieldSize>) -> Vec<FieldSize> {
         }
 
         // get the start, end, and size from the chunk
-        let start = &chunk_fields.front().unwrap().start;
-        let end = &chunk_fields.back().unwrap().end;
-        let size = u128::try_from(&(end - start)).unwrap();
-        chunks.push(FieldSize {
-            start: start.clone(),
-            end: end.clone(),
-            size,
-        });
+        let start = chunk_fields.front().unwrap().start;
+        let end = chunk_fields.back().unwrap().end;
+        let size = end - start;
+        chunks.push(FieldSize { start, end, size });
     }
 
     chunks
@@ -53,17 +49,17 @@ mod tests {
     fn test_group_fields_into_chunks_b10() {
         let base = 10;
         let size = 1000000000;
-        let base_range = base_range::get_base_range_natural(base).unwrap();
-        let fields = generate_fields::break_range_into_fields(&base_range.0, &base_range.1, size);
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let fields = generate_fields::break_range_into_fields(base_range.0, base_range.1, size);
         let chunks = group_fields_into_chunks(fields.clone());
 
         // check against known field
         assert_eq!(
             chunks,
             vec![FieldSize {
-                start: Natural::from(47u32),
-                end: Natural::from(100u32),
-                size: 53
+                start: 47u128,
+                end: 100u128,
+                size: 53u128
             }]
         );
 
@@ -75,10 +71,10 @@ mod tests {
     fn test_group_fields_into_chunks_general() {
         for base in [10, 11, 12, 13, 14, 15, 20, 30, 40] {
             for size in [100000000, 1000000000, 10000000000] {
-                let base_range = base_range::get_base_range_natural(base);
+                let base_range = base_range::get_base_range_u128(base).unwrap();
                 if let Some(range) = base_range {
                     // get the fields
-                    let fields = generate_fields::break_range_into_fields(&range.0, &range.1, size);
+                    let fields = generate_fields::break_range_into_fields(range.0, range.1, size);
                     let num_fields = fields.len();
 
                     // get the chunks
@@ -92,10 +88,10 @@ mod tests {
                     assert!(chunks.len() <= TARGET_NUM_CHUNKS as usize);
 
                     // check the chunks are in ascending order
-                    let mut last_start = Natural::from(0u32);
+                    let mut last_start = 0u128;
                     for chunk in chunks {
                         assert!(chunk.start > last_start);
-                        last_start = chunk.start.clone()
+                        last_start = chunk.start
                     }
 
                     // check the fields were not affected

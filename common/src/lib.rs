@@ -32,16 +32,25 @@ pub enum SearchMode {
     Niceonly,
 }
 
-/// Information on searchable fields.
-#[derive(Debug, Clone, PartialEq)]
+/// Data on the bounds of a search range.
+/// Could be a base, chunk, field, or something else.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FieldSize {
-    pub start: Natural,
-    pub end: Natural,
+    pub start: u128,
+    pub end: u128,
     pub size: u128,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct Base {
+    pub base: u32,
+    pub search_start: u128,
+    pub search_end: u128,
+    pub search_range: u128,
+}
+
 /// A field returned from the server. Used as input for processing.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FieldClaim {
     pub id: u32,
     pub username: String,
@@ -51,8 +60,40 @@ pub struct FieldClaim {
     pub search_range: u128,
 }
 
+/// Aggregate data on the niceness of all numbers in the range.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct UniquesDistributionSimple {
+    pub num_uniques: u32,
+    pub count: u128,
+}
+
+/// Extended version with derived stats.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct UniquesDistributionExtended {
+    pub num_uniques: u32,
+    pub count: u128,
+    pub niceness: f32,
+    pub density: f32,
+}
+
+/// Individual, notably nice numbers.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct NiceNumbersSimple {
+    pub number: Natural,
+    pub num_uniques: u32,
+}
+
+/// Extended version with derived stats.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct NiceNumbersExtended {
+    pub number: Natural,
+    pub num_uniques: u32,
+    pub base: u32,
+    pub niceness: f32,
+}
+
 /// The compiled results sent to the server after processing. Options for both modes.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FieldSubmit {
     pub id: u32,
     pub username: String,
