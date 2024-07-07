@@ -42,11 +42,11 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
 }
 
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
-pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
+pub fn process_detailed(claim_data: &FieldToClient, username: &String) -> FieldToServer {
     // get the basic parameters
     let base = claim_data.base;
-    let search_start = claim_data.search_start;
-    let search_end = claim_data.search_end;
+    let range_start = claim_data.range_start;
+    let range_end = claim_data.range_end;
 
     // get the minimum cutoff (90% of the base)
     let nice_list_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
@@ -56,7 +56,7 @@ pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
     let mut nice_list: HashMap<u128, u32> = HashMap::new();
 
     // process the range and collect num_uniques for each item in the range
-    (search_start..search_end).for_each(|num| {
+    (range_start..range_end).for_each(|num| {
         // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
 
         // get the number of uniques
@@ -77,9 +77,9 @@ pub fn process_detailed(claim_data: &FieldClaim) -> FieldSubmit {
         }
     });
 
-    FieldSubmit {
-        id: claim_data.id,
-        username: claim_data.username.clone(),
+    FieldToServer {
+        claim_id: claim_data.claim_id,
+        username: username.to_owned(),
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution: Some(unique_distribution),
         nice_list,
@@ -125,21 +125,21 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
 
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
-pub fn process_niceonly(claim_data: &FieldClaim) -> FieldSubmit {
+pub fn process_niceonly(claim_data: &FieldToClient, username: &String) -> FieldToServer {
     let base = claim_data.base;
-    let search_start = claim_data.search_start;
-    let search_end = claim_data.search_end;
+    let range_start = claim_data.range_start;
+    let range_end = claim_data.range_end;
     let residue_filter = residue_filter::get_residue_filter(&base);
 
-    let nice_list = (search_start..search_end)
+    let nice_list = (range_start..range_end)
         .filter(|num| residue_filter.contains(&((num % (base as u128 - 1)) as u32)))
         .filter(|num| get_is_nice(*num, base))
         .map(|num| (num, base))
         .collect();
 
-    FieldSubmit {
-        id: claim_data.id,
-        username: claim_data.username.clone(),
+    FieldToServer {
+        claim_id: claim_data.claim_id,
+        username: username.to_owned(),
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution: None,
         nice_list,
@@ -152,17 +152,17 @@ mod tests {
 
     #[test]
     fn process_detailed_b10() {
-        let claim_data = FieldClaim {
-            id: 0,
-            username: "benchmark".to_owned(),
+        let username = "anonymous".to_string();
+        let claim_data = FieldToClient {
+            claim_id: 0,
             base: 10,
-            search_start: 47,
-            search_end: 100,
-            search_range: 53,
+            range_start: 47,
+            range_end: 100,
+            range_size: 53,
         };
-        let submit_data = FieldSubmit {
-            id: claim_data.id.clone(),
-            username: claim_data.username.clone(),
+        let submit_data = FieldToServer {
+            claim_id: claim_data.claim_id.clone(),
+            username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: Some(HashMap::from([
                 (1, 0),
@@ -178,22 +178,22 @@ mod tests {
             ])),
             nice_list: HashMap::from([(69, 10)]),
         };
-        assert_eq!(process_detailed(&claim_data), submit_data);
+        assert_eq!(process_detailed(&claim_data, &username), submit_data);
     }
 
     #[test]
     fn process_detailed_b40() {
-        let claim_data = FieldClaim {
-            id: 0,
-            username: "benchmark".to_owned(),
+        let username = "anonymous".to_string();
+        let claim_data = FieldToClient {
+            claim_id: 0,
             base: 40,
-            search_start: 916284264916,
-            search_end: 916284264916 + 10000,
-            search_range: 10000,
+            range_start: 916284264916,
+            range_end: 916284264916 + 10000,
+            range_size: 10000,
         };
-        let submit_data = FieldSubmit {
-            id: claim_data.id.clone(),
-            username: claim_data.username.clone(),
+        let submit_data = FieldToServer {
+            claim_id: claim_data.claim_id.clone(),
+            username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: Some(HashMap::from([
                 (1, 0),
@@ -239,22 +239,22 @@ mod tests {
             ])),
             nice_list: HashMap::new(),
         };
-        assert_eq!(process_detailed(&claim_data), submit_data);
+        assert_eq!(process_detailed(&claim_data, &username), submit_data);
     }
 
     #[test]
     fn process_detailed_b80() {
-        let claim_data = FieldClaim {
-            id: 0,
-            username: "benchmark".to_owned(),
+        let username = "anonymous".to_string();
+        let claim_data = FieldToClient {
+            claim_id: 0,
             base: 80,
-            search_start: 653245554420798943087177909799,
-            search_end: 653245554420798943087177909799 + 10000,
-            search_range: 10000,
+            range_start: 653245554420798943087177909799,
+            range_end: 653245554420798943087177909799 + 10000,
+            range_size: 10000,
         };
-        let submit_data = FieldSubmit {
-            id: claim_data.id.clone(),
-            username: claim_data.username.clone(),
+        let submit_data = FieldToServer {
+            claim_id: claim_data.claim_id.clone(),
+            username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: Some(HashMap::from([
                 (1, 0),
@@ -340,66 +340,66 @@ mod tests {
             ])),
             nice_list: HashMap::new(),
         };
-        assert_eq!(process_detailed(&claim_data), submit_data);
+        assert_eq!(process_detailed(&claim_data, &username), submit_data);
     }
 
     #[test]
     fn process_niceonly_b10() {
-        let claim_data = FieldClaim {
-            id: 0,
-            username: "benchmark".to_owned(),
+        let username = "anonymous".to_string();
+        let claim_data = FieldToClient {
+            claim_id: 0,
             base: 10,
-            search_start: 47,
-            search_end: 100,
-            search_range: 53,
+            range_start: 47,
+            range_end: 100,
+            range_size: 53,
         };
-        let submit_data = FieldSubmit {
-            id: claim_data.id.clone(),
-            username: claim_data.username.clone(),
+        let submit_data = FieldToServer {
+            claim_id: claim_data.claim_id.clone(),
+            username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,
             nice_list: HashMap::from([(69, 10)]),
         };
-        assert_eq!(process_niceonly(&claim_data), submit_data);
+        assert_eq!(process_niceonly(&claim_data, &username), submit_data);
     }
 
     #[test]
     fn process_niceonly_b40() {
-        let claim_data = FieldClaim {
-            id: 0,
-            username: "benchmark".to_owned(),
+        let username = "anonymous".to_string();
+        let claim_data = FieldToClient {
+            claim_id: 0,
             base: 40,
-            search_start: 916284264916,
-            search_end: 916284264916 + 10000,
-            search_range: 10000,
+            range_start: 916284264916,
+            range_end: 916284264916 + 10000,
+            range_size: 10000,
         };
-        let submit_data = FieldSubmit {
-            id: claim_data.id.clone(),
-            username: claim_data.username.clone(),
+        let submit_data = FieldToServer {
+            claim_id: claim_data.claim_id.clone(),
+            username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,
             nice_list: HashMap::new(),
         };
-        assert_eq!(process_niceonly(&claim_data), submit_data);
+        assert_eq!(process_niceonly(&claim_data, &username), submit_data);
     }
 
     #[test]
     fn process_niceonly_b80() {
-        let claim_data = FieldClaim {
-            id: 0,
-            username: "benchmark".to_owned(),
+        let username = "anonymous".to_string();
+        let claim_data = FieldToClient {
+            claim_id: 0,
             base: 80,
-            search_start: 653245554420798943087177909799,
-            search_end: 653245554420798943087177909799 + 10000,
-            search_range: 10000,
+            range_start: 653245554420798943087177909799,
+            range_end: 653245554420798943087177909799 + 10000,
+            range_size: 10000,
         };
-        let submit_data = FieldSubmit {
-            id: claim_data.id.clone(),
-            username: claim_data.username.clone(),
+        let submit_data = FieldToServer {
+            claim_id: claim_data.claim_id.clone(),
+            username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,
             nice_list: HashMap::new(),
         };
-        assert_eq!(process_niceonly(&claim_data), submit_data);
+        assert_eq!(process_niceonly(&claim_data, &username), submit_data);
     }
 }

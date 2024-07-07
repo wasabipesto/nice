@@ -16,28 +16,27 @@ pub enum BenchmarkMode {
     HiBase,
 }
 
-pub fn get_benchmark_field(mode: BenchmarkMode) -> FieldClaim {
+pub fn get_benchmark_field(mode: BenchmarkMode) -> FieldToClient {
     let base = match mode {
         BenchmarkMode::Default => 40,
         BenchmarkMode::Large => 40,
         BenchmarkMode::ExtraLarge => 40,
         BenchmarkMode::HiBase => 80,
     };
-    let (start, _) = base_range::get_base_range_u128(base).unwrap().unwrap();
-    let range = match mode {
+    let (range_start, _) = base_range::get_base_range_u128(base).unwrap().unwrap();
+    let range_size = match mode {
         BenchmarkMode::Default => 100000,
         BenchmarkMode::Large => 10000000,
         BenchmarkMode::ExtraLarge => 1000000000,
         BenchmarkMode::HiBase => 100000,
     };
 
-    FieldClaim {
-        id: 0,
-        username: "benchmark".to_owned(),
+    FieldToClient {
+        claim_id: 0,
         base,
-        search_start: start,
-        search_end: start + range,
-        search_range: range,
+        range_start,
+        range_end: range_start + range_size,
+        range_size,
     }
 }
 

@@ -20,9 +20,9 @@ pub fn break_range_into_fields(min: u128, max: u128, size: u128) -> Vec<FieldSiz
 
         // build and push the field
         let field = FieldSize {
-            start,
-            end,
-            size: end - start,
+            range_start: start,
+            range_end: end,
+            range_size: end - start,
         };
         fields.push(field);
 
@@ -48,9 +48,9 @@ mod tests {
         assert_eq!(
             fields,
             vec![FieldSize {
-                start: 47u128,
-                end: 100u128,
-                size: 53u128
+                range_start: 47u128,
+                range_end: 100u128,
+                range_size: 53u128
             }]
         );
     }
@@ -65,12 +65,12 @@ mod tests {
                     let fields = break_range_into_fields(range.0, range.1, size);
 
                     // check the start and end are correct
-                    assert_eq!(fields.first().unwrap().start, range.0);
-                    assert_eq!(fields.last().unwrap().end, range.1);
+                    assert_eq!(fields.first().unwrap().range_start, range.0);
+                    assert_eq!(fields.last().unwrap().range_end, range.1);
 
                     // check the sizes are within range
                     for field in &fields {
-                        assert!(field.size <= size);
+                        assert!(field.range_size <= size);
                     }
 
                     // check there are the right number of fields
@@ -79,21 +79,21 @@ mod tests {
                     assert_eq!(fields.len(), num_fields_mo as usize + 1);
 
                     // check the last field is the correct size
-                    assert_eq!(fields.last().unwrap().size, last_field_size);
+                    assert_eq!(fields.last().unwrap().range_size, last_field_size);
 
                     // check the first field is the correct size
                     if fields.len() > 1 {
-                        assert_eq!(fields.first().unwrap().size, size);
+                        assert_eq!(fields.first().unwrap().range_size, size);
                     } else {
                         let range_size = range.1 - range.0;
-                        assert_eq!(fields.first().unwrap().size, range_size);
+                        assert_eq!(fields.first().unwrap().range_size, range_size);
                     }
 
                     // check the fields are in ascending order
                     let mut last_start = 0u128;
                     for field in fields {
-                        assert!(field.start > last_start);
-                        last_start = field.start.clone()
+                        assert!(field.range_start > last_start);
+                        last_start = field.range_start.clone()
                     }
                 }
             }

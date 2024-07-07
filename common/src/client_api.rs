@@ -3,7 +3,7 @@
 use super::*;
 
 /// Request a field from the server. Supplies CLI options as query strings.
-pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) -> FieldClaim {
+pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) -> FieldToClient {
     // build the url
     // TODO: use an actual url building lib?
     let mut query_url = api_base.to_owned();
@@ -17,14 +17,14 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) 
     let response = reqwest::blocking::get(&query_url).unwrap_or_else(|e| panic!("Error: {}", e));
 
     // deserialize and unwrap or panic
-    match response.json::<FieldClaim>() {
+    match response.json::<FieldToClient>() {
         Ok(claim_data) => claim_data,
         Err(e) => panic!("Error: {}", e),
     }
 }
 
 /// Submit field results to the server. Panic if there is an error.
-pub fn submit_field_to_server(mode: &SearchMode, api_base: &str, submit_data: FieldSubmit) {
+pub fn submit_field_to_server(mode: &SearchMode, api_base: &str, submit_data: FieldToServer) {
     // TODO: same route in v6
     let url = match mode {
         SearchMode::Detailed => format!("{}/submit", api_base),

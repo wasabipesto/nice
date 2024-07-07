@@ -38,9 +38,10 @@ CREATE TABLE field (
     range_start DECIMAL NOT NULL,
     range_end DECIMAL NOT NULL,
     range_size DECIMAL NOT NULL,
-    last_claim TIMESTAMPTZ,
+    last_claim_time TIMESTAMPTZ,
     canon_submission_id INTEGER,
-    check_level INTEGER
+    check_level INTEGER NOT NULL DEFAULT 0,
+    prioritize BOOLEAN NOT NULL DEFAULT 0
 );
 -- CLAIMS: LOG OF CLAIM REQUESTS
 DROP TABLE IF EXISTS claim;
@@ -58,14 +59,14 @@ CREATE TABLE submission (
     id BIGSERIAL PRIMARY KEY,
     claim_id INTEGER NOT NULL,
     field_id INTEGER NOT NULL,
-    search_mode VARCHAR,
+    search_mode VARCHAR NOT NULL,
     submit_time TIMESTAMPTZ,
     elapsed_secs INTEGER,
     username VARCHAR NOT NULL,
     user_ip VARCHAR,
     user_agent VARCHAR,
     client_version VARCHAR,
-    disqualified BOOLEAN DEFAULT 0,
+    disqualified BOOLEAN NOT NULL DEFAULT 0,
     distribution JSONB,
     numbers JSONB NOT NULL DEFAULT "[]"
 );

@@ -6,7 +6,7 @@ use nice_common::client_api::get_field_from_server;
 use nice_common::client_api::submit_field_to_server;
 use nice_common::client_process::process_detailed;
 use nice_common::client_process::process_niceonly;
-use nice_common::{FieldSubmit, SearchMode};
+use nice_common::{FieldToServer, SearchMode};
 
 use clap::Parser;
 use std::time::Instant;
@@ -61,9 +61,9 @@ fn main() {
     let before = Instant::now();
 
     // process range & compile results
-    let submit_data: FieldSubmit = match cli.mode {
-        SearchMode::Detailed => process_detailed(&claim_data),
-        SearchMode::Niceonly => process_niceonly(&claim_data),
+    let submit_data: FieldToServer = match cli.mode {
+        SearchMode::Detailed => process_detailed(&claim_data, &cli.username),
+        SearchMode::Niceonly => process_niceonly(&claim_data, &cli.username),
     };
 
     // stop the benchmarking timer
@@ -79,7 +79,7 @@ fn main() {
         println!("Elapsed time: {:.3?}", before.elapsed());
         println!(
             "Hash rate:    {:.3e}",
-            claim_data.search_range as f64 / elapsed_seconds
+            claim_data.range_size as f64 / elapsed_seconds
         );
     }
 
