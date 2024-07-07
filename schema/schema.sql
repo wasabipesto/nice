@@ -11,8 +11,8 @@ CREATE TABLE base (
     minimum_cl INTEGER NOT NULL DEFAULT 0,
     niceness_mean REAL,
     niceness_stdev REAL,
-    distribution JSONB NOT NULL DEFAULT "[]",
-    numbers JSONB NOT NULL DEFAULT "[]"
+    distribution JSONB NOT NULL DEFAULT '[]',
+    numbers JSONB NOT NULL DEFAULT '[]'
 );
 -- CHUNKS: AGGREGATE FIELDS FOR ANALYTICS
 DROP TABLE IF EXISTS chunk;
@@ -26,8 +26,8 @@ CREATE TABLE chunk (
     minimum_cl INTEGER NOT NULL DEFAULT 0,
     niceness_mean REAL,
     niceness_stdev REAL,
-    distribution JSONB NOT NULL DEFAULT "[]",
-    numbers JSONB NOT NULL DEFAULT "[]"
+    distribution JSONB NOT NULL DEFAULT '[]',
+    numbers JSONB NOT NULL DEFAULT '[]'
 );
 -- FIELDS: INDIVIDUAL SEARCH RANGES
 DROP TABLE IF EXISTS field;
@@ -41,7 +41,7 @@ CREATE TABLE field (
     last_claim_time TIMESTAMPTZ,
     canon_submission_id INTEGER,
     check_level INTEGER NOT NULL DEFAULT 0,
-    prioritize BOOLEAN NOT NULL DEFAULT 0
+    prioritize BOOLEAN NOT NULL DEFAULT 'false'
 );
 -- CLAIMS: LOG OF CLAIM REQUESTS
 DROP TABLE IF EXISTS claim;
@@ -66,7 +66,7 @@ CREATE TABLE submission (
     user_ip VARCHAR,
     user_agent VARCHAR,
     client_version VARCHAR,
-    disqualified BOOLEAN NOT NULL DEFAULT 0,
+    disqualified BOOLEAN NOT NULL DEFAULT 'false',
     distribution JSONB,
-    numbers JSONB NOT NULL DEFAULT "[]"
+    numbers JSONB NOT NULL DEFAULT '[]'
 );

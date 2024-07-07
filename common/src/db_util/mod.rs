@@ -9,6 +9,13 @@ use diesel::table;
 mod conversions;
 mod field;
 
+pub fn get_database_connection() -> PgConnection {
+    dotenv().ok();
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    PgConnection::establish(&database_url)
+        .unwrap_or_else(|_| panic!("Error connecting to {}", database_url))
+}
+
 /// Return the lowest field that has not been claimed recently and log the claim.
 pub fn claim_next_field() -> Result<(), String> {
     unimplemented!();
@@ -75,12 +82,19 @@ pub fn update_base_stats() -> Result<(), String> {
 
 /// Insert a bunch of fields and chunks for processing.
 /// Only called by admin scripts.
-pub fn insert_fields_and_chunks(
+pub fn insert_new_base_and_fields(
     conn: &mut PgConnection,
-    fields: Vec<FieldRecord>,
+    base: u32,
+    base_size: FieldSize,
+    field_sizes: Vec<FieldSize>,
 ) -> Result<(), String> {
-    for field in fields {
-        field::insert_field(conn, field)?;
+    // insert the base row
+    //base::insert_field(conn, base, base_size)?;
+
+    // insert each field
+    for size in field_sizes {
+        field::insert_field(conn, base, size)?;
     }
+
     Ok(())
 }

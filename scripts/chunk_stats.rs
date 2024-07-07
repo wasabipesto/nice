@@ -9,10 +9,12 @@ fn main() {
     println!("Field size: {}", field_size);
 
     for base in 10..51 {
-        let base_range = nice_common::base_range::get_base_range_natural(base);
+        let base_range = nice_common::base_range::get_base_range_u128(base).unwrap();
         if let Some(range) = base_range {
             let fields = nice_common::generate_fields::break_range_into_fields(
-                &range.0, &range.1, field_size,
+                range.range_start,
+                range.range_end,
+                field_size,
             );
             let chunks = nice_common::generate_chunks::group_fields_into_chunks(fields.clone());
             println!(

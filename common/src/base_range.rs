@@ -27,16 +27,21 @@ pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
 /// Get the range of possible values for a base, but return u128.
 /// Returns None if there are no valid numbers in that base.
 /// Returns Err if the numbers are too large for u128.
-pub fn get_base_range_u128(base: u32) -> Result<Option<(u128, u128)>, String> {
+pub fn get_base_range_u128(base: u32) -> Result<Option<FieldSize>, String> {
     // get the natural results
-    match get_base_range_natural(base) {
-        Some((min, max)) => Ok(Some((
+    let (range_start, range_end) = match get_base_range_natural(base) {
+        Some((min, max)) => (
             // convert to u128
             u128::try_from(&min).map_err(|_| format!("Failed to convert {min} to u128."))?,
             u128::try_from(&max).map_err(|_| format!("Failed to convert {max} to u128."))?,
-        ))),
-        None => Ok(None),
-    }
+        ),
+        None => return Ok(None),
+    };
+    Ok(Some(FieldSize {
+        range_start,
+        range_end,
+        range_size: range_end - range_start,
+    }))
 }
 
 #[cfg(test)]
@@ -46,23 +51,70 @@ mod tests {
 
     #[test]
     fn test_get_base_range_u128() {
-        assert_eq!(get_base_range_u128(4), Ok(Some((2u128, 2u128))));
-        assert_eq!(get_base_range_u128(5), Ok(Some((3u128, 5u128))));
+        assert_eq!(
+            get_base_range_u128(4),
+            Ok(Some(FieldSize {
+                range_start: 2u128,
+                range_end: 2u128,
+                range_size: 0u128
+            }))
+        );
+        assert_eq!(
+            get_base_range_u128(5),
+            Ok(Some(FieldSize {
+                range_start: 3u128,
+                range_end: 5u128,
+                range_size: 2u128
+            }))
+        );
         assert_eq!(get_base_range_u128(6), Ok(None));
-        assert_eq!(get_base_range_u128(7), Ok(Some((7u128, 13u128))));
-        assert_eq!(get_base_range_u128(8), Ok(Some((16u128, 22u128))));
-        assert_eq!(get_base_range_u128(9), Ok(Some((27u128, 38u128))));
-        assert_eq!(get_base_range_u128(10), Ok(Some((47u128, 100u128))));
+        assert_eq!(
+            get_base_range_u128(7),
+            Ok(Some(FieldSize {
+                range_start: 7u128,
+                range_end: 13u128,
+                range_size: 6u128
+            }))
+        );
+        assert_eq!(
+            get_base_range_u128(8),
+            Ok(Some(FieldSize {
+                range_start: 16u128,
+                range_end: 22u128,
+                range_size: 6u128
+            }))
+        );
+        assert_eq!(
+            get_base_range_u128(9),
+            Ok(Some(FieldSize {
+                range_start: 27u128,
+                range_end: 38u128,
+                range_size: 11u128
+            }))
+        );
+        assert_eq!(
+            get_base_range_u128(10),
+            Ok(Some(FieldSize {
+                range_start: 47u128,
+                range_end: 100u128,
+                range_size: 53u128
+            }))
+        );
         assert_eq!(
             get_base_range_u128(40),
-            Ok(Some((1916284264916u128, 6553600000000u128)))
+            Ok(Some(FieldSize {
+                range_start: 1916284264916u128,
+                range_end: 6553600000000u128,
+                range_size: 4637315735084u128
+            }))
         );
         assert_eq!(
             get_base_range_u128(80),
-            Ok(Some((
-                653245554420798943087177909799u128,
-                2814749767106560000000000000000u128
-            )))
+            Ok(Some(FieldSize {
+                range_start: 653245554420798943087177909799u128,
+                range_end: 2814749767106560000000000000000u128,
+                range_size: 2161504212685761056912822090201u128
+            }))
         );
     }
 

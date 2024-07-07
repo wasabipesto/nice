@@ -54,7 +54,11 @@ mod tests {
         let base = 10;
         let size = 1000000000;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
-        let fields = generate_fields::break_range_into_fields(base_range.0, base_range.1, size);
+        let fields = generate_fields::break_range_into_fields(
+            base_range.range_start,
+            base_range.range_end,
+            size,
+        );
         let chunks = group_fields_into_chunks(fields.clone());
 
         // check against known field
@@ -78,15 +82,19 @@ mod tests {
                 let base_range = base_range::get_base_range_u128(base).unwrap();
                 if let Some(range) = base_range {
                     // get the fields
-                    let fields = generate_fields::break_range_into_fields(range.0, range.1, size);
+                    let fields = generate_fields::break_range_into_fields(
+                        range.range_start,
+                        range.range_end,
+                        size,
+                    );
                     let num_fields = fields.len();
 
                     // get the chunks
                     let chunks = group_fields_into_chunks(fields.clone());
 
                     // check the start and end are correct
-                    assert_eq!(chunks.first().unwrap().range_start, range.0);
-                    assert_eq!(chunks.last().unwrap().range_end, range.1);
+                    assert_eq!(chunks.first().unwrap().range_start, range.range_start);
+                    assert_eq!(chunks.last().unwrap().range_end, range.range_end);
 
                     // check there are at most 100 chunks
                     assert!(chunks.len() <= TARGET_NUM_CHUNKS as usize);

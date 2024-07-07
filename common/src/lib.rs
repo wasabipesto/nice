@@ -11,6 +11,7 @@ pub mod residue_filter;
 
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
+use dotenvy::dotenv;
 use malachite::natural::Natural;
 use malachite::num::arithmetic::traits::{CeilingRoot, DivAssignRem, FloorRoot, Pow};
 use malachite::num::conversion::traits::Digits;

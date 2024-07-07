@@ -23,7 +23,10 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> FieldToClient {
         BenchmarkMode::ExtraLarge => 40,
         BenchmarkMode::HiBase => 80,
     };
-    let (range_start, _) = base_range::get_base_range_u128(base).unwrap().unwrap();
+    let range_start = base_range::get_base_range_u128(base)
+        .unwrap()
+        .unwrap()
+        .range_start;
     let range_size = match mode {
         BenchmarkMode::Default => 100000,
         BenchmarkMode::Large => 10000000,

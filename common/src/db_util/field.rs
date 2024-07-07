@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::*;
 
 table! {
@@ -15,7 +17,7 @@ table! {
     }
 }
 
-#[derive(Queryable, Insertable, AsChangeset)]
+#[derive(Queryable, AsChangeset)]
 #[diesel(table_name = field)]
 struct FieldPrivate {
     id: i64,
@@ -28,6 +30,15 @@ struct FieldPrivate {
     canon_submission_id: Option<i32>,
     check_level: i32,
     prioritize: bool,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = field)]
+struct FieldPrivateNew {
+    base_id: i32,
+    range_start: BigDecimal,
+    range_end: BigDecimal,
+    range_size: BigDecimal,
 }
 
 fn private_to_public(p: FieldPrivate) -> Result<FieldRecord, String> {
@@ -62,13 +73,24 @@ fn public_to_private(p: FieldRecord) -> Result<FieldPrivate, String> {
     })
 }
 
+fn build_new_row(base: u32, size: FieldSize) -> Result<FieldPrivateNew, String> {
+    use conversions::*;
+    Ok(FieldPrivateNew {
+        base_id: u32_to_i32(base)?,
+        range_start: u128_to_bigdec(size.range_start)?,
+        range_end: u128_to_bigdec(size.range_end)?,
+        range_size: u128_to_bigdec(size.range_size)?,
+    })
+}
+
 pub fn insert_field(
     conn: &mut PgConnection,
-    insert_row: FieldRecord,
+    base: u32,
+    size: FieldSize,
 ) -> Result<FieldRecord, String> {
     use self::field::dsl::*;
 
-    let insert_row = public_to_private(insert_row)?;
+    let insert_row = build_new_row(base, size)?;
 
     diesel::insert_into(field)
         .values(&insert_row)

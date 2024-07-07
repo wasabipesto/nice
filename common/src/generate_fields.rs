@@ -42,7 +42,7 @@ mod tests {
         let base = 10;
         let size = 1000000000;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
-        let fields = break_range_into_fields(base_range.0, base_range.1, size);
+        let fields = break_range_into_fields(base_range.range_start, base_range.range_end, size);
 
         // check against known field
         assert_eq!(
@@ -62,11 +62,11 @@ mod tests {
                 let base_range = base_range::get_base_range_u128(base).unwrap();
                 if let Some(range) = base_range {
                     // get the fields
-                    let fields = break_range_into_fields(range.0, range.1, size);
+                    let fields = break_range_into_fields(range.range_start, range.range_end, size);
 
                     // check the start and end are correct
-                    assert_eq!(fields.first().unwrap().range_start, range.0);
-                    assert_eq!(fields.last().unwrap().range_end, range.1);
+                    assert_eq!(fields.first().unwrap().range_start, range.range_start);
+                    assert_eq!(fields.last().unwrap().range_end, range.range_end);
 
                     // check the sizes are within range
                     for field in &fields {
@@ -75,7 +75,7 @@ mod tests {
 
                     // check there are the right number of fields
                     let (num_fields_mo, last_field_size) =
-                        (range.1.clone() - range.0.clone()).div_mod(size);
+                        (range.range_end.clone() - range.range_start.clone()).div_mod(size);
                     assert_eq!(fields.len(), num_fields_mo as usize + 1);
 
                     // check the last field is the correct size
@@ -85,8 +85,7 @@ mod tests {
                     if fields.len() > 1 {
                         assert_eq!(fields.first().unwrap().range_size, size);
                     } else {
-                        let range_size = range.1 - range.0;
-                        assert_eq!(fields.first().unwrap().range_size, range_size);
+                        assert_eq!(fields.first().unwrap().range_size, range.range_size);
                     }
 
                     // check the fields are in ascending order
