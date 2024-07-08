@@ -18,6 +18,7 @@ CREATE TABLE base (
 DROP TABLE IF EXISTS chunk;
 CREATE TABLE chunk (
     id SERIAL PRIMARY KEY,
+    base_id INTEGER NOT NULL,
     range_start DECIMAL NOT NULL,
     range_end DECIMAL NOT NULL,
     range_size DECIMAL NOT NULL,

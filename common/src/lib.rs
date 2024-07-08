@@ -96,6 +96,7 @@ pub struct BaseRecord {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ChunkRecord {
     pub chunk_id: u32,
+    pub base: u32,
     pub range_start: u128,
     pub range_end: u128,
     pub range_size: u128,

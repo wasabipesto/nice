@@ -5,7 +5,10 @@ use super::*;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use diesel::prelude::*;
 use diesel::table;
+use serde_json::Value;
 
+mod base;
+mod chunk;
 mod conversions;
 mod field;
 
@@ -87,13 +90,20 @@ pub fn insert_new_base_and_fields(
     base: u32,
     base_size: FieldSize,
     field_sizes: Vec<FieldSize>,
+    chunk_sizes: Vec<FieldSize>,
 ) -> Result<(), String> {
     // insert the base row
-    //base::insert_field(conn, base, base_size)?;
+    base::insert_base(conn, base, base_size)?;
 
     // insert each field
     for size in field_sizes {
         field::insert_field(conn, base, size)?;
+    }
+
+    // insert each chunk
+    for size in chunk_sizes {
+        chunk::insert_chunk(conn, base, size)?;
+        // TODO: Assign chunk ID to fields
     }
 
     Ok(())

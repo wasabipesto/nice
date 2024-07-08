@@ -17,6 +17,17 @@ pub fn u128_to_i64(i: u128) -> Result<i64, String> {
     }
 }
 
+pub fn i64_to_u32(i: i64) -> Result<u32, String> {
+    if i < 0 {
+        Err("i64 value is negative and cannot be converted to u32".to_string())
+    } else {
+        Ok(i as u32)
+    }
+}
+pub fn u32_to_i64(i: u32) -> Result<i64, String> {
+    Ok(i as i64)
+}
+
 pub fn i32_to_u32(i: i32) -> Result<u32, String> {
     if i < 0 {
         Err("i32 value is negative and cannot be converted to u32".to_string())
@@ -64,4 +75,18 @@ pub fn optu32_to_opti32(i: Option<u32>) -> Result<Option<i32>, String> {
         Some(value) => u32_to_i32(value).map(Some),
         None => Ok(None),
     }
+}
+
+pub fn deserialize_distribution(i: Value) -> Result<Vec<UniquesDistributionExtended>, String> {
+    serde_json::from_value(i).map_err(|e| e.to_string())
+}
+pub fn serialize_distribution(i: Vec<UniquesDistributionExtended>) -> Result<Value, String> {
+    serde_json::to_value(i).map_err(|e| e.to_string())
+}
+
+pub fn deserialize_numbers(i: Value) -> Result<Vec<NiceNumbersExtended>, String> {
+    serde_json::from_value(i).map_err(|e| e.to_string())
+}
+pub fn serialize_numbers(i: Vec<NiceNumbersExtended>) -> Result<Value, String> {
+    serde_json::to_value(i).map_err(|e| e.to_string())
 }
