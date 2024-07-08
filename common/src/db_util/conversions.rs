@@ -17,6 +17,7 @@ pub fn u128_to_i64(i: u128) -> Result<i64, String> {
     }
 }
 
+/*
 pub fn i64_to_u32(i: i64) -> Result<u32, String> {
     if i < 0 {
         Err("i64 value is negative and cannot be converted to u32".to_string())
@@ -27,6 +28,7 @@ pub fn i64_to_u32(i: i64) -> Result<u32, String> {
 pub fn u32_to_i64(i: u32) -> Result<i64, String> {
     Ok(i as i64)
 }
+*/
 
 pub fn i32_to_u32(i: i32) -> Result<u32, String> {
     if i < 0 {

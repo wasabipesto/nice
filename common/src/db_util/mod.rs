@@ -12,6 +12,7 @@ mod chunk;
 mod conversions;
 mod field;
 
+/// Get a single database connection.
 pub fn get_database_connection() -> PgConnection {
     dotenv().ok();
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -108,3 +109,5 @@ pub fn insert_new_base_and_fields(
 
     Ok(())
 }
+
+// TODO: Connect foreign keys in sql schema

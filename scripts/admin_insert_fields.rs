@@ -29,8 +29,8 @@ fn main() {
     println!();
 
     let base_range = nice_common::base_range::get_base_range_u128(base)
-        .expect("Base has no valid range!")
-        .expect("Base is higher than what can be represented!");
+        .unwrap()
+        .expect("Base has no valid range!");
     println!("Base Range:");
     println!("  Base:    {}", base);
     println!("  Minimum: {}", base_range.range_start);
@@ -88,6 +88,18 @@ fn main() {
         return;
     }
     let mut conn = nice_common::db_util::get_database_connection();
-    nice_common::db_util::insert_fields_and_chunks(&mut conn, base, fields.clone()).unwrap();
-    println!("{} fields added!", fields.len())
+    nice_common::db_util::insert_new_base_and_fields(
+        &mut conn,
+        base,
+        base_range,
+        fields.clone(),
+        chunks.clone(),
+    )
+    .unwrap();
+    println!(
+        "Base {} added: {} chunks, {} fields",
+        base,
+        fields.len(),
+        chunks.len()
+    )
 }
