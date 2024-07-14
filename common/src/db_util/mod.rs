@@ -12,6 +12,7 @@ mod chunk;
 mod claim;
 mod conversions;
 mod field;
+mod submission;
 
 /// Get a single database connection.
 pub fn get_database_connection() -> PgConnection {
@@ -66,14 +67,28 @@ pub fn log_claim(
 }
 
 /// Return a specific claim from the log.
-pub fn get_claim() -> Result<(), String> {
-    unimplemented!();
+pub fn get_claim_by_id(conn: &mut PgConnection, claim_id: u128) -> Result<ClaimRecord, String> {
+    claim::get_claim_by_id(conn, claim_id)
 }
 
 /// Push a new submission to the database.
 /// This is assumed to pass some basic validation but it is not considered canon until the consensus is reached.
-pub fn insert_submission() -> Result<(), String> {
-    unimplemented!();
+pub fn insert_submission(
+    conn: &mut PgConnection,
+    claim_record: ClaimRecord,
+    submit_data: FieldToServer,
+    user_ip: String,
+    distribution: Option<Vec<UniquesDistributionExtended>>,
+    numbers: Vec<NiceNumbersExtended>,
+) -> Result<SubmissionRecord, String> {
+    submission::insert_submission(
+        conn,
+        claim_record,
+        submit_data,
+        user_ip,
+        distribution,
+        numbers,
+    )
 }
 
 /// Log that scheduled jobs have started.
@@ -84,6 +99,11 @@ pub fn log_scheduled_jobs_started() -> Result<(), String> {
 /// Log that all scheduled jobs are complete.
 pub fn log_scheduled_jobs_complete() -> Result<(), String> {
     unimplemented!();
+}
+
+/// Get a field record (range plus cached stats).
+pub fn get_field_by_id(conn: &mut PgConnection, field_id: u128) -> Result<FieldRecord, String> {
+    field::get_field_by_id(conn, field_id)
 }
 
 /// Get a list of fields with new submissions.

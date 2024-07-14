@@ -52,8 +52,8 @@ pub fn process_detailed(claim_data: &FieldToClient, username: &String) -> FieldT
     let nice_list_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
 
     // init the output maps
-    let mut unique_distribution: HashMap<u32, u32> = (1..=base).map(|i| (i, 0u32)).collect();
-    let mut nice_list: HashMap<u128, u32> = HashMap::new();
+    let mut unique_distribution: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
+    let mut nice_numbers: HashMap<u128, u32> = HashMap::new();
 
     // process the range and collect num_uniques for each item in the range
     (range_start..range_end).for_each(|num| {
@@ -73,16 +73,29 @@ pub fn process_detailed(claim_data: &FieldToClient, username: &String) -> FieldT
 
         // save if the number is sufficiently nice
         if num_unique_digits > nice_list_cutoff {
-            nice_list.insert(num, num_unique_digits);
+            nice_numbers.insert(num, num_unique_digits);
         }
     });
+
+    let mut submit_distribution: Vec<DistributionSimple> = unique_distribution
+        .into_iter()
+        .map(|(num_uniques, count)| DistributionSimple { num_uniques, count })
+        .collect();
+    submit_distribution.sort_by_key(|d| d.num_uniques);
+    let submit_numbers = nice_numbers
+        .into_iter()
+        .map(|(number, num_uniques)| NiceNumbersSimple {
+            number,
+            num_uniques,
+        })
+        .collect();
 
     FieldToServer {
         claim_id: claim_data.claim_id,
         username: username.to_owned(),
         client_version: CLIENT_VERSION.to_string(),
-        unique_distribution: Some(unique_distribution),
-        nice_list,
+        unique_distribution: Some(submit_distribution),
+        nice_numbers: submit_numbers,
     }
 }
 
@@ -134,7 +147,10 @@ pub fn process_niceonly(claim_data: &FieldToClient, username: &String) -> FieldT
     let nice_list = (range_start..range_end)
         .filter(|num| residue_filter.contains(&((num % (base as u128 - 1)) as u32)))
         .filter(|num| get_is_nice(*num, base))
-        .map(|num| (num, base))
+        .map(|number| NiceNumbersSimple {
+            number,
+            num_uniques: base,
+        })
         .collect();
 
     FieldToServer {
@@ -142,7 +158,7 @@ pub fn process_niceonly(claim_data: &FieldToClient, username: &String) -> FieldT
         username: username.to_owned(),
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution: None,
-        nice_list,
+        nice_numbers: nice_list,
     }
 }
 
@@ -164,19 +180,52 @@ mod tests {
             claim_id: claim_data.claim_id.clone(),
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: Some(HashMap::from([
-                (1, 0),
-                (2, 0),
-                (3, 0),
-                (4, 4),
-                (5, 5),
-                (6, 15),
-                (7, 20),
-                (8, 7),
-                (9, 1),
-                (10, 1),
+            unique_distribution: Some(Vec::from([
+                DistributionSimple {
+                    num_uniques: 1,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 2,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 3,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 4,
+                    count: 4,
+                },
+                DistributionSimple {
+                    num_uniques: 5,
+                    count: 5,
+                },
+                DistributionSimple {
+                    num_uniques: 6,
+                    count: 15,
+                },
+                DistributionSimple {
+                    num_uniques: 7,
+                    count: 20,
+                },
+                DistributionSimple {
+                    num_uniques: 8,
+                    count: 7,
+                },
+                DistributionSimple {
+                    num_uniques: 9,
+                    count: 1,
+                },
+                DistributionSimple {
+                    num_uniques: 10,
+                    count: 1,
+                },
             ])),
-            nice_list: HashMap::from([(69, 10)]),
+            nice_numbers: Vec::from([NiceNumbersSimple {
+                number: 69,
+                num_uniques: 10,
+            }]),
         };
         assert_eq!(process_detailed(&claim_data, &username), submit_data);
     }
@@ -195,49 +244,169 @@ mod tests {
             claim_id: claim_data.claim_id.clone(),
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: Some(HashMap::from([
-                (1, 0),
-                (2, 0),
-                (3, 0),
-                (4, 0),
-                (5, 0),
-                (6, 0),
-                (7, 0),
-                (8, 0),
-                (9, 0),
-                (10, 0),
-                (11, 0),
-                (12, 0),
-                (13, 0),
-                (14, 0),
-                (15, 0),
-                (16, 0),
-                (17, 0),
-                (18, 1),
-                (19, 13),
-                (20, 40),
-                (21, 176),
-                (22, 520),
-                (23, 1046),
-                (24, 1710),
-                (25, 2115),
-                (26, 1947),
-                (27, 1322),
-                (28, 728),
-                (29, 283),
-                (30, 83),
-                (31, 13),
-                (32, 3),
-                (33, 0),
-                (34, 0),
-                (35, 0),
-                (36, 0),
-                (37, 0),
-                (38, 0),
-                (39, 0),
-                (40, 0),
+            unique_distribution: Some(Vec::from([
+                DistributionSimple {
+                    num_uniques: 1,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 2,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 3,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 4,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 5,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 6,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 7,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 8,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 9,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 10,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 11,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 12,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 13,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 14,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 15,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 16,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 17,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 18,
+                    count: 1,
+                },
+                DistributionSimple {
+                    num_uniques: 19,
+                    count: 13,
+                },
+                DistributionSimple {
+                    num_uniques: 20,
+                    count: 40,
+                },
+                DistributionSimple {
+                    num_uniques: 21,
+                    count: 176,
+                },
+                DistributionSimple {
+                    num_uniques: 22,
+                    count: 520,
+                },
+                DistributionSimple {
+                    num_uniques: 23,
+                    count: 1046,
+                },
+                DistributionSimple {
+                    num_uniques: 24,
+                    count: 1710,
+                },
+                DistributionSimple {
+                    num_uniques: 25,
+                    count: 2115,
+                },
+                DistributionSimple {
+                    num_uniques: 26,
+                    count: 1947,
+                },
+                DistributionSimple {
+                    num_uniques: 27,
+                    count: 1322,
+                },
+                DistributionSimple {
+                    num_uniques: 28,
+                    count: 728,
+                },
+                DistributionSimple {
+                    num_uniques: 29,
+                    count: 283,
+                },
+                DistributionSimple {
+                    num_uniques: 30,
+                    count: 83,
+                },
+                DistributionSimple {
+                    num_uniques: 31,
+                    count: 13,
+                },
+                DistributionSimple {
+                    num_uniques: 32,
+                    count: 3,
+                },
+                DistributionSimple {
+                    num_uniques: 33,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 34,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 35,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 36,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 37,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 38,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 39,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 40,
+                    count: 0,
+                },
             ])),
-            nice_list: HashMap::new(),
+            nice_numbers: Vec::new(),
         };
         assert_eq!(process_detailed(&claim_data, &username), submit_data);
     }
@@ -256,89 +425,329 @@ mod tests {
             claim_id: claim_data.claim_id.clone(),
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: Some(HashMap::from([
-                (1, 0),
-                (2, 0),
-                (3, 0),
-                (4, 0),
-                (5, 0),
-                (6, 0),
-                (7, 0),
-                (8, 0),
-                (9, 0),
-                (10, 0),
-                (11, 0),
-                (12, 0),
-                (13, 0),
-                (14, 0),
-                (15, 0),
-                (16, 0),
-                (17, 0),
-                (18, 0),
-                (19, 0),
-                (20, 0),
-                (21, 0),
-                (22, 0),
-                (23, 0),
-                (24, 0),
-                (25, 0),
-                (26, 0),
-                (27, 0),
-                (28, 0),
-                (29, 0),
-                (30, 0),
-                (31, 0),
-                (32, 0),
-                (33, 0),
-                (34, 0),
-                (35, 0),
-                (36, 1),
-                (37, 6),
-                (38, 14),
-                (39, 62),
-                (40, 122),
-                (41, 263),
-                (42, 492),
-                (43, 830),
-                (44, 1170),
-                (45, 1392),
-                (46, 1477),
-                (47, 1427),
-                (48, 1145),
-                (49, 745),
-                (50, 462),
-                (51, 242),
-                (52, 88),
-                (53, 35),
-                (54, 19),
-                (55, 7),
-                (56, 1),
-                (57, 0),
-                (58, 0),
-                (59, 0),
-                (60, 0),
-                (61, 0),
-                (62, 0),
-                (63, 0),
-                (64, 0),
-                (65, 0),
-                (66, 0),
-                (67, 0),
-                (68, 0),
-                (69, 0),
-                (70, 0),
-                (71, 0),
-                (72, 0),
-                (73, 0),
-                (74, 0),
-                (75, 0),
-                (76, 0),
-                (77, 0),
-                (78, 0),
-                (79, 0),
-                (80, 0),
+            unique_distribution: Some(Vec::from([
+                DistributionSimple {
+                    num_uniques: 1,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 2,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 3,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 4,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 5,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 6,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 7,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 8,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 9,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 10,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 11,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 12,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 13,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 14,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 15,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 16,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 17,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 18,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 19,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 20,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 21,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 22,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 23,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 24,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 25,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 26,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 27,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 28,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 29,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 30,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 31,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 32,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 33,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 34,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 35,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 36,
+                    count: 1,
+                },
+                DistributionSimple {
+                    num_uniques: 37,
+                    count: 6,
+                },
+                DistributionSimple {
+                    num_uniques: 38,
+                    count: 14,
+                },
+                DistributionSimple {
+                    num_uniques: 39,
+                    count: 62,
+                },
+                DistributionSimple {
+                    num_uniques: 40,
+                    count: 122,
+                },
+                DistributionSimple {
+                    num_uniques: 41,
+                    count: 263,
+                },
+                DistributionSimple {
+                    num_uniques: 42,
+                    count: 492,
+                },
+                DistributionSimple {
+                    num_uniques: 43,
+                    count: 830,
+                },
+                DistributionSimple {
+                    num_uniques: 44,
+                    count: 1170,
+                },
+                DistributionSimple {
+                    num_uniques: 45,
+                    count: 1392,
+                },
+                DistributionSimple {
+                    num_uniques: 46,
+                    count: 1477,
+                },
+                DistributionSimple {
+                    num_uniques: 47,
+                    count: 1427,
+                },
+                DistributionSimple {
+                    num_uniques: 48,
+                    count: 1145,
+                },
+                DistributionSimple {
+                    num_uniques: 49,
+                    count: 745,
+                },
+                DistributionSimple {
+                    num_uniques: 50,
+                    count: 462,
+                },
+                DistributionSimple {
+                    num_uniques: 51,
+                    count: 242,
+                },
+                DistributionSimple {
+                    num_uniques: 52,
+                    count: 88,
+                },
+                DistributionSimple {
+                    num_uniques: 53,
+                    count: 35,
+                },
+                DistributionSimple {
+                    num_uniques: 54,
+                    count: 19,
+                },
+                DistributionSimple {
+                    num_uniques: 55,
+                    count: 7,
+                },
+                DistributionSimple {
+                    num_uniques: 56,
+                    count: 1,
+                },
+                DistributionSimple {
+                    num_uniques: 57,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 58,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 59,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 60,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 61,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 62,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 63,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 64,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 65,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 66,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 67,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 68,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 69,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 70,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 71,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 72,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 73,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 74,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 75,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 76,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 77,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 78,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 79,
+                    count: 0,
+                },
+                DistributionSimple {
+                    num_uniques: 80,
+                    count: 0,
+                },
             ])),
-            nice_list: HashMap::new(),
+            nice_numbers: Vec::new(),
         };
         assert_eq!(process_detailed(&claim_data, &username), submit_data);
     }
@@ -358,7 +767,10 @@ mod tests {
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,
-            nice_list: HashMap::from([(69, 10)]),
+            nice_numbers: Vec::from([NiceNumbersSimple {
+                number: 69,
+                num_uniques: 10,
+            }]),
         };
         assert_eq!(process_niceonly(&claim_data, &username), submit_data);
     }
@@ -378,7 +790,7 @@ mod tests {
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,
-            nice_list: HashMap::new(),
+            nice_numbers: Vec::new(),
         };
         assert_eq!(process_niceonly(&claim_data, &username), submit_data);
     }
@@ -398,7 +810,7 @@ mod tests {
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,
-            nice_list: HashMap::new(),
+            nice_numbers: Vec::new(),
         };
         assert_eq!(process_niceonly(&claim_data, &username), submit_data);
     }

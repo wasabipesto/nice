@@ -4,9 +4,15 @@
 extern crate rocket;
 
 //use nice_common::benchmark::{get_benchmark_field, BenchmarkMode};
-use nice_common::db_util::{claim_field, get_database_connection, log_claim};
-use nice_common::{FieldClaimStrategy, FieldToClient, SearchMode, DEFAULT_FIELD_SIZE};
-use rocket::serde::json::{json, Value};
+use nice_common::db_util::{
+    claim_field, get_claim_by_id, get_database_connection, get_field_by_id, insert_submission,
+    log_claim,
+};
+use nice_common::expand_stats::{expand_distribution, expand_numbers};
+use nice_common::{
+    FieldClaimStrategy, FieldToClient, FieldToServer, SearchMode, DEFAULT_FIELD_SIZE,
+};
+use rocket::serde::json::{json, Json, Value};
 
 // TODO: Define error types (4xx, 5xx) and serialize them properly
 
@@ -102,9 +108,83 @@ fn claim_niceonly() -> Result<Value, Value> {
     Ok(json!(data_for_client))
 }
 
-#[post("/submit")]
-fn submit() -> Result<(), Value> {
-    Ok(())
+#[post("/submit", data = "<data>")]
+fn submit(data: Json<FieldToServer>) -> Result<Value, Value> {
+    // get database connection
+    // TODO: database connection pooling
+    let mut conn = get_database_connection();
+
+    // get submission data out of json container
+    let submit_data = FieldToServer {
+        claim_id: data.claim_id,
+        username: data.username.clone(),
+        client_version: data.client_version.clone(),
+        unique_distribution: data.unique_distribution.clone(),
+        nice_numbers: data.nice_numbers.clone(),
+    };
+
+    // get user IP
+    // TODO: actually do this
+    let user_ip = "unknown".to_string();
+
+    // get claim record
+    let claim_record = get_claim_by_id(&mut conn, submit_data.claim_id)?;
+
+    // get field record (for base)
+    let field_record = get_field_by_id(&mut conn, claim_record.field_id)?;
+    let base = field_record.base;
+
+    // expand nice numbers
+    let numbers_expanded = expand_numbers(&submit_data.nice_numbers, base);
+
+    match claim_record.search_mode {
+        SearchMode::Niceonly => {
+            // no checks, honor system
+            insert_submission(
+                &mut conn,
+                claim_record,
+                submit_data,
+                user_ip,
+                None,
+                numbers_expanded,
+            )?;
+        }
+        SearchMode::Detailed => {
+            // run through some basic validity tests
+            match &submit_data.unique_distribution {
+                Some(distribution) => {
+                    // expand distribution
+                    let distribution_expanded = expand_distribution(distribution, base);
+
+                    // TODO: Check distribution count sums to range_size
+                    // TODO: Check count of nice numbers against distribution
+
+                    // check each nice number provided
+                    for _num in &numbers_expanded {
+                        // TODO: check each nice number server-side
+                    }
+
+                    // save it
+                    insert_submission(
+                        &mut conn,
+                        claim_record,
+                        submit_data,
+                        user_ip,
+                        Some(distribution_expanded),
+                        numbers_expanded,
+                    )?;
+                }
+                None => {
+                    return Err(json!(
+                        "Unique distribution must be present for detailed searches."
+                    ))
+                }
+            }
+        }
+    }
+
+    // respond to user
+    Ok(json!("OK"))
 }
 
 #[catch(404)]

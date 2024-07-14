@@ -5,6 +5,7 @@ pub mod benchmark;
 pub mod client_api;
 pub mod client_process;
 pub mod db_util;
+pub mod expand_stats;
 pub mod generate_chunks;
 pub mod generate_fields;
 pub mod residue_filter;
@@ -54,7 +55,7 @@ pub struct FieldSize {
 
 /// Aggregate data on the niceness of all numbers in the range.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct UniquesDistributionSimple {
+pub struct DistributionSimple {
     pub num_uniques: u32,
     pub count: u128,
 }
@@ -71,7 +72,7 @@ pub struct UniquesDistributionExtended {
 /// Individual notably nice numbers.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct NiceNumbersSimple {
-    pub number: Natural,
+    pub number: u128,
     pub num_uniques: u32,
 }
 
@@ -149,8 +150,8 @@ pub struct FieldToServer {
     pub claim_id: u128,
     pub username: String,
     pub client_version: String,
-    pub unique_distribution: Option<HashMap<u32, u32>>,
-    pub nice_list: HashMap<u128, u32>,
+    pub unique_distribution: Option<Vec<DistributionSimple>>,
+    pub nice_numbers: Vec<NiceNumbersSimple>,
 }
 
 /// A basic claim log from the database.
@@ -171,11 +172,10 @@ pub struct SubmissionRecord {
     pub field_id: u128,
     pub search_mode: SearchMode,
     pub submit_time: DateTime<Utc>,
-    pub elapsed_secs: Option<u32>,
+    pub elapsed_secs: u32,
     pub username: String,
-    pub user_ip: Option<String>,
-    pub user_agent: Option<String>,
-    pub client_version: Option<String>,
+    pub user_ip: String,
+    pub client_version: String,
     pub disqualified: bool,
     pub distribution: Option<Vec<UniquesDistributionExtended>>,
     pub numbers: Vec<NiceNumbersExtended>,
