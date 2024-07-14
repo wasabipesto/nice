@@ -21,13 +21,50 @@ pub fn get_database_connection() -> PgConnection {
 }
 
 /// Return the lowest field that has not been claimed recently and log the claim.
-pub fn claim_next_field() -> Result<(), String> {
-    unimplemented!();
-}
+/// TODO: Insert claim row
+pub fn claim_field(
+    conn: &mut PgConnection,
+    claim_strategy: FieldClaimStrategy,
+    maximum_check_level: u8,
+    maximum_size: u128,
+) -> Result<FieldToClient, String> {
+    // try to find a field, respecting previous claims
+    let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS as i64);
+    if let Some(claimed_field) = field::try_claim_field(
+        conn,
+        claim_strategy,
+        maximum_timestamp,
+        maximum_check_level,
+        maximum_size,
+    )? {
+        return Ok(FieldToClient {
+            claim_id: 0,
+            base: claimed_field.base,
+            range_start: claimed_field.range_start,
+            range_end: claimed_field.range_end,
+            range_size: claimed_field.range_size,
+        });
+    }
 
-/// Return a random field that has not been claimed recently and log the claim.
-pub fn claim_random_field() -> Result<(), String> {
-    unimplemented!();
+    // try again, ignoring all previous claims and grabbing randomly
+    let maximum_timestamp = Utc::now();
+    if let Some(claimed_field) = field::try_claim_field(
+        conn,
+        FieldClaimStrategy::Random,
+        maximum_timestamp,
+        maximum_check_level,
+        maximum_size,
+    )? {
+        return Ok(FieldToClient {
+            claim_id: 0,
+            base: claimed_field.base,
+            range_start: claimed_field.range_start,
+            range_end: claimed_field.range_end,
+            range_size: claimed_field.range_size,
+        });
+    }
+
+    Err(format!("Could not find any field with maximum check level {maximum_check_level} and maximum size {maximum_size}!"))
 }
 
 /// Return a specific claim from the log.
@@ -74,9 +111,19 @@ pub fn get_recently_canonized_fields() -> Result<(), String> {
     unimplemented!();
 }
 
+/// Get a chunk record (range plus cached stats).
+pub fn get_chunk(conn: &mut PgConnection, chunk_id: u32) -> Result<ChunkRecord, String> {
+    chunk::get_chunk(conn, chunk_id)
+}
+
 /// Update a chunk's calculated statistics.
 pub fn update_chunk_stats() -> Result<(), String> {
     unimplemented!();
+}
+
+/// Get a base record (base range plus cached stats).
+pub fn get_base(conn: &mut PgConnection, base: u32) -> Result<BaseRecord, String> {
+    base::get_base(conn, base)
 }
 
 /// Update a base's calculated statistics.

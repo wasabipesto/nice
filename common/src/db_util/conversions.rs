@@ -1,4 +1,5 @@
 //! Safe-ish conversions between rust and sql types.
+//! Ideally this will be ripped out and implemented as whatever custom diesel types end up being necessary.
 
 use super::*;
 

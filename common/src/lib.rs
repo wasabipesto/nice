@@ -9,7 +9,7 @@ pub mod generate_chunks;
 pub mod generate_fields;
 pub mod residue_filter;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use clap::ValueEnum;
 use dotenvy::dotenv;
 use malachite::natural::Natural;
@@ -21,9 +21,11 @@ use std::convert::TryFrom;
 use std::env;
 use std::ops::Add;
 
-const CLIENT_REPO: &str = "https://github.com/wasabipesto/nice/nice_client"; // TODO
-const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
+pub const CLIENT_REPO: &str = "https://github.com/wasabipesto/nice/nice_client"; // TODO
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
+pub const CLAIM_DURATION_HOURS: u32 = 1;
+pub const DEFAULT_FIELD_SIZE: u128 = 1000000000;
 
 /// Each possible search mode the server and client supports.
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -33,6 +35,12 @@ pub enum SearchMode {
     /// Implements optimizations to speed up the search, usually by a factor of around 20.
     /// Does not keep statistics and cannot be quickly verified.
     Niceonly,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum FieldClaimStrategy {
+    Next,
+    Random,
 }
 
 /// Data on the bounds of a search range.

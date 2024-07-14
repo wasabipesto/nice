@@ -17,7 +17,7 @@ table! {
     }
 }
 
-#[derive(Queryable, AsChangeset)]
+#[derive(Queryable, AsChangeset, QueryableByName)]
 #[diesel(table_name = field)]
 struct FieldPrivate {
     id: i64,
@@ -99,7 +99,7 @@ pub fn insert_field(
         .and_then(private_to_public)
 }
 
-pub fn get_field(conn: &mut PgConnection, row_id: u128) -> Result<FieldRecord, String> {
+pub fn get_field_by_id(conn: &mut PgConnection, row_id: u128) -> Result<FieldRecord, String> {
     use self::field::dsl::*;
 
     let row_id = conversions::u128_to_i64(row_id)?;
@@ -109,6 +109,61 @@ pub fn get_field(conn: &mut PgConnection, row_id: u128) -> Result<FieldRecord, S
         .first::<FieldPrivate>(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
+}
+
+/// Finds the next field that matches the criteria, updates last_claim_time, and returns it.
+/// Returns Ok(None) if no matching fields are found.
+pub fn try_claim_field(
+    conn: &mut PgConnection,
+    claim_strategy: FieldClaimStrategy,
+    maximum_timestamp: DateTime<Utc>,
+    maximum_check_level: u8,
+    maximum_size: u128,
+) -> Result<Option<FieldRecord>, String> {
+    use diesel::sql_query;
+    use diesel::sql_types::{Integer, Numeric, Timestamptz};
+
+    let maximum_check_level = conversions::u8_to_i32(maximum_check_level)?;
+    let maximum_size = conversions::u128_to_bigdec(maximum_size)?;
+
+    let query = match claim_strategy {
+        FieldClaimStrategy::Next => {
+            "UPDATE field
+            SET last_claim_time = NOW()
+            WHERE id = (
+                SELECT id FROM field
+                WHERE (last_claim_time <= $1 OR last_claim_time IS NULL)
+                AND check_level <= $2
+                AND range_size <= $3
+                ORDER BY id ASC
+                LIMIT 1
+            )
+            RETURNING *;"
+        }
+        FieldClaimStrategy::Random => {
+            "UPDATE field
+            SET last_claim_time = NOW()
+            WHERE id = (
+                SELECT id FROM field
+                WHERE (last_claim_time <= $1 OR last_claim_time IS NULL)
+                AND check_level <= $2
+                AND range_size <= $3
+                ORDER BY RANDOM() ASC
+                LIMIT 1
+            )
+            RETURNING *;"
+        }
+    }
+    .to_string();
+
+    sql_query(query)
+        .bind::<Timestamptz, _>(maximum_timestamp)
+        .bind::<Integer, _>(maximum_check_level)
+        .bind::<Numeric, _>(maximum_size)
+        .get_result::<FieldPrivate>(conn)
+        .optional()
+        .map_err(|err| err.to_string())
+        .and_then(|opt| opt.map_or(Ok(None), |rec| private_to_public(rec).map(Some)))
 }
 
 pub fn update_field(
