@@ -170,7 +170,7 @@ fn submit(data: Json<FieldToServer>) -> Result<Value, Value> {
                     // check count of nice numbers against distribution
                     let num_uniques_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
                     for d in &distribution_expanded {
-                        if d.num_uniques >= num_uniques_cutoff {
+                        if d.num_uniques > num_uniques_cutoff {
                             let count_numbers = numbers_expanded
                                 .iter()
                                 .filter(|n| n.num_uniques == d.num_uniques)
@@ -190,7 +190,7 @@ fn submit(data: Json<FieldToServer>) -> Result<Value, Value> {
                     let num_total_count = numbers_expanded.len();
                     let dist_total_count_above_cutoff = distribution
                         .iter()
-                        .filter(|d| d.num_uniques >= num_uniques_cutoff)
+                        .filter(|d| d.num_uniques > num_uniques_cutoff)
                         .fold(0, |acc, d| acc + d.count);
                     if num_total_count as u128 != dist_total_count_above_cutoff {
                         return Err(format!(

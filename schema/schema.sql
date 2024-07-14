@@ -62,7 +62,7 @@ CREATE TABLE submission (
     field_id INTEGER NOT NULL REFERENCES field(id),
     search_mode VARCHAR NOT NULL,
     submit_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    elapsed_secs INTEGER NOT NULL,
+    elapsed_secs REAL NOT NULL,
     username VARCHAR NOT NULL,
     user_ip VARCHAR NOT NULL,
     client_version VARCHAR NOT NULL,

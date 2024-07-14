@@ -172,7 +172,7 @@ pub struct SubmissionRecord {
     pub field_id: u128,
     pub search_mode: SearchMode,
     pub submit_time: DateTime<Utc>,
-    pub elapsed_secs: u32,
+    pub elapsed_secs: f32,
     pub username: String,
     pub user_ip: String,
     pub client_version: String,

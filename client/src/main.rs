@@ -89,7 +89,7 @@ fn main() {
         );
     }
 
-    // print some debug info
+    // submit the results
     if cli.benchmark.is_none() {
         submit_field_to_server(&cli.api_base, submit_data)
     }

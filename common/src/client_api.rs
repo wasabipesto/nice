@@ -36,12 +36,16 @@ pub fn submit_field_to_server(api_base: &str, submit_data: FieldToServer) {
         Ok(response) => {
             // check for server errors
             if response.status().is_success() {
-                return; // 👍
-            }
-            match response.text() {
-                // we probably did something wrong, print anything we got from the server
-                Ok(msg) => panic!("Server returned an error: {}", msg),
-                Err(_) => panic!("Server returned an error."),
+                match response.text() {
+                    Ok(msg) => println!("Server response: {}", msg),
+                    Err(e) => panic!("Server returned success but an error occured: {}", e),
+                }
+            } else {
+                match response.text() {
+                    // we probably did something wrong, print anything we got from the server
+                    Ok(msg) => panic!("Server returned an error: {}", msg),
+                    Err(e) => panic!("Server returned an error, but another error occured: {}", e),
+                }
             }
         }
         Err(e) => panic!("Network error: {}", e),
