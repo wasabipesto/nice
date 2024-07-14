@@ -76,7 +76,7 @@ pub fn get_claim_by_id(conn: &mut PgConnection, claim_id: u128) -> Result<ClaimR
 pub fn insert_submission(
     conn: &mut PgConnection,
     claim_record: ClaimRecord,
-    submit_data: FieldToServer,
+    submit_data: DataToServer,
     user_ip: String,
     distribution: Option<Vec<UniquesDistributionExtended>>,
     numbers: Vec<NiceNumbersExtended>,

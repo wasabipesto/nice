@@ -88,7 +88,7 @@ fn public_to_private(p: SubmissionRecord) -> Result<SubmissionPrivate, String> {
 
 fn build_new_row(
     claim_record: ClaimRecord,
-    submit_data: FieldToServer,
+    submit_data: DataToServer,
     user_ip: String,
     distribution: Option<Vec<UniquesDistributionExtended>>,
     numbers: Vec<NiceNumbersExtended>,
@@ -110,7 +110,7 @@ fn build_new_row(
 pub fn insert_submission(
     conn: &mut PgConnection,
     claim_record: ClaimRecord,
-    submit_data: FieldToServer,
+    submit_data: DataToServer,
     input_user_ip: String,
     input_distribution: Option<Vec<UniquesDistributionExtended>>,
     input_numbers: Vec<NiceNumbersExtended>,

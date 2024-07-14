@@ -3,7 +3,7 @@
 use super::*;
 
 /// Request a field from the server. Supplies CLI options as query strings.
-pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) -> FieldToClient {
+pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) -> DataToClient {
     // build the url
     let url = match mode {
         SearchMode::Detailed => format!("{api_base}/claim/detailed?username={username}"),
@@ -14,14 +14,14 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) 
     let response = reqwest::blocking::get(url).unwrap_or_else(|e| panic!("Error: {}", e));
 
     // deserialize and unwrap or panic
-    match response.json::<FieldToClient>() {
+    match response.json::<DataToClient>() {
         Ok(claim_data) => claim_data,
         Err(e) => panic!("Error: {}", e),
     }
 }
 
 /// Submit field results to the server. Panic if there is an error.
-pub fn submit_field_to_server(api_base: &str, submit_data: FieldToServer) {
+pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) {
     // build the url
     let url = format!("{api_base}/submit");
 

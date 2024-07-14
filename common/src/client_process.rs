@@ -42,7 +42,7 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
 }
 
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
-pub fn process_detailed(claim_data: &FieldToClient, username: &String) -> FieldToServer {
+pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToServer {
     // get the basic parameters
     let base = claim_data.base;
     let range_start = claim_data.range_start;
@@ -90,7 +90,7 @@ pub fn process_detailed(claim_data: &FieldToClient, username: &String) -> FieldT
         })
         .collect();
 
-    FieldToServer {
+    DataToServer {
         claim_id: claim_data.claim_id,
         username: username.to_owned(),
         client_version: CLIENT_VERSION.to_string(),
@@ -138,7 +138,7 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
 
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
-pub fn process_niceonly(claim_data: &FieldToClient, username: &String) -> FieldToServer {
+pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToServer {
     let base = claim_data.base;
     let range_start = claim_data.range_start;
     let range_end = claim_data.range_end;
@@ -153,7 +153,7 @@ pub fn process_niceonly(claim_data: &FieldToClient, username: &String) -> FieldT
         })
         .collect();
 
-    FieldToServer {
+    DataToServer {
         claim_id: claim_data.claim_id,
         username: username.to_owned(),
         client_version: CLIENT_VERSION.to_string(),
@@ -169,14 +169,14 @@ mod tests {
     #[test]
     fn process_detailed_b10() {
         let username = "anonymous".to_string();
-        let claim_data = FieldToClient {
+        let claim_data = DataToClient {
             claim_id: 0,
             base: 10,
             range_start: 47,
             range_end: 100,
             range_size: 53,
         };
-        let submit_data = FieldToServer {
+        let submit_data = DataToServer {
             claim_id: claim_data.claim_id.clone(),
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
@@ -233,14 +233,14 @@ mod tests {
     #[test]
     fn process_detailed_b40() {
         let username = "anonymous".to_string();
-        let claim_data = FieldToClient {
+        let claim_data = DataToClient {
             claim_id: 0,
             base: 40,
             range_start: 916284264916,
             range_end: 916284264916 + 10000,
             range_size: 10000,
         };
-        let submit_data = FieldToServer {
+        let submit_data = DataToServer {
             claim_id: claim_data.claim_id.clone(),
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
@@ -414,14 +414,14 @@ mod tests {
     #[test]
     fn process_detailed_b80() {
         let username = "anonymous".to_string();
-        let claim_data = FieldToClient {
+        let claim_data = DataToClient {
             claim_id: 0,
             base: 80,
             range_start: 653245554420798943087177909799,
             range_end: 653245554420798943087177909799 + 10000,
             range_size: 10000,
         };
-        let submit_data = FieldToServer {
+        let submit_data = DataToServer {
             claim_id: claim_data.claim_id.clone(),
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
@@ -755,14 +755,14 @@ mod tests {
     #[test]
     fn process_niceonly_b10() {
         let username = "anonymous".to_string();
-        let claim_data = FieldToClient {
+        let claim_data = DataToClient {
             claim_id: 0,
             base: 10,
             range_start: 47,
             range_end: 100,
             range_size: 53,
         };
-        let submit_data = FieldToServer {
+        let submit_data = DataToServer {
             claim_id: claim_data.claim_id.clone(),
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
@@ -778,14 +778,14 @@ mod tests {
     #[test]
     fn process_niceonly_b40() {
         let username = "anonymous".to_string();
-        let claim_data = FieldToClient {
+        let claim_data = DataToClient {
             claim_id: 0,
             base: 40,
             range_start: 916284264916,
             range_end: 916284264916 + 10000,
             range_size: 10000,
         };
-        let submit_data = FieldToServer {
+        let submit_data = DataToServer {
             claim_id: claim_data.claim_id.clone(),
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
@@ -798,14 +798,14 @@ mod tests {
     #[test]
     fn process_niceonly_b80() {
         let username = "anonymous".to_string();
-        let claim_data = FieldToClient {
+        let claim_data = DataToClient {
             claim_id: 0,
             base: 80,
             range_start: 653245554420798943087177909799,
             range_end: 653245554420798943087177909799 + 10000,
             range_size: 10000,
         };
-        let submit_data = FieldToServer {
+        let submit_data = DataToServer {
             claim_id: claim_data.claim_id.clone(),
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),

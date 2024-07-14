@@ -10,7 +10,7 @@ use nice_common::db_util::{
 };
 use nice_common::expand_stats::{expand_distribution, expand_numbers};
 use nice_common::{
-    FieldClaimStrategy, FieldToClient, FieldToServer, NiceNumbersExtended, SearchMode,
+    DataToClient, DataToServer, FieldClaimStrategy, NiceNumbersExtended, SearchMode,
     DEFAULT_FIELD_SIZE, NEAR_MISS_CUTOFF_PERCENT,
 };
 use rand::Rng;
@@ -18,19 +18,18 @@ use rocket::serde::json::{json, Json, Value};
 
 // TODO: Define error types (4xx, 5xx) and serialize them properly
 
-#[get("/claim")]
-fn claim() -> Result<Value, Value> {
-    claim_detailed()
-}
-
-#[get("/claim/detailed")]
-fn claim_detailed() -> Result<Value, Value> {
+#[get("/claim/<mode>")]
+fn claim(mode: &str) -> Result<Value, Value> {
     // get database connection
     // TODO: database connection pooling
     let mut conn = get_database_connection();
 
     // set search mode based on path
-    let search_mode = SearchMode::Detailed;
+    let search_mode = match mode {
+        "detailed" => SearchMode::Detailed,
+        "niceonly" => SearchMode::Niceonly,
+        _ => return Err(not_found()),
+    };
 
     // get user IP
     // TODO: actually do this
@@ -47,12 +46,17 @@ fn claim_detailed() -> Result<Value, Value> {
         FieldClaimStrategy::Random
     };
 
-    let max_check_level = if rng.gen_range(0..100) < 80 {
-        // 80% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
-        1
-    } else {
-        // 20% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
-        2
+    let max_check_level = match search_mode {
+        SearchMode::Detailed => {
+            if rng.gen_range(0..100) < 80 {
+                1 // 80% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
+            } else {
+                2 // 20% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
+            }
+        }
+        SearchMode::Niceonly => {
+            0 // get CL0 (unchecked), never anything more
+        }
     };
 
     // this won't affect anything since all fields will be this size or smaller
@@ -66,62 +70,7 @@ fn claim_detailed() -> Result<Value, Value> {
     let claim_record = log_claim(&mut conn, &search_field, search_mode, user_ip)?;
 
     // build the struct to send to the client
-    let data_for_client = FieldToClient {
-        claim_id: claim_record.claim_id,
-        base: search_field.base,
-        range_start: search_field.range_start,
-        range_end: search_field.range_end,
-        range_size: search_field.range_size,
-    };
-
-    // return to user
-    Ok(json!(data_for_client))
-}
-
-#[get("/claim/niceonly")]
-fn claim_niceonly() -> Result<Value, Value> {
-    // get database connection
-    // TODO: database connection pooling
-    let mut conn = get_database_connection();
-
-    // set search mode based on path
-    let search_mode = SearchMode::Niceonly;
-
-    // get user IP
-    // TODO: actually do this
-    let user_ip = "unknown".to_string();
-
-    // get rng thread
-    let mut rng = rand::thread_rng();
-
-    let claim_strategy = if rng.gen_range(0..100) < 80 {
-        // 80% chance: get lowest valid field
-        FieldClaimStrategy::Next
-    } else {
-        // 20% chance: get random valid field
-        FieldClaimStrategy::Random
-    };
-
-    let max_check_level = if rng.gen_range(0..100) < 80 {
-        // 80% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
-        1
-    } else {
-        // 20% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
-        2
-    };
-
-    // this won't affect anything since all fields will be this size or smaller
-    // TODO: implement an "online benchmarking" option for e.g. gh runners that limits this
-    let max_range_size = DEFAULT_FIELD_SIZE;
-
-    // get the field to search based on claim strategy, max check level, etc
-    let search_field = claim_field(&mut conn, claim_strategy, max_check_level, max_range_size)?;
-
-    // log the claim and get the record
-    let claim_record = log_claim(&mut conn, &search_field, search_mode, user_ip)?;
-
-    // build the struct to send to the client
-    let data_for_client = FieldToClient {
+    let data_for_client = DataToClient {
         claim_id: claim_record.claim_id,
         base: search_field.base,
         range_start: search_field.range_start,
@@ -134,13 +83,13 @@ fn claim_niceonly() -> Result<Value, Value> {
 }
 
 #[post("/submit", data = "<data>")]
-fn submit(data: Json<FieldToServer>) -> Result<Value, Value> {
+fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
     // get database connection
     // TODO: database connection pooling
     let mut conn = get_database_connection();
 
     // get submission data out of json container
-    let submit_data = FieldToServer {
+    let submit_data = DataToServer {
         claim_id: data.claim_id,
         username: data.username.clone(),
         client_version: data.client_version.clone(),
@@ -264,18 +213,12 @@ fn index() -> Value {
 
 #[catch(404)]
 fn not_found() -> Value {
-    "The requested resource could not be found. 
-    Available resources include /claim and /submit. 
-    Visit https://nicenumbers.net for more information."
-        .into()
+    "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, and /submit. Visit https://nicenumbers.net for more information.".into()
 }
 
 #[launch]
 fn rocket() -> _ {
     rocket::build()
-        .mount(
-            "/",
-            routes![claim, claim_detailed, claim_niceonly, submit, index],
-        )
+        .mount("/", routes![claim, submit, index])
         .register("/", catchers![not_found])
 }

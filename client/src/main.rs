@@ -6,7 +6,7 @@ use nice_common::client_api::get_field_from_server;
 use nice_common::client_api::submit_field_to_server;
 use nice_common::client_process::process_detailed;
 use nice_common::client_process::process_niceonly;
-use nice_common::{FieldToServer, SearchMode};
+use nice_common::{DataToServer, SearchMode};
 
 extern crate serde_json;
 use clap::Parser;
@@ -64,7 +64,7 @@ fn main() {
     let before = Instant::now();
 
     // process range & compile results
-    let submit_data: FieldToServer = match cli.mode {
+    let submit_data: DataToServer = match cli.mode {
         SearchMode::Detailed => process_detailed(&claim_data, &cli.username),
         SearchMode::Niceonly => process_niceonly(&claim_data, &cli.username),
     };

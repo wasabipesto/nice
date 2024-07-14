@@ -136,7 +136,7 @@ pub struct FieldRecord {
 
 /// A field sent to the client for processing. Used as input for processing.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct FieldToClient {
+pub struct DataToClient {
     pub claim_id: u128,
     pub base: u32,
     pub range_start: u128,
@@ -146,7 +146,7 @@ pub struct FieldToClient {
 
 /// The compiled results sent to the server after processing.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct FieldToServer {
+pub struct DataToServer {
     pub claim_id: u128,
     pub username: String,
     pub client_version: String,

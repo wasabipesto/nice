@@ -16,7 +16,7 @@ pub enum BenchmarkMode {
     HiBase,
 }
 
-pub fn get_benchmark_field(mode: BenchmarkMode) -> FieldToClient {
+pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
     let base = match mode {
         BenchmarkMode::Default => 40,
         BenchmarkMode::Large => 40,
@@ -34,7 +34,7 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> FieldToClient {
         BenchmarkMode::HiBase => 100000,
     };
 
-    FieldToClient {
+    DataToClient {
         claim_id: 0,
         base,
         range_start,
