@@ -54,7 +54,10 @@ fn main() {
 
     // print some debug info
     if !cli.quiet {
-        println!("{}", serde_json::to_string_pretty(&claim_data).unwrap());
+        println!(
+            "Claim Data: {}",
+            serde_json::to_string_pretty(&claim_data).unwrap()
+        );
     }
 
     // start the timer for benchmarking
@@ -71,14 +74,17 @@ fn main() {
 
     // print some debug info
     if !cli.quiet {
-        println!("{}", serde_json::to_string_pretty(&submit_data).unwrap());
+        println!(
+            "Submit Data: {}",
+            serde_json::to_string_pretty(&submit_data).unwrap()
+        );
     }
 
     // print the benchmarking results
     if cli.benchmark.is_some() || cli.verbose {
-        println!("Elapsed time: {:.3?}", before.elapsed());
+        println!("Elapsed time:    {:.3?}", before.elapsed());
         println!(
-            "Hash rate:    {:.3e}",
+            "Processing rate: {:.3e} numbers/second",
             claim_data.range_size as f64 / elapsed_seconds
         );
     }
