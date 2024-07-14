@@ -2,9 +2,11 @@
 //! ```cargo
 //! [dependencies]
 //! nice_common = { path = "../common" }
+//! clap = "4.4"
 //! read_input = "0.8"
 //! ```
 
+use clap::Parser;
 use read_input::prelude::*;
 
 fn print_field(i: usize, field: &nice_common::FieldSize) -> () {
@@ -21,9 +23,17 @@ fn print_chunk(i: usize, field: &nice_common::FieldSize) -> () {
     println!("  Size:  {}", field.range_size);
 }
 
+#[derive(Parser)]
+pub struct Cli {
+    #[arg(short, long)]
+    base: u32,
+}
+
 fn main() {
-    print!("Enter a base: ");
-    let base = input::<u32>().get();
+    // parse args from command line
+    let cli = Cli::parse();
+    let base = cli.base;
+
     let field_size = 1000000000;
     println!("Using default field size {}.", field_size);
     println!();
@@ -88,6 +98,9 @@ fn main() {
         return;
     }
     let mut conn = nice_common::db_util::get_database_connection();
+    if let Ok(base_data) = nice_common::db_util::get_base(&mut conn, base) {
+        panic!("Base {} already exists: {:?}", base, base_data)
+    }
     nice_common::db_util::insert_new_base_and_fields(
         &mut conn,
         base,
