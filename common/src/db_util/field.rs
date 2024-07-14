@@ -73,7 +73,7 @@ fn public_to_private(p: FieldRecord) -> Result<FieldPrivate, String> {
     })
 }
 
-fn build_new_row(base: u32, size: FieldSize) -> Result<FieldPrivateNew, String> {
+fn build_new_row(base: u32, size: &FieldSize) -> Result<FieldPrivateNew, String> {
     use conversions::*;
     Ok(FieldPrivateNew {
         base_id: u32_to_i32(base)?,
@@ -83,20 +83,26 @@ fn build_new_row(base: u32, size: FieldSize) -> Result<FieldPrivateNew, String> 
     })
 }
 
-pub fn insert_field(
+pub fn insert_fields(
     conn: &mut PgConnection,
     base: u32,
-    size: FieldSize,
-) -> Result<FieldRecord, String> {
+    sizes: Vec<FieldSize>,
+) -> Result<(), String> {
     use self::field::dsl::*;
 
-    let insert_row = build_new_row(base, size)?;
+    let insert_rows: Vec<FieldPrivateNew> = sizes
+        .iter()
+        .map(|size| build_new_row(base, size).unwrap())
+        .collect();
 
-    diesel::insert_into(field)
-        .values(&insert_row)
-        .get_result(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+    for chunk in insert_rows.chunks(10000) {
+        diesel::insert_into(field)
+            .values(chunk)
+            .execute(conn)
+            .map_err(|err| err.to_string())?;
+    }
+
+    Ok(())
 }
 
 pub fn get_field_by_id(conn: &mut PgConnection, row_id: u128) -> Result<FieldRecord, String> {

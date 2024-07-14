@@ -151,6 +151,7 @@ pub fn update_base_stats() -> Result<(), String> {
 
 /// Insert a bunch of fields and chunks for processing.
 /// Only called by admin scripts.
+/// TODO: Break this up into 4 separate functions
 pub fn insert_new_base_and_fields(
     conn: &mut PgConnection,
     base: u32,
@@ -159,19 +160,20 @@ pub fn insert_new_base_and_fields(
     chunk_sizes: Vec<FieldSize>,
 ) -> Result<(), String> {
     // insert the base row
+    println!("Inserting base {}...", base);
     base::insert_base(conn, base, base_size)?;
 
-    // insert each field
-    // TODO: Bulk insert fields and chunks
-    for size in field_sizes {
-        field::insert_field(conn, base, size)?;
-    }
+    // insert all fields
+    println!("Inserting {} fields...", field_sizes.len());
+    field::insert_fields(conn, base, field_sizes)?;
 
-    // insert each chunk
-    for size in chunk_sizes {
-        chunk::insert_chunk(conn, base, size)?;
-        // TODO: Assign chunk ID to fields
-    }
+    // insert all chunks
+    println!("Inserting {} chunks...", chunk_sizes.len());
+    chunk::insert_chunks(conn, base, chunk_sizes)?;
+
+    // assign chunk ID to fields
+    println!("Updating base {} chunk assignments...", base);
+    chunk::reassign_fields_to_chunks(conn, base)?;
 
     Ok(())
 }

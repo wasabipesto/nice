@@ -110,7 +110,7 @@ fn main() {
     )
     .unwrap();
     println!(
-        "Base {} added: {} chunks, {} fields",
+        "Base {} added: {} fields, {} chunks",
         base,
         fields.len(),
         chunks.len()

@@ -49,7 +49,7 @@ fn main() {
     let claim_data = if let Some(benchmark) = cli.benchmark {
         get_benchmark_field(benchmark)
     } else {
-        get_field_from_server(&cli.mode, &cli.api_base, &cli.username)
+        get_field_from_server(&cli.mode, &cli.api_base)
     };
 
     // print some debug info

@@ -81,7 +81,7 @@ fn public_to_private(p: ChunkRecord) -> Result<ChunkPrivate, String> {
     })
 }
 
-fn build_new_row(base: u32, size: FieldSize) -> Result<ChunkPrivateNew, String> {
+fn build_new_row(base: u32, size: &FieldSize) -> Result<ChunkPrivateNew, String> {
     use conversions::*;
     Ok(ChunkPrivateNew {
         base_id: u32_to_i32(base)?,
@@ -91,17 +91,20 @@ fn build_new_row(base: u32, size: FieldSize) -> Result<ChunkPrivateNew, String> 
     })
 }
 
-pub fn insert_chunk(
+pub fn insert_chunks(
     conn: &mut PgConnection,
     base: u32,
-    size: FieldSize,
+    sizes: Vec<FieldSize>,
 ) -> Result<ChunkRecord, String> {
     use self::chunk::dsl::*;
 
-    let insert_row = build_new_row(base, size)?;
+    let insert_rows: Vec<ChunkPrivateNew> = sizes
+        .iter()
+        .map(|size| build_new_row(base, size).unwrap())
+        .collect();
 
     diesel::insert_into(chunk)
-        .values(&insert_row)
+        .values(&insert_rows)
         .get_result(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
@@ -134,4 +137,27 @@ pub fn update_chunk(
         .get_result(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
+}
+
+pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<usize, String> {
+    use diesel::sql_types::Integer;
+
+    let query = "WITH updated_fields AS (
+            SELECT f.id AS field_id, c.id AS chunk_id
+            FROM field f
+            JOIN chunk c
+            ON f.range_start >= c.range_start
+            AND f.range_end <= c.range_end
+            WHERE f.base_id = $1
+        )
+        UPDATE field
+        SET chunk_id = updated_fields.chunk_id
+        FROM updated_fields
+        WHERE field.id = updated_fields.field_id;"
+        .to_string();
+
+    diesel::sql_query(query)
+        .bind::<Integer, _>(base as i32)
+        .execute(conn)
+        .map_err(|err| err.to_string())
 }

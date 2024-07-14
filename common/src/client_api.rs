@@ -3,7 +3,7 @@
 use super::*;
 
 /// Request a field from the server. Supplies CLI options as query strings.
-pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) -> DataToClient {
+pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient {
     // build the url
     let url = match mode {
         SearchMode::Detailed => format!("{api_base}/claim/detailed"),
