@@ -97,6 +97,7 @@ pub fn insert_new_base_and_fields(
     base::insert_base(conn, base, base_size)?;
 
     // insert each field
+    // TODO: Bulk insert fields and chunks
     for size in field_sizes {
         field::insert_field(conn, base, size)?;
     }
@@ -109,5 +110,3 @@ pub fn insert_new_base_and_fields(
 
     Ok(())
 }
-
-// TODO: Connect foreign keys in sql schema

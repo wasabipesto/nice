@@ -18,7 +18,7 @@ CREATE TABLE base (
 DROP TABLE IF EXISTS chunk;
 CREATE TABLE chunk (
     id SERIAL PRIMARY KEY,
-    base_id INTEGER NOT NULL,
+    base_id INTEGER NOT NULL REFERENCES base(id),
     range_start DECIMAL NOT NULL,
     range_end DECIMAL NOT NULL,
     range_size DECIMAL NOT NULL,
@@ -34,8 +34,8 @@ CREATE TABLE chunk (
 DROP TABLE IF EXISTS field;
 CREATE TABLE field (
     id BIGSERIAL PRIMARY KEY,
-    base_id INTEGER NOT NULL,
-    chunk_id INTEGER,
+    base_id INTEGER NOT NULL REFERENCES base(id),
+    chunk_id INTEGER REFERENCES chunk(id),
     range_start DECIMAL NOT NULL,
     range_end DECIMAL NOT NULL,
     range_size DECIMAL NOT NULL,
@@ -48,7 +48,7 @@ CREATE TABLE field (
 DROP TABLE IF EXISTS claim;
 CREATE TABLE claim (
     id BIGSERIAL PRIMARY KEY,
-    field_id INTEGER NOT NULL,
+    field_id INTEGER NOT NULL REFERENCES field(id),
     search_mode VARCHAR,
     claim_time TIMESTAMPTZ,
     user_ip VARCHAR,
@@ -58,8 +58,8 @@ CREATE TABLE claim (
 DROP TABLE IF EXISTS submission;
 CREATE TABLE submission (
     id BIGSERIAL PRIMARY KEY,
-    claim_id INTEGER NOT NULL,
-    field_id INTEGER NOT NULL,
+    claim_id INTEGER NOT NULL REFERENCES claim(id),
+    field_id INTEGER NOT NULL REFERENCES field(id),
     search_mode VARCHAR NOT NULL,
     submit_time TIMESTAMPTZ,
     elapsed_secs INTEGER,
