@@ -6,8 +6,8 @@ use super::*;
 pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) -> DataToClient {
     // build the url
     let url = match mode {
-        SearchMode::Detailed => format!("{api_base}/claim/detailed?username={username}"),
-        SearchMode::Niceonly => format!("{api_base}/claim/niceonly?username={username}"),
+        SearchMode::Detailed => format!("{api_base}/claim/detailed"),
+        SearchMode::Niceonly => format!("{api_base}/claim/niceonly"),
     };
 
     // send it
