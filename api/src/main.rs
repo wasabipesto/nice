@@ -13,6 +13,7 @@ use nice_common::{
     FieldClaimStrategy, FieldToClient, FieldToServer, NiceNumbersExtended, SearchMode,
     DEFAULT_FIELD_SIZE, NEAR_MISS_CUTOFF_PERCENT,
 };
+use rand::Rng;
 use rocket::serde::json::{json, Json, Value};
 
 // TODO: Define error types (4xx, 5xx) and serialize them properly
@@ -35,13 +36,24 @@ fn claim_detailed() -> Result<Value, Value> {
     // TODO: actually do this
     let user_ip = "unknown".to_string();
 
-    // get lowest valid field
-    // TODO: random between next (80%) and random (20%)
-    let claim_strategy = FieldClaimStrategy::Next;
+    // get rng thread
+    let mut rng = rand::thread_rng();
 
-    // get CL0 (unchecked) and CL1 (nice only) but not CL2 (detailed)
-    // TODO: random between 1 (80%) and 2 (20%)
-    let max_check_level = 1;
+    let claim_strategy = if rng.gen_range(0..100) < 80 {
+        // 80% chance: get lowest valid field
+        FieldClaimStrategy::Next
+    } else {
+        // 20% chance: get random valid field
+        FieldClaimStrategy::Random
+    };
+
+    let max_check_level = if rng.gen_range(0..100) < 80 {
+        // 80% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
+        1
+    } else {
+        // 20% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
+        2
+    };
 
     // this won't affect anything since all fields will be this size or smaller
     // TODO: implement an "online benchmarking" option for e.g. gh runners that limits this
@@ -79,12 +91,24 @@ fn claim_niceonly() -> Result<Value, Value> {
     // TODO: actually do this
     let user_ip = "unknown".to_string();
 
-    // get lowest valid field
-    // TODO: random between next (80%) and random (20%)
-    let claim_strategy = FieldClaimStrategy::Next;
+    // get rng thread
+    let mut rng = rand::thread_rng();
 
-    // get CL0 (unchecked) but not CL1 (nice only) or CL2 (detailed)
-    let max_check_level = 0;
+    let claim_strategy = if rng.gen_range(0..100) < 80 {
+        // 80% chance: get lowest valid field
+        FieldClaimStrategy::Next
+    } else {
+        // 20% chance: get random valid field
+        FieldClaimStrategy::Random
+    };
+
+    let max_check_level = if rng.gen_range(0..100) < 80 {
+        // 80% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
+        1
+    } else {
+        // 20% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
+        2
+    };
 
     // this won't affect anything since all fields will be this size or smaller
     // TODO: implement an "online benchmarking" option for e.g. gh runners that limits this
@@ -233,14 +257,25 @@ fn submit(data: Json<FieldToServer>) -> Result<Value, Value> {
     Ok(json!("OK"))
 }
 
+#[get("/")]
+fn index() -> Value {
+    not_found()
+}
+
 #[catch(404)]
 fn not_found() -> Value {
-    json!("The requested resource could not be found.")
+    "The requested resource could not be found. 
+    Available resources include /claim and /submit. 
+    Visit https://nicenumbers.net for more information."
+        .into()
 }
 
 #[launch]
 fn rocket() -> _ {
     rocket::build()
-        .mount("/", routes![claim, claim_detailed, claim_niceonly, submit])
+        .mount(
+            "/",
+            routes![claim, claim_detailed, claim_niceonly, submit, index],
+        )
         .register("/", catchers![not_found])
 }
