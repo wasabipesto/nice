@@ -22,7 +22,6 @@ use std::convert::TryFrom;
 use std::env;
 use std::ops::Add;
 
-pub const CLIENT_REPO: &str = "https://github.com/wasabipesto/nice/nice_client"; // TODO
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 pub const CLAIM_DURATION_HOURS: u32 = 1;
@@ -145,6 +144,7 @@ pub struct FieldToClient {
 }
 
 /// The compiled results sent to the server after processing.
+// TODO: implement pretty print for client debug
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FieldToServer {
     pub claim_id: u128,

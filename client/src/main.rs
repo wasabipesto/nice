@@ -52,7 +52,6 @@ fn main() {
     };
 
     // print some debug info
-    // TODO: implement a pretty print for claim/submit data
     if !cli.quiet {
         println!("{:?}", claim_data);
     }
@@ -85,6 +84,6 @@ fn main() {
 
     // print some debug info
     if cli.benchmark.is_none() {
-        submit_field_to_server(&cli.mode, &cli.api_base, submit_data)
+        submit_field_to_server(&cli.api_base, submit_data)
     }
 }

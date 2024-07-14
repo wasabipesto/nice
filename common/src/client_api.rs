@@ -5,16 +5,13 @@ use super::*;
 /// Request a field from the server. Supplies CLI options as query strings.
 pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) -> FieldToClient {
     // build the url
-    // TODO: use an actual url building lib?
-    let mut query_url = api_base.to_owned();
-    query_url += match mode {
-        SearchMode::Detailed => "/claim/detailed",
-        SearchMode::Niceonly => "/claim/niceonly",
+    let url = match mode {
+        SearchMode::Detailed => format!("{api_base}/claim/detailed?username={username}"),
+        SearchMode::Niceonly => format!("{api_base}/claim/niceonly?username={username}"),
     };
-    query_url += &("?username=".to_owned() + username);
 
     // send it
-    let response = reqwest::blocking::get(&query_url).unwrap_or_else(|e| panic!("Error: {}", e));
+    let response = reqwest::blocking::get(url).unwrap_or_else(|e| panic!("Error: {}", e));
 
     // deserialize and unwrap or panic
     match response.json::<FieldToClient>() {
@@ -24,12 +21,9 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str, username: &str) 
 }
 
 /// Submit field results to the server. Panic if there is an error.
-pub fn submit_field_to_server(mode: &SearchMode, api_base: &str, submit_data: FieldToServer) {
-    // TODO: same route in v6
-    let url = match mode {
-        SearchMode::Detailed => format!("{}/submit", api_base),
-        SearchMode::Niceonly => format!("{}/submit", api_base),
-    };
+pub fn submit_field_to_server(api_base: &str, submit_data: FieldToServer) {
+    // build the url
+    let url = format!("{api_base}/submit");
 
     // send it
     let response = reqwest::blocking::Client::new()
