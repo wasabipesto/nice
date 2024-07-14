@@ -37,6 +37,7 @@ pub enum SearchMode {
     Niceonly,
 }
 
+/// Whether we should pick the next or random field when claiming.
 #[derive(Debug, Copy, Clone)]
 pub enum FieldClaimStrategy {
     Next,
@@ -144,7 +145,6 @@ pub struct FieldToClient {
 }
 
 /// The compiled results sent to the server after processing.
-// TODO: implement pretty print for client debug
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FieldToServer {
     pub claim_id: u128,

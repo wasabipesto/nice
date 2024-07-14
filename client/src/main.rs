@@ -8,6 +8,7 @@ use nice_common::client_process::process_detailed;
 use nice_common::client_process::process_niceonly;
 use nice_common::{FieldToServer, SearchMode};
 
+extern crate serde_json;
 use clap::Parser;
 use std::time::Instant;
 
@@ -53,7 +54,7 @@ fn main() {
 
     // print some debug info
     if !cli.quiet {
-        println!("{:?}", claim_data);
+        println!("{}", serde_json::to_string_pretty(&claim_data).unwrap());
     }
 
     // start the timer for benchmarking
@@ -70,7 +71,7 @@ fn main() {
 
     // print some debug info
     if !cli.quiet {
-        println!("{:?}", submit_data);
+        println!("{}", serde_json::to_string_pretty(&submit_data).unwrap());
     }
 
     // print the benchmarking results
