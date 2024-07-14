@@ -1,5 +1,10 @@
--- BASES: ENTRIE BASE RANGE
+-- DROP TABLES IN REVERSE ORDER
+DROP TABLE IF EXISTS submission;
+DROP TABLE IF EXISTS claim;
+DROP TABLE IF EXISTS field;
+DROP TABLE IF EXISTS chunk;
 DROP TABLE IF EXISTS base;
+-- BASES: ENTRIE BASE RANGE
 CREATE TABLE base (
     -- ID is the acual base
     id INTEGER PRIMARY KEY,
@@ -15,7 +20,6 @@ CREATE TABLE base (
     numbers JSONB NOT NULL DEFAULT '[]'
 );
 -- CHUNKS: AGGREGATE FIELDS FOR ANALYTICS
-DROP TABLE IF EXISTS chunk;
 CREATE TABLE chunk (
     id SERIAL PRIMARY KEY,
     base_id INTEGER NOT NULL REFERENCES base(id),
@@ -31,7 +35,6 @@ CREATE TABLE chunk (
     numbers JSONB NOT NULL DEFAULT '[]'
 );
 -- FIELDS: INDIVIDUAL SEARCH RANGES
-DROP TABLE IF EXISTS field;
 CREATE TABLE field (
     id BIGSERIAL PRIMARY KEY,
     base_id INTEGER NOT NULL REFERENCES base(id),
@@ -45,28 +48,24 @@ CREATE TABLE field (
     prioritize BOOLEAN NOT NULL DEFAULT 'false'
 );
 -- CLAIMS: LOG OF CLAIM REQUESTS
-DROP TABLE IF EXISTS claim;
 CREATE TABLE claim (
     id BIGSERIAL PRIMARY KEY,
     field_id INTEGER NOT NULL REFERENCES field(id),
-    search_mode VARCHAR,
-    claim_time TIMESTAMPTZ,
-    user_ip VARCHAR,
-    user_agent VARCHAR
+    search_mode VARCHAR NOT NULL,
+    claim_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    user_ip VARCHAR NOT NULL
 );
 -- SUBMISSIONS: LOG OF ALL VALIDATED SUIBMISSIONS
-DROP TABLE IF EXISTS submission;
 CREATE TABLE submission (
     id BIGSERIAL PRIMARY KEY,
     claim_id INTEGER NOT NULL REFERENCES claim(id),
     field_id INTEGER NOT NULL REFERENCES field(id),
     search_mode VARCHAR NOT NULL,
-    submit_time TIMESTAMPTZ,
-    elapsed_secs INTEGER,
+    submit_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    elapsed_secs INTEGER NOT NULL,
     username VARCHAR NOT NULL,
-    user_ip VARCHAR,
-    user_agent VARCHAR,
-    client_version VARCHAR,
+    user_ip VARCHAR NOT NULL,
+    client_version VARCHAR NOT NULL,
     disqualified BOOLEAN NOT NULL DEFAULT 'false',
     distribution JSONB,
     numbers JSONB NOT NULL DEFAULT '[]'

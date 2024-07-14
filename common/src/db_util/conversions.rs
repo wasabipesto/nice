@@ -18,6 +18,21 @@ pub fn u128_to_i64(i: u128) -> Result<i64, String> {
     }
 }
 
+pub fn i32_to_u128(i: i32) -> Result<u128, String> {
+    if i < 0 {
+        Err("i32 value is negative and cannot be converted to u128".to_string())
+    } else {
+        Ok(i as u128)
+    }
+}
+pub fn u128_to_i32(i: u128) -> Result<i32, String> {
+    if i > i32::MAX as u128 {
+        Err("u128 value exceeds i32::MAX and cannot be converted to i32".to_string())
+    } else {
+        Ok(i as i32)
+    }
+}
+
 /*
 pub fn i64_to_u32(i: i64) -> Result<u32, String> {
     if i < 0 {
@@ -92,4 +107,18 @@ pub fn deserialize_numbers(i: Value) -> Result<Vec<NiceNumbersExtended>, String>
 }
 pub fn serialize_numbers(i: Vec<NiceNumbersExtended>) -> Result<Value, String> {
     serde_json::to_value(i).map_err(|e| e.to_string())
+}
+
+pub fn deserialize_searchmode(i: String) -> Result<SearchMode, String> {
+    match i.as_str() {
+        "detailed" => Ok(SearchMode::Detailed),
+        "niceonly" => Ok(SearchMode::Niceonly),
+        _ => Err(format!("Failed to deserialize search mode: {i}")),
+    }
+}
+pub fn serialize_searchmode(i: SearchMode) -> String {
+    match i {
+        SearchMode::Detailed => "detailed".to_string(),
+        SearchMode::Niceonly => "niceonly".to_string(),
+    }
 }

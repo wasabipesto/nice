@@ -9,6 +9,7 @@ use serde_json::Value;
 
 mod base;
 mod chunk;
+mod claim;
 mod conversions;
 mod field;
 
@@ -21,13 +22,12 @@ pub fn get_database_connection() -> PgConnection {
 }
 
 /// Return the lowest field that has not been claimed recently and log the claim.
-/// TODO: Insert claim row
 pub fn claim_field(
     conn: &mut PgConnection,
     claim_strategy: FieldClaimStrategy,
     maximum_check_level: u8,
     maximum_size: u128,
-) -> Result<FieldToClient, String> {
+) -> Result<FieldRecord, String> {
     // try to find a field, respecting previous claims
     let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS as i64);
     if let Some(claimed_field) = field::try_claim_field(
@@ -37,34 +37,32 @@ pub fn claim_field(
         maximum_check_level,
         maximum_size,
     )? {
-        return Ok(FieldToClient {
-            claim_id: 0,
-            base: claimed_field.base,
-            range_start: claimed_field.range_start,
-            range_end: claimed_field.range_end,
-            range_size: claimed_field.range_size,
-        });
+        return Ok(claimed_field);
     }
 
     // try again, ignoring all previous claims and grabbing randomly
     let maximum_timestamp = Utc::now();
+    let claim_strategy = FieldClaimStrategy::Random;
     if let Some(claimed_field) = field::try_claim_field(
         conn,
-        FieldClaimStrategy::Random,
+        claim_strategy,
         maximum_timestamp,
         maximum_check_level,
         maximum_size,
     )? {
-        return Ok(FieldToClient {
-            claim_id: 0,
-            base: claimed_field.base,
-            range_start: claimed_field.range_start,
-            range_end: claimed_field.range_end,
-            range_size: claimed_field.range_size,
-        });
+        return Ok(claimed_field);
     }
 
     Err(format!("Could not find any field with maximum check level {maximum_check_level} and maximum size {maximum_size}!"))
+}
+
+pub fn log_claim(
+    conn: &mut PgConnection,
+    search_field: &FieldRecord,
+    search_mode: SearchMode,
+    user_ip: String,
+) -> Result<ClaimRecord, String> {
+    claim::insert_claim(conn, search_field.field_id, search_mode, user_ip)
 }
 
 /// Return a specific claim from the log.

@@ -158,10 +158,9 @@ pub struct FieldToServer {
 pub struct ClaimRecord {
     pub claim_id: u128,
     pub field_id: u128,
-    pub search_mode: Option<SearchMode>,
-    pub claim_time: Option<DateTime<Utc>>,
-    pub user_ip: Option<String>,
-    pub user_agent: Option<String>,
+    pub search_mode: SearchMode,
+    pub claim_time: DateTime<Utc>,
+    pub user_ip: String,
 }
 
 /// A validated submission ready to send to the database.
@@ -171,7 +170,7 @@ pub struct SubmissionRecord {
     pub claim_id: u128,
     pub field_id: u128,
     pub search_mode: SearchMode,
-    pub submit_time: Option<DateTime<Utc>>,
+    pub submit_time: DateTime<Utc>,
     pub elapsed_secs: Option<u32>,
     pub username: String,
     pub user_ip: Option<String>,

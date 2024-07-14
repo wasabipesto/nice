@@ -4,12 +4,11 @@
 extern crate rocket;
 
 //use nice_common::benchmark::{get_benchmark_field, BenchmarkMode};
-use nice_common::db_util::{claim_field, get_database_connection};
-use nice_common::{FieldClaimStrategy, DEFAULT_FIELD_SIZE};
+use nice_common::db_util::{claim_field, get_database_connection, log_claim};
+use nice_common::{FieldClaimStrategy, FieldToClient, SearchMode, DEFAULT_FIELD_SIZE};
 use rocket::serde::json::{json, Value};
 
 // TODO: Define error types (4xx, 5xx) and serialize them properly
-// TODO: Database connection pooling
 
 #[get("/claim")]
 fn claim() -> Result<Value, Value> {
@@ -18,7 +17,16 @@ fn claim() -> Result<Value, Value> {
 
 #[get("/claim/detailed")]
 fn claim_detailed() -> Result<Value, Value> {
+    // get database connection
+    // TODO: database connection pooling
     let mut conn = get_database_connection();
+
+    // set search mode based on path
+    let search_mode = SearchMode::Detailed;
+
+    // get user IP
+    // TODO: actually do this
+    let user_ip = "unknown".to_string();
 
     // get lowest valid field
     // TODO: random between next (80%) and random (20%)
@@ -32,16 +40,37 @@ fn claim_detailed() -> Result<Value, Value> {
     // TODO: implement an "online benchmarking" option for e.g. gh runners that limits this
     let max_range_size = DEFAULT_FIELD_SIZE;
 
-    // get the field
-    let claim = claim_field(&mut conn, claim_strategy, max_check_level, max_range_size)?;
+    // get the field to search based on claim strategy, max check level, etc
+    let search_field = claim_field(&mut conn, claim_strategy, max_check_level, max_range_size)?;
+
+    // log the claim and get the record
+    let claim_record = log_claim(&mut conn, &search_field, search_mode, user_ip)?;
+
+    // build the struct to send to the client
+    let data_for_client = FieldToClient {
+        claim_id: claim_record.claim_id,
+        base: search_field.base,
+        range_start: search_field.range_start,
+        range_end: search_field.range_end,
+        range_size: search_field.range_size,
+    };
 
     // return to user
-    Ok(json!(claim))
+    Ok(json!(data_for_client))
 }
 
 #[get("/claim/niceonly")]
 fn claim_niceonly() -> Result<Value, Value> {
+    // get database connection
+    // TODO: database connection pooling
     let mut conn = get_database_connection();
+
+    // set search mode based on path
+    let search_mode = SearchMode::Niceonly;
+
+    // get user IP
+    // TODO: actually do this
+    let user_ip = "unknown".to_string();
 
     // get lowest valid field
     // TODO: random between next (80%) and random (20%)
@@ -54,11 +83,23 @@ fn claim_niceonly() -> Result<Value, Value> {
     // TODO: implement an "online benchmarking" option for e.g. gh runners that limits this
     let max_range_size = DEFAULT_FIELD_SIZE;
 
-    // get the field
-    let claim = claim_field(&mut conn, claim_strategy, max_check_level, max_range_size)?;
+    // get the field to search based on claim strategy, max check level, etc
+    let search_field = claim_field(&mut conn, claim_strategy, max_check_level, max_range_size)?;
+
+    // log the claim and get the record
+    let claim_record = log_claim(&mut conn, &search_field, search_mode, user_ip)?;
+
+    // build the struct to send to the client
+    let data_for_client = FieldToClient {
+        claim_id: claim_record.claim_id,
+        base: search_field.base,
+        range_start: search_field.range_start,
+        range_end: search_field.range_end,
+        range_size: search_field.range_size,
+    };
 
     // return to user
-    Ok(json!(claim))
+    Ok(json!(data_for_client))
 }
 
 #[post("/submit")]
