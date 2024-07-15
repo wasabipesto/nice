@@ -3,15 +3,16 @@
 #[macro_use]
 extern crate rocket;
 
+use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
-    claim_field, get_claim_by_id, get_database_connection, get_field_by_id, insert_submission,
-    log_claim,
+    get_claim_by_id, get_database_connection, get_field_by_id, insert_claim, insert_submission,
+    try_claim_field,
 };
 use nice_common::expand_stats::{expand_distribution, expand_numbers};
 use nice_common::{
     DataToClient, DataToServer, FieldClaimStrategy, NiceNumbersExtended, SearchMode,
-    DEFAULT_FIELD_SIZE, NEAR_MISS_CUTOFF_PERCENT,
+    CLAIM_DURATION_HOURS, DEFAULT_FIELD_SIZE, NEAR_MISS_CUTOFF_PERCENT,
 };
 use rand::Rng;
 use rocket::serde::json::{json, Json, Value};
@@ -64,10 +65,36 @@ fn claim(mode: &str) -> Result<Value, Value> {
     let max_range_size = DEFAULT_FIELD_SIZE;
 
     // get the field to search based on claim strategy, max check level, etc
-    let search_field = claim_field(&mut conn, claim_strategy, max_check_level, max_range_size)?;
+    // try to find a field, respecting previous claims
+    let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS as i64);
+    let search_field = match try_claim_field(
+        &mut conn,
+        claim_strategy,
+        maximum_timestamp,
+        max_check_level,
+        max_range_size,
+    )? {
+        Some(claimed_field) => claimed_field,
+        None => {
+            let maximum_timestamp = Utc::now();
+            let claim_strategy = FieldClaimStrategy::Random;
+            match try_claim_field(
+                &mut conn,
+                claim_strategy,
+                maximum_timestamp,
+                max_check_level,
+                max_range_size,
+            )? {
+                Some(claimed_field) => claimed_field,
+                None => {
+                    return Err(format!("Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!").into());
+                }
+            }
+        }
+    };
 
     // log the claim and get the record
-    let claim_record = log_claim(&mut conn, &search_field, search_mode, user_ip)?;
+    let claim_record = insert_claim(&mut conn, &search_field, search_mode, user_ip)?;
 
     // build the struct to send to the client
     let data_for_client = DataToClient {
@@ -122,6 +149,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                 None,
                 numbers_expanded,
             )?;
+            // TODO: update CL to 1
         }
         SearchMode::Detailed => {
             // run through some basic validity tests

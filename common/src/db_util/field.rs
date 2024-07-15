@@ -95,6 +95,7 @@ pub fn insert_fields(
         .map(|size| build_new_row(base, size).unwrap())
         .collect();
 
+    // chunk it out if there's too many fields
     for chunk in insert_rows.chunks(10000) {
         diesel::insert_into(field)
             .values(chunk)

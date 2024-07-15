@@ -98,21 +98,17 @@ fn main() {
         return;
     }
     let mut conn = nice_common::db_util::get_database_connection();
-    if let Ok(base_data) = nice_common::db_util::get_base(&mut conn, base) {
+    if let Ok(base_data) = nice_common::db_util::get_base_by_id(&mut conn, base) {
         panic!("Base {} already exists: {:?}", base, base_data)
     }
-    nice_common::db_util::insert_new_base_and_fields(
-        &mut conn,
-        base,
-        base_range,
-        fields.clone(),
-        chunks.clone(),
-    )
-    .unwrap();
-    println!(
-        "Base {} added: {} fields, {} chunks",
-        base,
-        fields.len(),
-        chunks.len()
-    )
+
+    println!("Inserting base {}...", base);
+    nice_common::db_util::insert_new_base(&mut conn, base, base_range).unwrap();
+    println!("Inserting {} fields...", field_sizes.len());
+    nice_common::db_util::insert_new_fields(&mut conn, base, fields.clone()).unwrap();
+    println!("Inserting {} chunks...", chunk_sizes.len());
+    nice_common::db_util::insert_new_chunks(&mut conn, base, chunks.clone()).unwrap();
+    println!("Updating base {} chunk assignments...", base);
+    nice_common::db_util::reassign_fields_to_chunks(&mut conn, base).unwrap();
+    println!("Database updated.")
 }

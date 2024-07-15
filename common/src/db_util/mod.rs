@@ -22,42 +22,96 @@ pub fn get_database_connection() -> PgConnection {
         .unwrap_or_else(|_| panic!("Error connecting to {}", database_url))
 }
 
-/// Return the lowest field that has not been claimed recently and log the claim.
-pub fn claim_field(
-    conn: &mut PgConnection,
-    claim_strategy: FieldClaimStrategy,
-    maximum_check_level: u8,
-    maximum_size: u128,
-) -> Result<FieldRecord, String> {
-    // try to find a field, respecting previous claims
-    let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS as i64);
-    if let Some(claimed_field) = field::try_claim_field(
-        conn,
-        claim_strategy,
-        maximum_timestamp,
-        maximum_check_level,
-        maximum_size,
-    )? {
-        return Ok(claimed_field);
-    }
-
-    // try again, ignoring all previous claims and grabbing randomly
-    let maximum_timestamp = Utc::now();
-    let claim_strategy = FieldClaimStrategy::Random;
-    if let Some(claimed_field) = field::try_claim_field(
-        conn,
-        claim_strategy,
-        maximum_timestamp,
-        maximum_check_level,
-        maximum_size,
-    )? {
-        return Ok(claimed_field);
-    }
-
-    Err(format!("Could not find any field with maximum check level {maximum_check_level} and maximum size {maximum_size}!"))
+/// Get a base record (base range plus cached stats).
+pub fn get_base_by_id(conn: &mut PgConnection, base: u32) -> Result<BaseRecord, String> {
+    base::get_base_by_id(conn, base)
 }
 
-pub fn log_claim(
+/// Get all base records.
+pub fn get_all_bases(conn: &mut PgConnection) -> Result<Vec<BaseRecord>, String> {
+    base::get_all_bases(conn)
+}
+
+/// Insert a new base.
+/// Only called by admin scripts.
+pub fn insert_new_base(
+    conn: &mut PgConnection,
+    base: u32,
+    base_size: FieldSize,
+) -> Result<BaseRecord, String> {
+    base::insert_base(conn, base, base_size)
+}
+
+/// Update a base's calculated statistics.
+pub fn update_base_stats() -> Result<(), String> {
+    unimplemented!();
+}
+
+/// Get a chunk record (range plus cached stats).
+pub fn get_chunk_by_id(conn: &mut PgConnection, chunk_id: u32) -> Result<ChunkRecord, String> {
+    chunk::get_chunk_by_id(conn, chunk_id)
+}
+
+/// Get all chunk records in a certain base.
+pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<ChunkRecord>, String> {
+    chunk::get_chunks_in_base(conn, base)
+}
+
+/// Insert a bunch of new chunks.
+/// Only called by admin scripts.
+pub fn insert_new_chunks(
+    conn: &mut PgConnection,
+    base: u32,
+    chunk_sizes: Vec<FieldSize>,
+) -> Result<(), String> {
+    chunk::insert_chunks(conn, base, chunk_sizes)
+}
+
+/// Reassign chunk associations for all fields in a certain base.
+pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(), String> {
+    chunk::reassign_fields_to_chunks(conn, base)
+}
+
+/// Update a chunk's calculated statistics.
+pub fn update_chunk_stats() -> Result<(), String> {
+    unimplemented!();
+}
+
+/// Get a field record (range plus cached stats).
+pub fn get_field_by_id(conn: &mut PgConnection, field_id: u128) -> Result<FieldRecord, String> {
+    field::get_field_by_id(conn, field_id)
+}
+
+/// Try to claim a valid field.
+/// Returns Ok(None) if no matching fields are found.
+pub fn try_claim_field(
+    conn: &mut PgConnection,
+    claim_strategy: FieldClaimStrategy,
+    maximum_timestamp: DateTime<Utc>,
+    maximum_check_level: u8,
+    maximum_size: u128,
+) -> Result<Option<FieldRecord>, String> {
+    field::try_claim_field(
+        conn,
+        claim_strategy,
+        maximum_timestamp,
+        maximum_check_level,
+        maximum_size,
+    )
+}
+
+/// Insert a bunch of new fields.
+/// Only called by admin scripts.
+pub fn insert_new_fields(
+    conn: &mut PgConnection,
+    base: u32,
+    field_sizes: Vec<FieldSize>,
+) -> Result<(), String> {
+    field::insert_fields(conn, base, field_sizes)
+}
+
+/// Insert a claim with basic information.
+pub fn insert_claim(
     conn: &mut PgConnection,
     search_field: &FieldRecord,
     search_mode: SearchMode,
@@ -91,21 +145,6 @@ pub fn insert_submission(
     )
 }
 
-/// Log that scheduled jobs have started.
-pub fn log_scheduled_jobs_started() -> Result<(), String> {
-    unimplemented!();
-}
-
-/// Log that all scheduled jobs are complete.
-pub fn log_scheduled_jobs_complete() -> Result<(), String> {
-    unimplemented!();
-}
-
-/// Get a field record (range plus cached stats).
-pub fn get_field_by_id(conn: &mut PgConnection, field_id: u128) -> Result<FieldRecord, String> {
-    field::get_field_by_id(conn, field_id)
-}
-
 /// Get a list of fields with new submissions.
 /// Used for consensus.
 pub fn get_recently_submitted_fields() -> Result<(), String> {
@@ -127,53 +166,4 @@ pub fn update_field_canon() -> Result<(), String> {
 /// Used for downsampling.
 pub fn get_recently_canonized_fields() -> Result<(), String> {
     unimplemented!();
-}
-
-/// Get a chunk record (range plus cached stats).
-pub fn get_chunk(conn: &mut PgConnection, chunk_id: u32) -> Result<ChunkRecord, String> {
-    chunk::get_chunk(conn, chunk_id)
-}
-
-/// Update a chunk's calculated statistics.
-pub fn update_chunk_stats() -> Result<(), String> {
-    unimplemented!();
-}
-
-/// Get a base record (base range plus cached stats).
-pub fn get_base(conn: &mut PgConnection, base: u32) -> Result<BaseRecord, String> {
-    base::get_base(conn, base)
-}
-
-/// Update a base's calculated statistics.
-pub fn update_base_stats() -> Result<(), String> {
-    unimplemented!();
-}
-
-/// Insert a bunch of fields and chunks for processing.
-/// Only called by admin scripts.
-/// TODO: Break this up into 4 separate functions
-pub fn insert_new_base_and_fields(
-    conn: &mut PgConnection,
-    base: u32,
-    base_size: FieldSize,
-    field_sizes: Vec<FieldSize>,
-    chunk_sizes: Vec<FieldSize>,
-) -> Result<(), String> {
-    // insert the base row
-    println!("Inserting base {}...", base);
-    base::insert_base(conn, base, base_size)?;
-
-    // insert all fields
-    println!("Inserting {} fields...", field_sizes.len());
-    field::insert_fields(conn, base, field_sizes)?;
-
-    // insert all chunks
-    println!("Inserting {} chunks...", chunk_sizes.len());
-    chunk::insert_chunks(conn, base, chunk_sizes)?;
-
-    // assign chunk ID to fields
-    println!("Updating base {} chunk assignments...", base);
-    chunk::reassign_fields_to_chunks(conn, base)?;
-
-    Ok(())
 }

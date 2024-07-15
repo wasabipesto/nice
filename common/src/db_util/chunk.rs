@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use conversions::u32_to_i32;
+
 use super::*;
 
 table! {
@@ -95,7 +97,7 @@ pub fn insert_chunks(
     conn: &mut PgConnection,
     base: u32,
     sizes: Vec<FieldSize>,
-) -> Result<ChunkRecord, String> {
+) -> Result<(), String> {
     use self::chunk::dsl::*;
 
     let insert_rows: Vec<ChunkPrivateNew> = sizes
@@ -107,10 +109,12 @@ pub fn insert_chunks(
         .values(&insert_rows)
         .get_result(conn)
         .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .and_then(private_to_public)?;
+
+    Ok(())
 }
 
-pub fn get_chunk(conn: &mut PgConnection, row_id: u32) -> Result<ChunkRecord, String> {
+pub fn get_chunk_by_id(conn: &mut PgConnection, row_id: u32) -> Result<ChunkRecord, String> {
     use self::chunk::dsl::*;
 
     let row_id = conversions::u32_to_i32(row_id)?;
@@ -120,6 +124,22 @@ pub fn get_chunk(conn: &mut PgConnection, row_id: u32) -> Result<ChunkRecord, St
         .first::<ChunkPrivate>(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
+}
+
+pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<ChunkRecord>, String> {
+    use self::chunk::dsl::*;
+
+    let base = u32_to_i32(base)?;
+
+    let chunks_private: Vec<ChunkPrivate> = chunk
+        .filter(base_id.eq(base))
+        .load(conn)
+        .map_err(|err| err.to_string())?;
+    let mut chunks = Vec::new();
+    for c in chunks_private {
+        chunks.push(private_to_public(c)?)
+    }
+    Ok(chunks)
 }
 
 pub fn update_chunk(
@@ -139,7 +159,7 @@ pub fn update_chunk(
         .and_then(private_to_public)
 }
 
-pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<usize, String> {
+pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(), String> {
     use diesel::sql_types::Integer;
 
     let query = "WITH updated_fields AS (
@@ -159,5 +179,7 @@ pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<u
     diesel::sql_query(query)
         .bind::<Integer, _>(base as i32)
         .execute(conn)
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+
+    Ok(())
 }

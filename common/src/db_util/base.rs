@@ -103,7 +103,7 @@ pub fn insert_base(
         .and_then(private_to_public)
 }
 
-pub fn get_base(conn: &mut PgConnection, row_id: u32) -> Result<BaseRecord, String> {
+pub fn get_base_by_id(conn: &mut PgConnection, row_id: u32) -> Result<BaseRecord, String> {
     use self::base::dsl::*;
 
     let row_id = conversions::u32_to_i32(row_id)?;
@@ -112,6 +112,17 @@ pub fn get_base(conn: &mut PgConnection, row_id: u32) -> Result<BaseRecord, Stri
         .first::<BasePrivate>(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
+}
+
+pub fn get_all_bases(conn: &mut PgConnection) -> Result<Vec<BaseRecord>, String> {
+    use self::base::dsl::*;
+
+    let bases_private: Vec<BasePrivate> = base.load(conn).map_err(|err| err.to_string())?;
+    let mut bases = Vec::new();
+    for b in bases_private {
+        bases.push(private_to_public(b)?)
+    }
+    Ok(bases)
 }
 
 pub fn update_base(

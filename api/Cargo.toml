@@ -10,5 +10,6 @@ license-file = "../LICENSE"
 
 [dependencies]
 nice_common = { path = "../common" }
+chrono = { version = "0.4.31", features = ["serde"] }
 rand = { version = "0.8.5" }
 rocket = { version = "0.5.1", features = ["json"] }

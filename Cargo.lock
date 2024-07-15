@@ -1168,6 +1168,7 @@ dependencies = [
 name = "nice_api"
 version = "3.0.0"
 dependencies = [
+ "chrono",
  "nice_common",
  "rand",
  "rocket",
