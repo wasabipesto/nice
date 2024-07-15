@@ -10,5 +10,5 @@ license-file = "../LICENSE"
 
 [dependencies]
 nice_common = { path = "../common" }
-clap = { version = "4.4" }
+clap = { version = "4.5" }
 serde_json = { version = "1.0" }
