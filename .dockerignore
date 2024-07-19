@@ -1,0 +1,13 @@
+**/target
+**/Dockerfile
+**/.dockerignore
+.git
+.github
+.gitignore
+**/*.md
+**/*.sh
+**/*.out
+**/*.svg
+**/*.sql
+perf.*
+core
