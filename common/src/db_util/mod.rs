@@ -10,7 +10,6 @@ use serde_json::Value;
 mod base;
 mod chunk;
 mod claim;
-mod consensus;
 mod conversions;
 mod field;
 mod submission;
@@ -189,11 +188,43 @@ pub fn get_recently_canonized_fields() -> Result<(), String> {
     unimplemented!();
 }
 
-/// Given a field, get all submissions and determine if there is a consensus.
-/// If so, update the canon submission ID and field check level.
+/// Given a field, get all submissions and update the canon submission ID/check level as necessary.
 pub fn update_consensus(
     conn: &mut PgConnection,
     field: &FieldRecord,
-) -> Result<Option<SubmissionRecord>, String> {
-    consensus::update_consensus(conn, field)
+) -> Result<(Option<SubmissionRecord>, u8), String> {
+    // Get all qualified and detailed submissions for the field
+    let submissions = db_util::get_submissions_qualified_detailed_for_field(conn, field.field_id)
+        .map_err(|e| e.to_string())?;
+
+    // Establish the consensus
+    let (canon_submission, check_level) = consensus::evaluate_consensus(field, &submissions)?;
+    match &canon_submission {
+        None => {
+            if field.canon_submission_id.is_some() || field.check_level > 1 {
+                println!(
+                "Field #{} claimed to be checked (Submission #{:?}, CL{}) but no submissions were found, so it was reset to CL{}.",
+                field.field_id, field.canon_submission_id, field.check_level, check_level
+            );
+                update_field_canon_and_cl(conn, field.field_id, None, check_level)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Some(canon_submission_some) => {
+            // Update the field if necessary
+            if field.canon_submission_id != Some(canon_submission_some.submission_id as u32)
+                || field.check_level != check_level
+            {
+                update_field_canon_and_cl(
+                    conn,
+                    field.field_id,
+                    Some(canon_submission_some.submission_id as u32),
+                    check_level,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    Ok((canon_submission, check_level))
 }

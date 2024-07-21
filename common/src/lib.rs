@@ -4,6 +4,7 @@ pub mod base_range;
 pub mod benchmark;
 pub mod client_api;
 pub mod client_process;
+pub mod consensus;
 pub mod db_util;
 pub mod distribution_stats;
 pub mod generate_chunks;

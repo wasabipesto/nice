@@ -22,12 +22,14 @@ fn main() {
             db_util::get_fields_in_base(&mut conn, base).unwrap();
 
         for field in fields_to_check {
-            if let Ok(Some(canon_submission)) = db_util::update_consensus(&mut conn, &field) {
+            let (canon_submission, check_level) =
+                db_util::update_consensus(&mut conn, &field).unwrap();
+            if let Some(canon_submission_some) = canon_submission {
                 println!(
-                    "Base {} Field #{}: Canon submission is #{}",
-                    base, field.field_id, canon_submission.submission_id
+                    "Base {} Field #{} - Canon submission: #{}, CL{}",
+                    base, field.field_id, canon_submission_some.submission_id, check_level
                 );
-            }
+            };
         }
     }
 
