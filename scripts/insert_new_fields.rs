@@ -104,9 +104,9 @@ fn main() {
 
     println!("Inserting base {}...", base);
     nice_common::db_util::insert_new_base(&mut conn, base, base_range).unwrap();
-    println!("Inserting {} fields...", field_sizes.len());
+    println!("Inserting {} fields...", fields.len());
     nice_common::db_util::insert_new_fields(&mut conn, base, fields.clone()).unwrap();
-    println!("Inserting {} chunks...", chunk_sizes.len());
+    println!("Inserting {} chunks...", chunks.len());
     nice_common::db_util::insert_new_chunks(&mut conn, base, chunks.clone()).unwrap();
     println!("Updating base {} chunk assignments...", base);
     nice_common::db_util::reassign_fields_to_chunks(&mut conn, base).unwrap();

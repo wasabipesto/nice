@@ -170,24 +170,6 @@ pub fn get_submissions_qualified_detailed_for_field(
     submission::get_submissions_qualified_detailed_for_field(conn, field_id)
 }
 
-/// Get a list of fields with new submissions.
-/// Used for consensus.
-pub fn get_recently_submitted_fields() -> Result<(), String> {
-    unimplemented!();
-}
-
-/// Get a list of random fields with new submissions.
-/// Used for consensus.
-pub fn get_random_fields() -> Result<(), String> {
-    unimplemented!();
-}
-
-/// Get a list of fields with new canon submissions.
-/// Used for downsampling.
-pub fn get_recently_canonized_fields() -> Result<(), String> {
-    unimplemented!();
-}
-
 /// Given a field, get all submissions and update the canon submission ID/check level as necessary.
 pub fn update_consensus(
     conn: &mut PgConnection,

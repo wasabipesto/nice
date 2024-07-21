@@ -28,6 +28,7 @@ pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 pub const CLAIM_DURATION_HOURS: u32 = 1;
 pub const DEFAULT_FIELD_SIZE: u128 = 1000000000;
+pub const SAVE_TOP_N_NUMBERS: usize = 10000;
 
 /// Each possible search mode the server and client supports.
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -183,7 +184,7 @@ pub struct SubmissionRecord {
     pub numbers: Vec<NiceNumbersExtended>,
 }
 
-/// A submission with no metadata, used for consensus.
+/// A submission with no metadata, used for consensus hashing.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct SubmissionCandidate {
     pub distribution: Vec<DistributionSimple>,

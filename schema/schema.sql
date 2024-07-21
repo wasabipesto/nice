@@ -70,3 +70,9 @@ CREATE TABLE submission (
     distribution JSONB,
     numbers JSONB NOT NULL DEFAULT '[]'
 );
+-- POSTGREST USER ACCESS
+GRANT SELECT ON base TO web_anon;
+GRANT SELECT ON chunk TO web_anon;
+GRANT SELECT ON field TO web_anon;
+GRANT SELECT ON claim TO web_anon;
+GRANT SELECT ON submission TO web_anon;
