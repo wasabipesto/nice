@@ -170,6 +170,24 @@ pub fn get_submissions_qualified_detailed_for_field(
     submission::get_submissions_qualified_detailed_for_field(conn, field_id)
 }
 
+/// Get the percent of the range that has reached the given check level.
+pub fn get_count_checked_by_range(
+    conn: &mut PgConnection,
+    check_level: u8,
+    range: FieldSize,
+) -> Result<u128, String> {
+    field::get_count_checked_by_range(conn, check_level, range)
+}
+
+/// Get all canon submissions in a particular base.
+pub fn get_canon_submissions_by_range(
+    conn: &mut PgConnection,
+    range: FieldSize,
+) -> Result<Vec<SubmissionRecord>, String> {
+    //submission::get_canon_submissions_by_range(conn, range)
+    Ok(Vec::new())
+}
+
 /// Given a field, get all submissions and update the canon submission ID/check level as necessary.
 pub fn update_consensus(
     conn: &mut PgConnection,

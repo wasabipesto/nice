@@ -189,6 +189,30 @@ pub fn try_claim_field(
         .and_then(|opt| opt.map_or(Ok(None), |rec| private_to_public(rec).map(Some)))
 }
 
+pub fn get_count_checked_by_range(
+    conn: &mut PgConnection,
+    in_check_level: u8,
+    range: FieldSize,
+) -> Result<u128, String> {
+    use self::field::dsl::*;
+    use diesel::dsl::sum;
+
+    let in_check_level = conversions::u8_to_i32(in_check_level)?;
+    let in_range_start = conversions::u128_to_bigdec(range.range_start)?;
+    let in_range_end = conversions::u128_to_bigdec(range.range_end)?;
+
+    let count = field
+        .select(sum(range_size))
+        .filter(check_level.ge(in_check_level))
+        .filter(range_start.ge(in_range_start))
+        .filter(range_end.le(in_range_end))
+        .first::<Option<BigDecimal>>(conn)
+        .map_err(|err| err.to_string())?
+        .unwrap_or(BigDecimal::from(0u32));
+
+    conversions::bigdec_to_u128(count)
+}
+
 pub fn update_field(
     conn: &mut PgConnection,
     row_id: u128,

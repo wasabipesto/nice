@@ -4,11 +4,25 @@
 //! nice_common = { path = "../common" }
 //! ```
 
+use nice_common::db_util;
+use nice_common::SubmissionRecord;
+
 fn main() {
     // get db connection
     let mut conn = db_util::get_database_connection();
 
-    // register run started
+    // get all bases
+    let bases = db_util::get_all_bases(&mut conn).unwrap();
+
+    for b in bases {
+        let base = b.base;
+
+        // get canon submissions
+        let canon_submissions: Vec<SubmissionRecord> =
+            db_util::get_canon_submissions_in_base(&mut conn, base).unwrap();
+
+        let distributions = canon_submissions.map(|s| s.distribution)
+    }
 
     // downsampling
     // get list of bases
