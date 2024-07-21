@@ -118,6 +118,22 @@ pub fn get_field_by_id(conn: &mut PgConnection, row_id: u128) -> Result<FieldRec
         .and_then(private_to_public)
 }
 
+pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<FieldRecord>, String> {
+    use self::field::dsl::*;
+
+    let base = conversions::u32_to_i32(base)?;
+    let items_private: Vec<FieldPrivate> = field
+        .filter(base_id.eq(base))
+        .order(id.asc())
+        .load(conn)
+        .map_err(|err| err.to_string())?;
+
+    items_private
+        .into_iter()
+        .map(private_to_public)
+        .collect::<Result<Vec<FieldRecord>, String>>()
+}
+
 /// Finds the next field that matches the criteria, updates last_claim_time, and returns it.
 /// Returns Ok(None) if no matching fields are found.
 pub fn try_claim_field(
@@ -188,4 +204,28 @@ pub fn update_field(
         .get_result(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
+}
+
+pub fn update_field_canon_and_cl(
+    conn: &mut PgConnection,
+    field_id: u128,
+    submission_id: Option<u32>,
+    in_check_level: u8,
+) -> Result<(), String> {
+    use self::field::dsl::*;
+
+    let field_id = conversions::u128_to_i64(field_id)?;
+    let submission_id = conversions::optu32_to_opti32(submission_id)?;
+    let in_check_level = conversions::u8_to_i32(in_check_level)?;
+
+    diesel::update(field)
+        .filter(id.eq(field_id))
+        .set((
+            canon_submission_id.eq(submission_id),
+            check_level.eq(in_check_level),
+        ))
+        .execute(conn)
+        .map_err(|err| err.to_string())?;
+
+    Ok(())
 }

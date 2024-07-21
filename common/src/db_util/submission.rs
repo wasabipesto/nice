@@ -90,7 +90,7 @@ fn build_new_row(
     claim_record: ClaimRecord,
     submit_data: DataToServer,
     user_ip: String,
-    distribution: Option<Vec<UniquesDistributionExtended>>,
+    distribution: Option<Vec<UniquesDistribution>>,
     numbers: Vec<NiceNumbersExtended>,
 ) -> Result<SubmissionPrivateNew, String> {
     use conversions::*;
@@ -112,7 +112,7 @@ pub fn insert_submission(
     claim_record: ClaimRecord,
     submit_data: DataToServer,
     input_user_ip: String,
-    input_distribution: Option<Vec<UniquesDistributionExtended>>,
+    input_distribution: Option<Vec<UniquesDistribution>>,
     input_numbers: Vec<NiceNumbersExtended>,
 ) -> Result<SubmissionRecord, String> {
     use self::submission::dsl::*;
@@ -132,7 +132,7 @@ pub fn insert_submission(
         .and_then(private_to_public)
 }
 
-pub fn get_csubmission_by_id(
+pub fn get_submission_by_id(
     conn: &mut PgConnection,
     row_id: u128,
 ) -> Result<SubmissionRecord, String> {
@@ -145,4 +145,27 @@ pub fn get_csubmission_by_id(
         .first::<SubmissionPrivate>(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
+}
+
+pub fn get_submissions_qualified_detailed_for_field(
+    conn: &mut PgConnection,
+    input_field_id: u128,
+) -> Result<Vec<SubmissionRecord>, String> {
+    use self::submission::dsl::*;
+
+    let input_field_id = conversions::u128_to_i32(input_field_id)?;
+    let input_search_mode = conversions::serialize_searchmode(SearchMode::Detailed);
+    let input_disqualified = false;
+
+    let items_private: Vec<SubmissionPrivate> = submission
+        .filter(field_id.eq(input_field_id))
+        .filter(search_mode.eq(input_search_mode))
+        .filter(disqualified.eq(input_disqualified))
+        .load(conn)
+        .map_err(|err| err.to_string())?;
+
+    items_private
+        .into_iter()
+        .map(private_to_public)
+        .collect::<Result<Vec<SubmissionRecord>, String>>()
 }

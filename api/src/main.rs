@@ -7,9 +7,10 @@ use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
     get_claim_by_id, get_database_connection, get_field_by_id, insert_claim, insert_submission,
-    try_claim_field,
+    try_claim_field, update_field_canon_and_cl,
 };
-use nice_common::expand_stats::{expand_distribution, expand_numbers};
+use nice_common::distribution_stats::expand_distribution;
+use nice_common::number_stats::expand_numbers;
 use nice_common::{
     DataToClient, DataToServer, FieldClaimStrategy, NiceNumbersExtended, SearchMode,
     CLAIM_DURATION_HOURS, DEFAULT_FIELD_SIZE, NEAR_MISS_CUTOFF_PERCENT,
@@ -149,7 +150,15 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                 None,
                 numbers_expanded,
             )?;
-            // TODO: update CL to 1
+            // set CL to 1 if it's 0
+            if field_record.check_level == 0 {
+                update_field_canon_and_cl(
+                    &mut conn,
+                    field_record.field_id,
+                    field_record.canon_submission_id,
+                    1,
+                )?;
+            }
         }
         SearchMode::Detailed => {
             // run through some basic validity tests

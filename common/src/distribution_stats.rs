@@ -5,12 +5,12 @@ use super::*;
 pub fn expand_distribution(
     distribution: &[DistributionSimple],
     base: u32,
-) -> Vec<UniquesDistributionExtended> {
+) -> Vec<UniquesDistribution> {
     let base_f32 = base as f32;
     let total_count_f32 = distribution.iter().fold(0, |acc, d| acc + d.count) as f32;
     distribution
         .iter()
-        .map(|d| UniquesDistributionExtended {
+        .map(|d| UniquesDistribution {
             num_uniques: d.num_uniques,
             count: d.count,
             niceness: d.num_uniques as f32 / base_f32,
@@ -19,15 +19,12 @@ pub fn expand_distribution(
         .collect()
 }
 
-pub fn expand_numbers(numbers: &[NiceNumbersSimple], base: u32) -> Vec<NiceNumbersExtended> {
-    let base_f32 = base as f32;
-    numbers
+pub fn shrink_distribution(distribution: &[UniquesDistribution]) -> Vec<DistributionSimple> {
+    distribution
         .iter()
-        .map(|n| NiceNumbersExtended {
-            number: n.number,
-            num_uniques: n.num_uniques,
-            base,
-            niceness: n.num_uniques as f32 / base_f32,
+        .map(|d| DistributionSimple {
+            num_uniques: d.num_uniques,
+            count: d.count,
         })
         .collect()
 }

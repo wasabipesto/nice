@@ -10,6 +10,7 @@ use serde_json::Value;
 mod base;
 mod chunk;
 mod claim;
+mod consensus;
 mod conversions;
 mod field;
 mod submission;
@@ -82,6 +83,12 @@ pub fn get_field_by_id(conn: &mut PgConnection, field_id: u128) -> Result<FieldR
     field::get_field_by_id(conn, field_id)
 }
 
+/// Get all field records in a particular base.
+/// Could take a while!
+pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<FieldRecord>, String> {
+    field::get_fields_in_base(conn, base)
+}
+
 /// Try to claim a valid field.
 /// Returns Ok(None) if no matching fields are found.
 pub fn try_claim_field(
@@ -110,6 +117,16 @@ pub fn insert_new_fields(
     field::insert_fields(conn, base, field_sizes)
 }
 
+/// Update a field's check level and canon submission.
+pub fn update_field_canon_and_cl(
+    conn: &mut PgConnection,
+    field_id: u128,
+    submission_id: Option<u32>,
+    check_level: u8,
+) -> Result<(), String> {
+    field::update_field_canon_and_cl(conn, field_id, submission_id, check_level)
+}
+
 /// Insert a claim with basic information.
 pub fn insert_claim(
     conn: &mut PgConnection,
@@ -132,7 +149,7 @@ pub fn insert_submission(
     claim_record: ClaimRecord,
     submit_data: DataToServer,
     user_ip: String,
-    distribution: Option<Vec<UniquesDistributionExtended>>,
+    distribution: Option<Vec<UniquesDistribution>>,
     numbers: Vec<NiceNumbersExtended>,
 ) -> Result<SubmissionRecord, String> {
     submission::insert_submission(
@@ -143,6 +160,15 @@ pub fn insert_submission(
         distribution,
         numbers,
     )
+}
+
+/// Get all submission records for a particular field.
+/// Only returns qualified and detailed submissions.
+pub fn get_submissions_qualified_detailed_for_field(
+    conn: &mut PgConnection,
+    field_id: u128,
+) -> Result<Vec<SubmissionRecord>, String> {
+    submission::get_submissions_qualified_detailed_for_field(conn, field_id)
 }
 
 /// Get a list of fields with new submissions.
@@ -157,13 +183,17 @@ pub fn get_random_fields() -> Result<(), String> {
     unimplemented!();
 }
 
-/// Update a field's check level and canon submission.
-pub fn update_field_canon() -> Result<(), String> {
-    unimplemented!();
-}
-
 /// Get a list of fields with new canon submissions.
 /// Used for downsampling.
 pub fn get_recently_canonized_fields() -> Result<(), String> {
     unimplemented!();
+}
+
+/// Given a field, get all submissions and determine if there is a consensus.
+/// If so, update the canon submission ID and field check level.
+pub fn update_consensus(
+    conn: &mut PgConnection,
+    field: &FieldRecord,
+) -> Result<Option<SubmissionRecord>, String> {
+    consensus::update_consensus(conn, field)
 }

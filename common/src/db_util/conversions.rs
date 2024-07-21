@@ -95,23 +95,23 @@ pub fn optu32_to_opti32(i: Option<u32>) -> Result<Option<i32>, String> {
     }
 }
 
-pub fn deserialize_distribution(i: Value) -> Result<Vec<UniquesDistributionExtended>, String> {
+pub fn deserialize_distribution(i: Value) -> Result<Vec<UniquesDistribution>, String> {
     serde_json::from_value(i).map_err(|e| e.to_string())
 }
-pub fn serialize_distribution(i: Vec<UniquesDistributionExtended>) -> Result<Value, String> {
+pub fn serialize_distribution(i: Vec<UniquesDistribution>) -> Result<Value, String> {
     serde_json::to_value(i).map_err(|e| e.to_string())
 }
 
 pub fn deserialize_opt_distribution(
     i: Option<Value>,
-) -> Result<Option<Vec<UniquesDistributionExtended>>, String> {
+) -> Result<Option<Vec<UniquesDistribution>>, String> {
     match i {
         Some(i) => Ok(Some(deserialize_distribution(i)?)),
         None => Ok(None),
     }
 }
 pub fn serialize_opt_distribution(
-    i: Option<Vec<UniquesDistributionExtended>>,
+    i: Option<Vec<UniquesDistribution>>,
 ) -> Result<Option<Value>, String> {
     match i {
         Some(i) => Ok(Some(serialize_distribution(i)?)),

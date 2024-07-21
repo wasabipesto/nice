@@ -130,16 +130,15 @@ pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<Chun
     use self::chunk::dsl::*;
 
     let base = u32_to_i32(base)?;
-
-    let chunks_private: Vec<ChunkPrivate> = chunk
+    let items_private: Vec<ChunkPrivate> = chunk
         .filter(base_id.eq(base))
         .load(conn)
         .map_err(|err| err.to_string())?;
-    let mut chunks = Vec::new();
-    for c in chunks_private {
-        chunks.push(private_to_public(c)?)
-    }
-    Ok(chunks)
+
+    items_private
+        .into_iter()
+        .map(private_to_public)
+        .collect::<Result<Vec<ChunkRecord>, String>>()
 }
 
 pub fn update_chunk(

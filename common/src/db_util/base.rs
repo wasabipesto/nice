@@ -117,7 +117,10 @@ pub fn get_base_by_id(conn: &mut PgConnection, row_id: u32) -> Result<BaseRecord
 pub fn get_all_bases(conn: &mut PgConnection) -> Result<Vec<BaseRecord>, String> {
     use self::base::dsl::*;
 
-    let bases_private: Vec<BasePrivate> = base.load(conn).map_err(|err| err.to_string())?;
+    let bases_private: Vec<BasePrivate> = base
+        .order(id.asc())
+        .load(conn)
+        .map_err(|err| err.to_string())?;
     let mut bases = Vec::new();
     for b in bases_private {
         bases.push(private_to_public(b)?)

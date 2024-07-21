@@ -5,9 +5,10 @@ pub mod benchmark;
 pub mod client_api;
 pub mod client_process;
 pub mod db_util;
-pub mod expand_stats;
+pub mod distribution_stats;
 pub mod generate_chunks;
 pub mod generate_fields;
+pub mod number_stats;
 pub mod residue_filter;
 
 use chrono::{DateTime, Utc};
@@ -54,7 +55,7 @@ pub struct FieldSize {
 }
 
 /// Aggregate data on the niceness of all numbers in the range.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct DistributionSimple {
     pub num_uniques: u32,
     pub count: u128,
@@ -62,7 +63,7 @@ pub struct DistributionSimple {
 
 /// Extended version with derived stats.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct UniquesDistributionExtended {
+pub struct UniquesDistribution {
     pub num_uniques: u32,
     pub count: u128,
     pub niceness: f32,
@@ -70,7 +71,7 @@ pub struct UniquesDistributionExtended {
 }
 
 /// Individual notably nice numbers.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct NiceNumbersSimple {
     pub number: u128,
     pub num_uniques: u32,
@@ -97,7 +98,7 @@ pub struct BaseRecord {
     pub minimum_cl: u8,
     pub niceness_mean: Option<f32>,
     pub niceness_stdev: Option<f32>,
-    pub distribution: Vec<UniquesDistributionExtended>,
+    pub distribution: Vec<UniquesDistribution>,
     pub numbers: Vec<NiceNumbersExtended>,
 }
 
@@ -114,7 +115,7 @@ pub struct ChunkRecord {
     pub minimum_cl: u8,
     pub niceness_mean: Option<f32>,
     pub niceness_stdev: Option<f32>,
-    pub distribution: Vec<UniquesDistributionExtended>,
+    pub distribution: Vec<UniquesDistribution>,
     pub numbers: Vec<NiceNumbersExtended>,
 }
 
@@ -129,7 +130,7 @@ pub struct FieldRecord {
     pub range_end: u128,
     pub range_size: u128,
     pub last_claim_time: Option<DateTime<Utc>>,
-    pub canon_submission_id: Option<u32>,
+    pub canon_submission_id: Option<u32>, // u128?
     pub check_level: u8,
     pub prioritize: bool,
 }
@@ -177,6 +178,13 @@ pub struct SubmissionRecord {
     pub user_ip: String,
     pub client_version: String,
     pub disqualified: bool,
-    pub distribution: Option<Vec<UniquesDistributionExtended>>,
+    pub distribution: Option<Vec<UniquesDistribution>>,
     pub numbers: Vec<NiceNumbersExtended>,
+}
+
+/// A submission with no metadata, used for consensus.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+pub struct SubmissionCandidate {
+    pub distribution: Vec<DistributionSimple>,
+    pub numbers: Vec<NiceNumbersSimple>,
 }
