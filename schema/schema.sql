@@ -1,11 +1,11 @@
 -- DROP TABLES IN REVERSE ORDER
-DROP TABLE IF EXISTS submission;
-DROP TABLE IF EXISTS claim;
-DROP TABLE IF EXISTS field;
-DROP TABLE IF EXISTS chunk;
-DROP TABLE IF EXISTS base;
+DROP TABLE IF EXISTS submissions;
+DROP TABLE IF EXISTS claims;
+DROP TABLE IF EXISTS fields;
+DROP TABLE IF EXISTS chunks;
+DROP TABLE IF EXISTS bases;
 -- BASES: ENTRIE BASE RANGE
-CREATE TABLE base (
+CREATE TABLE bases (
     -- ID is the acual base
     id INTEGER PRIMARY KEY,
     range_start DECIMAL NOT NULL,
@@ -20,7 +20,7 @@ CREATE TABLE base (
     numbers JSONB NOT NULL DEFAULT '[]'
 );
 -- CHUNKS: AGGREGATE FIELDS FOR ANALYTICS
-CREATE TABLE chunk (
+CREATE TABLE chunks (
     id SERIAL PRIMARY KEY,
     base_id INTEGER NOT NULL REFERENCES base(id),
     range_start DECIMAL NOT NULL,
@@ -35,7 +35,7 @@ CREATE TABLE chunk (
     numbers JSONB NOT NULL DEFAULT '[]'
 );
 -- FIELDS: INDIVIDUAL SEARCH RANGES
-CREATE TABLE field (
+CREATE TABLE fields (
     id BIGSERIAL PRIMARY KEY,
     base_id INTEGER NOT NULL REFERENCES base(id),
     chunk_id INTEGER REFERENCES chunk(id),
@@ -48,7 +48,7 @@ CREATE TABLE field (
     prioritize BOOLEAN NOT NULL DEFAULT 'false'
 );
 -- CLAIMS: LOG OF CLAIM REQUESTS
-CREATE TABLE claim (
+CREATE TABLE claims (
     id BIGSERIAL PRIMARY KEY,
     field_id INTEGER NOT NULL REFERENCES field(id),
     search_mode VARCHAR NOT NULL,
@@ -56,7 +56,7 @@ CREATE TABLE claim (
     user_ip VARCHAR NOT NULL
 );
 -- SUBMISSIONS: LOG OF ALL VALIDATED SUIBMISSIONS
-CREATE TABLE submission (
+CREATE TABLE submissions (
     id BIGSERIAL PRIMARY KEY,
     claim_id INTEGER NOT NULL REFERENCES claim(id),
     field_id INTEGER NOT NULL REFERENCES field(id),
@@ -71,8 +71,8 @@ CREATE TABLE submission (
     numbers JSONB NOT NULL DEFAULT '[]'
 );
 -- POSTGREST USER ACCESS
-GRANT SELECT ON base TO web_anon;
-GRANT SELECT ON chunk TO web_anon;
-GRANT SELECT ON field TO web_anon;
-GRANT SELECT ON claim TO web_anon;
-GRANT SELECT ON submission TO web_anon;
+GRANT SELECT ON bases TO web_anon;
+GRANT SELECT ON chunks TO web_anon;
+GRANT SELECT ON fields TO web_anon;
+GRANT SELECT ON claims TO web_anon;
+GRANT SELECT ON submissions TO web_anon;

@@ -3,7 +3,7 @@
 use super::*;
 
 table! {
-    submission (id) {
+    submissions (id) {
         id -> BigInt,
         claim_id -> Integer,
         field_id -> Integer,
@@ -20,7 +20,7 @@ table! {
 }
 
 #[derive(Queryable)]
-#[diesel(table_name = submission)]
+#[diesel(table_name = submissions)]
 struct SubmissionPrivate {
     id: i64,
     claim_id: i32,
@@ -37,7 +37,7 @@ struct SubmissionPrivate {
 }
 
 #[derive(Insertable)]
-#[diesel(table_name = submission)]
+#[diesel(table_name = submissions)]
 struct SubmissionPrivateNew {
     claim_id: i32,
     field_id: i32,
@@ -115,7 +115,7 @@ pub fn insert_submission(
     input_distribution: Option<Vec<UniquesDistribution>>,
     input_numbers: Vec<NiceNumber>,
 ) -> Result<SubmissionRecord, String> {
-    use self::submission::dsl::*;
+    use self::submissions::dsl::*;
 
     let insert_row = build_new_row(
         claim_record,
@@ -125,7 +125,7 @@ pub fn insert_submission(
         input_numbers,
     )?;
 
-    diesel::insert_into(submission)
+    diesel::insert_into(submissions)
         .values(&insert_row)
         .get_result(conn)
         .map_err(|err| err.to_string())
@@ -136,11 +136,11 @@ pub fn get_submission_by_id(
     conn: &mut PgConnection,
     row_id: u128,
 ) -> Result<SubmissionRecord, String> {
-    use self::submission::dsl::*;
+    use self::submissions::dsl::*;
 
     let row_id = conversions::u128_to_i64(row_id)?;
 
-    submission
+    submissions
         .filter(id.eq(row_id))
         .first::<SubmissionPrivate>(conn)
         .map_err(|err| err.to_string())
@@ -151,13 +151,13 @@ pub fn get_submissions_qualified_detailed_for_field(
     conn: &mut PgConnection,
     input_field_id: u128,
 ) -> Result<Vec<SubmissionRecord>, String> {
-    use self::submission::dsl::*;
+    use self::submissions::dsl::*;
 
     let input_field_id = conversions::u128_to_i32(input_field_id)?;
     let input_search_mode = conversions::serialize_searchmode(SearchMode::Detailed);
     let input_disqualified = false;
 
-    let items_private: Vec<SubmissionPrivate> = submission
+    let items_private: Vec<SubmissionPrivate> = submissions
         .filter(field_id.eq(input_field_id))
         .filter(search_mode.eq(input_search_mode))
         .filter(disqualified.eq(input_disqualified))

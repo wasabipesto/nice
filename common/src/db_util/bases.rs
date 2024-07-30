@@ -1,13 +1,10 @@
 #![allow(dead_code)]
 
-use conversions::u32_to_i32;
-
 use super::*;
 
 table! {
-    chunk (id) {
+    bases (id) {
         id -> Integer,
-        base_id -> Integer,
         range_start -> Numeric,
         range_end -> Numeric,
         range_size -> Numeric,
@@ -22,10 +19,9 @@ table! {
 }
 
 #[derive(Queryable, AsChangeset)]
-#[diesel(table_name = chunk)]
-struct ChunkPrivate {
+#[diesel(table_name = bases)]
+struct BasePrivate {
     id: i32,
-    base_id: i32,
     range_start: BigDecimal,
     range_end: BigDecimal,
     range_size: BigDecimal,
@@ -39,19 +35,18 @@ struct ChunkPrivate {
 }
 
 #[derive(Insertable)]
-#[diesel(table_name = chunk)]
-struct ChunkPrivateNew {
-    base_id: i32,
+#[diesel(table_name = bases)]
+struct BasePrivateNew {
+    id: i32,
     range_start: BigDecimal,
     range_end: BigDecimal,
     range_size: BigDecimal,
 }
 
-fn private_to_public(p: ChunkPrivate) -> Result<ChunkRecord, String> {
+fn private_to_public(p: BasePrivate) -> Result<BaseRecord, String> {
     use conversions::*;
-    Ok(ChunkRecord {
-        chunk_id: i32_to_u32(p.id)?,
-        base: i32_to_u32(p.base_id)?,
+    Ok(BaseRecord {
+        base: i32_to_u32(p.id)?,
         range_start: bigdec_to_u128(p.range_start)?,
         range_end: bigdec_to_u128(p.range_end)?,
         range_size: bigdec_to_u128(p.range_size)?,
@@ -65,11 +60,10 @@ fn private_to_public(p: ChunkPrivate) -> Result<ChunkRecord, String> {
     })
 }
 
-fn public_to_private(p: ChunkRecord) -> Result<ChunkPrivate, String> {
+fn public_to_private(p: BaseRecord) -> Result<BasePrivate, String> {
     use conversions::*;
-    Ok(ChunkPrivate {
-        id: u32_to_i32(p.chunk_id)?,
-        base_id: u32_to_i32(p.base)?,
+    Ok(BasePrivate {
+        id: u32_to_i32(p.base)?,
         range_start: u128_to_bigdec(p.range_start)?,
         range_end: u128_to_bigdec(p.range_end)?,
         range_size: u128_to_bigdec(p.range_size)?,
@@ -83,102 +77,71 @@ fn public_to_private(p: ChunkRecord) -> Result<ChunkPrivate, String> {
     })
 }
 
-fn build_new_row(base: u32, size: &FieldSize) -> Result<ChunkPrivateNew, String> {
+fn build_new_row(base: u32, size: FieldSize) -> Result<BasePrivateNew, String> {
     use conversions::*;
-    Ok(ChunkPrivateNew {
-        base_id: u32_to_i32(base)?,
+    Ok(BasePrivateNew {
+        id: u32_to_i32(base)?,
         range_start: u128_to_bigdec(size.range_start)?,
         range_end: u128_to_bigdec(size.range_end)?,
         range_size: u128_to_bigdec(size.range_size)?,
     })
 }
 
-pub fn insert_chunks(
+pub fn insert_base(
     conn: &mut PgConnection,
-    base: u32,
-    sizes: Vec<FieldSize>,
-) -> Result<(), String> {
-    use self::chunk::dsl::*;
+    base_id: u32,
+    size: FieldSize,
+) -> Result<BaseRecord, String> {
+    use self::bases::dsl::*;
 
-    let insert_rows: Vec<ChunkPrivateNew> = sizes
-        .iter()
-        .map(|size| build_new_row(base, size).unwrap())
-        .collect();
+    let insert_row = build_new_row(base_id, size)?;
 
-    diesel::insert_into(chunk)
-        .values(&insert_rows)
+    diesel::insert_into(bases)
+        .values(&insert_row)
         .get_result(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)?;
-
-    Ok(())
-}
-
-pub fn get_chunk_by_id(conn: &mut PgConnection, row_id: u32) -> Result<ChunkRecord, String> {
-    use self::chunk::dsl::*;
-
-    let row_id = conversions::u32_to_i32(row_id)?;
-
-    chunk
-        .filter(id.eq(row_id))
-        .first::<ChunkPrivate>(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
 }
 
-pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<ChunkRecord>, String> {
-    use self::chunk::dsl::*;
+pub fn get_base_by_id(conn: &mut PgConnection, row_id: u32) -> Result<BaseRecord, String> {
+    use self::bases::dsl::*;
 
-    let base = u32_to_i32(base)?;
-    let items_private: Vec<ChunkPrivate> = chunk
-        .filter(base_id.eq(base))
-        .load(conn)
-        .map_err(|err| err.to_string())?;
+    let row_id = conversions::u32_to_i32(row_id)?;
 
-    items_private
-        .into_iter()
-        .map(private_to_public)
-        .collect::<Result<Vec<ChunkRecord>, String>>()
+    bases
+        .filter(id.eq(row_id))
+        .first::<BasePrivate>(conn)
+        .map_err(|err| err.to_string())
+        .and_then(private_to_public)
 }
 
-pub fn update_chunk(
+pub fn get_all_bases(conn: &mut PgConnection) -> Result<Vec<BaseRecord>, String> {
+    use self::bases::dsl::*;
+
+    let bases_private: Vec<BasePrivate> = bases
+        .order(id.asc())
+        .load(conn)
+        .map_err(|err| err.to_string())?;
+    let mut res = Vec::new();
+    for b in bases_private {
+        res.push(private_to_public(b)?)
+    }
+    Ok(res)
+}
+
+pub fn update_base(
     conn: &mut PgConnection,
     row_id: u32,
-    update_row: ChunkRecord,
-) -> Result<ChunkRecord, String> {
-    use self::chunk::dsl::*;
+    update_row: BaseRecord,
+) -> Result<BaseRecord, String> {
+    use self::bases::dsl::*;
 
     let row_id = conversions::u32_to_i32(row_id)?;
     let update_row = public_to_private(update_row)?;
 
-    diesel::update(chunk.filter(id.eq(row_id)))
+    diesel::update(bases.filter(id.eq(row_id)))
         .set(&update_row)
         .get_result(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
-}
-
-pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(), String> {
-    use diesel::sql_types::Integer;
-
-    let query = "WITH updated_fields AS (
-            SELECT f.id AS field_id, c.id AS chunk_id
-            FROM field f
-            JOIN chunk c
-            ON f.range_start >= c.range_start
-            AND f.range_end <= c.range_end
-            WHERE f.base_id = $1
-        )
-        UPDATE field
-        SET chunk_id = updated_fields.chunk_id
-        FROM updated_fields
-        WHERE field.id = updated_fields.field_id;"
-        .to_string();
-
-    diesel::sql_query(query)
-        .bind::<Integer, _>(base as i32)
-        .execute(conn)
-        .map_err(|err| err.to_string())?;
-
-    Ok(())
 }

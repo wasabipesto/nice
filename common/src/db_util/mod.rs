@@ -7,12 +7,12 @@ use diesel::prelude::*;
 use diesel::table;
 use serde_json::Value;
 
-mod base;
-mod chunk;
-mod claim;
+mod bases;
+mod chunks;
+mod claims;
 mod conversions;
-mod field;
-mod submission;
+mod fields;
+mod submissions;
 
 /// Get a single database connection.
 pub fn get_database_connection() -> PgConnection {
@@ -24,12 +24,12 @@ pub fn get_database_connection() -> PgConnection {
 
 /// Get a base record (base range plus cached stats).
 pub fn get_base_by_id(conn: &mut PgConnection, base: u32) -> Result<BaseRecord, String> {
-    base::get_base_by_id(conn, base)
+    bases::get_base_by_id(conn, base)
 }
 
 /// Get all base records.
 pub fn get_all_bases(conn: &mut PgConnection) -> Result<Vec<BaseRecord>, String> {
-    base::get_all_bases(conn)
+    bases::get_all_bases(conn)
 }
 
 /// Insert a new base.
@@ -39,7 +39,7 @@ pub fn insert_new_base(
     base: u32,
     base_size: FieldSize,
 ) -> Result<BaseRecord, String> {
-    base::insert_base(conn, base, base_size)
+    bases::insert_base(conn, base, base_size)
 }
 
 /// Update a base's calculated statistics.
@@ -49,12 +49,12 @@ pub fn update_base_stats() -> Result<(), String> {
 
 /// Get a chunk record (range plus cached stats).
 pub fn get_chunk_by_id(conn: &mut PgConnection, chunk_id: u32) -> Result<ChunkRecord, String> {
-    chunk::get_chunk_by_id(conn, chunk_id)
+    chunks::get_chunk_by_id(conn, chunk_id)
 }
 
 /// Get all chunk records in a certain base.
 pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<ChunkRecord>, String> {
-    chunk::get_chunks_in_base(conn, base)
+    chunks::get_chunks_in_base(conn, base)
 }
 
 /// Insert a bunch of new chunks.
@@ -64,12 +64,12 @@ pub fn insert_new_chunks(
     base: u32,
     chunk_sizes: Vec<FieldSize>,
 ) -> Result<(), String> {
-    chunk::insert_chunks(conn, base, chunk_sizes)
+    chunks::insert_chunks(conn, base, chunk_sizes)
 }
 
 /// Reassign chunk associations for all fields in a certain base.
 pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(), String> {
-    chunk::reassign_fields_to_chunks(conn, base)
+    chunks::reassign_fields_to_chunks(conn, base)
 }
 
 /// Update a chunk's calculated statistics.
@@ -79,13 +79,13 @@ pub fn update_chunk_stats() -> Result<(), String> {
 
 /// Get a field record (range plus cached stats).
 pub fn get_field_by_id(conn: &mut PgConnection, field_id: u128) -> Result<FieldRecord, String> {
-    field::get_field_by_id(conn, field_id)
+    fields::get_field_by_id(conn, field_id)
 }
 
 /// Get all field records in a particular base.
 /// Could take a while!
 pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<FieldRecord>, String> {
-    field::get_fields_in_base(conn, base)
+    fields::get_fields_in_base(conn, base)
 }
 
 /// Try to claim a valid field.
@@ -97,7 +97,7 @@ pub fn try_claim_field(
     maximum_check_level: u8,
     maximum_size: u128,
 ) -> Result<Option<FieldRecord>, String> {
-    field::try_claim_field(
+    fields::try_claim_field(
         conn,
         claim_strategy,
         maximum_timestamp,
@@ -113,7 +113,7 @@ pub fn insert_new_fields(
     base: u32,
     field_sizes: Vec<FieldSize>,
 ) -> Result<(), String> {
-    field::insert_fields(conn, base, field_sizes)
+    fields::insert_fields(conn, base, field_sizes)
 }
 
 /// Update a field's check level and canon submission.
@@ -123,7 +123,7 @@ pub fn update_field_canon_and_cl(
     submission_id: Option<u32>,
     check_level: u8,
 ) -> Result<(), String> {
-    field::update_field_canon_and_cl(conn, field_id, submission_id, check_level)
+    fields::update_field_canon_and_cl(conn, field_id, submission_id, check_level)
 }
 
 /// Insert a claim with basic information.
@@ -133,12 +133,12 @@ pub fn insert_claim(
     search_mode: SearchMode,
     user_ip: String,
 ) -> Result<ClaimRecord, String> {
-    claim::insert_claim(conn, search_field.field_id, search_mode, user_ip)
+    claims::insert_claim(conn, search_field.field_id, search_mode, user_ip)
 }
 
 /// Return a specific claim from the log.
 pub fn get_claim_by_id(conn: &mut PgConnection, claim_id: u128) -> Result<ClaimRecord, String> {
-    claim::get_claim_by_id(conn, claim_id)
+    claims::get_claim_by_id(conn, claim_id)
 }
 
 /// Push a new submission to the database.
@@ -151,7 +151,7 @@ pub fn insert_submission(
     distribution: Option<Vec<UniquesDistribution>>,
     numbers: Vec<NiceNumber>,
 ) -> Result<SubmissionRecord, String> {
-    submission::insert_submission(
+    submissions::insert_submission(
         conn,
         claim_record,
         submit_data,
@@ -167,7 +167,7 @@ pub fn get_submissions_qualified_detailed_for_field(
     conn: &mut PgConnection,
     field_id: u128,
 ) -> Result<Vec<SubmissionRecord>, String> {
-    submission::get_submissions_qualified_detailed_for_field(conn, field_id)
+    submissions::get_submissions_qualified_detailed_for_field(conn, field_id)
 }
 
 /// Get the percent of the range that has reached the given check level.
@@ -176,16 +176,16 @@ pub fn get_count_checked_by_range(
     check_level: u8,
     range: FieldSize,
 ) -> Result<u128, String> {
-    field::get_count_checked_by_range(conn, check_level, range)
+    fields::get_count_checked_by_range(conn, check_level, range)
 }
 
 /// Get all canon submissions in a particular base.
-pub fn get_canon_submissions_by_range(
-    conn: &mut PgConnection,
-    range: FieldSize,
+pub fn get_canon_submissions_by_range(//
+    //conn: &mut PgConnection,
+    //range: FieldSize,
 ) -> Result<Vec<SubmissionRecord>, String> {
     //submission::get_canon_submissions_by_range(conn, range)
-    Ok(Vec::new())
+    unimplemented!();
 }
 
 /// Given a field, get all submissions and update the canon submission ID/check level as necessary.

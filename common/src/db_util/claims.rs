@@ -3,7 +3,7 @@
 use super::*;
 
 table! {
-    claim (id) {
+    claims (id) {
         id -> BigInt,
         field_id -> Integer,
         search_mode -> Varchar,
@@ -13,7 +13,7 @@ table! {
 }
 
 #[derive(Queryable)]
-#[diesel(table_name = claim)]
+#[diesel(table_name = claims)]
 struct ClaimPrivate {
     id: i64,
     field_id: i32,
@@ -23,7 +23,7 @@ struct ClaimPrivate {
 }
 
 #[derive(Insertable)]
-#[diesel(table_name = claim)]
+#[diesel(table_name = claims)]
 struct ClaimPrivateNew {
     field_id: i32,
     search_mode: String,
@@ -71,11 +71,11 @@ pub fn insert_claim(
     input_search_mode: SearchMode,
     input_user_ip: String,
 ) -> Result<ClaimRecord, String> {
-    use self::claim::dsl::*;
+    use self::claims::dsl::*;
 
     let insert_row = build_new_row(input_field_id, input_search_mode, input_user_ip)?;
 
-    diesel::insert_into(claim)
+    diesel::insert_into(claims)
         .values(&insert_row)
         .get_result(conn)
         .map_err(|err| err.to_string())
@@ -83,11 +83,11 @@ pub fn insert_claim(
 }
 
 pub fn get_claim_by_id(conn: &mut PgConnection, row_id: u128) -> Result<ClaimRecord, String> {
-    use self::claim::dsl::*;
+    use self::claims::dsl::*;
 
     let row_id = conversions::u128_to_i64(row_id)?;
 
-    claim
+    claims
         .filter(id.eq(row_id))
         .first::<ClaimPrivate>(conn)
         .map_err(|err| err.to_string())

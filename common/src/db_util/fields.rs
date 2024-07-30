@@ -3,7 +3,7 @@
 use super::*;
 
 table! {
-    field (id) {
+    fields (id) {
         id -> BigInt,
         base_id -> Integer,
         chunk_id -> Nullable<Integer>,
@@ -18,7 +18,7 @@ table! {
 }
 
 #[derive(Queryable, AsChangeset, QueryableByName)]
-#[diesel(table_name = field)]
+#[diesel(table_name = fields)]
 struct FieldPrivate {
     id: i64,
     base_id: i32,
@@ -33,7 +33,7 @@ struct FieldPrivate {
 }
 
 #[derive(Insertable)]
-#[diesel(table_name = field)]
+#[diesel(table_name = fields)]
 struct FieldPrivateNew {
     base_id: i32,
     range_start: BigDecimal,
@@ -88,7 +88,7 @@ pub fn insert_fields(
     base: u32,
     sizes: Vec<FieldSize>,
 ) -> Result<(), String> {
-    use self::field::dsl::*;
+    use self::fields::dsl::*;
 
     let insert_rows: Vec<FieldPrivateNew> = sizes
         .iter()
@@ -97,7 +97,7 @@ pub fn insert_fields(
 
     // chunk it out if there's too many fields
     for chunk in insert_rows.chunks(10000) {
-        diesel::insert_into(field)
+        diesel::insert_into(fields)
             .values(chunk)
             .execute(conn)
             .map_err(|err| err.to_string())?;
@@ -107,11 +107,11 @@ pub fn insert_fields(
 }
 
 pub fn get_field_by_id(conn: &mut PgConnection, row_id: u128) -> Result<FieldRecord, String> {
-    use self::field::dsl::*;
+    use self::fields::dsl::*;
 
     let row_id = conversions::u128_to_i64(row_id)?;
 
-    field
+    fields
         .filter(id.eq(row_id))
         .first::<FieldPrivate>(conn)
         .map_err(|err| err.to_string())
@@ -119,10 +119,10 @@ pub fn get_field_by_id(conn: &mut PgConnection, row_id: u128) -> Result<FieldRec
 }
 
 pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<FieldRecord>, String> {
-    use self::field::dsl::*;
+    use self::fields::dsl::*;
 
     let base = conversions::u32_to_i32(base)?;
-    let items_private: Vec<FieldPrivate> = field
+    let items_private: Vec<FieldPrivate> = fields
         .filter(base_id.eq(base))
         .order(id.asc())
         .load(conn)
@@ -151,10 +151,10 @@ pub fn try_claim_field(
 
     let query = match claim_strategy {
         FieldClaimStrategy::Next => {
-            "UPDATE field
+            "UPDATE fields
             SET last_claim_time = NOW()
             WHERE id = (
-                SELECT id FROM field
+                SELECT id FROM fields
                 WHERE (last_claim_time <= $1 OR last_claim_time IS NULL)
                 AND check_level <= $2
                 AND range_size <= $3
@@ -164,10 +164,10 @@ pub fn try_claim_field(
             RETURNING *;"
         }
         FieldClaimStrategy::Random => {
-            "UPDATE field
+            "UPDATE fields
             SET last_claim_time = NOW()
             WHERE id = (
-                SELECT id FROM field
+                SELECT id FROM fields
                 WHERE (last_claim_time <= $1 OR last_claim_time IS NULL)
                 AND check_level <= $2
                 AND range_size <= $3
@@ -194,14 +194,14 @@ pub fn get_count_checked_by_range(
     in_check_level: u8,
     range: FieldSize,
 ) -> Result<u128, String> {
-    use self::field::dsl::*;
+    use self::fields::dsl::*;
     use diesel::dsl::sum;
 
     let in_check_level = conversions::u8_to_i32(in_check_level)?;
     let in_range_start = conversions::u128_to_bigdec(range.range_start)?;
     let in_range_end = conversions::u128_to_bigdec(range.range_end)?;
 
-    let count = field
+    let count = fields
         .select(sum(range_size))
         .filter(check_level.ge(in_check_level))
         .filter(range_start.ge(in_range_start))
@@ -218,12 +218,12 @@ pub fn update_field(
     row_id: u128,
     update_row: FieldRecord,
 ) -> Result<FieldRecord, String> {
-    use self::field::dsl::*;
+    use self::fields::dsl::*;
 
     let row_id = conversions::u128_to_i64(row_id)?;
     let update_row = public_to_private(update_row)?;
 
-    diesel::update(field.filter(id.eq(row_id)))
+    diesel::update(fields.filter(id.eq(row_id)))
         .set(&update_row)
         .get_result(conn)
         .map_err(|err| err.to_string())
@@ -236,13 +236,13 @@ pub fn update_field_canon_and_cl(
     submission_id: Option<u32>,
     in_check_level: u8,
 ) -> Result<(), String> {
-    use self::field::dsl::*;
+    use self::fields::dsl::*;
 
     let field_id = conversions::u128_to_i64(field_id)?;
     let submission_id = conversions::optu32_to_opti32(submission_id)?;
     let in_check_level = conversions::u8_to_i32(in_check_level)?;
 
-    diesel::update(field)
+    diesel::update(fields)
         .filter(id.eq(field_id))
         .set((
             canon_submission_id.eq(submission_id),
