@@ -28,6 +28,10 @@ pub struct Cli {
     #[arg(short, long, default_value = "anonymous")]
     username: String,
 
+    /// Run indefinitely with the current settings
+    #[arg(long)]
+    repeat: bool,
+
     /// Suppress some output
     #[arg(short, long)]
     quiet: bool,
@@ -92,5 +96,11 @@ fn main() {
     // submit the results
     if cli.benchmark.is_none() {
         submit_field_to_server(&cli.api_base, submit_data)
+    }
+
+    // repeat if requested
+    #[allow(clippy::main_recursion)]
+    if cli.repeat {
+        main()
     }
 }
