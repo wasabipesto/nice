@@ -29,7 +29,7 @@ pub struct Cli {
     username: String,
 
     /// Run indefinitely with the current settings
-    #[arg(long)]
+    #[arg(short, long)]
     repeat: bool,
 
     /// Suppress some output

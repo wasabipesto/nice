@@ -21,7 +21,7 @@ This will run once with default settings and submit your results to the server a
 A typical use-case involves running multiple clients continuously, in parallel, with a particular username:
 
 ```
-screen -dm bash -c "while true; do ./nice-client -u your_name; done"
+screen -dm ./nice-client -r -u your_name"
 ```
 
 You can find various settings and their options with the `--help` flag:
@@ -49,6 +49,9 @@ Options:
           The username to send alongside your contribution
 
           [default: anonymous]
+
+  -r, --repeat
+          Run indefinitely with the current settings
 
   -q, --quiet
           Suppress some output
