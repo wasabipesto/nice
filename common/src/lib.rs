@@ -58,7 +58,7 @@ pub struct FieldSize {
 
 /// Aggregate data on the niceness of all numbers in the range.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
-pub struct DistributionSimple {
+pub struct UniquesDistributionSimple {
     pub num_uniques: u32,
     pub count: u128,
 }
@@ -74,14 +74,14 @@ pub struct UniquesDistribution {
 
 /// Individual notably nice numbers.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
-pub struct NiceNumbersSimple {
+pub struct NiceNumberSimple {
     pub number: u128,
     pub num_uniques: u32,
 }
 
 /// Extended version with derived stats.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct NiceNumbersExtended {
+pub struct NiceNumber {
     pub number: u128,
     pub num_uniques: u32,
     pub base: u32,
@@ -101,7 +101,7 @@ pub struct BaseRecord {
     pub niceness_mean: Option<f32>,
     pub niceness_stdev: Option<f32>,
     pub distribution: Vec<UniquesDistribution>,
-    pub numbers: Vec<NiceNumbersExtended>,
+    pub numbers: Vec<NiceNumber>,
 }
 
 /// A chunk record from the database. Used for analytics.
@@ -118,7 +118,7 @@ pub struct ChunkRecord {
     pub niceness_mean: Option<f32>,
     pub niceness_stdev: Option<f32>,
     pub distribution: Vec<UniquesDistribution>,
-    pub numbers: Vec<NiceNumbersExtended>,
+    pub numbers: Vec<NiceNumber>,
 }
 
 /// A field record from the database.
@@ -153,8 +153,8 @@ pub struct DataToServer {
     pub claim_id: u128,
     pub username: String,
     pub client_version: String,
-    pub unique_distribution: Option<Vec<DistributionSimple>>,
-    pub nice_numbers: Vec<NiceNumbersSimple>,
+    pub unique_distribution: Option<Vec<UniquesDistributionSimple>>,
+    pub nice_numbers: Vec<NiceNumberSimple>,
 }
 
 /// A basic claim log from the database.
@@ -181,12 +181,12 @@ pub struct SubmissionRecord {
     pub client_version: String,
     pub disqualified: bool,
     pub distribution: Option<Vec<UniquesDistribution>>,
-    pub numbers: Vec<NiceNumbersExtended>,
+    pub numbers: Vec<NiceNumber>,
 }
 
 /// A submission with no metadata, used for consensus hashing.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct SubmissionCandidate {
-    pub distribution: Vec<DistributionSimple>,
-    pub numbers: Vec<NiceNumbersSimple>,
+    pub distribution: Vec<UniquesDistributionSimple>,
+    pub numbers: Vec<NiceNumberSimple>,
 }

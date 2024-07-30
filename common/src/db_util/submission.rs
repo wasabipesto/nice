@@ -91,7 +91,7 @@ fn build_new_row(
     submit_data: DataToServer,
     user_ip: String,
     distribution: Option<Vec<UniquesDistribution>>,
-    numbers: Vec<NiceNumbersExtended>,
+    numbers: Vec<NiceNumber>,
 ) -> Result<SubmissionPrivateNew, String> {
     use conversions::*;
     Ok(SubmissionPrivateNew {
@@ -113,7 +113,7 @@ pub fn insert_submission(
     submit_data: DataToServer,
     input_user_ip: String,
     input_distribution: Option<Vec<UniquesDistribution>>,
-    input_numbers: Vec<NiceNumbersExtended>,
+    input_numbers: Vec<NiceNumber>,
 ) -> Result<SubmissionRecord, String> {
     use self::submission::dsl::*;
 

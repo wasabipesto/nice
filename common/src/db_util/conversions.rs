@@ -119,10 +119,10 @@ pub fn serialize_opt_distribution(
     }
 }
 
-pub fn deserialize_numbers(i: Value) -> Result<Vec<NiceNumbersExtended>, String> {
+pub fn deserialize_numbers(i: Value) -> Result<Vec<NiceNumber>, String> {
     serde_json::from_value(i).map_err(|e| e.to_string())
 }
-pub fn serialize_numbers(i: Vec<NiceNumbersExtended>) -> Result<Value, String> {
+pub fn serialize_numbers(i: Vec<NiceNumber>) -> Result<Value, String> {
     serde_json::to_value(i).map_err(|e| e.to_string())
 }
 

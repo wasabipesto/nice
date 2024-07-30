@@ -3,7 +3,7 @@
 use super::*;
 
 pub fn expand_distribution(
-    distributions: &[DistributionSimple],
+    distributions: &[UniquesDistributionSimple],
     base: u32,
 ) -> Vec<UniquesDistribution> {
     let total_count = distributions.iter().fold(0, |acc, d| acc + d.count);
@@ -23,11 +23,11 @@ pub fn downsample_distributions(
     base: u32,
 ) -> Vec<UniquesDistribution> {
     // set up counter
-    let mut counter: HashMap<u32, DistributionSimple> = HashMap::new();
+    let mut counter: HashMap<u32, UniquesDistributionSimple> = HashMap::new();
     for n in 1..=base {
         counter.insert(
             n,
-            DistributionSimple {
+            UniquesDistributionSimple {
                 num_uniques: n,
                 count: 0,
             },
@@ -46,16 +46,16 @@ pub fn downsample_distributions(
     }
 
     // collate map values
-    let counter_values: Vec<DistributionSimple> = counter.values().cloned().collect();
+    let counter_values: Vec<UniquesDistributionSimple> = counter.values().cloned().collect();
 
     // expand out & return
     expand_distribution(&counter_values, base)
 }
 
-pub fn shrink_distribution(distribution: &[UniquesDistribution]) -> Vec<DistributionSimple> {
+pub fn shrink_distribution(distribution: &[UniquesDistribution]) -> Vec<UniquesDistributionSimple> {
     distribution
         .iter()
-        .map(|d| DistributionSimple {
+        .map(|d| UniquesDistributionSimple {
             num_uniques: d.num_uniques,
             count: d.count,
         })

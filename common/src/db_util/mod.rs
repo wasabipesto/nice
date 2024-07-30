@@ -149,7 +149,7 @@ pub fn insert_submission(
     submit_data: DataToServer,
     user_ip: String,
     distribution: Option<Vec<UniquesDistribution>>,
-    numbers: Vec<NiceNumbersExtended>,
+    numbers: Vec<NiceNumber>,
 ) -> Result<SubmissionRecord, String> {
     submission::insert_submission(
         conn,

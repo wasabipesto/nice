@@ -12,8 +12,8 @@ use nice_common::db_util::{
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::expand_numbers;
 use nice_common::{
-    DataToClient, DataToServer, FieldClaimStrategy, NiceNumbersExtended, SearchMode,
-    CLAIM_DURATION_HOURS, DEFAULT_FIELD_SIZE, NEAR_MISS_CUTOFF_PERCENT,
+    DataToClient, DataToServer, FieldClaimStrategy, NiceNumber, SearchMode, CLAIM_DURATION_HOURS,
+    DEFAULT_FIELD_SIZE, NEAR_MISS_CUTOFF_PERCENT,
 };
 use rand::Rng;
 use rocket::serde::json::{json, Json, Value};
@@ -184,7 +184,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                             let count_numbers = numbers_expanded
                                 .iter()
                                 .filter(|n| n.num_uniques == d.num_uniques)
-                                .collect::<Vec<&NiceNumbersExtended>>()
+                                .collect::<Vec<&NiceNumber>>()
                                 .len();
                             if count_numbers as u128 != d.count {
                                 return Err(format!(

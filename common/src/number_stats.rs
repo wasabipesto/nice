@@ -2,11 +2,11 @@
 
 use super::*;
 
-pub fn expand_numbers(numbers: &[NiceNumbersSimple], base: u32) -> Vec<NiceNumbersExtended> {
+pub fn expand_numbers(numbers: &[NiceNumberSimple], base: u32) -> Vec<NiceNumber> {
     let base_f32 = base as f32;
     numbers
         .iter()
-        .map(|n| NiceNumbersExtended {
+        .map(|n| NiceNumber {
             number: n.number,
             num_uniques: n.num_uniques,
             base,
@@ -15,7 +15,7 @@ pub fn expand_numbers(numbers: &[NiceNumbersSimple], base: u32) -> Vec<NiceNumbe
         .collect()
 }
 
-pub fn downsample_numbers(submissions: &[SubmissionRecord]) -> Vec<NiceNumbersExtended> {
+pub fn downsample_numbers(submissions: &[SubmissionRecord]) -> Vec<NiceNumber> {
     // collate all numbers
     let mut all_numbers = submissions.iter().fold(Vec::new(), |mut acc, sub| {
         acc.extend(sub.numbers.iter().cloned());
@@ -31,10 +31,10 @@ pub fn downsample_numbers(submissions: &[SubmissionRecord]) -> Vec<NiceNumbersEx
         .collect()
 }
 
-pub fn shrink_numbers(numbers: &[NiceNumbersExtended]) -> Vec<NiceNumbersSimple> {
+pub fn shrink_numbers(numbers: &[NiceNumber]) -> Vec<NiceNumberSimple> {
     numbers
         .iter()
-        .map(|n| NiceNumbersSimple {
+        .map(|n| NiceNumberSimple {
             number: n.number,
             num_uniques: n.num_uniques,
         })

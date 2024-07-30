@@ -77,14 +77,14 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
         }
     });
 
-    let mut submit_distribution: Vec<DistributionSimple> = unique_distribution
+    let mut submit_distribution: Vec<UniquesDistributionSimple> = unique_distribution
         .into_iter()
-        .map(|(num_uniques, count)| DistributionSimple { num_uniques, count })
+        .map(|(num_uniques, count)| UniquesDistributionSimple { num_uniques, count })
         .collect();
     submit_distribution.sort_by_key(|d| d.num_uniques);
     let submit_numbers = nice_numbers
         .into_iter()
-        .map(|(number, num_uniques)| NiceNumbersSimple {
+        .map(|(number, num_uniques)| NiceNumberSimple {
             number,
             num_uniques,
         })
@@ -147,7 +147,7 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
     let nice_list = (range_start..range_end)
         .filter(|num| residue_filter.contains(&((num % (base as u128 - 1)) as u32)))
         .filter(|num| get_is_nice(*num, base))
-        .map(|number| NiceNumbersSimple {
+        .map(|number| NiceNumberSimple {
             number,
             num_uniques: base,
         })
@@ -181,48 +181,48 @@ mod tests {
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: Some(Vec::from([
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 1,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 2,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 3,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 4,
                     count: 4,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 5,
                     count: 5,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 6,
                     count: 15,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 7,
                     count: 20,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 8,
                     count: 7,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 9,
                     count: 1,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 10,
                     count: 1,
                 },
             ])),
-            nice_numbers: Vec::from([NiceNumbersSimple {
+            nice_numbers: Vec::from([NiceNumberSimple {
                 number: 69,
                 num_uniques: 10,
             }]),
@@ -245,163 +245,163 @@ mod tests {
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: Some(Vec::from([
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 1,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 2,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 3,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 4,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 5,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 6,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 7,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 8,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 9,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 10,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 11,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 12,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 13,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 14,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 15,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 16,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 17,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 18,
                     count: 1,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 19,
                     count: 13,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 20,
                     count: 40,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 21,
                     count: 176,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 22,
                     count: 520,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 23,
                     count: 1046,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 24,
                     count: 1710,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 25,
                     count: 2115,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 26,
                     count: 1947,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 27,
                     count: 1322,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 28,
                     count: 728,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 29,
                     count: 283,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 30,
                     count: 83,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 31,
                     count: 13,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 32,
                     count: 3,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 33,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 34,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 35,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 36,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 37,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 38,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 39,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 40,
                     count: 0,
                 },
@@ -426,323 +426,323 @@ mod tests {
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: Some(Vec::from([
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 1,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 2,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 3,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 4,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 5,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 6,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 7,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 8,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 9,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 10,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 11,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 12,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 13,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 14,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 15,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 16,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 17,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 18,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 19,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 20,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 21,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 22,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 23,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 24,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 25,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 26,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 27,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 28,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 29,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 30,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 31,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 32,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 33,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 34,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 35,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 36,
                     count: 1,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 37,
                     count: 6,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 38,
                     count: 14,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 39,
                     count: 62,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 40,
                     count: 122,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 41,
                     count: 263,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 42,
                     count: 492,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 43,
                     count: 830,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 44,
                     count: 1170,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 45,
                     count: 1392,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 46,
                     count: 1477,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 47,
                     count: 1427,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 48,
                     count: 1145,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 49,
                     count: 745,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 50,
                     count: 462,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 51,
                     count: 242,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 52,
                     count: 88,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 53,
                     count: 35,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 54,
                     count: 19,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 55,
                     count: 7,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 56,
                     count: 1,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 57,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 58,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 59,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 60,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 61,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 62,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 63,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 64,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 65,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 66,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 67,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 68,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 69,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 70,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 71,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 72,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 73,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 74,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 75,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 76,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 77,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 78,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 79,
                     count: 0,
                 },
-                DistributionSimple {
+                UniquesDistributionSimple {
                     num_uniques: 80,
                     count: 0,
                 },
@@ -767,7 +767,7 @@ mod tests {
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,
-            nice_numbers: Vec::from([NiceNumbersSimple {
+            nice_numbers: Vec::from([NiceNumberSimple {
                 number: 69,
                 num_uniques: 10,
             }]),
