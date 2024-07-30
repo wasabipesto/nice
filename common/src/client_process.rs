@@ -177,7 +177,7 @@ mod tests {
             range_size: 53,
         };
         let submit_data = DataToServer {
-            claim_id: claim_data.claim_id.clone(),
+            claim_id: claim_data.claim_id,
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: Some(Vec::from([
@@ -241,7 +241,7 @@ mod tests {
             range_size: 10000,
         };
         let submit_data = DataToServer {
-            claim_id: claim_data.claim_id.clone(),
+            claim_id: claim_data.claim_id,
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: Some(Vec::from([
@@ -422,7 +422,7 @@ mod tests {
             range_size: 10000,
         };
         let submit_data = DataToServer {
-            claim_id: claim_data.claim_id.clone(),
+            claim_id: claim_data.claim_id,
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: Some(Vec::from([
@@ -763,7 +763,7 @@ mod tests {
             range_size: 53,
         };
         let submit_data = DataToServer {
-            claim_id: claim_data.claim_id.clone(),
+            claim_id: claim_data.claim_id,
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,
@@ -786,7 +786,7 @@ mod tests {
             range_size: 10000,
         };
         let submit_data = DataToServer {
-            claim_id: claim_data.claim_id.clone(),
+            claim_id: claim_data.claim_id,
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,
@@ -806,7 +806,7 @@ mod tests {
             range_size: 10000,
         };
         let submit_data = DataToServer {
-            claim_id: claim_data.claim_id.clone(),
+            claim_id: claim_data.claim_id,
             username: username.clone(),
             client_version: CLIENT_VERSION.to_string(),
             unique_distribution: None,

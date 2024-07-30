@@ -75,7 +75,7 @@ mod tests {
 
                     // check there are the right number of fields
                     let (num_fields_mo, last_field_size) =
-                        (range.range_end.clone() - range.range_start.clone()).div_mod(size);
+                        (range.range_end - range.range_start).div_mod(size);
                     assert_eq!(fields.len(), num_fields_mo as usize + 1);
 
                     // check the last field is the correct size
@@ -92,7 +92,7 @@ mod tests {
                     let mut last_start = 0u128;
                     for field in fields {
                         assert!(field.range_start > last_start);
-                        last_start = field.range_start.clone()
+                        last_start = field.range_start
                     }
                 }
             }
