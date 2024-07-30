@@ -229,6 +229,14 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                         Some(distribution_expanded),
                         numbers_expanded,
                     )?;
+                    if field_record.check_level < 2 {
+                        update_field_canon_and_cl(
+                            &mut conn,
+                            field_record.field_id,
+                            field_record.canon_submission_id,
+                            2,
+                        )?;
+                    }
                 }
                 None => {
                     return Err(json!(
