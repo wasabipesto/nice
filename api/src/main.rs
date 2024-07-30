@@ -19,6 +19,8 @@ use rand::Rng;
 use rocket::serde::json::{json, Json, Value};
 
 // TODO: Define error types (4xx, 5xx) and serialize them properly
+// TODO: Log claims, valid submissions, and invalid submissions
+// TODO: update table names to be plural
 
 #[get("/claim/<mode>")]
 fn claim(mode: &str) -> Result<Value, Value> {
