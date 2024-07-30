@@ -1,5 +1,8 @@
 //! An api for coordinating the search for square-cube pandigitals.
 
+#![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::too_many_lines)]
+
 #[macro_use]
 extern crate rocket;
 
@@ -69,31 +72,26 @@ fn claim(mode: &str) -> Result<Value, Value> {
 
     // get the field to search based on claim strategy, max check level, etc
     // try to find a field, respecting previous claims
+    #[allow(clippy::cast_lossless)]
     let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS as i64);
-    let search_field = match try_claim_field(
+    let search_field = if let Some(claimed_field) = try_claim_field(
         &mut conn,
         claim_strategy,
         maximum_timestamp,
         max_check_level,
         max_range_size,
     )? {
-        Some(claimed_field) => claimed_field,
-        None => {
-            let maximum_timestamp = Utc::now();
-            let claim_strategy = FieldClaimStrategy::Random;
-            match try_claim_field(
-                &mut conn,
-                claim_strategy,
-                maximum_timestamp,
-                max_check_level,
-                max_range_size,
-            )? {
-                Some(claimed_field) => claimed_field,
-                None => {
-                    return Err(format!("Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!").into());
-                }
-            }
-        }
+        claimed_field
+    } else {
+        let maximum_timestamp = Utc::now();
+        let claim_strategy = FieldClaimStrategy::Random;
+        try_claim_field(
+            &mut conn,
+            claim_strategy,
+            maximum_timestamp,
+            max_check_level,
+            max_range_size,
+        )?.ok_or_else(|| format!("Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!"))?
     };
 
     // log the claim and get the record
@@ -113,6 +111,7 @@ fn claim(mode: &str) -> Result<Value, Value> {
 }
 
 #[post("/submit", data = "<data>")]
+#[allow(clippy::needless_pass_by_value)]
 fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
     // get database connection
     // TODO: database connection pooling
@@ -179,8 +178,16 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                         .into());
                     }
 
+                    // get the near-miss cutoff
+                    #[allow(
+                        clippy::cast_sign_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_precision_loss
+                    )]
+                    let num_uniques_cutoff =
+                        (base as f32 * NEAR_MISS_CUTOFF_PERCENT).floor() as u32;
+
                     // check count of nice numbers against distribution
-                    let num_uniques_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
                     for d in &distribution_expanded {
                         if d.num_uniques > num_uniques_cutoff {
                             let count_numbers = numbers_expanded
@@ -206,8 +213,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                         .fold(0, |acc, d| acc + d.count);
                     if num_total_count as u128 != dist_total_count_above_cutoff {
                         return Err(format!(
-                            "Count of nice numbers does not match distribution (submitted {}, distribution claimed {}).",
-                            num_total_count, dist_total_count_above_cutoff
+                            "Count of nice numbers does not match distribution (submitted {num_total_count}, distribution claimed {dist_total_count_above_cutoff})."
                         )
                         .into());
                     }

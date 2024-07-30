@@ -1,5 +1,7 @@
 //! A simple CLI for the nice library.
 
+#![warn(clippy::all, clippy::pedantic)]
+
 extern crate nice_common;
 use nice_common::benchmark::{get_benchmark_field, BenchmarkMode};
 use nice_common::client_api::get_field_from_server;
@@ -85,6 +87,7 @@ fn main() {
     }
 
     // print the benchmarking results
+    #[allow(clippy::cast_precision_loss)]
     if cli.benchmark.is_some() || cli.verbose {
         println!("Elapsed time:    {:.3?}", before.elapsed());
         println!(
@@ -95,12 +98,12 @@ fn main() {
 
     // submit the results
     if cli.benchmark.is_none() {
-        submit_field_to_server(&cli.api_base, submit_data)
+        submit_field_to_server(&cli.api_base, submit_data);
     }
 
     // repeat if requested
     #[allow(clippy::main_recursion)]
     if cli.repeat {
-        main()
+        main();
     }
 }
