@@ -37,7 +37,7 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) {
             // check for server errors
             if response.status().is_success() {
                 match response.text() {
-                    Ok(msg) => println!("Server response: {}", msg),
+                    Ok(msg) => println!("Server response: {}", msg), // TODO: silence this or return as string
                     Err(e) => panic!("Server returned success but an error occured: {}", e),
                 }
             } else {
@@ -51,3 +51,5 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) {
         Err(e) => panic!("Network error: {}", e),
     }
 }
+
+// TODO: add tests
