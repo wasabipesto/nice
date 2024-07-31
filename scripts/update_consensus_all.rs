@@ -9,6 +9,7 @@ use nice_common::FieldRecord;
 
 // this takes 30 minutes to process all fields through base 46
 // in order to make this sustainable for much larger databases:
+// TODO: runs on all fields with at least one detailed submission
 // TODO: runs on all fields with submissions within the last 24 hours
 // TODO: runs on 10000 random fields
 
@@ -35,6 +36,7 @@ fn main() {
                     base, field.field_id, canon_submission_some.submission_id, check_level
                 );
             };
+            // TODO: print progress every 10k fields
         }
     }
 }
