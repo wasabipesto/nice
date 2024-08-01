@@ -23,7 +23,7 @@ pub struct Cli {
     mode: SearchMode,
 
     /// The base API URL to connect to
-    #[arg(long, default_value = "https://nicenumbers.net/api")]
+    #[arg(long, default_value = "https://api.nicenumbers.net")]
     api_base: String,
 
     /// The username to send alongside your contribution

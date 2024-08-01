@@ -7,7 +7,7 @@
 use nice_common::db_util;
 use nice_common::FieldRecord;
 
-// this takes 30 minutes to process all fields through base 46
+// this takes 60 minutes to process all fields through base 47
 // in order to make this sustainable for much larger databases:
 // TODO: runs on all fields with at least one detailed submission
 // TODO: runs on all fields with submissions within the last 24 hours
