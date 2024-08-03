@@ -6,6 +6,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use diesel::prelude::*;
 use diesel::table;
 use serde_json::Value;
+use submissions::get_submission_by_id;
 
 mod bases;
 mod chunks;
@@ -43,8 +44,11 @@ pub fn insert_new_base(
 }
 
 /// Update a base's calculated statistics.
-pub fn update_base_stats() -> Result<(), String> {
-    unimplemented!();
+pub fn update_base_stats(
+    conn: &mut PgConnection,
+    updated_base: BaseRecord,
+) -> Result<BaseRecord, String> {
+    bases::update_base(conn, updated_base.base, updated_base)
 }
 
 /// Get a chunk record (range plus cached stats).
@@ -73,8 +77,11 @@ pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(
 }
 
 /// Update a chunk's calculated statistics.
-pub fn update_chunk_stats() -> Result<(), String> {
-    unimplemented!();
+pub fn update_chunk_stats(
+    conn: &mut PgConnection,
+    updated_chunk: ChunkRecord,
+) -> Result<ChunkRecord, String> {
+    chunks::update_chunk(conn, updated_chunk.chunk_id, updated_chunk)
 }
 
 /// Get a field record (range plus cached stats).
@@ -86,6 +93,15 @@ pub fn get_field_by_id(conn: &mut PgConnection, field_id: u128) -> Result<FieldR
 /// Could take a while!
 pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<FieldRecord>, String> {
     fields::get_fields_in_base(conn, base)
+}
+
+/// Get all field records in a particular range
+pub fn get_fields_in_range(
+    conn: &mut PgConnection,
+    range_start: u128,
+    range_end: u128,
+) -> Result<Vec<FieldRecord>, String> {
+    fields::get_fields_in_range(conn, range_start, range_end)
 }
 
 /// Get all field records in a particular base that have a detailed submission.
@@ -187,11 +203,103 @@ pub fn get_count_checked_by_range(
     fields::get_count_checked_by_range(conn, check_level, range)
 }
 
-/// Get all canon submissions in a particular base.
-pub fn get_canon_submissions_by_range(//
-    //conn: &mut PgConnection,
-    //range: FieldSize,
+/// Get all canon submissions in a particular range.
+pub fn get_canon_submissions_by_range(
+    conn: &mut PgConnection,
+    range: FieldSize,
 ) -> Result<Vec<SubmissionRecord>, String> {
-    //submission::get_canon_submissions_by_range(conn, range)
-    unimplemented!();
+    submissions::get_canon_submissions_by_range(conn, range)
+}
+
+pub fn do_downsampling(conn: &mut PgConnection) {
+    // loop through bases
+    let bases = get_all_bases(conn).unwrap();
+    for base_rec in bases {
+        // get some base data
+        let base = base_rec.base;
+        let _base_start = base_rec.range_start;
+        let _base_end = base_rec.range_end;
+        println!("Base {} started...", base);
+
+        // create vec for all fields in the base
+        let mut base_fields: Vec<FieldRecord> = Vec::new();
+        let mut base_submissions: Vec<SubmissionRecord> = Vec::new();
+        let mut end = false;
+
+        // loop thorugh chunks in the base
+        let chunks = get_chunks_in_base(conn, base).unwrap();
+        for chunk in chunks {
+            let chunk_start = chunk.range_start;
+            let chunk_end = chunk.range_end;
+
+            // get fields and then check how many have canon submissions
+            let mut fields = get_fields_in_range(conn, chunk_start, chunk_end).unwrap();
+            let searched_fields: Vec<&FieldRecord> = fields
+                .iter()
+                .filter(|f| f.canon_submission_id.is_some())
+                .collect();
+            let chunk_range_searched: u128 = searched_fields.iter().map(|f| f.range_size).sum();
+            let chunk_percent_searched =
+                chunk_range_searched as f32 / (chunk_end - chunk_start) as f32;
+
+            if chunk_range_searched == 0 {
+                println!(
+                    "Reached end of searched range (chunk #{} empty). Wrapping up.",
+                    chunk.chunk_id
+                );
+                end = true;
+                break;
+            }
+
+            let mut submissions: Vec<SubmissionRecord> = searched_fields
+                .iter()
+                .map(|f| {
+                    get_submission_by_id(conn, f.canon_submission_id.unwrap() as u128).unwrap()
+                })
+                .collect();
+
+            // update chunk record
+            let mut updated_chunk = chunk.clone();
+            updated_chunk.distribution =
+                distribution_stats::downsample_distributions(&submissions, base);
+            updated_chunk.numbers = number_stats::downsample_numbers(&submissions);
+            // TODO: checked_detailed, checked_niceonly, minimum_cl, niceness_mean, niceness_stdev
+            update_chunk_stats(conn, updated_chunk).unwrap();
+            println!(
+                "Base {}, Chunk #{}: {:.0}% searched",
+                base,
+                chunk.chunk_id,
+                chunk_percent_searched * 100f32
+            );
+
+            // save fields and submissions
+            base_fields.append(&mut fields);
+            base_submissions.append(&mut submissions);
+
+            if chunk_percent_searched < DOWNSAMPLE_CUTOFF_PERCENT {
+                println!(
+                    "Reached end of searched range (searched < {:.0}%). Wrapping up.",
+                    DOWNSAMPLE_CUTOFF_PERCENT * 100f32
+                );
+                end = true;
+                break;
+            }
+        }
+
+        // TODO: get remaining submissions between final chunk and end of base range
+
+        // update base record
+        let mut updated_base = base_rec.clone();
+        updated_base.distribution =
+            distribution_stats::downsample_distributions(&base_submissions, base);
+        updated_base.numbers = number_stats::downsample_numbers(&base_submissions);
+        // TODO: checked_detailed, checked_niceonly, minimum_cl, niceness_mean, niceness_stdev
+        update_base_stats(conn, updated_base).unwrap();
+        println!("Base {} complete.", base,);
+        println!();
+
+        if end {
+            break;
+        }
+    }
 }

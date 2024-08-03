@@ -10,7 +10,6 @@ pub mod client_process;
 pub mod consensus;
 pub mod db_util;
 pub mod distribution_stats;
-//pub mod downsampling;
 pub mod generate_chunks;
 pub mod generate_fields;
 pub mod number_stats;
@@ -30,6 +29,7 @@ use std::ops::Add;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
+pub const DOWNSAMPLE_CUTOFF_PERCENT: f32 = 0.2;
 pub const CLAIM_DURATION_HOURS: u32 = 1;
 pub const DEFAULT_FIELD_SIZE: u128 = 1_000_000_000;
 pub const SAVE_TOP_N_NUMBERS: usize = 10000;

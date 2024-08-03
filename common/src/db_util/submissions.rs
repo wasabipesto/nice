@@ -19,7 +19,7 @@ table! {
     }
 }
 
-#[derive(Queryable)]
+#[derive(Queryable, QueryableByName)]
 #[diesel(table_name = submissions)]
 struct SubmissionPrivate {
     id: i64,
@@ -145,6 +145,34 @@ pub fn get_submission_by_id(
         .first::<SubmissionPrivate>(conn)
         .map_err(|err| err.to_string())
         .and_then(private_to_public)
+}
+
+pub fn get_canon_submissions_by_range(
+    conn: &mut PgConnection,
+    range: FieldSize,
+) -> Result<Vec<SubmissionRecord>, String> {
+    use diesel::sql_query;
+    use diesel::sql_types::Numeric;
+
+    let start = conversions::u128_to_bigdec(range.range_start)?;
+    let end = conversions::u128_to_bigdec(range.range_end)?;
+
+    let query = "SELECT s.*
+        FROM fields f
+        JOIN submissions s ON f.canon_submission_id = s.id
+        WHERE f.range_start >= $1
+        AND f.range_end <= $2;";
+
+    let items_private: Vec<SubmissionPrivate> = sql_query(query)
+        .bind::<Numeric, _>(start)
+        .bind::<Numeric, _>(end)
+        .load(conn)
+        .map_err(|err| err.to_string())?;
+
+    items_private
+        .into_iter()
+        .map(private_to_public)
+        .collect::<Result<Vec<SubmissionRecord>, String>>()
 }
 
 pub fn get_submissions_qualified_detailed_for_field(

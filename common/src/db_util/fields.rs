@@ -134,6 +134,29 @@ pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<Fiel
         .collect::<Result<Vec<FieldRecord>, String>>()
 }
 
+pub fn get_fields_in_range(
+    conn: &mut PgConnection,
+    field_start: u128,
+    field_end: u128,
+) -> Result<Vec<FieldRecord>, String> {
+    use self::fields::dsl::*;
+
+    let field_start = conversions::u128_to_bigdec(field_start)?;
+    let field_end = conversions::u128_to_bigdec(field_end)?;
+
+    let items_private: Vec<FieldPrivate> = fields
+        .filter(range_start.ge(field_start))
+        .filter(range_end.le(field_end))
+        .order(id.asc())
+        .load(conn)
+        .map_err(|err| err.to_string())?;
+
+    items_private
+        .into_iter()
+        .map(private_to_public)
+        .collect::<Result<Vec<FieldRecord>, String>>()
+}
+
 pub fn get_fields_in_base_with_detailed_subs(
     conn: &mut PgConnection,
     base: u32,

@@ -132,6 +132,7 @@ pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<Chun
     let base = u32_to_i32(base)?;
     let items_private: Vec<ChunkPrivate> = chunks
         .filter(base_id.eq(base))
+        .order(id.asc())
         .load(conn)
         .map_err(|err| err.to_string())?;
 
