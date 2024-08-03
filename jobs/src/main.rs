@@ -122,9 +122,9 @@ fn main() {
             let minimum_cl =
                 db_util::get_minimum_cl_by_range(&mut conn, chunk.range_start, chunk.range_end)
                     .unwrap();
-            let checked_niceonly = if minimum_cl < 1 {
-                // if min_cl is less than one, there's not been any searches at all
-                0
+            // if the min check level is X or more, we've already searched everything
+            let checked_niceonly = if minimum_cl >= 1 {
+                chunk.range_size
             } else {
                 db_util::get_count_checked_by_range(
                     &mut conn,
@@ -134,9 +134,8 @@ fn main() {
                 )
                 .unwrap()
             };
-            let checked_detailed = if minimum_cl < 2 {
-                // if min_cl is less than two, there's not been any detailed searches
-                0
+            let checked_detailed = if minimum_cl >= 2 {
+                chunk.range_size
             } else {
                 db_util::get_count_checked_by_range(
                     &mut conn,
