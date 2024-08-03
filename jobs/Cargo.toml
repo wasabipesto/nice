@@ -1,0 +1,13 @@
+[package]
+name = "nice_jobs"
+version = "3.0.0"
+edition = "2021"
+authors = ["wasabipesto <nice@wasabipesto.com>"]
+description = "scheduled jobs for the nice project"
+repository = "https://github.com/wasabipesto/nice"
+readme = "README.md"
+license-file = "../LICENSE"
+
+[dependencies]
+nice_common = { path = "../common" }
+clap = { version = "4.5" }
