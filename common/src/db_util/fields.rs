@@ -134,6 +134,31 @@ pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<Fiel
         .collect::<Result<Vec<FieldRecord>, String>>()
 }
 
+pub fn get_fields_in_base_with_detailed_subs(
+    conn: &mut PgConnection,
+    base: u32,
+) -> Result<Vec<FieldRecord>, String> {
+    use diesel::sql_query;
+    use diesel::sql_types::Integer;
+
+    let base = conversions::u32_to_i32(base)?;
+    let query = "SELECT DISTINCT ON (f.id) f.*
+            FROM fields f
+            JOIN submissions s ON f.id = s.field_id
+            WHERE f.base_id = $1 AND s.search_mode = 'detailed'
+            ORDER BY f.id ASC";
+
+    let items_private: Vec<FieldPrivate> = sql_query(query)
+        .bind::<Integer, _>(base)
+        .load(conn)
+        .map_err(|err| err.to_string())?;
+
+    items_private
+        .into_iter()
+        .map(private_to_public)
+        .collect::<Result<Vec<FieldRecord>, String>>()
+}
+
 /// Finds the next field that matches the criteria, updates last_claim_time, and returns it.
 /// Returns Ok(None) if no matching fields are found.
 pub fn try_claim_field(

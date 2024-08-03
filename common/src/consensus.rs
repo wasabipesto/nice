@@ -10,8 +10,13 @@ pub fn evaluate_consensus(
 ) -> Result<(Option<SubmissionRecord>, u8), String> {
     // If there are no submissions, reset the canon submission and cap the check level
     if submissions.is_empty() {
-        let check_level = field.check_level.min(1);
-        return Ok((None, check_level));
+        return Ok((None, field.check_level.min(1)));
+    }
+    // If there is one submission, return it
+    if submissions.len() == 1 {
+        if let Some(sub) = submissions.first() {
+            return Ok((Some(sub.clone()), 2));
+        }
     }
 
     // Group submissions by distribution and numbers
@@ -33,7 +38,7 @@ pub fn evaluate_consensus(
         };
         submission_groups
             .entry(subcan)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(sub.clone());
     }
 
