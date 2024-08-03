@@ -119,40 +119,54 @@ fn main() {
             io::stdout().flush().unwrap();
 
             // get basic stats like how much has been cheked
-            let checked_niceonly = db_util::get_count_checked_by_range(
-                &mut conn,
-                1,
-                chunk.range_start,
-                chunk.range_end,
-            )
-            .unwrap();
-            let checked_detailed = db_util::get_count_checked_by_range(
-                &mut conn,
-                2,
-                chunk.range_start,
-                chunk.range_end,
-            )
-            .unwrap();
-
-            #[allow(clippy::cast_precision_loss)]
-            let chunk_percent_checked_detailed = checked_detailed as f32 / chunk_size as f32;
             let minimum_cl =
                 db_util::get_minimum_cl_by_range(&mut conn, chunk.range_start, chunk.range_end)
                     .unwrap();
+            let checked_niceonly = if minimum_cl < 1 {
+                // if min_cl is less than one, there's not been any searches at all
+                0
+            } else {
+                db_util::get_count_checked_by_range(
+                    &mut conn,
+                    1,
+                    chunk.range_start,
+                    chunk.range_end,
+                )
+                .unwrap()
+            };
+            let checked_detailed = if minimum_cl < 2 {
+                // if min_cl is less than two, there's not been any detailed searches
+                0
+            } else {
+                db_util::get_count_checked_by_range(
+                    &mut conn,
+                    2,
+                    chunk.range_start,
+                    chunk.range_end,
+                )
+                .unwrap()
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let chunk_percent_checked_detailed = checked_detailed as f32 / chunk_size as f32;
             print!(
-                "CL{}, Checked {:.0}%, ",
+                "CL{}, Checked {:.1}%, ",
                 minimum_cl,
                 chunk_percent_checked_detailed * 100f32
             );
             io::stdout().flush().unwrap();
 
             // get all submissions for the chunk
-            let mut submissions: Vec<SubmissionRecord> = db_util::get_canon_submissions_by_range(
-                &mut conn,
-                chunk.range_start,
-                chunk.range_end,
-            )
-            .unwrap();
+            let mut submissions: Vec<SubmissionRecord> = if minimum_cl < 2 {
+                // if min_cl is less than two, there's not been any detailed searches
+                Vec::new()
+            } else {
+                db_util::get_canon_submissions_by_range(
+                    &mut conn,
+                    chunk.range_start,
+                    chunk.range_end,
+                )
+                .unwrap()
+            };
 
             // update chunk record
             let mut updated_chunk = chunk.clone();
@@ -193,7 +207,7 @@ fn main() {
 
         print!("Base {base}: ",);
         print!(
-            "CL{}, Checked {:.0}%, ",
+            "CL{}, Checked {:.1}%, ",
             base_minimum_cl,
             base_percent_checked_detailed * 100f32
         );
