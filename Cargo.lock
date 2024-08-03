@@ -1201,6 +1201,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nice_jobs"
+version = "3.0.0"
+dependencies = [
+ "clap",
+ "nice_common",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
