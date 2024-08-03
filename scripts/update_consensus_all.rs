@@ -9,10 +9,6 @@ use nice_common::db_util;
 use nice_common::FieldRecord;
 use std::time::Instant;
 
-// this runs at about 20-25 fields per second on a remote machine for single-submission fields
-// more complex comparisons drop this to 5-10 fields per second
-// takes ~4 minutes total for ~5000 fields as of 8/3/24
-// TODO: only run on fields with new submissions
 // TODO: get fields to check and their submissions in one operation
 
 fn main() {
