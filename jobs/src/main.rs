@@ -9,6 +9,7 @@ use nice_common::distribution_stats;
 use nice_common::number_stats;
 use nice_common::DOWNSAMPLE_CUTOFF_PERCENT;
 use nice_common::{FieldRecord, SubmissionRecord};
+use std::io::{self, Write};
 
 fn main() {
     // get db connection
@@ -115,6 +116,7 @@ fn main() {
         for chunk in chunks {
             let chunk_size = chunk.range_size;
             print!("Chunk #{}: ", chunk.chunk_id);
+            io::stdout().flush().unwrap();
 
             // get basic stats like how much has been cheked
             let checked_niceonly = db_util::get_count_checked_by_range(
@@ -142,6 +144,7 @@ fn main() {
                 minimum_cl,
                 chunk_percent_checked_detailed * 100f32
             );
+            io::stdout().flush().unwrap();
 
             // get all submissions for the chunk
             let mut submissions: Vec<SubmissionRecord> = db_util::get_canon_submissions_by_range(
@@ -166,6 +169,7 @@ fn main() {
                 updated_chunk.niceness_mean = Some(niceness_mean);
                 updated_chunk.niceness_stdev = Some(niceness_stdev);
                 print!("Mean {niceness_mean:.2}, StDev {niceness_stdev:.2}, ");
+                io::stdout().flush().unwrap();
             } else {
                 // otherwise reset to "no data" default
                 updated_chunk.distribution = Vec::new();
