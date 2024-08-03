@@ -136,6 +136,10 @@ fn main() {
             };
             let checked_detailed = if minimum_cl >= 2 {
                 chunk.range_size
+            } else if checked_niceonly == 0 {
+                // checked_niceonly will always be less than checked_detailed
+                // if it's zero then this will be too
+                0
             } else {
                 db_util::get_count_checked_by_range(
                     &mut conn,
