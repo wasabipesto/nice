@@ -52,6 +52,23 @@ pub fn downsample_distributions(
     expand_distribution(&counter[1..], base)
 }
 
+pub fn mean_stdev_from_distribution(distribution: &[UniquesDistribution]) -> (f32, f32) {
+    let mut mean = 0.0;
+    let mut stdev = 0.0;
+    let count: u128 = distribution.iter().map(|d| d.count).sum();
+    assert!(count > 0);
+
+    for d in distribution {
+        mean += d.niceness * d.count as f32;
+        stdev += d.count as f32 * d.niceness.powi(2);
+    }
+
+    mean /= count as f32;
+    stdev = (stdev / count as f32 - mean.powi(2)).sqrt();
+
+    (mean, stdev)
+}
+
 pub fn shrink_distribution(distribution: &[UniquesDistribution]) -> Vec<UniquesDistributionSimple> {
     distribution
         .iter()

@@ -281,9 +281,11 @@ pub fn do_downsampling(conn: &mut PgConnection) {
                 updated_chunk.distribution =
                     distribution_stats::downsample_distributions(&submissions, base);
                 updated_chunk.numbers = number_stats::downsample_numbers(&submissions);
-                // TODO: niceness_mean
-                // TODO: niceness_stdev
-                // print!("Mean {:.2}, StDev {:.2}, ", niceness_mean, niceness_stdev);
+                let (niceness_mean, niceness_stdev) =
+                    distribution_stats::mean_stdev_from_distribution(&updated_chunk.distribution);
+                updated_chunk.niceness_mean = Some(niceness_mean);
+                updated_chunk.niceness_stdev = Some(niceness_stdev);
+                print!("Mean {:.2}, StDev {:.2}, ", niceness_mean, niceness_stdev);
             } else {
                 // otherwise reset to "no data" default
                 updated_chunk.distribution = Vec::new();
@@ -302,6 +304,13 @@ pub fn do_downsampling(conn: &mut PgConnection) {
 
         // TODO: get remaining submissions between final chunk and end of base range
 
+        print!("Base {}: ", base);
+        print!(
+            "CL{}, Checked {:.0}%, ",
+            base_minimum_cl,
+            base_percent_checked_detailed * 100f32
+        );
+
         // update base record
         let mut updated_base = base_rec.clone();
         updated_base.checked_niceonly = base_checked_niceonly;
@@ -312,9 +321,11 @@ pub fn do_downsampling(conn: &mut PgConnection) {
             updated_base.distribution =
                 distribution_stats::downsample_distributions(&base_submissions, base);
             updated_base.numbers = number_stats::downsample_numbers(&base_submissions);
-            // TODO: niceness_mean
-            // TODO: niceness_stdev
-            // print!("Mean {:.2}, StDev {:.2}, ", niceness_mean, niceness_stdev);
+            let (niceness_mean, niceness_stdev) =
+                distribution_stats::mean_stdev_from_distribution(&updated_base.distribution);
+            updated_base.niceness_mean = Some(niceness_mean);
+            updated_base.niceness_stdev = Some(niceness_stdev);
+            print!("Mean {:.2}, StDev {:.2}, ", niceness_mean, niceness_stdev);
         } else {
             // otherwise reset to "no data" default
             updated_base.distribution = Vec::new();
@@ -325,7 +336,7 @@ pub fn do_downsampling(conn: &mut PgConnection) {
 
         // save it
         update_base_stats(conn, updated_base).unwrap();
-        println!("Base {} complete.", base,);
+        println!("Updated!");
         println!();
     }
 }
