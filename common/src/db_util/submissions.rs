@@ -149,13 +149,14 @@ pub fn get_submission_by_id(
 
 pub fn get_canon_submissions_by_range(
     conn: &mut PgConnection,
-    range: FieldSize,
+    start: u128,
+    end: u128,
 ) -> Result<Vec<SubmissionRecord>, String> {
     use diesel::sql_query;
     use diesel::sql_types::Numeric;
 
-    let start = conversions::u128_to_bigdec(range.range_start)?;
-    let end = conversions::u128_to_bigdec(range.range_end)?;
+    let start = conversions::u128_to_bigdec(start)?;
+    let end = conversions::u128_to_bigdec(end)?;
 
     let query = "SELECT s.*
         FROM fields f

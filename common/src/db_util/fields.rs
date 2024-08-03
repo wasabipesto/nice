@@ -240,16 +240,17 @@ pub fn try_claim_field(
 pub fn get_count_checked_by_range(
     conn: &mut PgConnection,
     in_check_level: u8,
-    range: FieldSize,
+    start: u128,
+    end: u128,
 ) -> Result<u128, String> {
     use self::fields::dsl::*;
     use diesel::dsl::sum;
 
     let in_check_level = conversions::u8_to_i32(in_check_level)?;
-    let in_range_start = conversions::u128_to_bigdec(range.range_start)?;
-    let in_range_end = conversions::u128_to_bigdec(range.range_end)?;
+    let in_range_start = conversions::u128_to_bigdec(start)?;
+    let in_range_end = conversions::u128_to_bigdec(end)?;
 
-    let count = fields
+    let result = fields
         .select(sum(range_size))
         .filter(check_level.ge(in_check_level))
         .filter(range_start.ge(in_range_start))
@@ -258,7 +259,29 @@ pub fn get_count_checked_by_range(
         .map_err(|err| err.to_string())?
         .unwrap_or(BigDecimal::from(0u32));
 
-    conversions::bigdec_to_u128(count)
+    conversions::bigdec_to_u128(result)
+}
+
+pub fn get_minimum_cl_by_range(
+    conn: &mut PgConnection,
+    start: u128,
+    end: u128,
+) -> Result<u8, String> {
+    use self::fields::dsl::*;
+    use diesel::dsl::min;
+
+    let in_range_start = conversions::u128_to_bigdec(start)?;
+    let in_range_end = conversions::u128_to_bigdec(end)?;
+
+    let result = fields
+        .select(min(check_level))
+        .filter(range_start.ge(in_range_start))
+        .filter(range_end.le(in_range_end))
+        .first::<Option<i32>>(conn)
+        .map_err(|err| err.to_string())?
+        .unwrap_or_default();
+
+    conversions::i32_to_u8(result)
 }
 
 pub fn update_field(

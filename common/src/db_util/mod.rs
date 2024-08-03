@@ -6,7 +6,6 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use diesel::prelude::*;
 use diesel::table;
 use serde_json::Value;
-use submissions::get_submission_by_id;
 
 mod bases;
 mod chunks;
@@ -194,21 +193,32 @@ pub fn get_submissions_qualified_detailed_for_field(
     submissions::get_submissions_qualified_detailed_for_field(conn, field_id)
 }
 
-/// Get the percent of the range that has reached the given check level.
+/// Get the range that has reached the given check level.
 pub fn get_count_checked_by_range(
     conn: &mut PgConnection,
     check_level: u8,
-    range: FieldSize,
+    start: u128,
+    end: u128,
 ) -> Result<u128, String> {
-    fields::get_count_checked_by_range(conn, check_level, range)
+    fields::get_count_checked_by_range(conn, check_level, start, end)
+}
+
+/// Get the minimum check level for the range.
+pub fn get_minimum_cl_by_range(
+    conn: &mut PgConnection,
+    start: u128,
+    end: u128,
+) -> Result<u8, String> {
+    fields::get_minimum_cl_by_range(conn, start, end)
 }
 
 /// Get all canon submissions in a particular range.
 pub fn get_canon_submissions_by_range(
     conn: &mut PgConnection,
-    range: FieldSize,
+    start: u128,
+    end: u128,
 ) -> Result<Vec<SubmissionRecord>, String> {
-    submissions::get_canon_submissions_by_range(conn, range)
+    submissions::get_canon_submissions_by_range(conn, start, end)
 }
 
 pub fn do_downsampling(conn: &mut PgConnection) {
@@ -217,89 +227,105 @@ pub fn do_downsampling(conn: &mut PgConnection) {
     for base_rec in bases {
         // get some base data
         let base = base_rec.base;
-        let _base_start = base_rec.range_start;
-        let _base_end = base_rec.range_end;
-        println!("Base {} started...", base);
+        let base_size = base_rec.range_size;
+        print!("Base {}: ", base);
+
+        // get basic stats like how much has been cheked
+        let base_checked_niceonly =
+            get_count_checked_by_range(conn, 1, base_rec.range_start, base_rec.range_end).unwrap();
+        let base_checked_detailed =
+            get_count_checked_by_range(conn, 2, base_rec.range_start, base_rec.range_end).unwrap();
+        let base_percent_checked_detailed = base_checked_detailed as f32 / base_size as f32;
+        let base_minimum_cl =
+            get_minimum_cl_by_range(conn, base_rec.range_start, base_rec.range_end).unwrap();
+        println!(
+            "CL{}, Checked {:.0}%",
+            base_minimum_cl,
+            base_percent_checked_detailed * 100f32
+        );
 
         // create vec for all fields in the base
-        let mut base_fields: Vec<FieldRecord> = Vec::new();
         let mut base_submissions: Vec<SubmissionRecord> = Vec::new();
-        let mut end = false;
 
         // loop thorugh chunks in the base
         let chunks = get_chunks_in_base(conn, base).unwrap();
         for chunk in chunks {
-            let chunk_start = chunk.range_start;
-            let chunk_end = chunk.range_end;
+            let chunk_size = chunk.range_size;
+            print!("Chunk #{}: ", chunk.chunk_id);
 
-            // get fields and then check how many have canon submissions
-            let mut fields = get_fields_in_range(conn, chunk_start, chunk_end).unwrap();
-            let searched_fields: Vec<&FieldRecord> = fields
-                .iter()
-                .filter(|f| f.canon_submission_id.is_some())
-                .collect();
-            let chunk_range_searched: u128 = searched_fields.iter().map(|f| f.range_size).sum();
-            let chunk_percent_searched =
-                chunk_range_searched as f32 / (chunk_end - chunk_start) as f32;
+            // get basic stats like how much has been cheked
+            let checked_niceonly =
+                get_count_checked_by_range(conn, 1, chunk.range_start, chunk.range_end).unwrap();
+            let checked_detailed =
+                get_count_checked_by_range(conn, 2, chunk.range_start, chunk.range_end).unwrap();
+            let chunk_percent_checked_detailed = checked_detailed as f32 / chunk_size as f32;
+            let minimum_cl =
+                get_minimum_cl_by_range(conn, chunk.range_start, chunk.range_end).unwrap();
+            print!(
+                "CL{}, Checked {:.0}%, ",
+                minimum_cl,
+                chunk_percent_checked_detailed * 100f32
+            );
 
-            if chunk_range_searched == 0 {
-                println!(
-                    "Reached end of searched range (chunk #{} empty). Wrapping up.",
-                    chunk.chunk_id
-                );
-                end = true;
-                break;
-            }
-
-            let mut submissions: Vec<SubmissionRecord> = searched_fields
-                .iter()
-                .map(|f| {
-                    get_submission_by_id(conn, f.canon_submission_id.unwrap() as u128).unwrap()
-                })
-                .collect();
+            // get all submissions for the chunk
+            let mut submissions: Vec<SubmissionRecord> =
+                get_canon_submissions_by_range(conn, chunk.range_start, chunk.range_end).unwrap();
 
             // update chunk record
             let mut updated_chunk = chunk.clone();
-            updated_chunk.distribution =
-                distribution_stats::downsample_distributions(&submissions, base);
-            updated_chunk.numbers = number_stats::downsample_numbers(&submissions);
-            // TODO: checked_detailed, checked_niceonly, minimum_cl, niceness_mean, niceness_stdev
-            update_chunk_stats(conn, updated_chunk).unwrap();
-            println!(
-                "Base {}, Chunk #{}: {:.0}% searched",
-                base,
-                chunk.chunk_id,
-                chunk_percent_searched * 100f32
-            );
-
-            // save fields and submissions
-            base_fields.append(&mut fields);
-            base_submissions.append(&mut submissions);
-
-            if chunk_percent_searched < DOWNSAMPLE_CUTOFF_PERCENT {
-                println!(
-                    "Reached end of searched range (searched < {:.0}%). Wrapping up.",
-                    DOWNSAMPLE_CUTOFF_PERCENT * 100f32
-                );
-                end = true;
-                break;
+            updated_chunk.checked_niceonly = checked_niceonly;
+            updated_chunk.checked_detailed = checked_detailed;
+            updated_chunk.minimum_cl = minimum_cl;
+            if chunk_percent_checked_detailed > DOWNSAMPLE_CUTOFF_PERCENT {
+                // only update these detailed stats if we have a representative sample
+                updated_chunk.distribution =
+                    distribution_stats::downsample_distributions(&submissions, base);
+                updated_chunk.numbers = number_stats::downsample_numbers(&submissions);
+                // TODO: niceness_mean
+                // TODO: niceness_stdev
+                // print!("Mean {:.2}, StDev {:.2}, ", niceness_mean, niceness_stdev);
+            } else {
+                // otherwise reset to "no data" default
+                updated_chunk.distribution = Vec::new();
+                updated_chunk.numbers = Vec::new();
+                updated_chunk.niceness_mean = None;
+                updated_chunk.niceness_stdev = None;
             }
+
+            // save it
+            update_chunk_stats(conn, updated_chunk).unwrap();
+            println!("Updated!");
+
+            // save submissions for the base stats
+            base_submissions.append(&mut submissions);
         }
 
         // TODO: get remaining submissions between final chunk and end of base range
 
         // update base record
         let mut updated_base = base_rec.clone();
-        updated_base.distribution =
-            distribution_stats::downsample_distributions(&base_submissions, base);
-        updated_base.numbers = number_stats::downsample_numbers(&base_submissions);
-        // TODO: checked_detailed, checked_niceonly, minimum_cl, niceness_mean, niceness_stdev
+        updated_base.checked_niceonly = base_checked_niceonly;
+        updated_base.checked_detailed = base_checked_detailed;
+        updated_base.minimum_cl = base_minimum_cl;
+        if base_percent_checked_detailed > DOWNSAMPLE_CUTOFF_PERCENT {
+            // only update these detailed stats if we have a representative sample
+            updated_base.distribution =
+                distribution_stats::downsample_distributions(&base_submissions, base);
+            updated_base.numbers = number_stats::downsample_numbers(&base_submissions);
+            // TODO: niceness_mean
+            // TODO: niceness_stdev
+            // print!("Mean {:.2}, StDev {:.2}, ", niceness_mean, niceness_stdev);
+        } else {
+            // otherwise reset to "no data" default
+            updated_base.distribution = Vec::new();
+            updated_base.numbers = Vec::new();
+            updated_base.niceness_mean = None;
+            updated_base.niceness_stdev = None;
+        }
+
+        // save it
         update_base_stats(conn, updated_base).unwrap();
         println!("Base {} complete.", base,);
         println!();
-
-        if end {
-            break;
-        }
     }
 }
