@@ -162,18 +162,13 @@ pub fn update_chunk(
 pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(), String> {
     use diesel::sql_types::Integer;
 
-    let query = "WITH updated_fields AS (
-            SELECT f.id AS field_id, c.id AS chunk_id
-            FROM fields f
-            JOIN chunks c
-            ON f.range_start >= c.range_start
-            AND f.range_end <= c.range_end
-            WHERE f.base_id = $1
-        )
-        UPDATE fields
-        SET chunk_id = updated_fields.chunk_id
-        FROM updated_fields
-        WHERE fields.id = updated_fields.field_id;"
+    let query = "
+        UPDATE fields f
+        SET chunk_id = c.id
+        FROM chunks c
+        WHERE f.base_id = $1
+            AND f.range_start >= c.range_start
+            AND f.range_end <= c.range_end;"
         .to_string();
 
     diesel::sql_query(query)
