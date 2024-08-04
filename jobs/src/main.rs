@@ -159,8 +159,7 @@ fn main() {
             io::stdout().flush().unwrap();
 
             // get all submissions for the chunk
-            let mut submissions: Vec<SubmissionRecord> = if minimum_cl < 2 {
-                // if min_cl is less than two, there's not been any detailed searches
+            let mut submissions: Vec<SubmissionRecord> = if checked_detailed == 0 {
                 Vec::new()
             } else {
                 db_util::get_canon_submissions_by_range(
