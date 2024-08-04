@@ -45,20 +45,20 @@ fn claim(mode: &str) -> Result<Value, Value> {
     // get rng thread
     let mut rng = rand::thread_rng();
 
-    let claim_strategy = if rng.gen_range(0..100) < 80 {
-        // 80% chance: get lowest valid field
+    let claim_strategy = if rng.gen_range(0..100) < 95 {
+        // 95% chance: get lowest valid field
         FieldClaimStrategy::Next
     } else {
-        // 20% chance: get random valid field
+        // 5% chance: get random valid field
         FieldClaimStrategy::Random
     };
 
     let max_check_level = match search_mode {
         SearchMode::Detailed => {
-            if rng.gen_range(0..100) < 80 {
-                1 // 80% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
+            if rng.gen_range(0..100) < 95 {
+                1 // 95% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
             } else {
-                2 // 20% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
+                2 // 5% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
             }
         }
         SearchMode::Niceonly => {
@@ -106,7 +106,11 @@ fn claim(mode: &str) -> Result<Value, Value> {
         range_size: search_field.range_size,
     };
 
-    // return to user
+    // log & return to user
+    println!(
+        "New {:?} claim for field #{}",
+        claim_record.search_mode, claim_record.field_id
+    );
     Ok(json!(data_for_client))
 }
 
@@ -145,7 +149,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
             // no checks, honor system
             insert_submission(
                 &mut conn,
-                claim_record,
+                claim_record.clone(),
                 submit_data,
                 user_ip,
                 None,
@@ -231,7 +235,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                     // save it
                     insert_submission(
                         &mut conn,
-                        claim_record,
+                        claim_record.clone(),
                         submit_data,
                         user_ip,
                         Some(distribution_expanded),
@@ -255,8 +259,12 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
         }
     }
 
-    // respond to user
-    Ok(json!("OK"))
+    // log & respond to user
+    println!(
+        "New {:?} submission for field #{}",
+        claim_record.search_mode, claim_record.field_id
+    );
+    Ok("OK".into())
 }
 
 #[get("/")]
