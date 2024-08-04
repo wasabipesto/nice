@@ -21,7 +21,7 @@ This will run once with default settings and submit your results to the server a
 A typical use-case involves running multiple clients continuously, in parallel, with a particular username:
 
 ```
-screen -dm ./nice-client -r -u your_name"
+screen -dm ./nice-client -r -u your_name
 ```
 
 You can find various settings and their options with the `--help` flag:

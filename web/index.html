@@ -1,0 +1,371 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Nice!</title>
+        <link
+            rel="stylesheet"
+            href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css"
+        />
+        <link
+            rel="icon"
+            type="image/png"
+            sizes="32x32"
+            href="/favicon-32x32.png"
+        />
+        <link
+            rel="icon"
+            type="image/png"
+            sizes="16x16"
+            href="/favicon-16x16.png"
+        />
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            .modebar-btn .icon {
+                height: 0.75em;
+                width: 0.75em;
+            }
+        </style>
+    </head>
+    <body class="has-background-dark">
+        <section class="section">
+            <div class="container">
+                <div class="columns">
+                    <div class="column">
+                        <div class="box content p-6">
+                            <p class="subtitle is-3">
+                                <strong>4134931983708</strong> is
+                                <strong>97.5%</strong> nice.
+                            </p>
+                            <p class="title is-2">
+                                Join the search to find the next nice number.
+                            </p>
+                        </div>
+                        <div class="box content">
+                            <h1 class="title is-4 mb-3">What is this?</h1>
+                            <p>
+                                We're looking for a specific kind of number
+                                called square-cube pandigitals, or "nice
+                                numbers". A number is "nice" if the digits in
+                                its square and cube contain all possible values
+                                with no repeats. Right now the only known nice
+                                number is 69 (evaluated in base 10), but the
+                                math says if we expand our search to other bases
+                                there should be more, possibly infinitely many
+                                more! This site is a summary of our progress so
+                                far.
+                            </p>
+                        </div>
+                        <div class="box content">
+                            <h1 class="title is-4 mb-3">How can I help?</h1>
+                            <p>
+                                There are two main ways to help with this
+                                project.
+                            </p>
+                            <p>
+                                The first is to lend your computational power,
+                                like with the old distributed computing
+                                initiatives such as SETI@Home.
+                                <a href="https://github.com/wasabipesto/nice"
+                                    >This repository</a
+                                >
+                                has a program that connects to a central server
+                                and "checks out" a range to search for nice
+                                numbers. If you let it run it will report back
+                                with any results and credit those discoveries to
+                                your name!
+                            </p>
+                            <p>
+                                The second is to help with the math. This site
+                                collects a lot of information from the clients,
+                                such as a log of highly-nice numbers and the
+                                "niceness" distribution for each range that you
+                                can query for analysis. You can use that data to
+                                find patterns or just attack the problem with
+                                pure theory at one of the discussion links
+                                below.
+                            </p>
+                        </div>
+                        <div class="box content">
+                            <h1 class="title is-4 mb-3">
+                                Where can I learn more?
+                            </h1>
+                            <ul>
+                                <li>
+                                    Jacob Cohen's
+                                    <a
+                                        href="https://beautifulthorns.wixsite.com/home/post/is-69-unique"
+                                        >excellent post</a
+                                    >
+                                    over at Chromatic Conflux that started this
+                                    whole thing. All of the original ideas and
+                                    concepts are 100% from his efforts.
+                                </li>
+                                <li>
+                                    Jacob's
+                                    <a
+                                        href="https://beautifulthorns.wixsite.com/home/post/progress-update-on-the-search-for-nice-numbers"
+                                        >followup post</a
+                                    >
+                                    on advances in the theory and procedure of
+                                    finding nice numbers, including information
+                                    on residue class filtering.
+                                </li>
+                                <li>
+                                    The
+                                    <a
+                                        href="https://manifold.markets/Conflux/will-i-learn-of-a-nice-number-besid-c68dd57dfc1"
+                                        >most recent prediction market</a
+                                    >
+                                    on whether a nice number will be discovered
+                                    by the end of March 2023 (it wasn't).
+                                </li>
+                                <li>
+                                    The
+                                    <a
+                                        href="https://manifold.markets/Conflux/will-i-learn-of-a-nice-number-besid"
+                                        >original prediction market</a
+                                    >
+                                    that has since been closed but contains a
+                                    lot of early advancements on the topic.
+                                </li>
+                            </ul>
+                        </div>
+                    </div>
+                    <div class="column is-three-fifths">
+                        <div class="box content">
+                            <h1 class="title is-4 mb-1">
+                                Notably Nice Numbers
+                            </h1>
+                            <p>Which numbers are closest to being 100% nice?</p>
+                            <div id="numbers"></div>
+                        </div>
+                        <div class="box content">
+                            <h1 class="title is-4 mb-1">Chunk Niceness</h1>
+                            <p>
+                                On average, how nice is each chunk we've
+                                searched?
+                            </p>
+                            <div id="niceness"></div>
+                        </div>
+                        <div class="box content">
+                            <h1 class="title is-4 mb-1">Chunk Completion</h1>
+                            <p>
+                                How many chunks have we searched, and how many
+                                do we have left?
+                            </p>
+                            <div id="completion"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="box content has-text-centered">
+                    <p>
+                        nicenumbers.net made with ♡ by
+                        <a href="https://wasabipesto.com">wasabipesto</a>
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <script type="module">
+            import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/+esm";
+
+            async function fetchData(url) {
+                const response = await fetch(url);
+                return response.json();
+            }
+
+            (async () => {
+                const bases = await fetchData(
+                    "https://data.nicenumbers.net/bases?order=id.asc",
+                );
+                const chunks = await fetchData(
+                    "https://data.nicenumbers.net/chunks?order=id.asc",
+                );
+
+                const numbers = bases.reduce(
+                    (acc, base) => acc.concat(base.numbers),
+                    [],
+                );
+
+                const number_plot = Plot.plot({
+                    width: 900,
+                    height: 300,
+                    inset: 10,
+                    x: { label: "Number", type: "log" },
+                    y: { label: "Niceness" },
+                    color: { legend: false, scheme: "Reds", reverse: true },
+                    marks: [
+                        Plot.dot(numbers, {
+                            x: "number",
+                            y: "niceness",
+                            channels: { Base: "base", Uniques: "num_uniques" },
+                            fill: (i) => i.base - i.num_uniques,
+                            tip: {
+                                format: {
+                                    fill: false,
+                                },
+                            },
+                        }),
+                        Plot.tip(["69 is the only known nice number."], {
+                            x: 69,
+                            y: 1,
+                            dy: 3,
+                            anchor: "top-left",
+                        }),
+                        Plot.tip(
+                            [
+                                "4,134,931,983,708 is the largest known off-by-one!",
+                            ],
+                            {
+                                x: 4134931983708,
+                                y: 0.975,
+                                dy: -3,
+                                anchor: "bottom-right",
+                            },
+                        ),
+                        Plot.tip(['This arc is the "off-by-two" crowd.'], {
+                            x: 324147,
+                            y: 0.90909,
+                            dx: -3,
+                            anchor: "right",
+                        }),
+                        Plot.ruleY([1], {
+                            stroke: "rgb(103, 0, 13)",
+                            opacity: 0.5,
+                        }),
+                    ],
+                });
+                const number_div = document.querySelector("#numbers");
+                number_div.append(number_plot);
+
+                const max_range_end = chunks
+                    .filter((item) => item.niceness_mean !== null)
+                    .reduce(
+                        (max, item) =>
+                            item.range_end > max ? item.range_end : max,
+                        -Infinity,
+                    );
+                const niceness_plot = Plot.plot({
+                    width: 900,
+                    height: 300,
+                    insetLeft: 10,
+                    x: {
+                        label: "Chunk",
+                        type: "log",
+                        domain: [45, max_range_end],
+                    },
+                    y: {
+                        label: "Niceness",
+                        domain: [0.35, 0.9],
+                    },
+                    color: { legend: false, scheme: "Reds" },
+                    marks: [
+                        Plot.rect(chunks, {
+                            x1: (i) => i.range_start,
+                            x2: (i) => i.range_end,
+                            y1: (i) => i.niceness_mean - i.niceness_stdev,
+                            y2: (i) => i.niceness_mean + i.niceness_stdev,
+                            stroke: "black",
+                            strokeWidth: (i) => (i.base_id == 12 ? 1 : 0),
+                            fill: "niceness_mean",
+                            opacity: 0.5,
+                            channels: {
+                                Base: "base_id",
+                                "Niceness Mean": "niceness_mean",
+                                "Niceness StDev": "niceness_stdev",
+                            },
+                            tip: {
+                                format: {
+                                    base_id: false,
+                                    fill: false,
+                                    y: false,
+                                    strokeWidth: false,
+                                },
+                            },
+                        }),
+                        Plot.tip(
+                            [
+                                "Base 10's average niceness is skewed high due to 69.",
+                            ],
+                            { x: 69, y: 0.775, anchor: "bottom-left" },
+                        ),
+                        Plot.tip(["Base 12's niceness is surprisingly low."], {
+                            x: 236,
+                            y: 0.48,
+                            anchor: "top-left",
+                        }),
+                        Plot.tip(
+                            [
+                                "The first few chunks in each range start low before returning to normal.",
+                            ],
+                            { x: 9.5e10, y: 0.563, anchor: "top" },
+                        ),
+                        Plot.tip(
+                            [
+                                "The ranges seem to be approaching a niceness of 0.632, which is what we would expect for a random distribution.",
+                            ],
+                            { x: 4.5e12, y: 0.685, anchor: "bottom-right" },
+                        ),
+                        Plot.ruleY([0.632], { stroke: "black", opacity: 0.3 }),
+                    ],
+                });
+                const niceness_div = document.querySelector("#niceness");
+                niceness_div.append(niceness_plot);
+
+                const completion_plot = Plot.plot({
+                    width: 900,
+                    //height: 700,
+                    x: { axis: null },
+                    y: { axis: null },
+                    marks: [
+                        Plot.rect(chunks, {
+                            x: (i) => chunks.indexOf(i) % 50,
+                            y: (i) => Math.floor(chunks.indexOf(i) / 50),
+                            fill: (i) =>
+                                i.minimum_cl > 1
+                                    ? "Searched (Detailed)"
+                                    : i.minimum_cl > 0
+                                      ? "Searched (Nice Only)"
+                                      : "Unsearched",
+                            channels: {
+                                Base: "base_id",
+                                Size: "range_size",
+                                Status: "fill",
+                            },
+                            tip: {
+                                format: {
+                                    base: true,
+                                    size: true,
+                                    x: false,
+                                    y: false,
+                                },
+                            },
+                        }),
+                        Plot.tip(
+                            [
+                                "The first few chunks are small and can easily be searched in a few seconds.",
+                            ],
+                            { x: 1, y: 1, anchor: "top-left" },
+                        ),
+                        Plot.tip(
+                            [
+                                "Starting here the chunks are 47 billion numbers, taking around 3 hours each.",
+                            ],
+                            { x: 23, y: 6, anchor: "bottom" },
+                        ),
+                        Plot.tip(
+                            [
+                                "Starting here the chunks are 5.5 trillion numbers, taking around 2 weeks each.",
+                            ],
+                            { x: 22, y: 14, anchor: "left" },
+                        ),
+                    ],
+                });
+                const completion_div = document.querySelector("#completion");
+                completion_div.append(completion_plot);
+            })();
+        </script>
+    </body>
+</html>
