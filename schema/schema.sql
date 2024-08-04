@@ -76,3 +76,7 @@ GRANT SELECT ON chunks TO web_anon;
 GRANT SELECT ON fields TO web_anon;
 GRANT SELECT ON claims TO web_anon;
 GRANT SELECT ON submissions TO web_anon;
+-- ADDITIONAL INDEXES
+CREATE INDEX idx_fields_base_id ON fields(base_id);
+CREATE INDEX idx_fields_range_start ON fields(range_start);
+CREATE INDEX idx_fields_range_end ON fields(range_end);

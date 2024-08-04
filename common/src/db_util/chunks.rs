@@ -170,10 +170,10 @@ pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(
             AND f.range_end <= c.range_end
             WHERE f.base_id = $1
         )
-        UPDATE field
+        UPDATE fields
         SET chunk_id = updated_fields.chunk_id
         FROM updated_fields
-        WHERE field.id = updated_fields.field_id;"
+        WHERE fields.id = updated_fields.field_id;"
         .to_string();
 
     diesel::sql_query(query)
