@@ -12,7 +12,6 @@
             rel="icon"
             href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✨</text></svg>"
         />
-        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
         <style>
             .modebar-btn .icon {
                 height: 0.75em;
@@ -323,6 +322,7 @@
                                       : "Unsearched",
                             channels: {
                                 Base: "base_id",
+                                Start: "range_start",
                                 Size: "range_size",
                                 Status: "fill",
                             },
@@ -343,15 +343,21 @@
                         ),
                         Plot.tip(
                             [
-                                "Starting here the chunks are 47 billion numbers, taking around 3 hours each.",
+                                "Starting here the chunks are 47 billion numbers, taking a few hours each.",
                             ],
                             { x: 23, y: 6, anchor: "bottom" },
                         ),
                         Plot.tip(
                             [
-                                "Starting here the chunks are 5.5 trillion numbers, taking around 2 weeks each.",
+                                "Starting here the chunks are 5.4 trillion numbers, taking around a week each.",
                             ],
                             { x: 22, y: 14, anchor: "left" },
+                        ),
+                        Plot.tip(
+                            [
+                                "Starting here the chunks are 711 trillion numbers, taking a few years each.",
+                            ],
+                            { x: 22, y: 21, anchor: "left" },
                         ),
                     ],
                 });

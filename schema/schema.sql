@@ -80,3 +80,4 @@ GRANT SELECT ON submissions TO web_anon;
 CREATE INDEX idx_fields_base_id ON fields(base_id);
 CREATE INDEX idx_fields_range_start ON fields(range_start);
 CREATE INDEX idx_fields_range_end ON fields(range_end);
+CREATE INDEX idx_fields_check_level ON fields(check_level);
