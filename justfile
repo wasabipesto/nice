@@ -4,6 +4,10 @@ set dotenv-load
 default:
   just --list
 
+# Run all tests
+test:
+    cargo test
+
 # Run client continuously
 client mode='detailed':
     cargo run -r --bin nice_client -- --repeat {{mode}}
