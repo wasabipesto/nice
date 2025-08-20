@@ -1,6 +1,21 @@
-//! A module with "nice" calculation utilities.
-//! We will iterate over n as u128 (max 3.4e38), but expand it into Natural for n^2 and n^3.
-//! That means we can go up through base 97 (5.6e37 to 2.6e38) but not base 98 (3.1e38 to 6.7e38).
+//! A module with "nice" calculation utilities for the client.
+//!
+//! The search ranges are precalculated by the server and all numbers in the range are guaranteed to have a
+//! square and cube ("sqube") with the correct number of digits. The ranges provided are a sequential and continuous.
+//!
+//! There's some tradeoffs to make for speed:
+//!  1. We can either get all nicencess statistics (detailed mode) or just the 100% nice numbers (nice-only mode).
+//!     Nice-only is much faster because it uses some smart filtering and breaks out of the hot loop early.
+//!     Detailed mode is good for analytics and potentially finding patters to help reduce the search space.
+//!  2. We could deserialize our search range as Natural (arbitrarily-large) numbers, but operations on them are slow.
+//!     We could deserialize perform all operations as u128, but we have to hold n^3 in memory which limits the maximum
+//!     value to 7e12 (cube root of 3.4e38). This would get us through base 40 (1.9e12 to 6.5e12) but not base 41.
+//!     Instead, we will iterate over n as u128 (max 3.4e38), but expand it into Natural for n^2 and n^3.
+//!     That means we can go up through base 97 (5.6e37 to 2.6e38) but not base 98 (3.1e38 to 6.7e38).
+//!
+//! Currently the ranges of interest are bases 40-60 (1.9e12 to 2.1e21), so these tradeoffs will last us for a while.
+//! Clients are able to choose if they want to contribute to (or even re-implement) the detailed or nice-only searches,
+//! and the results are verified via consensus to ensure that everything can be trusted.
 
 use super::*;
 
