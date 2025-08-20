@@ -1,4 +1,4 @@
-//! A module for deaing with residue filters
+//! A module for dealing with residue filters
 //! For more information: https://beautifulthorns.wixsite.com/home/post/progress-update-on-the-search-for-nice-numbers
 
 /// Get a list of residue filters for a base.
@@ -6,6 +6,14 @@ pub fn get_residue_filter(base: &u32) -> Vec<u32> {
     let target_residue = base * (base - 1) / 2 % (base - 1);
     (0..(base - 1))
         .filter(|num| (num.pow(2) + num.pow(3)) % (base - 1) == target_residue)
+        .collect()
+}
+
+/// Get a list of residue filters for a base, but as u128 for easier processing.
+pub fn get_residue_filter_u128(base: &u32) -> Vec<u128> {
+    get_residue_filter(base)
+        .iter()
+        .map(|num| *num as u128)
         .collect()
 }
 
@@ -63,5 +71,63 @@ mod tests {
         );
         assert_eq!(get_residue_filter(&119), Vec::<u32>::new());
         assert_eq!(get_residue_filter(&120), Vec::from([0, 34, 84, 118]));
+    }
+
+    #[test]
+    fn test_get_residue_filter_u128() {
+        assert_eq!(get_residue_filter_u128(&10), Vec::from([0, 3, 6, 8]));
+        assert_eq!(get_residue_filter_u128(&11), Vec::<u128>::new());
+        assert_eq!(get_residue_filter_u128(&12), Vec::from([0, 10]));
+        assert_eq!(get_residue_filter_u128(&13), Vec::from([5, 9]));
+        assert_eq!(get_residue_filter_u128(&14), Vec::from([0, 12]));
+        assert_eq!(get_residue_filter_u128(&15), Vec::<u128>::new());
+        assert_eq!(get_residue_filter_u128(&16), Vec::from([0, 5, 9, 14]));
+        assert_eq!(get_residue_filter_u128(&17), Vec::from([7]));
+        assert_eq!(get_residue_filter_u128(&18), Vec::from([0, 16]));
+        assert_eq!(get_residue_filter_u128(&19), Vec::<u128>::new());
+        assert_eq!(get_residue_filter_u128(&20), Vec::from([0, 18]));
+        assert_eq!(get_residue_filter_u128(&21), Vec::from([5, 9]));
+        assert_eq!(get_residue_filter_u128(&22), Vec::from([0, 6, 14, 20]));
+        assert_eq!(get_residue_filter_u128(&23), Vec::<u128>::new());
+        assert_eq!(get_residue_filter_u128(&24), Vec::from([0, 22]));
+        assert_eq!(
+            get_residue_filter_u128(&25),
+            Vec::from([2, 3, 6, 11, 14, 18])
+        );
+        assert_eq!(
+            get_residue_filter_u128(&26),
+            Vec::from([0, 5, 10, 15, 20, 24])
+        );
+        assert_eq!(get_residue_filter_u128(&27), Vec::<u128>::new());
+        assert_eq!(get_residue_filter_u128(&28), Vec::from([0, 9, 18, 26]));
+        assert_eq!(get_residue_filter_u128(&29), Vec::from([13, 21]));
+        assert_eq!(get_residue_filter_u128(&30), Vec::from([0, 28]));
+        assert_eq!(get_residue_filter_u128(&40), Vec::from([0, 12, 26, 38]));
+        assert_eq!(
+            get_residue_filter_u128(&50),
+            Vec::from([0, 7, 14, 21, 28, 35, 42, 48])
+        );
+        assert_eq!(get_residue_filter_u128(&60), Vec::from([0, 58]));
+        assert_eq!(get_residue_filter_u128(&70), Vec::from([0, 23, 45, 68]));
+        assert_eq!(get_residue_filter_u128(&80), Vec::from([0, 78]));
+        assert_eq!(get_residue_filter_u128(&90), Vec::from([0, 88]));
+        assert_eq!(
+            get_residue_filter_u128(&100),
+            Vec::from([0, 21, 33, 44, 54, 66, 87, 98])
+        );
+        assert_eq!(get_residue_filter_u128(&110), Vec::from([0, 108]));
+        assert_eq!(get_residue_filter_u128(&111), Vec::<u128>::new());
+        assert_eq!(get_residue_filter_u128(&112), Vec::from([0, 36, 74, 110]));
+        assert_eq!(get_residue_filter_u128(&113), Vec::from([7, 55]));
+        assert_eq!(get_residue_filter_u128(&114), Vec::from([0, 112]));
+        assert_eq!(get_residue_filter_u128(&115), Vec::<u128>::new());
+        assert_eq!(get_residue_filter_u128(&116), Vec::from([0, 45, 69, 114]));
+        assert_eq!(get_residue_filter_u128(&117), Vec::from([29, 57]));
+        assert_eq!(
+            get_residue_filter_u128(&118),
+            Vec::from([0, 12, 26, 39, 51, 78, 90, 116])
+        );
+        assert_eq!(get_residue_filter_u128(&119), Vec::<u128>::new());
+        assert_eq!(get_residue_filter_u128(&120), Vec::from([0, 34, 84, 118]));
     }
 }
