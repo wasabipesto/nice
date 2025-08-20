@@ -63,12 +63,14 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
     let range_start = claim_data.range_start;
     let range_end = claim_data.range_end;
 
-    // get the minimum cutoff (90% of the base)
+    // calculate the minimum num_unique_digits cutoff (default 90% of the base)
     let nice_list_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
 
-    // init the output maps
-    let mut unique_distribution: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
-    let mut nice_numbers: HashMap<u128, u32> = HashMap::new();
+    // initialize a list of nice numbers, ready to submit
+    let mut nice_numbers: Vec<NiceNumberSimple> = Vec::new();
+
+    // initialize a map indexed by num_unique_digits with the count of each
+    let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
 
     // process the range and collect num_uniques for each item in the range
     (range_start..range_end).for_each(|num| {
@@ -84,33 +86,31 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
         // allocating everything at once takes, uh, a bit too much memory.
 
         // increment the correct bin in the distribution
-        *unique_distribution.entry(num_unique_digits).or_insert(0) += 1;
+        *unique_distribution_map
+            .entry(num_unique_digits)
+            .or_insert(0) += 1;
 
         // save if the number is sufficiently nice
         if num_unique_digits > nice_list_cutoff {
-            nice_numbers.insert(num, num_unique_digits);
+            nice_numbers.push(NiceNumberSimple {
+                number: num,
+                num_uniques: num_unique_digits,
+            });
         }
     });
 
-    let mut submit_distribution: Vec<UniquesDistributionSimple> = unique_distribution
+    let mut submit_distribution: Vec<UniquesDistributionSimple> = unique_distribution_map
         .into_iter()
         .map(|(num_uniques, count)| UniquesDistributionSimple { num_uniques, count })
         .collect();
     submit_distribution.sort_by_key(|d| d.num_uniques);
-    let submit_numbers = nice_numbers
-        .into_iter()
-        .map(|(number, num_uniques)| NiceNumberSimple {
-            number,
-            num_uniques,
-        })
-        .collect();
 
     DataToServer {
         claim_id: claim_data.claim_id,
         username: username.to_owned(),
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution: Some(submit_distribution),
-        nice_numbers: submit_numbers,
+        nice_numbers,
     }
 }
 
