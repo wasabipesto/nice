@@ -72,32 +72,37 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
     // initialize a map indexed by num_unique_digits with the count of each
     let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
 
-    // process the range and collect num_uniques for each item in the range
-    (range_start..range_end).for_each(|num| {
-        // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    // break up the range into chunks
+    let chunk_size: usize = 10_000;
+    let chunks = (range_start..range_end).chunks(chunk_size);
 
-        // get the number of uniques
-        let num_unique_digits = get_num_unique_digits(num, base);
+    // process everything, saving results and aggregating after each chunk finishes
+    for chunk in &chunks {
+        // get chunk results
+        let chunk_results: Vec<(u128, u32)> = chunk
+            .map(|num| (num, get_num_unique_digits(num, base)))
+            .collect();
 
-        // TODO: Break this up into chunks
-        // There's a tradeoff between allocating a bunch of memory upfront and
-        // aggregating stats (distribution, top nice numbers) later, or updating
-        // the stats as we go. Doing it for every number just wastes cycles but
-        // allocating everything at once takes, uh, a bit too much memory.
-
-        // increment the correct bin in the distribution
-        *unique_distribution_map
-            .entry(num_unique_digits)
-            .or_insert(0) += 1;
-
-        // save if the number is sufficiently nice
-        if num_unique_digits > nice_list_cutoff {
-            nice_numbers.push(NiceNumberSimple {
-                number: num,
-                num_uniques: num_unique_digits,
-            });
+        // aggregate unique_distribution
+        for (bin_uniques, total_count) in unique_distribution_map.iter_mut() {
+            let chunk_count = chunk_results
+                .iter()
+                .filter(|(_, num_unique_digits)| num_unique_digits == bin_uniques)
+                .count() as u128;
+            *total_count += chunk_count;
         }
-    });
+
+        // collect nice numbers
+        nice_numbers.extend(
+            chunk_results
+                .into_iter()
+                .filter(|(_, num_unique_digits)| num_unique_digits > &nice_list_cutoff)
+                .map(|(num, num_unique_digits)| NiceNumberSimple {
+                    number: num,
+                    num_uniques: num_unique_digits,
+                }),
+        );
+    }
 
     let mut submit_distribution: Vec<UniquesDistributionSimple> = unique_distribution_map
         .into_iter()
