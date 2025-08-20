@@ -25,9 +25,9 @@ use super::*;
 pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
     // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
 
-    // create a boolean array that represents all possible digits
-    // tested allocating this outside of the loop and it didn't have any effect
-    let mut digits_indicator: Vec<bool> = vec![false; base as usize];
+    // create an indicator variable as a boolean array
+    // each bit represents a number, flip them with bit ops
+    let mut digits_indicator: u128 = 0;
 
     // convert u128 to natural
     let num = Natural::from(num_u128);
@@ -36,24 +36,17 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
     // tried using foiled out versions but malachite is already pretty good
     let squared = (&num).pow(2);
     for digit in squared.to_digits_asc(&base) {
-        digits_indicator[digit as usize] = true;
+        digits_indicator |= 1 << digit;
     }
 
     // cube, convert to base and save the digits
     let cubed = squared * &num;
     for digit in cubed.to_digits_asc(&base) {
-        digits_indicator[digit as usize] = true;
+        digits_indicator |= 1 << digit;
     }
 
     // output the number of unique digits
-    let mut num_unique_digits = 0;
-    for digit in digits_indicator {
-        if digit {
-            num_unique_digits += 1
-        }
-    }
-
-    num_unique_digits
+    digits_indicator.count_ones()
 }
 
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
