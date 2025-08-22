@@ -1,6 +1,6 @@
-# Nice Numbers Web Client
+# Nice Numbers - Browser Client
 
-A WebAssembly-based browser client for the Nice Numbers distributed computing project. This client allows you to contribute to the search for "nice numbers" (square-cube pandigitals) directly from your web browser.
+A WebAssembly-powered browser client for the Nice Numbers distributed computing project. This client allows you to contribute to the search for "nice numbers" (square-cube pandigitals) directly from your web browser using Web Workers for responsive performance.
 
 ## What are Nice Numbers?
 
@@ -10,243 +10,180 @@ Nice numbers are square-cube pandigitals - numbers where the digits in their squ
 
 - 🌐 **Browser-based**: No installation required, runs directly in your web browser
 - ⚡ **WebAssembly powered**: Uses Rust compiled to WASM for high performance
-- 🧵 **Web Worker support**: Non-blocking computation that keeps your browser responsive
+- 🧵 **Web Worker architecture**: Non-blocking computation keeps your browser responsive
 - 🔧 **Two search modes**:
   - **Nice-only mode**: Fast search that only finds 100% nice numbers
   - **Detailed mode**: Slower search that collects comprehensive statistics
 - 🧪 **Offline testing**: Built-in benchmark mode for testing without server connection
-- 📊 **Real-time progress**: Live updates on processing status and results
+- 📊 **Real-time progress**: Live updates on processing status without UI freezing
 
-## Prerequisites
+## Quick Start
 
-- **Rust toolchain** (for building)
-- **wasm-pack** (for WebAssembly compilation)
-- **HTTP server** (for serving the client - required due to WASM security restrictions)
+1. **Install dependencies:**
+   ```bash
+   # Install Rust (if not already installed)
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   
+   # Install wasm-pack (if not already installed)
+   curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+   ```
 
-### Installing Dependencies
+2. **Build and run:**
+   ```bash
+   cd nice/web-client
+   chmod +x run.sh
+   ./run.sh
+   ```
 
-1. Install Rust from [rustup.rs](https://rustup.rs/)
-
-2. Install wasm-pack:
-```bash
-curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-```
-
-## Building
-
-1. Navigate to the web-client directory:
-```bash
-cd nice/web-client
-```
-
-2. Run the build script:
-```bash
-chmod +x build.sh
-./build.sh
-```
-
-Or build manually:
-```bash
-wasm-pack build --target web --out-dir pkg
-```
-
-## Running
-
-After building, you need to serve the files with an HTTP server (required for WASM modules):
-
-### Option 1: Python
-```bash
-# Python 3
-python3 -m http.server 8000
-
-# Python 2
-python -m SimpleHTTPServer 8000
-```
-
-### Option 2: Node.js
-```bash
-npx serve .
-```
-
-### Option 3: PHP
-```bash
-php -S localhost:8000
-```
-
-### Option 4: Any other HTTP server
-Point your favorite HTTP server to serve the `web-client` directory.
-
-Then open your browser and navigate to `http://localhost:8000`
-
-## Client Versions
-
-This project includes two client implementations:
-
-### Standard Client (`index.html`)
-- Direct WASM execution on the main thread
-- Simpler implementation
-- May cause browser freezing during intensive computation
-
-### Web Worker Client (`index-worker.html`) - **Recommended**
-- WASM execution in a background Web Worker
-- Keeps the browser UI responsive during computation
-- Better user experience for long-running computations
-- Progress updates without blocking the interface
-
-## Usage
-
-1. **Choose your client**:
-   - Open `index-worker.html` for the recommended Web Worker version
-   - Or open `index.html` for the standard version
-
-2. **Configure settings**:
-   - Enter your username (or leave as "anonymous")
-   - Choose search mode (Nice-only is faster, Detailed provides more data)
-   - Set API URL (default: https://api.nicenumbers.net)
-   - Select Live mode to contribute, or Offline mode for testing
-
-3. **Start processing**:
-   - Click "Start Processing" to begin
-   - The client will automatically request work from the server
-   - Processing happens in your browser using WebAssembly
-   - Results are automatically submitted back to the server
-
-4. **Monitor progress**:
-   - Watch real-time status updates
-   - View processing statistics and any nice numbers found
-   - Stop processing at any time (Web Worker version is more responsive to stops)
-
-## Search Modes
-
-### Nice-only Mode (Recommended)
-- **Fast**: Optimized for speed, typically 20x faster than detailed mode
-- **Purpose**: Finds only 100% nice numbers (uses all digits exactly once)
-- **Best for**: Most users contributing to the search
-
-### Detailed Mode
-- **Slower**: Comprehensive analysis of all numbers in the range
-- **Purpose**: Collects statistics on "niceness" distribution for research
-- **Best for**: Users contributing to mathematical analysis and research
+3. **Open browser:**
+   - Navigate to `http://localhost:8000`
+   - Configure your settings and click "Start Processing"
 
 ## Architecture
 
-The web client consists of:
+### Web Worker Design
+The client uses a Web Worker architecture to prevent browser freezing:
 
-- **Rust/WASM core** (`src/lib.rs`): High-performance number processing
-- **JavaScript interface** (`index.html`, `index-worker.html`): Web UI and server communication
-- **Web Worker** (`worker.js`): Background computation for non-blocking processing
-- **WebAssembly bridge**: Seamless integration between Rust and JavaScript
+```
+Main Thread: [UI & Controls] ←→ [PostMessage API] ←→ [Web Worker: WASM Computation]
+```
 
-### Standard Version
-- WASM runs directly on main thread
-- Simple architecture but can block UI during computation
+**Benefits:**
+- UI remains responsive during computation
+- Real-time progress updates every second
+- Immediate response to stop requests
+- Better user experience for long-running tasks
 
-### Web Worker Version
-- WASM runs in a background Web Worker thread
-- Main thread handles UI updates and user interaction
-- Worker thread handles all computation and sends progress updates
-- Better user experience with responsive UI
+### Key Components
+- **`index.html`** - Main interface and Web Worker management
+- **`worker.js`** - Background computation thread
+- **`src/lib.rs`** - Rust/WASM core with digit counting algorithms
+- **`run.sh`** - Build and serve script
 
-Key functions exposed to JavaScript:
-- `process_niceonly()`: Fast nice number search
-- `process_detailed()`: Comprehensive analysis
-- `get_benchmark_field()`: Offline testing data
-- `get_num_unique_digits_wasm()`: Core digit counting function for worker
+## Usage
+
+### Configuration
+- **Username**: Your contributor name (defaults to "anonymous")
+- **Processing Mode**: 
+  - Nice-only: Fast mode, finds only 100% nice numbers
+  - Detailed: Slower mode, includes statistical analysis
+- **Server URL**: API endpoint (default: https://api.nicenumbers.net)
+- **Test Mode**: 
+  - Online: Connects to server for real work
+  - Offline: Uses benchmark data for testing
+
+### Processing
+1. Click "Start Processing" to begin
+2. Monitor real-time progress updates
+3. Results are automatically submitted to server (online mode)
+4. Processing continues automatically until stopped
+5. Click "Stop Processing" to halt immediately
+
+## Performance
+
+### Typical Rates (Modern Browser)
+- **Nice-only mode**: ~1M numbers/second
+- **Detailed mode**: ~50K numbers/second
+- **Progress updates**: Every 1 second with minimal overhead
+- **Stop response**: <100ms from user interaction
+
+### Browser Compatibility
+- **Chrome/Chromium**: Excellent performance
+- **Firefox**: Excellent performance
+- **Safari**: Good performance
+- **Edge**: Excellent performance
+
+**Requirements:**
+- Web Workers support (all modern browsers)
+- WebAssembly support (all modern browsers)
+- HTTP/HTTPS serving (required for WASM security)
 
 ## Development
 
 ### Project Structure
 ```
 web-client/
-├── src/
-│   └── lib.rs          # Main Rust/WASM implementation
+├── src/lib.rs          # Rust/WASM implementation
+├── index.html          # Main Web Worker interface
+├── worker.js           # Web Worker background script
+├── run.sh              # Build and serve script
+├── serve.py            # Development server with WASM support
 ├── pkg/                # Generated WASM files (after build)
-├── index.html          # Standard web interface
-├── index-worker.html   # Web Worker version (recommended)
-├── worker.js          # Web Worker script for background processing
-├── run.sh             # Build and serve script
-├── serve.py           # Development server with WASM support
-├── Cargo.toml         # Rust dependencies
-└── README.md          # This file
+└── Cargo.toml          # Rust dependencies
 ```
 
 ### Key Dependencies
 - `wasm-bindgen`: Rust-JavaScript interop
-- `malachite`: Arbitrary precision arithmetic
-- `serde`: JSON serialization
-- `web-sys`: Browser APIs
+- `malachite`: Arbitrary precision arithmetic for large number handling
+- `web-sys`: Browser API bindings
 
-### Building for Different Targets
-The current build targets the web with ES modules. To build for different targets:
-
+### Manual Build
 ```bash
-# Web (ES modules) - default
-wasm-pack build --target web
+# Build WASM package
+wasm-pack build --target web --out-dir pkg
 
-# Node.js
-wasm-pack build --target nodejs
+# Serve files (required for WASM)
+python3 -m http.server 8000
 
-# Bundler (webpack, etc.)
-wasm-pack build --target bundler
+# Open browser to http://localhost:8000
 ```
 
-## Contributing
-
-This web client is part of the larger Nice Numbers project. To contribute:
-
-1. Test the client thoroughly in different browsers
-2. Report any bugs or performance issues
-3. Suggest UI improvements
-4. Help optimize the WASM performance
-5. Add new features (with appropriate tests)
-
-## Security Considerations
-
-- The client runs entirely in your browser - no external executables
-- All network communication is with the official Nice Numbers API
-- Processing happens locally using WebAssembly
-- No personal data is collected beyond the username you provide
-
-## Performance
-
-Typical performance on modern browsers:
-- **Nice-only mode**: ~1M numbers/second
-- **Detailed mode**: ~50K numbers/second
-
-Performance varies based on:
-- Browser and JavaScript engine
-- CPU speed and available cores
-- Base number being searched
-- Range size assigned by server
+### Customization
+Modify computation parameters in `worker.js`:
+```javascript
+const progressUpdateInterval = 1000; // Progress update frequency
+const chunkSize = BigInt(1000);       // Numbers processed per chunk
+```
 
 ## Troubleshooting
 
-### WASM fails to load
-- Ensure you're serving files via HTTP/HTTPS (not file://)
-- Check browser console for specific error messages
-- Try a different browser (Chrome, Firefox, Safari, Edge)
-- For Web Worker version, ensure Web Workers are supported (all modern browsers)
+### Common Issues
 
-### Browser freezing (Standard version)
-- Use the Web Worker version (`index-worker.html`) instead
-- The standard version blocks the UI thread during computation
+**WASM fails to load**
+- Ensure files are served via HTTP/HTTPS (not `file://`)
+- Check browser console for specific errors
+- Verify `pkg/` directory exists and contains `.wasm` files
 
-### Slow performance
+**Browser freezing**
+- This shouldn't happen with the Web Worker version
+- Check that Web Workers are supported in your browser
+- Monitor browser console for Web Worker errors
+
+**Slow performance**
 - Try Nice-only mode instead of Detailed mode
-- Use the Web Worker version for better responsiveness
-- Close other browser tabs/applications
-- Check if your browser supports WebAssembly (all modern browsers do)
+- Close unnecessary browser tabs
+- Check if other applications are using CPU
 
-### Web Worker issues
-- Check browser console for worker-related errors
-- Ensure `worker.js` is served from the same domain
-- Try the standard version if Web Workers aren't supported
+**Connection errors**
+- Verify API URL is correct and accessible
+- Test with offline/benchmark mode first
+- Check internet connection
 
-### Connection errors
-- Verify the API URL is correct
-- Check your internet connection
-- Try offline/benchmark mode for testing
+**Web Worker not loading**
+- Ensure `worker.js` exists and is served correctly
+- Check browser console for worker creation errors
+- Verify WASM files are built and available
+
+## Security & Privacy
+
+- Runs entirely in your browser - no external executables
+- Only communicates with the official Nice Numbers API
+- Processing happens locally using WebAssembly
+- No personal data collected beyond provided username
+- Open source - audit the code yourself
+
+## Contributing
+
+Ways to help:
+1. **Compute**: Run the client to contribute processing power
+2. **Test**: Try different browsers and report issues
+3. **Optimize**: Improve WASM performance or UI/UX
+4. **Document**: Help improve documentation and guides
 
 ## License
 
-This project is part of the Nice Numbers distributed computing project. See the main project LICENSE file for details.
+This project is part of the Nice Numbers distributed computing project. See the main project repository for license details.
+
+---
+
+**Ready to contribute?** Run `./run.sh` and start helping discover new nice numbers!
