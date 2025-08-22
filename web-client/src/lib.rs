@@ -32,7 +32,7 @@ pub struct ServerDataToClient {
     pub range_size: u128,
 }
 
-// JavaScript-compatible format (all large numbers as strings)
+// JavaScript-compatible format for input processing (all large numbers as strings)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DataToClient {
     pub claim_id: String,
@@ -42,21 +42,24 @@ pub struct DataToClient {
     pub range_size: String,
 }
 
+// Server format for nice numbers (exactly matching common library)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NiceNumberSimple {
-    pub number: String,
+    pub number: u128, // Server expects u128, not string
     pub num_uniques: u32,
 }
 
+// Server format for distribution (exactly matching common library)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UniquesDistributionSimple {
     pub num_uniques: u32,
-    pub count: String,
+    pub count: u128, // Server expects u128, not string
 }
 
+// Server submission format (exactly matching common library)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DataToServer {
-    pub claim_id: u128, // Server expects this as integer
+    pub claim_id: u128, // Server expects u128, not string
     pub username: String,
     pub client_version: String,
     pub unique_distribution: Option<Vec<UniquesDistributionSimple>>,
@@ -140,6 +143,25 @@ pub fn convert_server_response(server_json: &str) -> String {
     }
 }
 
+/// Create error response in correct server format
+fn create_error_response(
+    claim_id: u128,
+    username: &str,
+    include_distribution: bool,
+) -> DataToServer {
+    DataToServer {
+        claim_id,
+        username: username.to_string(),
+        client_version: CLIENT_VERSION.to_string(),
+        unique_distribution: if include_distribution {
+            Some(Vec::new())
+        } else {
+            None
+        },
+        nice_numbers: Vec::new(),
+    }
+}
+
 /// Process a field in "nice-only" mode (faster, only finds 100% nice numbers)
 #[wasm_bindgen]
 pub fn process_niceonly(claim_data_json: &str, username: &str) -> String {
@@ -147,14 +169,7 @@ pub fn process_niceonly(claim_data_json: &str, username: &str) -> String {
         Ok(data) => data,
         Err(e) => {
             console_log!("Error parsing claim data: {}", e);
-            // Return a valid JSON response even on error
-            let error_response = DataToServer {
-                claim_id: 0,
-                username: username.to_string(),
-                client_version: CLIENT_VERSION.to_string(),
-                unique_distribution: None,
-                nice_numbers: Vec::new(),
-            };
+            let error_response = create_error_response(0, username, false);
             return serde_json::to_string(&error_response).unwrap_or("{}".to_string());
         }
     };
@@ -164,13 +179,7 @@ pub fn process_niceonly(claim_data_json: &str, username: &str) -> String {
         Ok(n) => n,
         Err(_) => {
             console_log!("Error parsing range_start: {}", claim_data.range_start);
-            let error_response = DataToServer {
-                claim_id: 0,
-                username: username.to_string(),
-                client_version: CLIENT_VERSION.to_string(),
-                unique_distribution: None,
-                nice_numbers: Vec::new(),
-            };
+            let error_response = create_error_response(0, username, false);
             return serde_json::to_string(&error_response).unwrap_or("{}".to_string());
         }
     };
@@ -178,13 +187,7 @@ pub fn process_niceonly(claim_data_json: &str, username: &str) -> String {
         Ok(n) => n,
         Err(_) => {
             console_log!("Error parsing range_end: {}", claim_data.range_end);
-            let error_response = DataToServer {
-                claim_id: 0,
-                username: username.to_string(),
-                client_version: CLIENT_VERSION.to_string(),
-                unique_distribution: None,
-                nice_numbers: Vec::new(),
-            };
+            let error_response = create_error_response(0, username, false);
             return serde_json::to_string(&error_response).unwrap_or("{}".to_string());
         }
     };
@@ -212,7 +215,7 @@ pub fn process_niceonly(claim_data_json: &str, username: &str) -> String {
             // Only keep 100% nice numbers (all digits used)
             if num_uniques == base {
                 nice_numbers.push(NiceNumberSimple {
-                    number: num.to_string(),
+                    number: num, // Keep as u128 for server
                     num_uniques,
                 });
             }
@@ -222,7 +225,7 @@ pub fn process_niceonly(claim_data_json: &str, username: &str) -> String {
     }
 
     let submit_data = DataToServer {
-        claim_id,
+        claim_id, // u128 as expected by server
         username: username.to_string(),
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution: None,
@@ -233,13 +236,7 @@ pub fn process_niceonly(claim_data_json: &str, username: &str) -> String {
         Ok(json) => json,
         Err(e) => {
             console_log!("Error serializing submit data: {}", e);
-            let error_response = DataToServer {
-                claim_id,
-                username: username.to_string(),
-                client_version: CLIENT_VERSION.to_string(),
-                unique_distribution: None,
-                nice_numbers: Vec::new(),
-            };
+            let error_response = create_error_response(claim_id, username, false);
             serde_json::to_string(&error_response).unwrap_or("{}".to_string())
         }
     }
@@ -252,13 +249,7 @@ pub fn process_detailed(claim_data_json: &str, username: &str) -> String {
         Ok(data) => data,
         Err(e) => {
             console_log!("Error parsing claim data: {}", e);
-            let error_response = DataToServer {
-                claim_id: 0,
-                username: username.to_string(),
-                client_version: CLIENT_VERSION.to_string(),
-                unique_distribution: Some(Vec::new()),
-                nice_numbers: Vec::new(),
-            };
+            let error_response = create_error_response(0, username, true);
             return serde_json::to_string(&error_response).unwrap_or("{}".to_string());
         }
     };
@@ -268,13 +259,7 @@ pub fn process_detailed(claim_data_json: &str, username: &str) -> String {
         Ok(n) => n,
         Err(_) => {
             console_log!("Error parsing range_start: {}", claim_data.range_start);
-            let error_response = DataToServer {
-                claim_id: 0,
-                username: username.to_string(),
-                client_version: CLIENT_VERSION.to_string(),
-                unique_distribution: Some(Vec::new()),
-                nice_numbers: Vec::new(),
-            };
+            let error_response = create_error_response(0, username, true);
             return serde_json::to_string(&error_response).unwrap_or("{}".to_string());
         }
     };
@@ -282,13 +267,7 @@ pub fn process_detailed(claim_data_json: &str, username: &str) -> String {
         Ok(n) => n,
         Err(_) => {
             console_log!("Error parsing range_end: {}", claim_data.range_end);
-            let error_response = DataToServer {
-                claim_id: 0,
-                username: username.to_string(),
-                client_version: CLIENT_VERSION.to_string(),
-                unique_distribution: Some(Vec::new()),
-                nice_numbers: Vec::new(),
-            };
+            let error_response = create_error_response(0, username, true);
             return serde_json::to_string(&error_response).unwrap_or("{}".to_string());
         }
     };
@@ -323,7 +302,7 @@ pub fn process_detailed(claim_data_json: &str, username: &str) -> String {
             // Collect nice numbers above threshold
             if num_uniques > nice_list_cutoff {
                 nice_numbers.push(NiceNumberSimple {
-                    number: num.to_string(),
+                    number: num, // Keep as u128 for server
                     num_uniques,
                 });
             }
@@ -336,13 +315,13 @@ pub fn process_detailed(claim_data_json: &str, username: &str) -> String {
         .into_iter()
         .map(|(num_uniques, count)| UniquesDistributionSimple {
             num_uniques,
-            count: count.to_string(),
+            count, // Keep as u128 for server
         })
         .collect();
     submit_distribution.sort_by_key(|d| d.num_uniques);
 
     let submit_data = DataToServer {
-        claim_id,
+        claim_id, // u128 as expected by server
         username: username.to_string(),
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution: Some(submit_distribution),
@@ -353,13 +332,7 @@ pub fn process_detailed(claim_data_json: &str, username: &str) -> String {
         Ok(json) => json,
         Err(e) => {
             console_log!("Error serializing submit data: {}", e);
-            let error_response = DataToServer {
-                claim_id,
-                username: username.to_string(),
-                client_version: CLIENT_VERSION.to_string(),
-                unique_distribution: Some(Vec::new()),
-                nice_numbers: Vec::new(),
-            };
+            let error_response = create_error_response(claim_id, username, true);
             serde_json::to_string(&error_response).unwrap_or("{}".to_string())
         }
     }
@@ -370,10 +343,10 @@ pub fn process_detailed(claim_data_json: &str, username: &str) -> String {
 pub fn get_benchmark_field() -> String {
     let benchmark_data = DataToClient {
         claim_id: "0".to_string(),
-        base: 10,
-        range_start: "1000".to_string(),
-        range_end: "2000".to_string(),
-        range_size: "1000".to_string(),
+        base: 40,
+        range_start: "1916284264916".to_string(),
+        range_end: "1916294264916".to_string(),
+        range_size: "10000000".to_string(),
     };
 
     match serde_json::to_string(&benchmark_data) {

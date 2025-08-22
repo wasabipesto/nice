@@ -1,352 +1,660 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nice Numbers - Server Response Debug Tool</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            max-width: 1000px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-            color: #333;
-        }
-        .container {
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-        }
-        h1 {
-            color: #2c3e50;
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .section {
-            margin-bottom: 25px;
-            padding: 15px;
-            border-left: 4px solid #3498db;
-            background-color: #f8f9fa;
-        }
-        .controls {
-            display: grid;
-            grid-template-columns: 1fr auto;
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-        label {
-            font-weight: bold;
-            margin-bottom: 5px;
-            display: block;
-        }
-        input, select, button {
-            width: 100%;
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-        button {
-            background-color: #3498db;
-            color: white;
-            border: none;
-            cursor: pointer;
-            font-weight: bold;
-            transition: background-color 0.3s;
-            width: auto;
-            white-space: nowrap;
-        }
-        button:hover:not(:disabled) {
-            background-color: #2980b9;
-        }
-        .status {
-            padding: 10px;
-            border-radius: 4px;
-            margin-top: 15px;
-            font-weight: bold;
-        }
-        .status.info {
-            background-color: #d1ecf1;
-            color: #0c5460;
-        }
-        .status.success {
-            background-color: #d4edda;
-            color: #155724;
-        }
-        .status.error {
-            background-color: #f8d7da;
-            color: #721c24;
-        }
-        .json-display {
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 4px;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            white-space: pre-wrap;
-            border: 1px solid #dee2e6;
-            max-height: 400px;
-            overflow-y: auto;
-        }
-        .comparison {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-        }
-        .column {
-            min-height: 200px;
-        }
-        .type-info {
-            color: #666;
-            font-style: italic;
-            margin-bottom: 10px;
-        }
-        .highlight {
-            background-color: #fff3cd;
-            padding: 2px 4px;
-            border-radius: 2px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔍 Nice Numbers Server Debug Tool</h1>
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Nice Numbers - Server Response Debug Tool</title>
+        <style>
+            body {
+                font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+                max-width: 1000px;
+                margin: 0 auto;
+                padding: 20px;
+                background-color: #f5f5f5;
+                color: #333;
+            }
+            .container {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            }
+            h1 {
+                color: #2c3e50;
+                text-align: center;
+                margin-bottom: 30px;
+            }
+            .section {
+                margin-bottom: 25px;
+                padding: 15px;
+                border-left: 4px solid #3498db;
+                background-color: #f8f9fa;
+            }
+            .controls {
+                display: grid;
+                grid-template-columns: 1fr auto;
+                gap: 15px;
+                margin-bottom: 20px;
+            }
+            label {
+                font-weight: bold;
+                margin-bottom: 5px;
+                display: block;
+            }
+            input,
+            select,
+            button {
+                width: 100%;
+                padding: 8px 12px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                font-size: 14px;
+                box-sizing: border-box;
+            }
+            button {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                cursor: pointer;
+                font-weight: bold;
+                transition: background-color 0.3s;
+                width: auto;
+                white-space: nowrap;
+            }
+            button:hover:not(:disabled) {
+                background-color: #2980b9;
+            }
+            .status {
+                padding: 10px;
+                border-radius: 4px;
+                margin-top: 15px;
+                font-weight: bold;
+            }
+            .status.info {
+                background-color: #d1ecf1;
+                color: #0c5460;
+            }
+            .status.success {
+                background-color: #d4edda;
+                color: #155724;
+            }
+            .status.error {
+                background-color: #f8d7da;
+                color: #721c24;
+            }
+            .json-display {
+                background-color: #f8f9fa;
+                padding: 15px;
+                border-radius: 4px;
+                font-family: "Courier New", monospace;
+                font-size: 12px;
+                white-space: pre-wrap;
+                border: 1px solid #dee2e6;
+                max-height: 400px;
+                overflow-y: auto;
+            }
+            .comparison {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 20px;
+            }
+            .column {
+                min-height: 200px;
+            }
+            .type-info {
+                color: #666;
+                font-style: italic;
+                margin-bottom: 10px;
+            }
+            .highlight {
+                background-color: #fff3cd;
+                padding: 2px 4px;
+                border-radius: 2px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔍 Nice Numbers Server Debug Tool</h1>
 
-        <div class="section">
-            <h3>Server Request</h3>
-            <div class="controls">
-                <div>
-                    <label for="apiUrl">API URL:</label>
-                    <input type="text" id="apiUrl" value="https://api.nicenumbers.net" placeholder="API endpoint">
+            <div class="section">
+                <h3>Server Request</h3>
+                <div class="controls">
+                    <div>
+                        <label for="apiUrl">API URL:</label>
+                        <input
+                            type="text"
+                            id="apiUrl"
+                            value="https://api.nicenumbers.net"
+                            placeholder="API endpoint"
+                        />
+                    </div>
+                    <button onclick="testServerResponse()">
+                        Test Server Response
+                    </button>
                 </div>
-                <button onclick="testServerResponse()">Test Server Response</button>
-            </div>
 
-            <div class="controls">
-                <div>
-                    <label for="mode">Search Mode:</label>
-                    <select id="mode">
-                        <option value="niceonly">Nice-only</option>
-                        <option value="detailed">Detailed</option>
-                    </select>
-                </div>
-                <button onclick="testBothModes()">Test Both Modes</button>
-            </div>
-        </div>
-
-        <div id="status" class="status info">Ready to test server responses</div>
-
-        <div class="section">
-            <h3>Response Analysis</h3>
-            <div class="comparison">
-                <div class="column">
-                    <h4>Raw Server Response</h4>
-                    <div class="type-info">Direct JSON from server</div>
-                    <div id="rawResponse" class="json-display">No data yet</div>
-                </div>
-                <div class="column">
-                    <h4>Converted for WASM</h4>
-                    <div class="type-info">Numbers converted to strings</div>
-                    <div id="convertedResponse" class="json-display">No data yet</div>
+                <div class="controls">
+                    <div>
+                        <label for="mode">Search Mode:</label>
+                        <select id="mode">
+                            <option value="niceonly">Nice-only</option>
+                            <option value="detailed">Detailed</option>
+                        </select>
+                    </div>
+                    <button onclick="testBothModes()">Test Both Modes</button>
                 </div>
             </div>
+
+            <div id="status" class="status info">
+                Ready to test server responses
+            </div>
+
+            <div class="section">
+                <h3>Response Analysis</h3>
+                <div class="comparison">
+                    <div class="column">
+                        <h4>Raw Server Response</h4>
+                        <div class="type-info">Direct JSON from server</div>
+                        <div id="rawResponse" class="json-display">
+                            No data yet
+                        </div>
+                    </div>
+                    <div class="column">
+                        <h4>Converted for WASM</h4>
+                        <div class="type-info">
+                            Numbers converted to strings
+                        </div>
+                        <div id="convertedResponse" class="json-display">
+                            No data yet
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>Data Type Analysis</h3>
+                <div id="typeAnalysis" class="json-display">
+                    No analysis yet
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>Test Results</h3>
+                <div id="testResults" class="json-display">
+                    No tests run yet
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>Submission Format Test</h3>
+                <div class="controls">
+                    <button onclick="testSubmissionFormat()">
+                        Test WASM Submission Format
+                    </button>
+                    <button onclick="validateAgainstServer()">
+                        Validate Server Compatibility
+                    </button>
+                </div>
+                <div id="submissionTest" class="json-display">
+                    No submission test run yet
+                </div>
+            </div>
         </div>
 
-        <div class="section">
-            <h3>Data Type Analysis</h3>
-            <div id="typeAnalysis" class="json-display">No analysis yet</div>
-        </div>
+        <script>
+            function updateStatus(message, type = "info") {
+                const statusDiv = document.getElementById("status");
+                statusDiv.textContent = message;
+                statusDiv.className = `status ${type}`;
+            }
 
-        <div class="section">
-            <h3>Test Results</h3>
-            <div id="testResults" class="json-display">No tests run yet</div>
-        </div>
-    </div>
+            function displayJSON(elementId, data, title = "") {
+                const element = document.getElementById(elementId);
+                let output = title
+                    ? `${title}\n${"=".repeat(title.length)}\n\n`
+                    : "";
+                output += JSON.stringify(data, null, 2);
+                element.textContent = output;
+            }
 
-    <script>
-        function updateStatus(message, type = "info") {
-            const statusDiv = document.getElementById("status");
-            statusDiv.textContent = message;
-            statusDiv.className = `status ${type}`;
-        }
-
-        function displayJSON(elementId, data, title = "") {
-            const element = document.getElementById(elementId);
-            let output = title ? `${title}\n${"=".repeat(title.length)}\n\n` : "";
-            output += JSON.stringify(data, null, 2);
-            element.textContent = output;
-        }
-
-        function analyzeDataTypes(data) {
-            const analysis = {
-                fields: {},
-                largeNumbers: [],
-                potentialIssues: []
-            };
-
-            for (const [key, value] of Object.entries(data)) {
-                const type = typeof value;
-                const jsType = Array.isArray(value) ? 'array' : type;
-
-                analysis.fields[key] = {
-                    value: value,
-                    type: jsType,
-                    stringValue: String(value)
+            function analyzeDataTypes(data) {
+                const analysis = {
+                    fields: {},
+                    largeNumbers: [],
+                    potentialIssues: [],
                 };
 
-                // Check for large numbers that might cause precision issues
-                if (type === 'number' && value > Number.MAX_SAFE_INTEGER) {
-                    analysis.largeNumbers.push({
-                        field: key,
-                        value: value,
-                        maxSafeInteger: Number.MAX_SAFE_INTEGER
-                    });
-                }
+                for (const [key, value] of Object.entries(data)) {
+                    const type = typeof value;
+                    const jsType = Array.isArray(value) ? "array" : type;
 
-                // Check for potential issues
-                if (key.includes('id') && type === 'number') {
-                    analysis.potentialIssues.push(`${key} is a number (${value}) - might need string conversion for WASM`);
-                }
-                if (key.includes('start') || key.includes('end') || key.includes('size')) {
-                    if (type === 'number') {
-                        analysis.potentialIssues.push(`${key} is a number (${value}) - might need string conversion for large ranges`);
+                    analysis.fields[key] = {
+                        value: value,
+                        type: jsType,
+                        stringValue: String(value),
+                    };
+
+                    // Check for large numbers that might cause precision issues
+                    if (type === "number" && value > Number.MAX_SAFE_INTEGER) {
+                        analysis.largeNumbers.push({
+                            field: key,
+                            value: value,
+                            maxSafeInteger: Number.MAX_SAFE_INTEGER,
+                        });
+                    }
+
+                    // Check for potential issues
+                    if (key.includes("id") && type === "number") {
+                        analysis.potentialIssues.push(
+                            `${key} is a number (${value}) - might need string conversion for WASM`,
+                        );
+                    }
+                    if (
+                        key.includes("start") ||
+                        key.includes("end") ||
+                        key.includes("size")
+                    ) {
+                        if (type === "number") {
+                            analysis.potentialIssues.push(
+                                `${key} is a number (${value}) - might need string conversion for large ranges`,
+                            );
+                        }
                     }
                 }
+
+                return analysis;
             }
 
-            return analysis;
-        }
-
-        function convertToWASMFormat(serverData) {
-            return {
-                claim_id: String(serverData.claim_id || 0),
-                base: serverData.base || 10,
-                range_start: String(serverData.range_start || 0),
-                range_end: String(serverData.range_end || 0),
-                range_size: String(serverData.range_size || 0),
-            };
-        }
-
-        async function testServerResponse() {
-            const apiUrl = document.getElementById("apiUrl").value;
-            const mode = document.getElementById("mode").value;
-
-            updateStatus("Testing server response...", "info");
-
-            try {
-                const endpoint = mode === 'detailed' ? '/claim/detailed' : '/claim/niceonly';
-                const response = await fetch(`${apiUrl}${endpoint}`);
-
-                if (!response.ok) {
-                    throw new Error(`Server responded with ${response.status}: ${response.statusText}`);
-                }
-
-                const serverData = await response.json();
-
-                // Display raw response
-                displayJSON("rawResponse", serverData, `${mode.toUpperCase()} Mode Response`);
-
-                // Convert and display
-                const convertedData = convertToWASMFormat(serverData);
-                displayJSON("convertedResponse", convertedData, "WASM-Compatible Format");
-
-                // Analyze data types
-                const analysis = analyzeDataTypes(serverData);
-                displayJSON("typeAnalysis", analysis, "Data Type Analysis");
-
-                // Test results
-                const testResults = {
-                    timestamp: new Date().toISOString(),
-                    mode: mode,
-                    endpoint: endpoint,
-                    success: true,
-                    serverDataTypes: Object.keys(serverData).map(key => ({
-                        field: key,
-                        type: typeof serverData[key],
-                        value: serverData[key]
-                    })),
-                    conversionIssues: analysis.potentialIssues,
-                    largeNumbers: analysis.largeNumbers
+            function convertToWASMFormat(serverData) {
+                return {
+                    claim_id: String(serverData.claim_id || 0),
+                    base: serverData.base || 10,
+                    range_start: String(serverData.range_start || 0),
+                    range_end: String(serverData.range_end || 0),
+                    range_size: String(serverData.range_size || 0),
                 };
-
-                displayJSON("testResults", testResults, "Test Results Summary");
-                updateStatus(`Successfully tested ${mode} mode - check results below`, "success");
-
-            } catch (error) {
-                updateStatus(`Error: ${error.message}`, "error");
-                displayJSON("testResults", {
-                    timestamp: new Date().toISOString(),
-                    mode: mode,
-                    success: false,
-                    error: error.message,
-                    stack: error.stack
-                }, "Error Details");
             }
-        }
 
-        async function testBothModes() {
-            updateStatus("Testing both modes...", "info");
+            async function testServerResponse() {
+                const apiUrl = document.getElementById("apiUrl").value;
+                const mode = document.getElementById("mode").value;
 
-            const modes = ['niceonly', 'detailed'];
-            const results = {};
+                updateStatus("Testing server response...", "info");
 
-            for (const mode of modes) {
-                document.getElementById("mode").value = mode;
                 try {
-                    const apiUrl = document.getElementById("apiUrl").value;
-                    const endpoint = mode === 'detailed' ? '/claim/detailed' : '/claim/niceonly';
+                    const endpoint =
+                        mode === "detailed"
+                            ? "/claim/detailed"
+                            : "/claim/niceonly";
                     const response = await fetch(`${apiUrl}${endpoint}`);
 
-                    if (response.ok) {
-                        const data = await response.json();
-                        results[mode] = {
-                            success: true,
-                            data: data,
-                            dataTypes: Object.keys(data).map(key => ({
-                                field: key,
-                                type: typeof data[key],
-                                value: data[key]
-                            }))
-                        };
-                    } else {
+                    if (!response.ok) {
+                        throw new Error(
+                            `Server responded with ${response.status}: ${response.statusText}`,
+                        );
+                    }
+
+                    const serverData = await response.json();
+
+                    // Display raw response
+                    displayJSON(
+                        "rawResponse",
+                        serverData,
+                        `${mode.toUpperCase()} Mode Response`,
+                    );
+
+                    // Convert and display
+                    const convertedData = convertToWASMFormat(serverData);
+                    displayJSON(
+                        "convertedResponse",
+                        convertedData,
+                        "WASM-Compatible Format",
+                    );
+
+                    // Analyze data types
+                    const analysis = analyzeDataTypes(serverData);
+                    displayJSON("typeAnalysis", analysis, "Data Type Analysis");
+
+                    // Test results
+                    const testResults = {
+                        timestamp: new Date().toISOString(),
+                        mode: mode,
+                        endpoint: endpoint,
+                        success: true,
+                        serverDataTypes: Object.keys(serverData).map((key) => ({
+                            field: key,
+                            type: typeof serverData[key],
+                            value: serverData[key],
+                        })),
+                        conversionIssues: analysis.potentialIssues,
+                        largeNumbers: analysis.largeNumbers,
+                    };
+
+                    displayJSON(
+                        "testResults",
+                        testResults,
+                        "Test Results Summary",
+                    );
+                    updateStatus(
+                        `Successfully tested ${mode} mode - check results below`,
+                        "success",
+                    );
+                } catch (error) {
+                    updateStatus(`Error: ${error.message}`, "error");
+                    displayJSON(
+                        "testResults",
+                        {
+                            timestamp: new Date().toISOString(),
+                            mode: mode,
+                            success: false,
+                            error: error.message,
+                            stack: error.stack,
+                        },
+                        "Error Details",
+                    );
+                }
+            }
+
+            async function testBothModes() {
+                updateStatus("Testing both modes...", "info");
+
+                const modes = ["niceonly", "detailed"];
+                const results = {};
+
+                for (const mode of modes) {
+                    document.getElementById("mode").value = mode;
+                    try {
+                        const apiUrl = document.getElementById("apiUrl").value;
+                        const endpoint =
+                            mode === "detailed"
+                                ? "/claim/detailed"
+                                : "/claim/niceonly";
+                        const response = await fetch(`${apiUrl}${endpoint}`);
+
+                        if (response.ok) {
+                            const data = await response.json();
+                            results[mode] = {
+                                success: true,
+                                data: data,
+                                dataTypes: Object.keys(data).map((key) => ({
+                                    field: key,
+                                    type: typeof data[key],
+                                    value: data[key],
+                                })),
+                            };
+                        } else {
+                            results[mode] = {
+                                success: false,
+                                error: `${response.status}: ${response.statusText}`,
+                            };
+                        }
+                    } catch (error) {
                         results[mode] = {
                             success: false,
-                            error: `${response.status}: ${response.statusText}`
+                            error: error.message,
                         };
                     }
-                } catch (error) {
-                    results[mode] = {
-                        success: false,
-                        error: error.message
+                }
+
+                displayJSON(
+                    "testResults",
+                    {
+                        timestamp: new Date().toISOString(),
+                        testType: "Both Modes Comparison",
+                        results: results,
+                        comparison: {
+                            bothSucceeded:
+                                results.niceonly?.success &&
+                                results.detailed?.success,
+                            sameStructure:
+                                JSON.stringify(
+                                    Object.keys(results.niceonly?.data || {}),
+                                ) ===
+                                JSON.stringify(
+                                    Object.keys(results.detailed?.data || {}),
+                                ),
+                        },
+                    },
+                    "Both Modes Test Results",
+                );
+
+                if (results.niceonly?.success) {
+                    displayJSON(
+                        "rawResponse",
+                        results.niceonly.data,
+                        "NICEONLY Mode Response",
+                    );
+                    const converted = convertToWASMFormat(
+                        results.niceonly.data,
+                    );
+                    displayJSON(
+                        "convertedResponse",
+                        converted,
+                        "WASM-Compatible Format",
+                    );
+                }
+
+                updateStatus("Both modes tested - check results", "success");
+            }
+
+            async function testSubmissionFormat() {
+                updateStatus("Testing WASM submission format...", "info");
+
+                try {
+                    // Load WASM module if not already loaded
+                    if (!window.wasm) {
+                        const wasmModule = await import(
+                            "./pkg/nice_web_client.js"
+                        );
+                        await wasmModule.default();
+                        window.wasm = wasmModule;
+                    }
+
+                    // Get benchmark data and process it
+                    const benchmarkJson = window.wasm.get_benchmark_field();
+                    const claimData = JSON.parse(benchmarkJson);
+
+                    // Process with both modes
+                    const niceonlyResult = window.wasm.process_niceonly(
+                        benchmarkJson,
+                        "test_user",
+                    );
+                    const detailedResult = window.wasm.process_detailed(
+                        benchmarkJson,
+                        "test_user",
+                    );
+
+                    const niceonlyData = JSON.parse(niceonlyResult);
+                    const detailedData = JSON.parse(detailedResult);
+
+                    // Analyze the formats
+                    const analysis = {
+                        benchmark_input: claimData,
+                        niceonly_output: {
+                            data: niceonlyData,
+                            data_types: analyzeSubmissionTypes(niceonlyData),
+                        },
+                        detailed_output: {
+                            data: detailedData,
+                            data_types: analyzeSubmissionTypes(detailedData),
+                        },
+                        server_compatibility: {
+                            claim_id_is_number:
+                                typeof niceonlyData.claim_id === "number",
+                            nice_numbers_format:
+                                niceonlyData.nice_numbers.length > 0
+                                    ? typeof niceonlyData.nice_numbers[0]
+                                          .number === "number"
+                                    : "no_numbers_found",
+                            distribution_format:
+                                detailedData.unique_distribution
+                                    ? typeof detailedData.unique_distribution[0]
+                                          .count === "number"
+                                    : "no_distribution",
+                        },
                     };
+
+                    displayJSON(
+                        "submissionTest",
+                        analysis,
+                        "WASM Submission Format Analysis",
+                    );
+                    updateStatus("Submission format test completed", "success");
+                } catch (error) {
+                    updateStatus(
+                        `Submission test error: ${error.message}`,
+                        "error",
+                    );
+                    displayJSON(
+                        "submissionTest",
+                        {
+                            error: error.message,
+                            stack: error.stack,
+                        },
+                        "Submission Test Error",
+                    );
                 }
             }
 
-            displayJSON("testResults", {
-                timestamp: new Date().toISOString(),
-                testType: "Both Modes Comparison",
-                results: results,
-                comparison: {
-                    bothSucceeded: results.niceonly?.success && results.detailed?.success,
-                    sameStructure: JSON.stringify(Object.keys(results.niceonly?.data || {})) ===
-                                  JSON.stringify(Object.keys(results.detailed?.data || {}))
+            function analyzeSubmissionTypes(submitData) {
+                const types = {};
+                for (const [key, value] of Object.entries(submitData)) {
+                    if (Array.isArray(value)) {
+                        types[key] = {
+                            type: "array",
+                            length: value.length,
+                            first_item_type:
+                                value.length > 0 ? typeof value[0] : "empty",
+                        };
+                        if (value.length > 0 && typeof value[0] === "object") {
+                            types[key].first_item_fields = {};
+                            for (const [fieldKey, fieldValue] of Object.entries(
+                                value[0],
+                            )) {
+                                types[key].first_item_fields[fieldKey] =
+                                    typeof fieldValue;
+                            }
+                        }
+                    } else {
+                        types[key] = {
+                            type: typeof value,
+                            value: value,
+                        };
+                    }
                 }
-            }, "Both Modes Test Results");
-
-            if (results.niceonly?.success) {
-                displayJSON("rawResponse", results.niceonly.data, "NICEONLY Mode Response");
-                const converted = convertToWASMFormat(results.niceonly.data);
-                displayJSON("convertedResponse", converted, "WASM-Compatible Format");
+                return types;
             }
 
-            updateStatus("Both modes tested - check results", "success");
-        }
+            async function validateAgainstServer() {
+                updateStatus("Validating server compatibility...", "info");
 
-        // Test on page load with default values
-        updateStatus("Debug tool ready - click 'Test Server Response' to begin", "success");
-    </script>
-</body>
+                try {
+                    const apiUrl = document.getElementById("apiUrl").value;
+
+                    // Get field from server
+                    const response = await fetch(`${apiUrl}/claim/niceonly`);
+                    if (!response.ok) {
+                        throw new Error(
+                            `Server claim failed: ${response.status}`,
+                        );
+                    }
+
+                    const serverData = await response.json();
+                    const convertedData = convertToWASMFormat(serverData);
+
+                    // Load WASM and process
+                    if (!window.wasm) {
+                        const wasmModule = await import(
+                            "./pkg/nice_web_client.js"
+                        );
+                        await wasmModule.default();
+                        window.wasm = wasmModule;
+                    }
+
+                    const resultJson = window.wasm.process_niceonly(
+                        JSON.stringify(convertedData),
+                        "validation_test",
+                    );
+                    const resultData = JSON.parse(resultJson);
+
+                    // Validate format matches server expectations
+                    const validation = {
+                        server_claim_format: {
+                            claim_id: typeof serverData.claim_id,
+                            base: typeof serverData.base,
+                            range_start: typeof serverData.range_start,
+                            range_end: typeof serverData.range_end,
+                            range_size: typeof serverData.range_size,
+                        },
+                        wasm_submission_format: {
+                            claim_id: typeof resultData.claim_id,
+                            username: typeof resultData.username,
+                            client_version: typeof resultData.client_version,
+                            nice_numbers_count: resultData.nice_numbers.length,
+                            nice_numbers_sample:
+                                resultData.nice_numbers.length > 0
+                                    ? {
+                                          number_type:
+                                              typeof resultData.nice_numbers[0]
+                                                  .number,
+                                          num_uniques_type:
+                                              typeof resultData.nice_numbers[0]
+                                                  .num_uniques,
+                                      }
+                                    : null,
+                        },
+                        compatibility_check: {
+                            claim_id_matches:
+                                typeof serverData.claim_id ===
+                                typeof resultData.claim_id,
+                            ready_for_submission:
+                                typeof resultData.claim_id === "number" &&
+                                (resultData.nice_numbers.length === 0 ||
+                                    typeof resultData.nice_numbers[0].number ===
+                                        "number"),
+                        },
+                        raw_data: {
+                            server_response: serverData,
+                            wasm_result: resultData,
+                        },
+                    };
+
+                    displayJSON(
+                        "submissionTest",
+                        validation,
+                        "Server Compatibility Validation",
+                    );
+
+                    if (validation.compatibility_check.ready_for_submission) {
+                        updateStatus(
+                            "✅ Format validation successful - ready for server submission",
+                            "success",
+                        );
+                    } else {
+                        updateStatus(
+                            "⚠️ Format validation found issues - check results",
+                            "error",
+                        );
+                    }
+                } catch (error) {
+                    updateStatus(`Validation error: ${error.message}`, "error");
+                    displayJSON(
+                        "submissionTest",
+                        {
+                            error: error.message,
+                            stack: error.stack,
+                        },
+                        "Validation Error",
+                    );
+                }
+            }
+
+            // Test on page load with default values
+            updateStatus(
+                "Debug tool ready - click 'Test Server Response' to begin",
+                "success",
+            );
+        </script>
+    </body>
 </html>
