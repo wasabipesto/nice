@@ -1,0 +1,33 @@
+# Rust/Cargo build artifacts
+target/
+Cargo.lock
+
+# WebAssembly build outputs
+pkg/
+*.wasm
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Node modules (if accidentally created)
+node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

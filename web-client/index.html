@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Nice Numbers - Web Client</title>
+        <style>
+            body {
+                font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+                background-color: #f5f5f5;
+                color: #333;
+            }
+            .container {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            }
+            h1 {
+                color: #2c3e50;
+                text-align: center;
+                margin-bottom: 30px;
+            }
+            .section {
+                margin-bottom: 25px;
+                padding: 15px;
+                border-left: 4px solid #3498db;
+                background-color: #f8f9fa;
+            }
+            .controls {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 15px;
+                margin-bottom: 20px;
+            }
+            label {
+                font-weight: bold;
+                margin-bottom: 5px;
+                display: block;
+            }
+            input,
+            select,
+            button {
+                width: 100%;
+                padding: 8px 12px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                font-size: 14px;
+                box-sizing: border-box;
+            }
+            button {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                cursor: pointer;
+                font-weight: bold;
+                transition: background-color 0.3s;
+            }
+            button:hover:not(:disabled) {
+                background-color: #2980b9;
+            }
+            button:disabled {
+                background-color: #bdc3c7;
+                cursor: not-allowed;
+            }
+            .status {
+                padding: 10px;
+                border-radius: 4px;
+                margin-top: 15px;
+                font-weight: bold;
+            }
+            .status.info {
+                background-color: #d1ecf1;
+                color: #0c5460;
+            }
+            .status.success {
+                background-color: #d4edda;
+                color: #155724;
+            }
+            .status.error {
+                background-color: #f8d7da;
+                color: #721c24;
+            }
+            .status.working {
+                background-color: #fff3cd;
+                color: #856404;
+            }
+            .progress {
+                width: 100%;
+                height: 20px;
+                background-color: #e9ecef;
+                border-radius: 10px;
+                overflow: hidden;
+                margin-top: 10px;
+            }
+            .progress-bar {
+                height: 100%;
+                background-color: #28a745;
+                width: 0%;
+                transition: width 0.3s ease;
+            }
+            .results {
+                background-color: #f8f9fa;
+                padding: 15px;
+                border-radius: 4px;
+                font-family: monospace;
+                white-space: pre-wrap;
+                max-height: 300px;
+                overflow-y: auto;
+                margin-top: 15px;
+            }
+            .hidden {
+                display: none;
+            }
+            .info-box {
+                background-color: #e7f3ff;
+                border: 1px solid #b6d7ff;
+                padding: 15px;
+                border-radius: 4px;
+                margin-bottom: 20px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔢 Nice Numbers Web Client</h1>
+
+            <div class="info-box">
+                <strong>What are Nice Numbers?</strong><br />
+                Nice numbers are square-cube pandigitals - numbers where the
+                digits in their square and cube contain all possible digit
+                values with no repeats. Currently, 69 (in base 10) is the only
+                known nice number, but mathematicians believe there should be
+                more in other bases!
+            </div>
+
+            <div class="section">
+                <h3>Client Configuration</h3>
+                <div class="controls">
+                    <div>
+                        <label for="username">Username:</label>
+                        <input
+                            type="text"
+                            id="username"
+                            value="anonymous"
+                            placeholder="Enter your username"
+                        />
+                    </div>
+                    <div>
+                        <label for="mode">Search Mode:</label>
+                        <select id="mode">
+                            <option value="niceonly">Nice-only (Fast)</option>
+                            <option value="detailed">Detailed (Slower)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="apiUrl">API URL:</label>
+                        <input
+                            type="text"
+                            id="apiUrl"
+                            value="https://api.nicenumbers.net"
+                            placeholder="API endpoint"
+                        />
+                    </div>
+                    <div>
+                        <label for="testMode">Test Mode:</label>
+                        <select id="testMode">
+                            <option value="false">
+                                Live (Connect to server)
+                            </option>
+                            <option value="true">Offline (Benchmark)</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>Processing</h3>
+                <button id="startBtn" onclick="startProcessing()">
+                    Start Processing
+                </button>
+                <button
+                    id="stopBtn"
+                    onclick="stopProcessing()"
+                    class="hidden"
+                    style="background-color: #e74c3c"
+                >
+                    Stop Processing
+                </button>
+
+                <div id="status" class="status info">
+                    Loading WASM module... Please wait.
+                </div>
+
+                <div id="progressContainer" class="hidden">
+                    <div class="progress">
+                        <div id="progressBar" class="progress-bar"></div>
+                    </div>
+                    <div id="progressText">Progress: 0%</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>Results</h3>
+                <div id="results" class="results">
+                    No results yet. Start processing to see output here.
+                </div>
+            </div>
+        </div>
+
+        <script type="module">
+            let wasm;
+            let isProcessing = false;
+            let shouldStop = false;
+
+            // Initialize WASM module
+            async function init() {
+                try {
+                    const wasmModule = await import("./pkg/nice_web_client.js");
+                    await wasmModule.default();
+                    wasm = wasmModule;
+
+                    // Test WASM loading
+                    wasm.greet("Web Client");
+                    updateStatus(
+                        "Ready to start! Click 'Start Processing' to begin contributing to the search.",
+                        "success",
+                    );
+
+                    document.getElementById("startBtn").disabled = false;
+                } catch (error) {
+                    updateStatus(
+                        `Error loading WASM: ${error.message}`,
+                        "error",
+                    );
+                    console.error("Failed to load WASM:", error);
+                }
+            }
+
+            function updateStatus(message, type = "info") {
+                const statusDiv = document.getElementById("status");
+                statusDiv.textContent = message;
+                statusDiv.className = `status ${type}`;
+            }
+
+            function updateProgress(percent, text = "") {
+                const progressBar = document.getElementById("progressBar");
+                const progressText = document.getElementById("progressText");
+
+                progressBar.style.width = `${percent}%`;
+                progressText.textContent =
+                    text || `Progress: ${percent.toFixed(1)}%`;
+            }
+
+            function appendResults(text) {
+                const resultsDiv = document.getElementById("results");
+                const timestamp = new Date().toLocaleTimeString();
+                resultsDiv.textContent += `[${timestamp}] ${text}\n`;
+                resultsDiv.scrollTop = resultsDiv.scrollHeight;
+            }
+
+            async function getFieldFromServer(apiUrl, mode) {
+                const endpoint =
+                    mode === "detailed" ? "/claim/detailed" : "/claim/niceonly";
+                const response = await fetch(`${apiUrl}${endpoint}`);
+
+                if (!response.ok) {
+                    throw new Error(
+                        `Server responded with ${response.status}: ${response.statusText}`,
+                    );
+                }
+
+                const serverData = await response.json();
+
+                // Convert server integers to strings for WASM compatibility
+                return {
+                    claim_id: serverData.claim_id.toString(),
+                    base: serverData.base,
+                    range_start: serverData.range_start.toString(),
+                    range_end: serverData.range_end.toString(),
+                    range_size: serverData.range_size.toString(),
+                };
+            }
+
+            async function submitFieldToServer(apiUrl, submitData) {
+                const response = await fetch(`${apiUrl}/submit`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify(submitData),
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(
+                        `Server responded with ${response.status}: ${errorText}`,
+                    );
+                }
+
+                return await response.text();
+            }
+
+            window.startProcessing = async function () {
+                if (isProcessing) return;
+
+                const username =
+                    document.getElementById("username").value || "anonymous";
+                const mode = document.getElementById("mode").value;
+                const apiUrl = document.getElementById("apiUrl").value;
+                const testMode =
+                    document.getElementById("testMode").value === "true";
+
+                if (!wasm) {
+                    updateStatus(
+                        "WASM not loaded yet. Please wait...",
+                        "error",
+                    );
+                    return;
+                }
+
+                isProcessing = true;
+                shouldStop = false;
+                document.getElementById("startBtn").classList.add("hidden");
+                document.getElementById("stopBtn").classList.remove("hidden");
+                document
+                    .getElementById("progressContainer")
+                    .classList.remove("hidden");
+                document.getElementById("results").textContent = "";
+
+                try {
+                    while (isProcessing && !shouldStop) {
+                        updateStatus("Getting work from server...", "working");
+                        appendResults("Requesting new field from server...");
+
+                        let claimData;
+                        if (testMode) {
+                            // Use benchmark data
+                            try {
+                                const benchmarkJson =
+                                    wasm.get_benchmark_field();
+                                claimData = JSON.parse(benchmarkJson);
+                                appendResults(
+                                    "Using benchmark data (offline mode)",
+                                );
+                            } catch (error) {
+                                throw new Error(
+                                    `Failed to get benchmark data: ${error.message}`,
+                                );
+                            }
+                        } else {
+                            // Get real data from server
+                            try {
+                                claimData = await getFieldFromServer(
+                                    apiUrl,
+                                    mode,
+                                );
+                                appendResults(
+                                    `Received field ${claimData.claim_id}: range ${claimData.range_start} to ${claimData.range_end} in base ${claimData.base}`,
+                                );
+                            } catch (error) {
+                                throw new Error(
+                                    `Failed to get work from server: ${error.message}`,
+                                );
+                            }
+                        }
+
+                        updateStatus(
+                            `Processing field in ${mode} mode...`,
+                            "working",
+                        );
+                        updateProgress(0, "Starting processing...");
+
+                        const startTime = Date.now();
+                        let resultJson;
+
+                        // Process the field using WASM
+                        try {
+                            if (mode === "detailed") {
+                                resultJson = wasm.process_detailed(
+                                    JSON.stringify(claimData),
+                                    username,
+                                );
+                            } else {
+                                resultJson = wasm.process_niceonly(
+                                    JSON.stringify(claimData),
+                                    username,
+                                );
+                            }
+                        } catch (error) {
+                            throw new Error(
+                                `Processing failed: ${error.message}`,
+                            );
+                        }
+
+                        const endTime = Date.now();
+                        const elapsedSeconds = (endTime - startTime) / 1000;
+
+                        updateProgress(100, "Processing complete!");
+
+                        let results;
+                        try {
+                            results = JSON.parse(resultJson);
+                        } catch (error) {
+                            throw new Error(
+                                `Failed to parse processing results: ${error.message}`,
+                            );
+                        }
+
+                        // Ensure results has the expected structure
+                        if (!results.nice_numbers) {
+                            results.nice_numbers = [];
+                        }
+
+                        const rangeSize = parseInt(claimData.range_size);
+                        const numbersPerSecond = rangeSize / elapsedSeconds;
+
+                        appendResults(
+                            `Processing completed in ${elapsedSeconds.toFixed(2)} seconds`,
+                        );
+                        appendResults(
+                            `Rate: ${numbersPerSecond.toFixed(0)} numbers/second`,
+                        );
+                        appendResults(
+                            `Found ${results.nice_numbers.length} nice numbers`,
+                        );
+
+                        if (
+                            results.nice_numbers &&
+                            results.nice_numbers.length > 0
+                        ) {
+                            appendResults("Nice numbers found:");
+                            results.nice_numbers.forEach((nn) => {
+                                appendResults(
+                                    `  ${nn.number} (${nn.num_uniques} unique digits)`,
+                                );
+                            });
+                        }
+
+                        if (!testMode) {
+                            updateStatus(
+                                "Submitting results to server...",
+                                "working",
+                            );
+                            appendResults("Submitting results...");
+
+                            try {
+                                const serverResponse =
+                                    await submitFieldToServer(apiUrl, results);
+                                appendResults(
+                                    `Server response: ${serverResponse}`,
+                                );
+                                updateStatus(
+                                    "Results submitted successfully! Getting next field...",
+                                    "success",
+                                );
+                            } catch (error) {
+                                throw new Error(
+                                    `Failed to submit results: ${error.message}`,
+                                );
+                            }
+                        } else {
+                            updateStatus(
+                                "Benchmark completed successfully!",
+                                "success",
+                            );
+                            appendResults(
+                                "Benchmark mode - results not submitted to server",
+                            );
+                            break; // Don't loop in benchmark mode
+                        }
+
+                        // Brief pause before next iteration
+                        await new Promise((resolve) =>
+                            setTimeout(resolve, 1000),
+                        );
+                    }
+
+                    if (shouldStop) {
+                        updateStatus("Processing stopped by user.", "info");
+                        appendResults("Processing stopped by user");
+                    }
+                } catch (error) {
+                    updateStatus(`Error: ${error.message}`, "error");
+                    appendResults(`ERROR: ${error.message}`);
+                    console.error("Processing error:", error);
+                } finally {
+                    isProcessing = false;
+                    document
+                        .getElementById("startBtn")
+                        .classList.remove("hidden");
+                    document.getElementById("stopBtn").classList.add("hidden");
+                    updateProgress(0, "");
+                    document
+                        .getElementById("progressContainer")
+                        .classList.add("hidden");
+                }
+            };
+
+            window.stopProcessing = function () {
+                shouldStop = true;
+                updateStatus(
+                    "Stopping after current field completes...",
+                    "working",
+                );
+            };
+
+            // Validate browser support
+            function checkBrowserSupport() {
+                if (typeof WebAssembly !== "object") {
+                    updateStatus(
+                        "Your browser doesn't support WebAssembly. Please use a modern browser (Chrome, Firefox, Safari, Edge).",
+                        "error",
+                    );
+                    return false;
+                }
+                return true;
+            }
+
+            // Initialize when page loads
+            if (checkBrowserSupport()) {
+                updateStatus("Loading WASM module...", "working");
+                document.getElementById("startBtn").disabled = true;
+                init();
+            }
+        </script>
+    </body>
+</html>
