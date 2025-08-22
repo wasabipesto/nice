@@ -355,6 +355,12 @@ pub fn get_benchmark_field() -> String {
     }
 }
 
+/// Expose the digit counting function for web worker use
+#[wasm_bindgen]
+pub fn get_num_unique_digits_wasm(num_str: &str, base: u32) -> u32 {
+    get_num_unique_digits(num_str, base)
+}
+
 /// Simple utility to test WASM loading
 #[wasm_bindgen]
 pub fn greet(name: &str) {

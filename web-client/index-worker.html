@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Nice Numbers - Browser Client (Web Worker)</title>
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                    Roboto, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                color: #333;
+            }
+
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+                background: white;
+                border-radius: 12px;
+                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+                overflow: hidden;
+            }
+
+            h1 {
+                background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+                color: white;
+                padding: 30px;
+                margin: 0;
+                text-align: center;
+                font-size: 2em;
+            }
+
+            .section {
+                padding: 30px;
+                border-bottom: 1px solid #eee;
+            }
+
+            .section:last-child {
+                border-bottom: none;
+            }
+
+            .controls {
+                display: grid;
+                gap: 20px;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                margin-bottom: 20px;
+            }
+
+            label {
+                font-weight: 600;
+                color: #555;
+                margin-bottom: 8px;
+                display: block;
+            }
+
+            input,
+            select,
+            button {
+                width: 100%;
+                padding: 12px;
+                border: 2px solid #ddd;
+                border-radius: 8px;
+                font-size: 16px;
+                font-family: inherit;
+                transition: border-color 0.3s ease;
+            }
+
+            input:focus,
+            select:focus {
+                outline: none;
+                border-color: #4facfe;
+                box-shadow: 0 0 0 3px rgba(79, 172, 254, 0.1);
+            }
+
+            button {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                cursor: pointer;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                transition: all 0.3s ease;
+            }
+
+            button:hover:not(:disabled) {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+            }
+
+            button:disabled {
+                opacity: 0.6;
+                cursor: not-allowed;
+                transform: none;
+            }
+
+            .status {
+                padding: 15px;
+                border-radius: 8px;
+                margin: 20px 0;
+                font-weight: 500;
+            }
+
+            .status.info {
+                background: #e3f2fd;
+                color: #1976d2;
+                border: 1px solid #bbdefb;
+            }
+
+            .status.success {
+                background: #e8f5e8;
+                color: #2e7d32;
+                border: 1px solid #c8e6c9;
+            }
+
+            .status.error {
+                background: #ffebee;
+                color: #c62828;
+                border: 1px solid #ffcdd2;
+            }
+
+            .status.working {
+                background: #fff3e0;
+                color: #ef6c00;
+                border: 1px solid #ffcc02;
+            }
+
+            .progress {
+                background: #f5f5f5;
+                border-radius: 10px;
+                overflow: hidden;
+                height: 20px;
+                margin: 10px 0;
+                position: relative;
+            }
+
+            .progress-bar {
+                height: 100%;
+                background: linear-gradient(90deg, #4facfe 0%, #00f2fe 100%);
+                width: 0%;
+                transition: width 0.3s ease;
+            }
+
+            .progress-text {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                font-size: 12px;
+                font-weight: 600;
+                color: #333;
+                z-index: 1;
+            }
+
+            .results {
+                background: #f8f9fa;
+                border: 1px solid #e9ecef;
+                border-radius: 8px;
+                padding: 20px;
+                font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
+                font-size: 14px;
+                line-height: 1.6;
+                max-height: 400px;
+                overflow-y: auto;
+                white-space: pre-wrap;
+                word-break: break-all;
+            }
+
+            .hidden {
+                display: none;
+            }
+
+            .info-box {
+                background: #f0f7ff;
+                border: 1px solid #b3d9ff;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 20px;
+                color: #0066cc;
+            }
+
+            .worker-status {
+                padding: 10px;
+                border-radius: 6px;
+                margin: 10px 0;
+                font-size: 14px;
+                font-weight: 500;
+            }
+
+            .worker-status.initializing {
+                background: #fff3cd;
+                color: #856404;
+                border: 1px solid #ffeaa7;
+            }
+
+            .worker-status.ready {
+                background: #d1ecf1;
+                color: #0c5460;
+                border: 1px solid #bee5eb;
+            }
+
+            .worker-status.error {
+                background: #f8d7da;
+                color: #721c24;
+                border: 1px solid #f5c6cb;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔢 Nice Numbers - Web Worker Client</h1>
+
+            <div class="section">
+                <div class="info-box">
+                    <strong>About:</strong> This client uses Web Workers to run
+                    computations in the background, preventing the browser from
+                    freezing during processing. It searches for "nice numbers"
+                    (pandigital square-cube pairs) in different bases.
+                </div>
+
+                <div class="worker-status initializing" id="workerStatus">
+                    Initializing Web Worker...
+                </div>
+
+                <div class="controls">
+                    <div>
+                        <label for="username">Username:</label>
+                        <input
+                            type="text"
+                            id="username"
+                            placeholder="anonymous"
+                        />
+                    </div>
+
+                    <div>
+                        <label for="mode">Processing Mode:</label>
+                        <select id="mode">
+                            <option value="niceonly">
+                                Nice Only (Faster - 100% nice numbers only)
+                            </option>
+                            <option value="detailed">
+                                Detailed (Slower - Includes statistics)
+                            </option>
+                        </select>
+                    </div>
+
+                    <div>
+                        <label for="apiUrl">Server API URL:</label>
+                        <input
+                            type="url"
+                            id="apiUrl"
+                            value="https://api.nicenumbers.net"
+                            placeholder="https://api.nicenumbers.net"
+                        />
+                    </div>
+
+                    <div>
+                        <label for="testMode">Test Mode:</label>
+                        <select id="testMode">
+                            <option value="false">
+                                Online (Connect to server)
+                            </option>
+                            <option value="true">
+                                Offline (Use benchmark data)
+                            </option>
+                        </select>
+                    </div>
+                </div>
+
+                <button id="startBtn" onclick="startProcessing()" disabled>
+                    Start Processing
+                </button>
+                <button
+                    id="stopBtn"
+                    onclick="stopProcessing()"
+                    class="hidden"
+                    style="background: #dc3545"
+                >
+                    Stop Processing
+                </button>
+            </div>
+
+            <div class="section">
+                <div id="status" class="status info">
+                    Loading Web Worker...
+                </div>
+
+                <div id="progressContainer" class="hidden">
+                    <div class="progress">
+                        <div id="progressBar" class="progress-bar"></div>
+                        <div id="progressText" class="progress-text">
+                            Progress: 0%
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <h3>Processing Results:</h3>
+                    <div id="results" class="results"></div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            let worker = null;
+            let isProcessing = false;
+            let shouldStop = false;
+
+            // Initialize Web Worker
+            async function init() {
+                try {
+                    updateWorkerStatus("Initializing Web Worker...", "initializing");
+
+                    // Create the web worker
+                    worker = new Worker('./worker.js');
+
+                    // Set up message handlers
+                    worker.onmessage = handleWorkerMessage;
+                    worker.onerror = handleWorkerError;
+
+                    // Initialize the worker
+                    worker.postMessage({ type: 'init' });
+
+                } catch (error) {
+                    updateStatus(`Error creating Web Worker: ${error.message}`, "error");
+                    updateWorkerStatus("Failed to create Web Worker", "error");
+                    console.error("Failed to create Web Worker:", error);
+                }
+            }
+
+            function handleWorkerMessage(e) {
+                const { type, data, ...rest } = e.data;
+
+                switch (type) {
+                    case 'initialized':
+                        if (rest.success) {
+                            updateWorkerStatus("Web Worker ready!", "ready");
+                            updateStatus(
+                                "Ready to start! Click 'Start Processing' to begin contributing to the search.",
+                                "success"
+                            );
+                            document.getElementById("startBtn").disabled = false;
+                        } else {
+                            updateWorkerStatus("Web Worker initialization failed", "error");
+                            updateStatus(
+                                `Error initializing WASM in worker: ${rest.error}`,
+                                "error"
+                            );
+                        }
+                        break;
+
+                    case 'progress':
+                        updateProgress(rest.percent, rest.message);
+                        break;
+
+                    case 'complete':
+                        handleProcessingComplete(rest.result, rest.elapsedSeconds);
+                        break;
+
+                    case 'stopped':
+                        handleProcessingStopped(rest.message);
+                        break;
+
+                    case 'error':
+                        updateStatus(`Processing error: ${rest.error}`, "error");
+                        appendResults(`Error: ${rest.error}`);
+                        resetUI();
+                        break;
+
+                    case 'benchmark_data':
+                        handleBenchmarkData(data);
+                        break;
+
+                    default:
+                        console.warn('Unknown worker message type:', type);
+                }
+            }
+
+            function handleWorkerError(error) {
+                updateStatus(`Worker error: ${error.message}`, "error");
+                updateWorkerStatus("Web Worker error", "error");
+                console.error("Worker error:", error);
+                resetUI();
+            }
+
+            function updateWorkerStatus(message, type) {
+                const statusDiv = document.getElementById("workerStatus");
+                statusDiv.textContent = message;
+                statusDiv.className = `worker-status ${type}`;
+            }
+
+            function updateStatus(message, type = "info") {
+                const statusDiv = document.getElementById("status");
+                statusDiv.textContent = message;
+                statusDiv.className = `status ${type}`;
+            }
+
+            function updateProgress(percent, text = "") {
+                const progressBar = document.getElementById("progressBar");
+                const progressText = document.getElementById("progressText");
+
+                progressBar.style.width = `${percent}%`;
+                progressText.textContent = text || `Progress: ${percent.toFixed(1)}%`;
+            }
+
+            function appendResults(text) {
+                const resultsDiv = document.getElementById("results");
+                const timestamp = new Date().toLocaleTimeString();
+                resultsDiv.textContent += `[${timestamp}] ${text}\n`;
+                resultsDiv.scrollTop = resultsDiv.scrollHeight;
+            }
+
+            async function getFieldFromServer(apiUrl, mode) {
+                const endpoint = mode === "detailed" ? "/claim/detailed" : "/claim/niceonly";
+                const response = await fetch(`${apiUrl}${endpoint}`);
+
+                if (!response.ok) {
+                    throw new Error(
+                        `Server responded with ${response.status}: ${response.statusText}`
+                    );
+                }
+
+                const serverData = await response.json();
+
+                // Convert server integers to strings for compatibility
+                return {
+                    claim_id: serverData.claim_id.toString(),
+                    base: serverData.base,
+                    range_start: serverData.range_start.toString(),
+                    range_end: serverData.range_end.toString(),
+                    range_size: serverData.range_size.toString(),
+                };
+            }
+
+            async function submitFieldToServer(apiUrl, submitData) {
+                const response = await fetch(`${apiUrl}/submit`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify(submitData),
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(
+                        `Server responded with ${response.status}: ${errorText}`
+                    );
+                }
+
+                return await response.text();
+            }
+
+            function handleProcessingComplete(result, elapsedSeconds) {
+                const claimData = getCurrentClaimData();
+                if (!claimData) return;
+
+                const rangeSize = parseInt(claimData.range_size);
+                const numbersPerSecond = rangeSize / elapsedSeconds;
+
+                appendResults(`Processing completed in ${elapsedSeconds.toFixed(2)} seconds`);
+                appendResults(
+                    `Rate: ${numbersPerSecond.toFixed(0)} (${numbersPerSecond.toExponential(2)}) numbers/second`
+                );
+                appendResults(`Found ${result.nice_numbers.length} nice numbers`);
+
+                if (result.nice_numbers && result.nice_numbers.length > 0) {
+                    appendResults("Nice numbers found:");
+                    result.nice_numbers.forEach((nn) => {
+                        appendResults(`  ${nn.number} (${nn.num_uniques} unique digits)`);
+                    });
+                }
+
+                const testMode = document.getElementById("testMode").value === "true";
+                if (!testMode) {
+                    submitResults(result);
+                } else {
+                    updateProgress(100, "Benchmark complete!");
+                    updateStatus("Benchmark processing completed!", "success");
+                    setTimeout(() => {
+                        if (isProcessing && !shouldStop) {
+                            startNextField();
+                        }
+                    }, 1000);
+                }
+            }
+
+            function handleProcessingStopped(message) {
+                appendResults(`Processing stopped: ${message}`);
+                updateStatus("Processing stopped by user", "info");
+                resetUI();
+            }
+
+            async function submitResults(result) {
+                try {
+                    updateStatus("Submitting results to server...", "working");
+                    appendResults("Submitting results...");
+
+                    const apiUrl = document.getElementById("apiUrl").value;
+                    const response = await submitFieldToServer(apiUrl, result);
+
+                    appendResults("Results submitted successfully!");
+                    appendResults(`Server response: ${response}`);
+                    updateStatus("Results submitted! Getting next field...", "success");
+
+                    // Continue processing if not stopped
+                    if (isProcessing && !shouldStop) {
+                        setTimeout(() => startNextField(), 1000);
+                    }
+                } catch (error) {
+                    appendResults(`Error submitting results: ${error.message}`);
+                    updateStatus(`Submission failed: ${error.message}`, "error");
+                    console.error("Submission error:", error);
+                    resetUI();
+                }
+            }
+
+            let currentClaimData = null;
+
+            function getCurrentClaimData() {
+                return currentClaimData;
+            }
+
+            function handleBenchmarkData(data) {
+                currentClaimData = data;
+                processCurrentField();
+            }
+
+            async function startNextField() {
+                if (!isProcessing || shouldStop) return;
+
+                try {
+                    updateStatus("Getting work from server...", "working");
+                    appendResults("Requesting new field from server...");
+
+                    const username = document.getElementById("username").value || "anonymous";
+                    const mode = document.getElementById("mode").value;
+                    const apiUrl = document.getElementById("apiUrl").value;
+
+                    const claimData = await getFieldFromServer(apiUrl, mode);
+                    currentClaimData = claimData;
+
+                    appendResults(
+                        `Received field ${claimData.claim_id}: range ${claimData.range_start} to ${claimData.range_end} in base ${claimData.base}`
+                    );
+
+                    processCurrentField();
+                } catch (error) {
+                    appendResults(`Error getting work from server: ${error.message}`);
+                    updateStatus(`Server error: ${error.message}`, "error");
+                    resetUI();
+                }
+            }
+
+            function processCurrentField() {
+                if (!currentClaimData || !worker) return;
+
+                const username = document.getElementById("username").value || "anonymous";
+                const mode = document.getElementById("mode").value;
+
+                updateStatus(`Processing field in ${mode} mode...`, "working");
+                updateProgress(0, "Starting processing...");
+
+                // Send processing request to worker
+                worker.postMessage({
+                    type: 'process',
+                    data: {
+                        claimData: currentClaimData,
+                        username: username,
+                        mode: mode
+                    }
+                });
+            }
+
+            window.startProcessing = async function () {
+                if (isProcessing || !worker) return;
+
+                const testMode = document.getElementById("testMode").value === "true";
+
+                isProcessing = true;
+                shouldStop = false;
+                document.getElementById("startBtn").classList.add("hidden");
+                document.getElementById("stopBtn").classList.remove("hidden");
+                document.getElementById("progressContainer").classList.remove("hidden");
+                document.getElementById("results").textContent = "";
+
+                try {
+                    if (testMode) {
+                        updateStatus("Getting benchmark data...", "working");
+                        appendResults("Using benchmark data (offline mode)");
+                        worker.postMessage({ type: 'benchmark' });
+                    } else {
+                        await startNextField();
+                    }
+                } catch (error) {
+                    updateStatus(`Error starting processing: ${error.message}`, "error");
+                    resetUI();
+                }
+            };
+
+            window.stopProcessing = function () {
+                shouldStop = true;
+                isProcessing = false;
+
+                if (worker) {
+                    worker.postMessage({ type: 'stop' });
+                }
+
+                updateStatus("Stopping processing...", "working");
+                appendResults("Stop requested by user");
+            };
+
+            function resetUI() {
+                isProcessing = false;
+                shouldStop = false;
+                currentClaimData = null;
+
+                document.getElementById("startBtn").classList.remove("hidden");
+                document.getElementById("stopBtn").classList.add("hidden");
+                document.getElementById("progressContainer").classList.add("hidden");
+
+                updateProgress(0, "");
+            }
+
+            function checkBrowserSupport() {
+                if (!window.Worker) {
+                    updateStatus("Web Workers not supported in this browser", "error");
+                    updateWorkerStatus("Web Workers not supported", "error");
+                    return false;
+                }
+
+                if (!window.WebAssembly) {
+                    updateStatus("WebAssembly not supported in this browser", "error");
+                    updateWorkerStatus("WebAssembly not supported", "error");
+                    return false;
+                }
+
+                return true;
+            }
+
+            // Initialize when page loads
+            document.addEventListener("DOMContentLoaded", () => {
+                if (checkBrowserSupport()) {
+                    init();
+                }
+            });
+        </script>
+    </body>
+</html>
