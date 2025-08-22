@@ -31,7 +31,7 @@ print_error() {
 
 print_header() {
     echo -e "\n${BLUE}🔢 Nice Numbers Web Client${NC}"
-    echo -e "${BLUE}=================================${NC}\n"
+    echo -e "${BLUE}=================================${NC}"
 }
 
 # Check if we're in the right directory
@@ -98,17 +98,6 @@ check_python() {
     fi
 }
 
-# Check Web Worker files
-check_worker_files() {
-    if [ ! -f "worker.js" ]; then
-        print_error "worker.js not found!"
-        print_info "The Web Worker script is required for this client"
-        exit 1
-    fi
-
-    print_success "Web Worker files found"
-}
-
 # Build the WASM package
 build_wasm() {
     print_info "Building WebAssembly package..."
@@ -146,7 +135,6 @@ start_server() {
     local port=${1:-8000}
 
     print_info "Starting development server on port $port..."
-    print_info "🧵 This client uses Web Workers to prevent browser freezing"
 
     if [ -f "serve.py" ]; then
         print_info "Using custom Python server with WASM support..."
@@ -226,7 +214,6 @@ main() {
 
     # Run checks
     check_directory
-    check_worker_files
 
     if [ "$serve_only" = false ]; then
         check_rust
@@ -236,16 +223,6 @@ main() {
 
     if [ "$build_only" = false ]; then
         check_python
-        echo ""
-        print_success "Setup complete! Starting Web Worker client..."
-        print_info "🧵 Web Workers prevent browser freezing during computation"
-        print_info "Open your browser and navigate to: http://localhost:$port"
-        print_warning "Press Ctrl+C to stop the server"
-        echo ""
-
-        # Give user a moment to read the instructions
-        sleep 2
-
         start_server $port
     else
         print_success "Build completed! To serve the files:"

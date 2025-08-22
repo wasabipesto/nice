@@ -239,12 +239,8 @@
                     <div>
                         <label for="mode">Processing Mode:</label>
                         <select id="mode">
-                            <option value="niceonly">
-                                Nice Only (Faster - 100% nice numbers only)
-                            </option>
-                            <option value="detailed">
-                                Detailed (Slower - Includes statistics)
-                            </option>
+                            <option value="detailed">Detailed</option>
+                            <option value="niceonly">Nice Only</option>
                         </select>
                     </div>
 
@@ -261,12 +257,8 @@
                     <div>
                         <label for="testMode">Test Mode:</label>
                         <select id="testMode">
-                            <option value="false">
-                                Online (Connect to server)
-                            </option>
-                            <option value="true">
-                                Offline (Use benchmark data)
-                            </option>
+                            <option value="false">Online</option>
+                            <option value="true">Offline Benchmark</option>
                         </select>
                     </div>
                 </div>
@@ -440,6 +432,7 @@
                 }
 
                 const serverData = await response.json();
+                console.log("Server Data: ", serverData);
 
                 // Convert server integers to strings for compatibility
                 return {
@@ -459,15 +452,16 @@
                     },
                     body: JSON.stringify(submitData),
                 });
+                const responseText = await response.text();
 
                 if (!response.ok) {
-                    const errorText = await response.text();
                     throw new Error(
-                        `Server responded with ${response.status}: ${errorText}`,
+                        `Server responded with ${response.status}: ${responseText}`,
                     );
                 }
 
-                return await response.text();
+                console.log("Server Response: ", responseText);
+                return responseText;
             }
 
             function handleProcessingComplete(result, elapsedSeconds) {
@@ -488,7 +482,7 @@
                 );
 
                 if (result.nice_numbers && result.nice_numbers.length > 0) {
-                    appendResults("Nice numbers found:");
+                    appendResults("Semi-nice numbers found:");
                     result.nice_numbers.forEach((nn) => {
                         appendResults(
                             `  ${nn.number} (${nn.num_uniques} unique digits)`,
@@ -503,11 +497,6 @@
                 } else {
                     updateProgress(100, "Benchmark complete!");
                     updateStatus("Benchmark processing completed!", "success");
-                    setTimeout(() => {
-                        if (isProcessing && !shouldStop) {
-                            startNextField();
-                        }
-                    }, 1000);
                 }
             }
 
