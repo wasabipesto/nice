@@ -10,7 +10,7 @@
         />
         <link
             rel="icon"
-            href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔢</text></svg>"
+            href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✨</text></svg>"
         />
         <style>
             .modebar-btn .icon {
@@ -55,10 +55,6 @@
                 background: #f8d7da;
                 color: #721c24;
                 border: 1px solid #f5c6cb;
-            }
-
-            #histogram {
-                min-height: 300px;
             }
         </style>
     </head>
@@ -257,7 +253,13 @@
                                 Real-time histogram of digits found during
                                 processing
                             </p>
-                            <div id="histogram"></div>
+                            <div id="histogram">
+                                <div class="is-info">
+                                    This will be auto-populated once the process
+                                    begins. Click 'Start Processing' to see
+                                    results.
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -530,9 +532,7 @@
                         `Server responded with ${response.status}: ${response.statusText}`,
                     );
                 }
-
                 const serverData = await response.json();
-                console.log("Server Data:", serverData);
 
                 // Convert server integers to strings for compatibility
                 return {
@@ -546,8 +546,6 @@
 
             async function submitFieldToServer(data) {
                 const apiUrl = "https://api.nicenumbers.net";
-
-                console.log("Submitting data:", data);
                 const response = await fetch(`${apiUrl}/submit`, {
                     method: "POST",
                     headers: {
@@ -562,8 +560,6 @@
                         `Server responded with ${response.status}: ${responseText}`,
                     );
                 }
-
-                console.log("Server Response:", responseText);
                 return responseText;
             }
 
@@ -745,6 +741,7 @@
                         updateStatus("Getting benchmark data...", "is-warning");
                         appendResults("Using benchmark data (offline mode)");
                         worker.postMessage({ type: "benchmark" });
+                        //shouldStop = true;
                     } else {
                         await startNextField();
                     }

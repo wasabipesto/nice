@@ -9,7 +9,7 @@ let shouldStop = false;
 async function initWasm() {
     try {
         // Import the WASM module
-        const wasmModule = await import("./pkg/nice_web_client.js");
+        const wasmModule = await import("./pkg/nice_wasm_client.js");
         await wasmModule.default();
         wasm = wasmModule;
         isInitialized = true;
