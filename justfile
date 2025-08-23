@@ -23,3 +23,21 @@ server:
 # Run scheduled jobs
 jobs:
     cargo run -r --bin nice_jobs
+
+# Deploy the website and bundled assets
+deploy-site:
+    rclone sync web $RCLONE_SITE_TARGET --progress
+
+# Start dev server for website
+[working-directory: 'web']
+dev:
+    python3 -m http.server
+
+# Build WASM app and copy result to web dir
+[working-directory: 'wasm-client']
+build-wasm:
+    wasm-pack build --target web --out-dir pkg
+    cp -rv pkg {{justfile_dir()}}/web/search/
+
+# Build WASM app and start dev server
+wasm: build-wasm dev

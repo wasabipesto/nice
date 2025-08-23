@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Nice Numbers - Browser Client</title>
+        <link
+            rel="stylesheet"
+            href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css"
+        />
+        <link
+            rel="icon"
+            href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✨</text></svg>"
+        />
+        <style>
+            .modebar-btn .icon {
+                height: 0.75em;
+                width: 0.75em;
+            }
+
+            .results {
+                font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
+                font-size: 14px;
+                line-height: 1.6;
+                max-height: 400px;
+                overflow-y: auto;
+                white-space: pre-wrap;
+                word-break: break-all;
+                background: #fafafa;
+                padding: 1rem;
+                border-radius: 6px;
+            }
+
+            .worker-status {
+                padding: 0.75rem;
+                border-radius: 6px;
+                margin: 1rem 0;
+                font-size: 0.875rem;
+                font-weight: 500;
+            }
+
+            .worker-status.initializing {
+                background: #fff3cd;
+                color: #856404;
+                border: 1px solid #ffeaa7;
+            }
+
+            .worker-status.ready {
+                background: #d1ecf1;
+                color: #0c5460;
+                border: 1px solid #bee5eb;
+            }
+
+            .worker-status.error {
+                background: #f8d7da;
+                color: #721c24;
+                border: 1px solid #f5c6cb;
+            }
+        </style>
+    </head>
+    <body class="has-background-dark">
+        <section class="section">
+            <div class="container">
+                <div class="columns">
+                    <div class="column is-two-fifths">
+                        <div class="box content">
+                            <h1 class="title is-3 pt-4">
+                                Nice Numbers Browser Client
+                            </h1>
+
+                            <p class="">
+                                This page lets you search for "nice numbers"
+                                (square-cube pandigitals) in different bases.
+                                The client connects to a central server and
+                                "checks out" a range to search for nice numbers.
+                                If you let it run it will report back with any
+                                results and credit those discoveries to your
+                                name!
+                            </p>
+
+                            <div class="field">
+                                <label class="label" for="username"
+                                    >Username:</label
+                                >
+                                <div class="control">
+                                    <input
+                                        class="input"
+                                        type="text"
+                                        id="username"
+                                        placeholder="anonymous"
+                                    />
+                                </div>
+                            </div>
+
+                            <div class="field">
+                                <label class="label" for="testMode"
+                                    >Connection:</label
+                                >
+                                <div class="control">
+                                    <div class="select is-fullwidth">
+                                        <select id="testMode">
+                                            <option value="false">
+                                                Online
+                                            </option>
+                                            <option value="true">
+                                                Offline Benchmark
+                                            </option>
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="field is-grouped">
+                                <div class="control">
+                                    <button
+                                        id="startBtn"
+                                        class="button is-primary is-fullwidth"
+                                        onclick="startProcessing()"
+                                        disabled
+                                    >
+                                        Start Processing
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div
+                                class="field is-grouped is-hidden"
+                                id="stopContainer"
+                            >
+                                <div class="control">
+                                    <button
+                                        id="stopBtn"
+                                        class="button is-danger is-fullwidth"
+                                        onclick="stopProcessing()"
+                                    >
+                                        Stop Processing
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div id="status" class="notification is-info">
+                                Loading Web Worker...
+                            </div>
+
+                            <div id="progressContainer" class="is-hidden">
+                                <progress
+                                    id="progressBar"
+                                    class="progress is-primary"
+                                    value="0"
+                                    max="100"
+                                >
+                                    0%
+                                </progress>
+                                <p
+                                    id="progressText"
+                                    class="has-text-centered is-hidden"
+                                >
+                                    Progress: 0%
+                                </p>
+                                <div
+                                    id="progressDetails"
+                                    class="has-text-centered is-size-7 mt-2 is-hidden"
+                                >
+                                    <div class="columns is-mobile is-gapless">
+                                        <div class="column">
+                                            <strong>Percent Complete:</strong>
+                                            <span id="progressPercentage"
+                                                >0%</span
+                                            >
+                                        </div>
+                                        <div class="column">
+                                            <strong>Elapsed:</strong>
+                                            <span id="timeElapsed">0s</span>
+                                        </div>
+                                        <div class="column">
+                                            <strong>ETA:</strong>
+                                            <span id="estimatedTimeRemaining"
+                                                >--</span
+                                            >
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="box content">
+                            <h3 class="title is-5">Processing Results:</h3>
+                            <div
+                                class="worker-status initializing"
+                                id="workerStatus"
+                            >
+                                Initializing Web Worker...
+                            </div>
+                            <div id="results" class="results"></div>
+                        </div>
+                    </div>
+
+                    <div class="column">
+                        <div class="box content">
+                            <h2 class="title is-4 mb-3">
+                                Processing Statistics
+                            </h2>
+                            <div class="columns is-multiline">
+                                <div class="column is-half">
+                                    <div class="has-text-centered">
+                                        <p class="heading">Numbers Processed</p>
+                                        <p
+                                            class="title is-4"
+                                            id="numbersProcessed"
+                                        >
+                                            0
+                                        </p>
+                                    </div>
+                                </div>
+                                <div class="column is-half">
+                                    <div class="has-text-centered">
+                                        <p class="heading">Processing Rate</p>
+                                        <p
+                                            class="title is-4"
+                                            id="processingRate"
+                                        >
+                                            0/sec
+                                        </p>
+                                    </div>
+                                </div>
+                                <div class="column is-half">
+                                    <div class="has-text-centered">
+                                        <p class="heading">
+                                            Semi-nice Numbers Found
+                                        </p>
+                                        <p
+                                            class="title is-4"
+                                            id="niceNumbersFound"
+                                        >
+                                            0
+                                        </p>
+                                    </div>
+                                </div>
+                                <div class="column is-half">
+                                    <div class="has-text-centered">
+                                        <p class="heading">Current Base</p>
+                                        <p class="title is-4" id="currentBase">
+                                            -
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="box content">
+                            <h2 class="title is-4 mb-5">Digit Distribution</h2>
+                            <p class="subtitle is-6">
+                                Real-time histogram of digits found during
+                                processing
+                            </p>
+                            <div id="histogram">
+                                <div class="is-info">
+                                    This will be auto-populated once the process
+                                    begins. Click 'Start Processing' to see
+                                    results.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="box content has-text-centered">
+                    <p>
+                        nicenumbers.net made with ♡ by
+                        <a href="https://wasabipesto.com">wasabipesto</a>
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <script type="module">
+            import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/+esm";
+
+            let worker = null;
+            let isProcessing = false;
+            let shouldStop = false;
+            let currentClaimData = null;
+            let totalDigitsProcessed = 0;
+            let numbersProcessedCount = 0;
+            let startTime = null;
+            let niceNumbersCount = 0;
+
+            // Update histogram with current digit counts
+            function updateHistogram(uniqueDistribution) {
+                if (uniqueDistribution == undefined) return;
+                const data = [...uniqueDistribution].map(([digit, count]) => ({
+                    digit,
+                    count,
+                }));
+
+                const plot = Plot.plot({
+                    width: 900,
+                    marginLeft: 75,
+                    x: {
+                        label: "Digit",
+                        domain: data.map((d) => d.digit),
+                        tickFormat: (d) => d.toString(),
+                    },
+                    y: {
+                        label: "Count",
+                        grid: true,
+                    },
+                    marks: [
+                        Plot.barY(data, {
+                            x: "digit",
+                            y: "count",
+                            tip: true,
+                        }),
+                        Plot.ruleY([0]),
+                    ],
+                });
+
+                const histogramDiv = document.querySelector("#histogram");
+                histogramDiv.innerHTML = "";
+                histogramDiv.append(plot);
+            }
+
+            // Update statistics display
+            function updateStatistics(numbersProcessedCount, niceNumbersCount) {
+                document.getElementById("numbersProcessed").textContent =
+                    numbersProcessedCount.toLocaleString();
+                document.getElementById("niceNumbersFound").textContent =
+                    niceNumbersCount.toString();
+
+                if (startTime && numbersProcessedCount > 0) {
+                    const elapsed = (Date.now() - startTime) / 1000;
+                    const rate = Math.round(numbersProcessedCount / elapsed);
+                    document.getElementById("processingRate").textContent =
+                        `${rate.toLocaleString()}/sec`;
+                }
+
+                if (currentClaimData) {
+                    document.getElementById("currentBase").textContent =
+                        currentClaimData.base.toString();
+                }
+            }
+
+            // Initialize Web Worker
+            async function init() {
+                try {
+                    updateWorkerStatus(
+                        "Initializing Web Worker...",
+                        "initializing",
+                    );
+
+                    // Create the web worker
+                    worker = new Worker("./worker.js");
+
+                    // Set up message handlers
+                    worker.onmessage = handleWorkerMessage;
+                    worker.onerror = handleWorkerError;
+
+                    // Initialize the worker
+                    worker.postMessage({ type: "init" });
+                } catch (error) {
+                    updateStatus(
+                        `Error creating Web Worker: ${error.message}`,
+                        "is-danger",
+                    );
+                    updateWorkerStatus("Failed to create Web Worker", "error");
+                    console.error("Failed to create Web Worker:", error);
+                }
+            }
+
+            function handleWorkerMessage(e) {
+                const { type, data, ...rest } = e.data;
+
+                switch (type) {
+                    case "initialized":
+                        if (rest.success) {
+                            updateWorkerStatus(
+                                "Web Worker communicating!",
+                                "ready",
+                            );
+                            updateStatus(
+                                "Ready to start! Click 'Start Processing' to begin contributing to the search.",
+                                "is-success",
+                            );
+                            document.getElementById("startBtn").disabled =
+                                false;
+                        } else {
+                            updateWorkerStatus(
+                                "Web Worker initialization failed",
+                                "error",
+                            );
+                            updateStatus(
+                                `Error initializing WASM in worker: ${rest.error}`,
+                                "is-danger",
+                            );
+                        }
+                        break;
+
+                    case "progress":
+                        updateProgress(rest.percent, rest.message);
+
+                        // Update statistics display
+                        updateStatistics(
+                            rest.processedCount,
+                            rest.niceNumbers.length,
+                        );
+                        updateHistogram(rest.uniqueDistribution);
+                        break;
+
+                    case "complete":
+                        handleProcessingComplete(
+                            rest.result,
+                            rest.elapsedSeconds,
+                        );
+                        break;
+
+                    case "stopped":
+                        handleProcessingStopped(rest.message);
+                        break;
+
+                    case "error":
+                        updateStatus(
+                            `Processing error: ${rest.error}`,
+                            "is-danger",
+                        );
+                        appendResults(`Error: ${rest.error}`);
+                        resetUI();
+                        break;
+
+                    case "benchmark_data":
+                        handleBenchmarkData(data);
+                        break;
+
+                    default:
+                        console.warn("Unknown worker message type:", type);
+                }
+            }
+
+            function handleWorkerError(error) {
+                updateStatus(`Worker error: ${error.message}`, "is-danger");
+                updateWorkerStatus("Web Worker error", "error");
+                console.error("Worker error:", error);
+                resetUI();
+            }
+
+            function updateWorkerStatus(message, type) {
+                const statusDiv = document.getElementById("workerStatus");
+                statusDiv.textContent = message;
+                statusDiv.className = `worker-status ${type}`;
+            }
+
+            function updateStatus(message, type = "is-info") {
+                const statusDiv = document.getElementById("status");
+                statusDiv.textContent = message;
+                statusDiv.className = `notification ${type}`;
+            }
+
+            function updateProgress(percent, text = "") {
+                const progressBar = document.getElementById("progressBar");
+                const progressText = document.getElementById("progressText");
+                const progressDetails =
+                    document.getElementById("progressDetails");
+                const progressPercentage =
+                    document.getElementById("progressPercentage");
+                const timeElapsed = document.getElementById("timeElapsed");
+                const estimatedTimeRemaining = document.getElementById(
+                    "estimatedTimeRemaining",
+                );
+
+                progressBar.value = percent;
+                progressText.textContent =
+                    text || `Progress: ${percent.toFixed(1)}%`;
+
+                // Show progress details when processing starts
+                if (percent > 0 && startTime) {
+                    progressDetails.classList.remove("is-hidden");
+
+                    // Update percentage
+                    progressPercentage.textContent = `${percent.toFixed(1)}%`;
+
+                    // Calculate and display elapsed time
+                    const elapsed = (Date.now() - startTime) / 1000;
+                    const elapsedMinutes = Math.floor(elapsed / 60);
+                    const elapsedSeconds = Math.floor(elapsed % 60);
+                    timeElapsed.textContent =
+                        elapsedMinutes > 0
+                            ? `${elapsedMinutes}m ${elapsedSeconds}s`
+                            : `${elapsedSeconds}s`;
+
+                    // Calculate and display ETA
+                    if (percent > 0 && percent < 100) {
+                        const remainingPercent = 100 - percent;
+                        const estimatedTotalTime = elapsed * (100 / percent);
+                        const estimatedRemaining = estimatedTotalTime - elapsed;
+
+                        if (estimatedRemaining > 0) {
+                            const etaMinutes = Math.floor(
+                                estimatedRemaining / 60,
+                            );
+                            const etaSeconds = Math.floor(
+                                estimatedRemaining % 60,
+                            );
+                            estimatedTimeRemaining.textContent =
+                                etaMinutes > 0
+                                    ? `${etaMinutes}m ${etaSeconds}s`
+                                    : `${etaSeconds}s`;
+                        } else {
+                            estimatedTimeRemaining.textContent = "0s";
+                        }
+                    } else if (percent >= 100) {
+                        estimatedTimeRemaining.textContent = "Complete";
+                    }
+                } else {
+                    // Hide progress details when not processing
+                    progressDetails.classList.add("is-hidden");
+                }
+            }
+
+            function appendResults(text) {
+                const resultsDiv = document.getElementById("results");
+                const timestamp = new Date().toLocaleTimeString();
+                resultsDiv.textContent += `[${timestamp}] ${text}\n`;
+                resultsDiv.scrollTop = resultsDiv.scrollHeight;
+            }
+
+            async function getFieldFromServer() {
+                const apiUrl = "https://api.nicenumbers.net";
+                const endpoint = "/claim/detailed";
+                const response = await fetch(`${apiUrl}${endpoint}`);
+
+                if (!response.ok) {
+                    throw new Error(
+                        `Server responded with ${response.status}: ${response.statusText}`,
+                    );
+                }
+                const serverData = await response.json();
+
+                // Convert server integers to strings for compatibility
+                return {
+                    claim_id: serverData.claim_id.toString(),
+                    base: serverData.base,
+                    range_start: serverData.range_start.toString(),
+                    range_end: serverData.range_end.toString(),
+                    range_size: serverData.range_size.toString(),
+                };
+            }
+
+            async function submitFieldToServer(data) {
+                const apiUrl = "https://api.nicenumbers.net";
+                const response = await fetch(`${apiUrl}/submit`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify(data),
+                });
+                const responseText = await response.text();
+
+                if (!response.ok) {
+                    throw new Error(
+                        `Server responded with ${response.status}: ${responseText}`,
+                    );
+                }
+                return responseText;
+            }
+
+            function handleProcessingComplete(result, elapsedSeconds) {
+                const claimData = getCurrentClaimData();
+                if (!claimData) return;
+
+                const rangeSize = parseInt(claimData.range_size);
+                const numbersPerSecond = rangeSize / elapsedSeconds;
+
+                // Update nice numbers count
+                if (result.nice_numbers && result.nice_numbers.length > 0) {
+                    niceNumbersCount += result.nice_numbers.length;
+                }
+
+                updateStatistics(rangeSize, niceNumbersCount);
+                updateHistogram();
+
+                appendResults(
+                    `Processing completed in ${elapsedSeconds.toFixed(2)} seconds`,
+                );
+                appendResults(
+                    `Rate: ${numbersPerSecond.toFixed(0)} (${numbersPerSecond.toExponential(2)}) numbers/second`,
+                );
+                appendResults(
+                    `Found ${result.nice_numbers.length} semi-nice numbers`,
+                );
+
+                if (result.nice_numbers && result.nice_numbers.length > 0) {
+                    appendResults("Semi-nice numbers found:");
+                    result.nice_numbers.forEach((nn) => {
+                        appendResults(
+                            `  ${nn.number} (${nn.num_uniques} unique digits)`,
+                        );
+                    });
+                }
+
+                const testMode =
+                    document.getElementById("testMode").value === "true";
+                if (!testMode) {
+                    submitResults(result);
+                } else {
+                    updateProgress(100, "Benchmark complete!");
+                    updateStatus(
+                        "Benchmark processing completed!",
+                        "is-success",
+                    );
+                }
+            }
+
+            function handleProcessingStopped(message) {
+                appendResults(`Processing stopped: ${message}`);
+                updateStatus("Processing stopped by user", "is-info");
+                resetUI();
+            }
+
+            async function submitResults(result) {
+                try {
+                    updateStatus(
+                        "Submitting results to server...",
+                        "is-warning",
+                    );
+                    appendResults("Submitting results...");
+
+                    const response = await submitFieldToServer(result);
+
+                    appendResults("Results submitted successfully!");
+                    appendResults(`Server response: ${response}`);
+                    updateStatus(
+                        "Results submitted! Getting next field...",
+                        "is-success",
+                    );
+
+                    // Continue processing if not stopped
+                    if (isProcessing && !shouldStop) {
+                        setTimeout(() => startNextField(), 1000);
+                    }
+                } catch (error) {
+                    appendResults(`Error submitting results: ${error.message}`);
+                    updateStatus(
+                        `Submission failed: ${error.message}`,
+                        "is-danger",
+                    );
+                    console.error("Submission error:", error);
+                    resetUI();
+                }
+            }
+
+            function getCurrentClaimData() {
+                return currentClaimData;
+            }
+
+            function handleBenchmarkData(data) {
+                currentClaimData = data;
+                startTime = Date.now();
+                updateStatistics(0, 0);
+                processCurrentField();
+            }
+
+            async function startNextField() {
+                if (!isProcessing || shouldStop) return;
+
+                try {
+                    updateStatus("Getting work from server...", "is-warning");
+                    appendResults("Requesting new field from server...");
+
+                    const username =
+                        document.getElementById("username").value ||
+                        "anonymous";
+
+                    const claimData = await getFieldFromServer();
+                    currentClaimData = claimData;
+
+                    // Initialize for new field
+                    startTime = Date.now();
+                    numbersProcessedCount = 0;
+                    updateStatistics(0, 0);
+
+                    appendResults(
+                        `Received field ${claimData.claim_id}: range ${claimData.range_start} to ${claimData.range_end} in base ${claimData.base}`,
+                    );
+
+                    processCurrentField();
+                } catch (error) {
+                    appendResults(
+                        `Error getting work from server: ${error.message}`,
+                    );
+                    updateStatus(`Server error: ${error.message}`, "is-danger");
+                    resetUI();
+                }
+            }
+
+            function processCurrentField() {
+                if (!currentClaimData || !worker) return;
+
+                const username =
+                    document.getElementById("username").value || "anonymous";
+
+                updateStatus(
+                    `Processing field in detailed mode...`,
+                    "is-warning",
+                );
+                updateProgress(0, "Starting processing...");
+
+                // Send processing request to worker
+                worker.postMessage({
+                    type: "process",
+                    data: {
+                        claimData: currentClaimData,
+                        username: username,
+                        mode: "detailed",
+                    },
+                });
+            }
+
+            window.startProcessing = async function () {
+                if (isProcessing || !worker) return;
+
+                const testMode =
+                    document.getElementById("testMode").value === "true";
+
+                isProcessing = true;
+                shouldStop = false;
+                startTime = Date.now();
+                numbersProcessedCount = 0;
+                niceNumbersCount = 0;
+
+                document.getElementById("startBtn").classList.add("is-hidden");
+                document
+                    .getElementById("stopContainer")
+                    .classList.remove("is-hidden");
+                document
+                    .getElementById("progressContainer")
+                    .classList.remove("is-hidden");
+                document.getElementById("results").textContent = "";
+
+                try {
+                    if (testMode) {
+                        updateStatus("Getting benchmark data...", "is-warning");
+                        appendResults("Using benchmark data (offline mode)");
+                        worker.postMessage({ type: "benchmark" });
+                        //shouldStop = true;
+                    } else {
+                        await startNextField();
+                    }
+                } catch (error) {
+                    updateStatus(
+                        `Error starting processing: ${error.message}`,
+                        "is-danger",
+                    );
+                    resetUI();
+                }
+            };
+
+            window.stopProcessing = function () {
+                shouldStop = true;
+                isProcessing = false;
+
+                if (worker) {
+                    worker.postMessage({ type: "stop" });
+                }
+
+                updateStatus("Stopping processing...", "is-warning");
+                appendResults("Stop requested by user");
+            };
+
+            function resetUI() {
+                isProcessing = false;
+                shouldStop = false;
+                currentClaimData = null;
+
+                document
+                    .getElementById("startBtn")
+                    .classList.remove("is-hidden");
+                document
+                    .getElementById("stopContainer")
+                    .classList.add("is-hidden");
+                document
+                    .getElementById("progressContainer")
+                    .classList.add("is-hidden");
+
+                updateProgress(0, "");
+                document
+                    .getElementById("progressDetails")
+                    .classList.add("is-hidden");
+            }
+
+            function checkBrowserSupport() {
+                if (!window.Worker) {
+                    updateStatus(
+                        "Web Workers not supported in this browser",
+                        "is-danger",
+                    );
+                    updateWorkerStatus("Web Workers not supported", "error");
+                    return false;
+                }
+
+                if (!window.WebAssembly) {
+                    updateStatus(
+                        "WebAssembly not supported in this browser",
+                        "is-danger",
+                    );
+                    updateWorkerStatus("WebAssembly not supported", "error");
+                    return false;
+                }
+
+                return true;
+            }
+
+            // Initialize when page loads
+            document.addEventListener("DOMContentLoaded", () => {
+                if (checkBrowserSupport()) {
+                    init();
+                }
+            });
+        </script>
+    </body>
+</html>
