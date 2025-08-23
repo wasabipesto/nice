@@ -5,10 +5,6 @@
 
 use wasm_bindgen::prelude::*;
 
-// Use `wee_alloc` as the global allocator for smaller WASM size
-#[global_allocator]
-static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
-
 // Define the panic hook for better error messages in the browser
 #[wasm_bindgen(start)]
 pub fn main() {
