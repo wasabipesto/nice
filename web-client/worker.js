@@ -28,14 +28,13 @@ async function initWasm() {
     }
 }
 
-// Process numbers with detailed progress reporting
+// Process numbers using WASM chunk processing
 function processDetailedWithProgress(claimDataJson, username) {
     const claimData = JSON.parse(claimDataJson);
     const base = claimData.base;
     const rangeStart = BigInt(claimData.range_start);
     const rangeEnd = BigInt(claimData.range_end);
     const rangeSize = rangeEnd - rangeStart;
-    const niceCutoff = Math.floor(base * 0.9);
 
     // Send initial status
     self.postMessage({
@@ -44,7 +43,7 @@ function processDetailedWithProgress(claimDataJson, username) {
         message: "Starting detailed processing...",
     });
 
-    const niceNumbers = [];
+    const allNiceNumbers = [];
     const uniqueDistribution = new Map();
 
     // Initialize distribution map
@@ -53,7 +52,7 @@ function processDetailedWithProgress(claimDataJson, username) {
     }
 
     let processed = BigInt(0);
-    const chunkSize = BigInt(1000);
+    const chunkSize = BigInt(10000); // Large chunks for WASM efficiency
     let lastProgressUpdate = Date.now();
     const progressUpdateInterval = 1000; // Update every 1 second
 
@@ -65,25 +64,28 @@ function processDetailedWithProgress(claimDataJson, username) {
         const chunkEnd =
             current + chunkSize > rangeEnd ? rangeEnd : current + chunkSize;
 
-        // Process chunk
-        for (let num = current; num < chunkEnd && !shouldStop; num++) {
-            const numStr = num.toString();
-            const numUniques = getNumUniqueDigits(numStr, base);
+        // Process entire chunk in WASM
+        const chunkResultJson = wasm.process_chunk_wasm(
+            current.toString(),
+            chunkEnd.toString(),
+            base,
+        );
 
-            // Update distribution
-            const currentCount = uniqueDistribution.get(numUniques) || 0;
-            uniqueDistribution.set(numUniques, currentCount + 1);
+        const chunkResult = JSON.parse(chunkResultJson);
 
-            // Collect nice numbers above threshold
-            if (numUniques > niceCutoff) {
-                niceNumbers.push({
-                    number: numStr, // Convert to string for large numbers
-                    num_uniques: numUniques,
-                });
-            }
+        // Merge nice numbers
+        allNiceNumbers.push(...chunkResult.nice_numbers);
 
-            processed++;
+        // Update distribution
+        for (const entry of chunkResult.distribution_updates) {
+            const currentCount = uniqueDistribution.get(entry.num_uniques) || 0;
+            uniqueDistribution.set(
+                entry.num_uniques,
+                currentCount + entry.count,
+            );
         }
+
+        processed += BigInt(chunkResult.processed_count);
 
         // Send progress update
         const now = Date.now();
@@ -111,8 +113,8 @@ function processDetailedWithProgress(claimDataJson, username) {
     }
 
     // Convert results back to server format
-    const serverNiceNumbers = niceNumbers.map((nn) => ({
-        number: parseInt(nn.number), // Convert back to number for server
+    const serverNiceNumbers = allNiceNumbers.map((nn) => ({
+        number: parseInt(nn.number),
         num_uniques: nn.num_uniques,
     }));
 
@@ -132,51 +134,6 @@ function processDetailedWithProgress(claimDataJson, username) {
     };
 
     return JSON.stringify(result);
-}
-
-// Simplified digit counting for worker (we'll use WASM when available, fallback otherwise)
-function getNumUniqueDigits(numStr, base) {
-    if (wasm) {
-        // Use the WASM function if available
-        try {
-            return wasm.get_num_unique_digits_wasm
-                ? wasm.get_num_unique_digits_wasm(numStr, base)
-                : getNumUniqueDigitsJS(numStr, base);
-        } catch (error) {
-            console.warn(
-                "WASM digit counting failed, falling back to JS:",
-                error,
-            );
-            return getNumUniqueDigitsJS(numStr, base);
-        }
-    }
-    return getNumUniqueDigitsJS(numStr, base);
-}
-
-// JavaScript fallback for digit counting (simplified version)
-function getNumUniqueDigitsJS(numStr, base) {
-    const num = BigInt(numStr);
-    const squared = num * num;
-    const cubed = squared * num;
-
-    const digits = new Set();
-
-    // Add digits from squared number
-    addDigitsToSet(squared, base, digits);
-
-    // Add digits from cubed number
-    addDigitsToSet(cubed, base, digits);
-
-    return digits.size;
-}
-
-function addDigitsToSet(num, base, digitSet) {
-    let remaining = num;
-    while (remaining > 0n) {
-        const digit = Number(remaining % BigInt(base));
-        digitSet.add(digit);
-        remaining = remaining / BigInt(base);
-    }
 }
 
 // Handle messages from main thread

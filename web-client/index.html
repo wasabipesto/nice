@@ -414,7 +414,7 @@
                 }
 
                 const serverData = await response.json();
-                console.log("Server Data: ", serverData);
+                console.log("Server Data:", serverData);
 
                 // Convert server integers to strings for compatibility
                 return {
@@ -428,12 +428,14 @@
 
             async function submitFieldToServer(data) {
                 const apiUrl = "https://api.nicenumbers.net";
+
+                console.log("Submitting data:", data);
                 const response = await fetch(`${apiUrl}/submit`, {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
                     },
-                    body: JSON.stringify(submitData),
+                    body: JSON.stringify(data),
                 });
                 const responseText = await response.text();
 
@@ -443,7 +445,7 @@
                     );
                 }
 
-                console.log("Server Response: ", responseText);
+                console.log("Server Response:", responseText);
                 return responseText;
             }
 
