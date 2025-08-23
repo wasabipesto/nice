@@ -166,6 +166,29 @@
                                 >
                                     Progress: 0%
                                 </p>
+                                <div
+                                    id="progressDetails"
+                                    class="has-text-centered is-size-7 mt-2 is-hidden"
+                                >
+                                    <div class="columns is-mobile is-gapless">
+                                        <div class="column">
+                                            <strong>Percent Complete:</strong>
+                                            <span id="progressPercentage"
+                                                >0%</span
+                                            >
+                                        </div>
+                                        <div class="column">
+                                            <strong>Elapsed:</strong>
+                                            <span id="timeElapsed">0s</span>
+                                        </div>
+                                        <div class="column">
+                                            <strong>ETA:</strong>
+                                            <span id="estimatedTimeRemaining"
+                                                >--</span
+                                            >
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
 
@@ -459,10 +482,62 @@
             function updateProgress(percent, text = "") {
                 const progressBar = document.getElementById("progressBar");
                 const progressText = document.getElementById("progressText");
+                const progressDetails =
+                    document.getElementById("progressDetails");
+                const progressPercentage =
+                    document.getElementById("progressPercentage");
+                const timeElapsed = document.getElementById("timeElapsed");
+                const estimatedTimeRemaining = document.getElementById(
+                    "estimatedTimeRemaining",
+                );
 
                 progressBar.value = percent;
                 progressText.textContent =
                     text || `Progress: ${percent.toFixed(1)}%`;
+
+                // Show progress details when processing starts
+                if (percent > 0 && startTime) {
+                    progressDetails.classList.remove("is-hidden");
+
+                    // Update percentage
+                    progressPercentage.textContent = `${percent.toFixed(1)}%`;
+
+                    // Calculate and display elapsed time
+                    const elapsed = (Date.now() - startTime) / 1000;
+                    const elapsedMinutes = Math.floor(elapsed / 60);
+                    const elapsedSeconds = Math.floor(elapsed % 60);
+                    timeElapsed.textContent =
+                        elapsedMinutes > 0
+                            ? `${elapsedMinutes}m ${elapsedSeconds}s`
+                            : `${elapsedSeconds}s`;
+
+                    // Calculate and display ETA
+                    if (percent > 0 && percent < 100) {
+                        const remainingPercent = 100 - percent;
+                        const estimatedTotalTime = elapsed * (100 / percent);
+                        const estimatedRemaining = estimatedTotalTime - elapsed;
+
+                        if (estimatedRemaining > 0) {
+                            const etaMinutes = Math.floor(
+                                estimatedRemaining / 60,
+                            );
+                            const etaSeconds = Math.floor(
+                                estimatedRemaining % 60,
+                            );
+                            estimatedTimeRemaining.textContent =
+                                etaMinutes > 0
+                                    ? `${etaMinutes}m ${etaSeconds}s`
+                                    : `${etaSeconds}s`;
+                        } else {
+                            estimatedTimeRemaining.textContent = "0s";
+                        }
+                    } else if (percent >= 100) {
+                        estimatedTimeRemaining.textContent = "Complete";
+                    }
+                } else {
+                    // Hide progress details when not processing
+                    progressDetails.classList.add("is-hidden");
+                }
             }
 
             function appendResults(text) {
@@ -746,6 +821,9 @@
                     .classList.add("is-hidden");
 
                 updateProgress(0, "");
+                document
+                    .getElementById("progressDetails")
+                    .classList.add("is-hidden");
             }
 
             function checkBrowserSupport() {

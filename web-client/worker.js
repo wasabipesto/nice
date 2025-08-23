@@ -55,7 +55,7 @@ function processDetailedWithProgress(claimDataJson, username) {
     }
 
     let processed = BigInt(0);
-    const chunkSize = BigInt(10000); // Large chunks for WASM efficiency
+    const chunkSize = BigInt(100000); // Large chunks for WASM efficiency
     let lastProgressUpdate = Date.now();
     const progressUpdateInterval = 1000; // Update every 1 second
 
