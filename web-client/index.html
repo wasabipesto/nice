@@ -68,24 +68,19 @@
                 <div class="columns">
                     <div class="column is-two-fifths">
                         <div class="box content">
-                            <h1 class="title is-3 has-text-centered">
-                                🔢 Nice Numbers Client
+                            <h1 class="title is-3 pt-4">
+                                Nice Numbers Browser Client
                             </h1>
 
-                            <div class="notification is-info is-light">
-                                <strong>About:</strong> This client searches for
-                                "nice numbers" (pandigital square-cube pairs) in
-                                different bases. The client runs entirely in
-                                your browser and coordinates with the server to
-                                deliver results.
-                            </div>
-
-                            <div
-                                class="worker-status initializing"
-                                id="workerStatus"
-                            >
-                                Initializing Web Worker...
-                            </div>
+                            <p class="">
+                                This page lets you search for "nice numbers"
+                                (square-cube pandigitals) in different bases.
+                                The client connects to a central server and
+                                "checks out" a range to search for nice numbers.
+                                If you let it run it will report back with any
+                                results and credit those discoveries to your
+                                name!
+                            </p>
 
                             <div class="field">
                                 <label class="label" for="username"
@@ -194,20 +189,17 @@
 
                         <div class="box content">
                             <h3 class="title is-5">Processing Results:</h3>
+                            <div
+                                class="worker-status initializing"
+                                id="workerStatus"
+                            >
+                                Initializing Web Worker...
+                            </div>
                             <div id="results" class="results"></div>
                         </div>
                     </div>
 
                     <div class="column">
-                        <div class="box content">
-                            <h2 class="title is-4 mb-5">Digit Distribution</h2>
-                            <p class="subtitle is-6">
-                                Real-time histogram of digits found during
-                                processing
-                            </p>
-                            <div id="histogram"></div>
-                        </div>
-
                         <div class="box content">
                             <h2 class="title is-4 mb-3">
                                 Processing Statistics
@@ -258,12 +250,21 @@
                                 </div>
                             </div>
                         </div>
+
+                        <div class="box content">
+                            <h2 class="title is-4 mb-5">Digit Distribution</h2>
+                            <p class="subtitle is-6">
+                                Real-time histogram of digits found during
+                                processing
+                            </p>
+                            <div id="histogram"></div>
+                        </div>
                     </div>
                 </div>
 
                 <div class="box content has-text-centered">
                     <p>
-                        Nice Numbers Browser Client made with ♡ by
+                        nicenumbers.net made with ♡ by
                         <a href="https://wasabipesto.com">wasabipesto</a>
                     </p>
                 </div>
@@ -277,23 +278,10 @@
             let isProcessing = false;
             let shouldStop = false;
             let currentClaimData = null;
-
-            // Digit counting for histogram
-            let digitCounts = {};
             let totalDigitsProcessed = 0;
             let numbersProcessedCount = 0;
             let startTime = null;
             let niceNumbersCount = 0;
-
-            // Initialize digit counts
-            function initializeDigitCounts(base) {
-                digitCounts = {};
-                for (let i = 0; i < base; i++) {
-                    digitCounts[i] = 0;
-                }
-                totalDigitsProcessed = 0;
-                updateHistogram();
-            }
 
             // Update histogram with current digit counts
             function updateHistogram(uniqueDistribution) {
@@ -328,24 +316,6 @@
                 const histogramDiv = document.querySelector("#histogram");
                 histogramDiv.innerHTML = "";
                 histogramDiv.append(plot);
-            }
-
-            // Process digits from a number and update counts
-            function processDigits(numberStr, base) {
-                if (!numberStr || typeof numberStr !== "string") {
-                    console.error("Invalid input:", numberStr);
-                    return;
-                }
-
-                for (let char of numberStr) {
-                    const digit = parseInt(char, base);
-                    if (!isNaN(digit) && digit >= 0 && digit < base) {
-                        digitCounts[digit] = (digitCounts[digit] || 0) + 1;
-                        totalDigitsProcessed++;
-                    } else {
-                        console.error("Invalid digit:", char);
-                    }
-                }
             }
 
             // Update statistics display
@@ -401,7 +371,10 @@
                 switch (type) {
                     case "initialized":
                         if (rest.success) {
-                            updateWorkerStatus("Web Worker ready!", "ready");
+                            updateWorkerStatus(
+                                "Web Worker communicating!",
+                                "ready",
+                            );
                             updateStatus(
                                 "Ready to start! Click 'Start Processing' to begin contributing to the search.",
                                 "is-success",
@@ -601,13 +574,6 @@
                 const rangeSize = parseInt(claimData.range_size);
                 const numbersPerSecond = rangeSize / elapsedSeconds;
 
-                // Process all numbers for final digit count update
-                if (result.all_numbers) {
-                    result.all_numbers.forEach((num) => {
-                        processDigits(num.toString(), claimData.base);
-                    });
-                }
-
                 // Update nice numbers count
                 if (result.nice_numbers && result.nice_numbers.length > 0) {
                     niceNumbersCount += result.nice_numbers.length;
@@ -692,7 +658,6 @@
 
             function handleBenchmarkData(data) {
                 currentClaimData = data;
-                initializeDigitCounts(data.base);
                 startTime = Date.now();
                 updateStatistics(0, 0);
                 processCurrentField();
@@ -713,7 +678,6 @@
                     currentClaimData = claimData;
 
                     // Initialize for new field
-                    initializeDigitCounts(claimData.base);
                     startTime = Date.now();
                     numbersProcessedCount = 0;
                     updateStatistics(0, 0);
@@ -852,8 +816,6 @@
             document.addEventListener("DOMContentLoaded", () => {
                 if (checkBrowserSupport()) {
                     init();
-                    // Initialize empty histogram
-                    initializeDigitCounts(10);
                 }
             });
         </script>
