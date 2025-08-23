@@ -23,3 +23,9 @@ server:
 # Run scheduled jobs
 jobs:
     cargo run -r --bin nice_jobs
+
+# Build & deploy WASM app
+[working-directory: 'web-client']
+wasm:
+    wasm-pack build --target web --out-dir pkg
+    python3 -m http.server
