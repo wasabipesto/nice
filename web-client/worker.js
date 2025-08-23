@@ -28,92 +28,7 @@ async function initWasm() {
     }
 }
 
-// Modified WASM functions with progress reporting
-function processNiceOnlyWithProgress(claimDataJson, username) {
-    const claimData = JSON.parse(claimDataJson);
-    const base = claimData.base;
-    const rangeStart = BigInt(claimData.range_start);
-    const rangeEnd = BigInt(claimData.range_end);
-    const rangeSize = rangeEnd - rangeStart;
-
-    // Send initial status
-    self.postMessage({
-        type: "progress",
-        percent: 0,
-        message: "Starting nice-only processing...",
-    });
-
-    const niceNumbers = [];
-    let processed = BigInt(0);
-    const chunkSize = BigInt(1000);
-    let lastProgressUpdate = Date.now();
-    const progressUpdateInterval = 1000; // Update every 1 second
-
-    for (
-        let current = rangeStart;
-        current < rangeEnd && !shouldStop;
-        current += chunkSize
-    ) {
-        const chunkEnd =
-            current + chunkSize > rangeEnd ? rangeEnd : current + chunkSize;
-
-        // Process chunk
-        for (let num = current; num < chunkEnd && !shouldStop; num++) {
-            const numStr = num.toString();
-            const numUniques = getNumUniqueDigits(numStr, base);
-
-            if (numUniques === base) {
-                niceNumbers.push({
-                    number: numStr, // Convert to string for large numbers
-                    num_uniques: numUniques,
-                });
-            }
-
-            processed++;
-        }
-
-        // Send progress update
-        const now = Date.now();
-        if (now - lastProgressUpdate > progressUpdateInterval) {
-            const percent = Number((processed * BigInt(100)) / rangeSize);
-            const processedCount = Number(processed);
-            const totalCount = Number(rangeSize);
-
-            self.postMessage({
-                type: "progress",
-                percent: percent,
-                message: `Processed ${processedCount.toLocaleString()} / ${totalCount.toLocaleString()} numbers`,
-            });
-
-            lastProgressUpdate = now;
-        }
-    }
-
-    if (shouldStop) {
-        self.postMessage({
-            type: "stopped",
-            message: "Processing stopped by user",
-        });
-        return;
-    }
-
-    // Convert results back to server format
-    const serverNiceNumbers = niceNumbers.map((nn) => ({
-        number: parseInt(nn.number), // Convert back to number for server
-        num_uniques: nn.num_uniques,
-    }));
-
-    const result = {
-        claim_id: parseInt(claimData.claim_id),
-        username: username,
-        client_version: "3.0.0-wasm-worker",
-        unique_distribution: null,
-        nice_numbers: serverNiceNumbers,
-    };
-
-    return JSON.stringify(result);
-}
-
+// Process numbers with detailed progress reporting
 function processDetailedWithProgress(claimDataJson, username) {
     const claimData = JSON.parse(claimDataJson);
     const base = claimData.base;
@@ -283,23 +198,14 @@ self.onmessage = async function (e) {
             }
 
             shouldStop = false;
-            const { claimData, username, mode } = data;
+            const { claimData, username } = data;
 
             try {
                 const startTime = Date.now();
-                let resultJson;
-
-                if (mode === "detailed") {
-                    resultJson = processDetailedWithProgress(
-                        JSON.stringify(claimData),
-                        username,
-                    );
-                } else {
-                    resultJson = processNiceOnlyWithProgress(
-                        JSON.stringify(claimData),
-                        username,
-                    );
-                }
+                const resultJson = processDetailedWithProgress(
+                    JSON.stringify(claimData),
+                    username,
+                );
 
                 if (!shouldStop && resultJson) {
                     const endTime = Date.now();

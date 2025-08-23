@@ -237,24 +237,6 @@
                     </div>
 
                     <div>
-                        <label for="mode">Processing Mode:</label>
-                        <select id="mode">
-                            <option value="detailed">Detailed</option>
-                            <option value="niceonly">Nice Only</option>
-                        </select>
-                    </div>
-
-                    <div>
-                        <label for="apiUrl">Server API URL:</label>
-                        <input
-                            type="url"
-                            id="apiUrl"
-                            value="https://api.nicenumbers.net"
-                            placeholder="https://api.nicenumbers.net"
-                        />
-                    </div>
-
-                    <div>
                         <label for="testMode">Test Mode:</label>
                         <select id="testMode">
                             <option value="false">Online</option>
@@ -420,9 +402,9 @@
                 resultsDiv.scrollTop = resultsDiv.scrollHeight;
             }
 
-            async function getFieldFromServer(apiUrl, mode) {
-                const endpoint =
-                    mode === "detailed" ? "/claim/detailed" : "/claim/niceonly";
+            async function getFieldFromServer() {
+                const apiUrl = "https://api.nicenumbers.net";
+                const endpoint = "/claim/detailed";
                 const response = await fetch(`${apiUrl}${endpoint}`);
 
                 if (!response.ok) {
@@ -444,7 +426,8 @@
                 };
             }
 
-            async function submitFieldToServer(apiUrl, submitData) {
+            async function submitFieldToServer(data) {
+                const apiUrl = "https://api.nicenumbers.net";
                 const response = await fetch(`${apiUrl}/submit`, {
                     method: "POST",
                     headers: {
@@ -511,8 +494,7 @@
                     updateStatus("Submitting results to server...", "working");
                     appendResults("Submitting results...");
 
-                    const apiUrl = document.getElementById("apiUrl").value;
-                    const response = await submitFieldToServer(apiUrl, result);
+                    const response = await submitFieldToServer(result);
 
                     appendResults("Results submitted successfully!");
                     appendResults(`Server response: ${response}`);
@@ -557,10 +539,8 @@
                     const username =
                         document.getElementById("username").value ||
                         "anonymous";
-                    const mode = document.getElementById("mode").value;
-                    const apiUrl = document.getElementById("apiUrl").value;
 
-                    const claimData = await getFieldFromServer(apiUrl, mode);
+                    const claimData = await getFieldFromServer();
                     currentClaimData = claimData;
 
                     appendResults(
@@ -582,9 +562,8 @@
 
                 const username =
                     document.getElementById("username").value || "anonymous";
-                const mode = document.getElementById("mode").value;
 
-                updateStatus(`Processing field in ${mode} mode...`, "working");
+                updateStatus(`Processing field in detailed mode...`, "working");
                 updateProgress(0, "Starting processing...");
 
                 // Send processing request to worker
@@ -593,7 +572,7 @@
                     data: {
                         claimData: currentClaimData,
                         username: username,
-                        mode: mode,
+                        mode: "detailed",
                     },
                 });
             }
