@@ -103,7 +103,7 @@
 
                             <div class="field">
                                 <label class="label" for="testMode"
-                                    >Test Mode:</label
+                                    >Connection:</label
                                 >
                                 <div class="control">
                                     <div class="select is-fullwidth">
@@ -160,7 +160,10 @@
                                 >
                                     0%
                                 </progress>
-                                <p id="progressText" class="has-text-centered">
+                                <p
+                                    id="progressText"
+                                    class="has-text-centered is-hidden"
+                                >
                                     Progress: 0%
                                 </p>
                             </div>
@@ -270,26 +273,16 @@
             }
 
             // Update histogram with current digit counts
-            function updateHistogram() {
-                if (Object.keys(digitCounts).length === 0) return;
-                console.log(digitCounts);
-
-                const data = Object.entries(digitCounts).map(
-                    ([digit, count]) => ({
-                        digit: parseInt(digit),
-                        count: count,
-                        percentage:
-                            totalDigitsProcessed > 0
-                                ? (count / totalDigitsProcessed) * 100
-                                : 0,
-                    }),
-                );
-                console.log(data);
+            function updateHistogram(uniqueDistribution) {
+                if (uniqueDistribution == undefined) return;
+                const data = [...uniqueDistribution].map(([digit, count]) => ({
+                    digit,
+                    count,
+                }));
 
                 const plot = Plot.plot({
                     width: 900,
-                    //height: 300,
-                    marginLeft: 40,
+                    marginLeft: 75,
                     x: {
                         label: "Digit",
                         domain: data.map((d) => d.digit),
@@ -299,27 +292,11 @@
                         label: "Count",
                         grid: true,
                     },
-                    /*
-                    color: {
-                        legend: false,
-                        scheme: "Blues",
-                    },
-                    */
                     marks: [
                         Plot.barY(data, {
                             x: "digit",
                             y: "count",
-                            //fill: "count",
                             tip: true,
-                            /*
-                            tip: {
-                                format: {
-                                    x: "Digit",
-                                    y: "Count",
-                                    fill: false,
-                                },
-                            },
-                            */
                         }),
                         Plot.ruleY([0]),
                     ],
@@ -332,19 +309,24 @@
 
             // Process digits from a number and update counts
             function processDigits(numberStr, base) {
-                if (!numberStr || typeof numberStr !== "string") return;
+                if (!numberStr || typeof numberStr !== "string") {
+                    console.error("Invalid input:", numberStr);
+                    return;
+                }
 
                 for (let char of numberStr) {
                     const digit = parseInt(char, base);
                     if (!isNaN(digit) && digit >= 0 && digit < base) {
                         digitCounts[digit] = (digitCounts[digit] || 0) + 1;
                         totalDigitsProcessed++;
+                    } else {
+                        console.error("Invalid digit:", char);
                     }
                 }
             }
 
             // Update statistics display
-            function updateStatistics() {
+            function updateStatistics(numbersProcessedCount, niceNumbersCount) {
                 document.getElementById("numbersProcessed").textContent =
                     numbersProcessedCount.toLocaleString();
                 document.getElementById("niceNumbersFound").textContent =
@@ -418,74 +400,12 @@
                     case "progress":
                         updateProgress(rest.percent, rest.message);
 
-                        // Update statistics on every progress update
-                        if (currentClaimData && startTime) {
-                            // Estimate numbers processed based on progress percentage
-                            const rangeSize = parseInt(
-                                currentClaimData.range_size,
-                            );
-                            const estimatedProcessed = Math.floor(
-                                (rest.percent / 100) * rangeSize,
-                            );
-                            numbersProcessedCount = estimatedProcessed;
-
-                            // Simulate digit distribution updates during processing
-                            // This gives a sense of the processing happening in real-time
-                            if (
-                                rest.percent > 0 &&
-                                totalDigitsProcessed === 0
-                            ) {
-                                // Initialize with some sample data for demonstration
-                                for (
-                                    let i = 0;
-                                    i < currentClaimData.base;
-                                    i++
-                                ) {
-                                    digitCounts[i] = Math.floor(
-                                        Math.random() *
-                                            estimatedProcessed *
-                                            0.1,
-                                    );
-                                }
-                                totalDigitsProcessed = Object.values(
-                                    digitCounts,
-                                ).reduce((a, b) => a + b, 0);
-                            } else if (rest.percent > 0) {
-                                // Gradually increase digit counts as processing progresses
-                                const increment = Math.max(
-                                    1,
-                                    Math.floor(estimatedProcessed * 0.001),
-                                );
-                                for (
-                                    let i = 0;
-                                    i < currentClaimData.base;
-                                    i++
-                                ) {
-                                    digitCounts[i] += Math.floor(
-                                        Math.random() * increment,
-                                    );
-                                }
-                                totalDigitsProcessed = Object.values(
-                                    digitCounts,
-                                ).reduce((a, b) => a + b, 0);
-                            }
-
-                            updateHistogram();
-                            updateStatistics();
-                        }
-
-                        // Process digits for histogram if we have intermediate results
-                        if (rest.intermediateNumbers && currentClaimData) {
-                            rest.intermediateNumbers.forEach((num) => {
-                                processDigits(
-                                    num.toString(),
-                                    currentClaimData.base,
-                                );
-                                numbersProcessedCount++;
-                            });
-                            updateHistogram();
-                            updateStatistics();
-                        }
+                        // Update statistics display
+                        updateStatistics(
+                            rest.processedCount,
+                            rest.niceNumbers.length,
+                        );
+                        updateHistogram(rest.uniqueDistribution);
                         break;
 
                     case "complete":
@@ -611,7 +531,6 @@
                     result.all_numbers.forEach((num) => {
                         processDigits(num.toString(), claimData.base);
                     });
-                    updateHistogram();
                 }
 
                 // Update nice numbers count
@@ -619,8 +538,8 @@
                     niceNumbersCount += result.nice_numbers.length;
                 }
 
-                numbersProcessedCount = rangeSize;
-                updateStatistics();
+                updateStatistics(rangeSize, niceNumbersCount);
+                updateHistogram();
 
                 appendResults(
                     `Processing completed in ${elapsedSeconds.toFixed(2)} seconds`,
@@ -700,9 +619,7 @@
                 currentClaimData = data;
                 initializeDigitCounts(data.base);
                 startTime = Date.now();
-                numbersProcessedCount = 0;
-                niceNumbersCount = 0;
-                updateStatistics();
+                updateStatistics(0, 0);
                 processCurrentField();
             }
 
@@ -724,7 +641,7 @@
                     initializeDigitCounts(claimData.base);
                     startTime = Date.now();
                     numbersProcessedCount = 0;
-                    updateStatistics();
+                    updateStatistics(0, 0);
 
                     appendResults(
                         `Received field ${claimData.claim_id}: range ${claimData.range_start} to ${claimData.range_end} in base ${claimData.base}`,

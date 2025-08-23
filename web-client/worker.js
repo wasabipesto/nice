@@ -41,6 +41,9 @@ function processDetailedWithProgress(claimDataJson, username) {
         type: "progress",
         percent: 0,
         message: "Starting detailed processing...",
+        processedCount: 0,
+        uniqueDistribution: new Map(),
+        niceNumbers: [],
     });
 
     const allNiceNumbers = [];
@@ -98,6 +101,9 @@ function processDetailedWithProgress(claimDataJson, username) {
                 type: "progress",
                 percent: percent,
                 message: `Processed ${processedCount.toLocaleString()} / ${totalCount.toLocaleString()} numbers`,
+                processedCount: processedCount,
+                uniqueDistribution: uniqueDistribution,
+                niceNumbers: allNiceNumbers,
             });
 
             lastProgressUpdate = now;
