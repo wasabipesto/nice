@@ -88,7 +88,7 @@ function processDetailedWithProgress(claimDataJson, username) {
             );
         }
 
-        processed += BigInt(chunkResult.processed_count);
+        processed += chunkSize;
 
         // Send progress update
         const now = Date.now();

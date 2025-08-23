@@ -16,11 +16,15 @@ pub fn main() {
 }
 
 // Import types from the common library
+use itertools::Itertools;
 use malachite::natural::Natural;
 use malachite::num::arithmetic::traits::Pow;
-use malachite::num::conversion::traits::{Digits, FromStringBase};
+use malachite::num::conversion::traits::Digits;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
+
+pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 
 #[wasm_bindgen]
 extern "C" {
@@ -37,60 +41,65 @@ struct NiceNumber {
 #[derive(Serialize, Deserialize)]
 struct DistributionEntry {
     num_uniques: u32,
-    count: u64,
+    count: u128,
 }
 
 #[derive(Serialize, Deserialize)]
 struct ChunkResult {
     nice_numbers: Vec<NiceNumber>,
     distribution_updates: Vec<DistributionEntry>,
-    processed_count: u64,
 }
 
 /// Process a chunk of numbers and return nice numbers and distribution updates
 #[wasm_bindgen]
 pub fn process_chunk_wasm(range_start_str: &str, range_end_str: &str, base: u32) -> String {
-    let range_start = match Natural::from_string_base(10, range_start_str) {
-        Some(n) => n,
-        None => return "{}".to_string(),
-    };
+    console_error_panic_hook::set_once();
 
-    let range_end = match Natural::from_string_base(10, range_end_str) {
-        Some(n) => n,
-        None => return "{}".to_string(),
-    };
+    // get range start and end
+    let range_start = u128::from_str(range_start_str).unwrap();
+    let range_end = u128::from_str(range_end_str).unwrap();
 
-    let nice_cutoff = (base as f64 * 0.9).floor() as u32;
+    // calculate the minimum num_unique_digits cutoff (default 90% of the base)
+    let nice_list_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
+
+    // set up outputs
     let mut nice_numbers = Vec::new();
-    let mut distribution = HashMap::new();
-    let mut processed_count = 0u64;
+    let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
 
-    // Initialize distribution map
-    for i in 1..=base {
-        distribution.insert(i, 0u64);
-    }
+    // break up the range into chunks
+    let chunk_size: usize = 10_000;
+    let chunks = (range_start..range_end).chunks(chunk_size);
 
-    let mut current = range_start;
-    while current < range_end {
-        let num_uniques = get_num_unique_digits(&current, base);
+    // process everything, saving results and aggregating after each chunk finishes
+    for chunk in &chunks {
+        // get chunk results
+        let chunk_results: Vec<(u128, u32)> = chunk
+            .map(|num| (num, get_num_unique_digits(num, base)))
+            .collect();
 
-        // Update distribution
-        *distribution.entry(num_uniques).or_insert(0) += 1;
-
-        // Check if it's a nice number
-        if num_uniques > nice_cutoff {
-            nice_numbers.push(NiceNumber {
-                number: current.to_string(),
-                num_uniques,
-            });
+        // aggregate unique_distribution
+        for (bin_uniques, total_count) in unique_distribution_map.iter_mut() {
+            let chunk_count = chunk_results
+                .iter()
+                .filter(|(_, num_unique_digits)| num_unique_digits == bin_uniques)
+                .count() as u128;
+            *total_count += chunk_count;
         }
 
-        processed_count += 1;
-        current += Natural::from(1u32);
+        // collect nice numbers
+        nice_numbers.extend(
+            chunk_results
+                .into_iter()
+                .filter(|(_, num_unique_digits)| num_unique_digits > &nice_list_cutoff)
+                .map(|(num, num_unique_digits)| NiceNumber {
+                    number: num.to_string(),
+                    num_uniques: num_unique_digits,
+                }),
+        );
     }
 
     // Convert distribution to sorted vector
-    let mut distribution_updates: Vec<DistributionEntry> = distribution
+    let mut distribution_updates: Vec<DistributionEntry> = unique_distribution_map
         .into_iter()
         .map(|(num_uniques, count)| DistributionEntry { num_uniques, count })
         .collect();
@@ -99,36 +108,42 @@ pub fn process_chunk_wasm(range_start_str: &str, range_end_str: &str, base: u32)
     let result = ChunkResult {
         nice_numbers,
         distribution_updates,
-        processed_count,
     };
 
-    match serde_json::to_string(&result) {
-        Ok(json) => json,
-        Err(_) => "{}".to_string(),
-    }
+    serde_json::to_string(&result).unwrap()
 }
 
 /// Internal function to calculate unique digits for a Natural number
-fn get_num_unique_digits(num: &Natural, base: u32) -> u32 {
-    // Create an indicator variable as a boolean array
-    let mut digits_indicator: u128 = 0;
+fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
 
-    // Square the number, convert to base and save the digits
-    let squared = num.pow(2);
+    // create an indicator variable as a boolean array
+    let mut digits_indicator: Vec<bool> = vec![false; base as usize];
+
+    // convert u128 to natural
+    let num = Natural::from(num_u128);
+
+    // square the number, convert to base and save the digits
+    // tried using foiled out versions but malachite is already pretty good
+    let squared = (&num).pow(2);
     for digit in squared.to_digits_asc(&base) {
-        if digit < 128 {
-            digits_indicator |= 1 << digit;
-        }
+        digits_indicator[digit as usize] = true;
     }
 
-    // Cube, convert to base and save the digits
-    let cubed = &squared * num;
+    // cube, convert to base and save the digits
+    let cubed = squared * &num;
     for digit in cubed.to_digits_asc(&base) {
-        if digit < 128 {
-            digits_indicator |= 1 << digit;
+        digits_indicator[digit as usize] = true;
+    }
+
+    // output the number of unique digits
+    let mut num_unique_digits = 0;
+
+    for digit in digits_indicator {
+        if digit {
+            num_unique_digits += 1
         }
     }
 
-    // Return the number of unique digits
-    digits_indicator.count_ones()
+    num_unique_digits
 }

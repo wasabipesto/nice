@@ -1200,6 +1200,7 @@ name = "nice-web-client"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "itertools 0.14.0",
  "malachite",
  "serde",
  "serde_json",
