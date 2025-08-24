@@ -56,6 +56,70 @@
                 color: #721c24;
                 border: 1px solid #f5c6cb;
             }
+
+            /* Thread count slider styling */
+            .slider {
+                -webkit-appearance: none;
+                appearance: none;
+                height: 8px;
+                border-radius: 4px;
+                background: #ddd;
+                outline: none;
+                opacity: 0.7;
+                transition: opacity 0.2s;
+                margin: 10px 0;
+            }
+
+            .slider:hover {
+                opacity: 1;
+            }
+
+            .slider::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                appearance: none;
+                width: 20px;
+                height: 20px;
+                border-radius: 50%;
+                background: #3273dc;
+                cursor: pointer;
+                border: 2px solid #fff;
+                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+            }
+
+            .slider::-moz-range-thumb {
+                width: 20px;
+                height: 20px;
+                border-radius: 50%;
+                background: #3273dc;
+                cursor: pointer;
+                border: 2px solid #fff;
+                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+            }
+
+            .slider::-webkit-slider-track {
+                -webkit-appearance: none;
+                appearance: none;
+                height: 8px;
+                border-radius: 4px;
+                background: linear-gradient(
+                    to right,
+                    #48c774 0%,
+                    #ffdd57 70%,
+                    #ff3860 100%
+                );
+            }
+
+            .slider::-moz-range-track {
+                height: 8px;
+                border-radius: 4px;
+                background: linear-gradient(
+                    to right,
+                    #48c774 0%,
+                    #ffdd57 70%,
+                    #ff3860 100%
+                );
+                border: none;
+            }
         </style>
     </head>
     <body class="has-background-dark">
@@ -110,6 +174,28 @@
                                 </div>
                             </div>
 
+                            <div class="field">
+                                <label class="label" for="threadCount">
+                                    Thread Count:
+                                    <span id="threadCountValue">1</span>
+                                </label>
+                                <div class="control">
+                                    <input
+                                        type="range"
+                                        id="threadCount"
+                                        class="slider is-fullwidth"
+                                        min="1"
+                                        max="1"
+                                        value="1"
+                                        step="1"
+                                    />
+                                </div>
+                                <div class="help">
+                                    Use fewer threads to keep your system
+                                    responsive
+                                </div>
+                            </div>
+
                             <div class="field is-grouped">
                                 <div class="control">
                                     <button
@@ -139,7 +225,7 @@
                             </div>
 
                             <div id="status" class="notification is-info">
-                                Loading Web Worker...
+                                Loading Worker Pool...
                             </div>
 
                             <div id="progressContainer" class="is-hidden">
@@ -189,7 +275,7 @@
                                 class="worker-status initializing"
                                 id="workerStatus"
                             >
-                                Initializing Web Worker...
+                                Initializing Worker Pool...
                             </div>
                             <div id="results" class="results"></div>
                         </div>
@@ -273,10 +359,13 @@
             </div>
         </section>
 
+        <!-- Import worker pool -->
+        <script src="./worker-pool.js"></script>
+
         <script type="module">
             import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/+esm";
 
-            let worker = null;
+            let workerPool = null;
             let isProcessing = false;
             let shouldStop = false;
             let currentClaimData = null;
@@ -343,30 +432,83 @@
             // Initialize Web Worker
             async function init() {
                 try {
+                    const cores = navigator.hardwareConcurrency || 4;
                     updateWorkerStatus(
-                        "Initializing Web Worker...",
+                        `Initializing Worker Pool with ${cores} workers...`,
                         "initializing",
                     );
 
-                    // Create the web worker
-                    worker = new Worker("./worker.js");
+                    // Get user settings
+                    const threadCount = parseInt(
+                        document.getElementById("threadCount").value,
+                    );
 
-                    // Set up message handlers
-                    worker.onmessage = handleWorkerMessage;
-                    worker.onerror = handleWorkerError;
+                    // Create the worker pool with user settings
+                    workerPool = new WorkerPool({
+                        maxWorkers: threadCount,
+                        progressUpdateInterval: 500,
+                    });
+                    await workerPool.initialize();
 
-                    // Initialize the worker
-                    worker.postMessage({ type: "init" });
+                    updateWorkerStatus(
+                        `Worker Pool ready with ${workerPool.getWorkerCount()} workers!`,
+                        "ready",
+                    );
+                    updateStatus(
+                        `Multi-threaded processing ready with ${workerPool.getWorkerCount()} workers`,
+                        "is-success",
+                    );
+
+                    // Enable the start button
+                    document.getElementById("startBtn").disabled = false;
+                    console.log(
+                        "Worker pool initialized - start button enabled",
+                    );
+
+                    // Fallback timeout to ensure button is enabled
+                    setTimeout(() => {
+                        if (workerPool && workerPool.isReady()) {
+                            document.getElementById("startBtn").disabled =
+                                false;
+                            console.log("Fallback: start button force-enabled");
+                        }
+                    }, 1000);
                 } catch (error) {
                     updateStatus(
-                        `Error creating Web Worker: ${error.message}`,
+                        `Error creating Worker Pool: ${error.message}`,
                         "is-danger",
                     );
-                    updateWorkerStatus("Failed to create Web Worker", "error");
-                    console.error("Failed to create Web Worker:", error);
+                    updateWorkerStatus("Failed to create Worker Pool", "error");
+                    console.error("Failed to create Worker Pool:", error);
                 }
             }
 
+            // Worker Pool Message Handlers
+            function handleWorkerPoolProgress(progressData) {
+                updateProgress(progressData.percent, progressData.message);
+
+                // Update statistics display
+                updateStatistics(
+                    progressData.processedCount,
+                    progressData.niceNumbers.length,
+                );
+                updateHistogram(progressData.uniqueDistribution);
+            }
+
+            function handleWorkerPoolComplete(completeData) {
+                handleProcessingComplete(
+                    completeData.result,
+                    completeData.elapsedSeconds,
+                );
+            }
+
+            function handleWorkerPoolError(error) {
+                updateStatus(`Processing error: ${error}`, "is-danger");
+                appendResults(`Error: ${error}`);
+                resetUI();
+            }
+
+            // Legacy handlers - kept for compatibility
             function handleWorkerMessage(e) {
                 const { type, data, ...rest } = e.data;
 
@@ -389,7 +531,7 @@
                                 "error",
                             );
                             updateStatus(
-                                `Error initializing WASM in worker: ${rest.error}`,
+                                `Error initializing WASM in worker pool: ${rest.error}`,
                                 "is-danger",
                             );
                         }
@@ -431,14 +573,17 @@
                         break;
 
                     default:
-                        console.warn("Unknown worker message type:", type);
+                        console.warn("Unknown worker pool message type:", type);
                 }
             }
 
             function handleWorkerError(error) {
-                updateStatus(`Worker error: ${error.message}`, "is-danger");
-                updateWorkerStatus("Web Worker error", "error");
-                console.error("Worker error:", error);
+                updateStatus(
+                    `Worker pool error: ${error.message}`,
+                    "is-danger",
+                );
+                updateWorkerStatus("Worker Pool error", "error");
+                console.error("Worker pool error:", error);
                 resetUI();
             }
 
@@ -693,30 +838,27 @@
             }
 
             function processCurrentField() {
-                if (!currentClaimData || !worker) return;
+                if (!currentClaimData || !workerPool) return;
 
                 const username =
                     document.getElementById("username").value || "anonymous";
 
                 updateStatus(
-                    `Processing field in detailed mode...`,
+                    `Processing field with ${workerPool.getWorkerCount()} workers in parallel...`,
                     "is-warning",
                 );
-                updateProgress(0, "Starting processing...");
+                updateProgress(0, "Starting multi-threaded processing...");
 
-                // Send processing request to worker
-                worker.postMessage({
-                    type: "process",
-                    data: {
-                        claimData: currentClaimData,
-                        username: username,
-                        mode: "detailed",
-                    },
+                // Send processing request to worker pool
+                workerPool.processClaimData(currentClaimData, username, {
+                    onProgress: handleWorkerPoolProgress,
+                    onComplete: handleWorkerPoolComplete,
+                    onError: handleWorkerPoolError,
                 });
             }
 
             window.startProcessing = async function () {
-                if (isProcessing || !worker) return;
+                if (isProcessing || !workerPool) return;
 
                 const testMode =
                     document.getElementById("testMode").value === "true";
@@ -740,8 +882,9 @@
                     if (testMode) {
                         updateStatus("Getting benchmark data...", "is-warning");
                         appendResults("Using benchmark data (offline mode)");
-                        worker.postMessage({ type: "benchmark" });
-                        //shouldStop = true;
+                        const benchmarkData =
+                            await workerPool.getBenchmarkData();
+                        handleBenchmarkData(benchmarkData);
                     } else {
                         await startNextField();
                     }
@@ -758,12 +901,14 @@
                 shouldStop = true;
                 isProcessing = false;
 
-                if (worker) {
-                    worker.postMessage({ type: "stop" });
+                if (workerPool) {
+                    workerPool.stopProcessing();
                 }
 
-                updateStatus("Stopping processing...", "is-warning");
-                appendResults("Stop requested by user");
+                updateStatus("Stopping all workers...", "is-warning");
+                appendResults(
+                    "Stop requested by user - stopping all parallel workers",
+                );
             };
 
             function resetUI() {
@@ -774,6 +919,11 @@
                 document
                     .getElementById("startBtn")
                     .classList.remove("is-hidden");
+
+                // Re-enable the start button if worker pool is ready
+                if (workerPool && workerPool.isReady()) {
+                    document.getElementById("startBtn").disabled = false;
+                }
                 document
                     .getElementById("stopContainer")
                     .classList.add("is-hidden");
@@ -790,7 +940,7 @@
             function checkBrowserSupport() {
                 if (!window.Worker) {
                     updateStatus(
-                        "Web Workers not supported in this browser",
+                        "Your browser does not support Web Workers. Multi-threaded processing requires a modern browser.",
                         "is-danger",
                     );
                     updateWorkerStatus("Web Workers not supported", "error");
@@ -799,12 +949,17 @@
 
                 if (!window.WebAssembly) {
                     updateStatus(
-                        "WebAssembly not supported in this browser",
+                        "Your browser does not support WebAssembly. High-performance processing requires a modern browser.",
                         "is-danger",
                     );
                     updateWorkerStatus("WebAssembly not supported", "error");
                     return false;
                 }
+
+                const cores = navigator.hardwareConcurrency || 4;
+                console.log(
+                    `Browser supports ${cores} concurrent threads for parallel processing`,
+                );
 
                 return true;
             }
@@ -812,9 +967,85 @@
             // Initialize when page loads
             document.addEventListener("DOMContentLoaded", () => {
                 if (checkBrowserSupport()) {
+                    setupCpuControls();
                     init();
                 }
             });
+
+            // Setup thread controls
+            function setupCpuControls() {
+                const cores = navigator.hardwareConcurrency || 4;
+                const threadSlider = document.getElementById("threadCount");
+                const threadValue = document.getElementById("threadCountValue");
+
+                // Setup thread count slider
+                threadSlider.max = cores;
+                const defaultThreads = Math.max(1, Math.floor(cores * 0.8));
+                threadSlider.value = defaultThreads;
+                threadValue.textContent = defaultThreads;
+
+                // Update display when slider changes
+                threadSlider.addEventListener("input", () => {
+                    threadValue.textContent = threadSlider.value;
+                });
+
+                // Add event listener to update worker pool if already initialized
+                threadSlider.addEventListener("change", () => {
+                    if (workerPool && !isProcessing) {
+                        restartWorkerPool();
+                    }
+                });
+            }
+
+            // Restart worker pool with new settings
+            async function restartWorkerPool() {
+                if (workerPool && !isProcessing) {
+                    const threadCount = parseInt(
+                        document.getElementById("threadCount").value,
+                    );
+
+                    updateStatus(
+                        "Restarting worker pool with new settings...",
+                        "is-warning",
+                    );
+                    updateWorkerStatus(
+                        "Restarting Worker Pool...",
+                        "initializing",
+                    );
+
+                    // Terminate old pool
+                    workerPool.terminate();
+
+                    try {
+                        // Create new pool with updated settings
+                        workerPool = new WorkerPool({
+                            maxWorkers: threadCount,
+                            progressUpdateInterval: 500,
+                        });
+                        await workerPool.initialize();
+
+                        updateWorkerStatus(
+                            `Worker Pool ready with ${workerPool.getWorkerCount()} workers!`,
+                            "ready",
+                        );
+                        updateStatus(
+                            `Settings applied: ${threadCount} worker${threadCount > 1 ? "s" : ""}`,
+                            "is-success",
+                        );
+
+                        document.getElementById("startBtn").disabled = false;
+                    } catch (error) {
+                        updateStatus(
+                            `Error restarting Worker Pool: ${error.message}`,
+                            "is-danger",
+                        );
+                        updateWorkerStatus(
+                            "Failed to restart Worker Pool",
+                            "error",
+                        );
+                    }
+                }
+            }
         </script>
     </body>
 </html>
