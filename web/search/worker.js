@@ -120,7 +120,7 @@ function processDetailedWithProgress(claimDataJson, username) {
 
     // Convert results back to server format
     const serverNiceNumbers = allNiceNumbers.map((nn) => ({
-        number: parseInt(nn.number),
+        number: nn.number,
         num_uniques: nn.num_uniques,
     }));
 
@@ -132,7 +132,7 @@ function processDetailedWithProgress(claimDataJson, username) {
         .sort((a, b) => a.num_uniques - b.num_uniques);
 
     const result = {
-        claim_id: parseInt(claimData.claim_id),
+        claim_id: claimData.claim_id,
         username: username,
         client_version: "3.0.0-wasm-worker",
         unique_distribution: serverDistribution,

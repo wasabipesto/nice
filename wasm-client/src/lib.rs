@@ -30,7 +30,7 @@ extern "C" {
 
 #[derive(Serialize, Deserialize)]
 struct NiceNumber {
-    number: String,
+    number: u128,
     num_uniques: u32,
 }
 
@@ -88,7 +88,7 @@ pub fn process_chunk_wasm(range_start_str: &str, range_end_str: &str, base: u32)
                 .into_iter()
                 .filter(|(_, num_unique_digits)| num_unique_digits > &nice_list_cutoff)
                 .map(|(num, num_unique_digits)| NiceNumber {
-                    number: num.to_string(),
+                    number: num,
                     num_uniques: num_unique_digits,
                 }),
         );

@@ -31,6 +31,10 @@ class WorkerPool {
         this.currentJobId = null;
         this.workerProgress = new Map(); // Track individual worker progress
         this.lastProgressUpdate = 0;
+
+        // Current job data
+        this.currentClaimId = null;
+        this.currentUsername = null;
     }
 
     async initialize() {
@@ -122,6 +126,10 @@ class WorkerPool {
         this.progressCallback = callbacks.onProgress;
         this.completeCallback = callbacks.onComplete;
         this.errorCallback = callbacks.onError;
+
+        // Store claim_id and username for later use
+        this.currentClaimId = parseInt(claimData.claim_id) || 0;
+        this.currentUsername = username;
 
         // Reset aggregated results
         this.resetAggregatedResults();
@@ -252,7 +260,10 @@ class WorkerPool {
     }
 
     handleComplete(workerInfo, result, elapsedSeconds) {
-        console.log(`Worker ${workerInfo.id} completed processing`);
+        console.log(
+            `Worker ${workerInfo.id} completed processing. Result:`,
+            result,
+        );
 
         // Validate result structure
         if (!result || typeof result !== "object") {
@@ -302,12 +313,12 @@ class WorkerPool {
         // If too many workers fail, abort the entire operation
         const failureThreshold = Math.ceil(this.maxWorkers / 2); // Allow up to half to fail
         if (this.aggregatedResults.errors.length >= failureThreshold) {
-            this.stopProcessing();
             if (this.errorCallback) {
                 this.errorCallback(
                     `Too many worker failures (${this.aggregatedResults.errors.length}/${this.maxWorkers}). Aborting operation.`,
                 );
             }
+            this.stopProcessing();
             return;
         }
 
@@ -414,6 +425,7 @@ class WorkerPool {
     }
 
     aggregateWorkerResults(result) {
+        console.log("🔍 aggregateWorkerResults called with:", result);
         try {
             // Merge nice numbers with validation
             if (result.nice_numbers && Array.isArray(result.nice_numbers)) {
@@ -469,35 +481,19 @@ class WorkerPool {
             }))
             .sort((a, b) => a.num_uniques - b.num_uniques);
 
-        // Get claim_id from any worker result, or from the original claim data
-        let claim_id = 0;
-        if (
-            this.aggregatedResults.niceNumbers.length > 0 &&
-            this.aggregatedResults.niceNumbers[0].claim_id
-        ) {
-            claim_id = this.aggregatedResults.niceNumbers[0].claim_id;
-        } else {
-            // Get from active jobs or stored claim data
-            const firstJob = Array.from(this.activeJobs.values())[0];
-            if (firstJob && firstJob.claimData) {
-                claim_id = parseInt(firstJob.claimData.claim_id);
-            }
-        }
-
-        // Get username from any active job
-        let username = "anonymous";
-        const firstJob = Array.from(this.activeJobs.values())[0];
-        if (firstJob && firstJob.username) {
-            username = firstJob.username;
-        }
+        // Use stored claim_id and username from processing initialization
+        const claim_id = this.currentClaimId || 0;
+        const username = this.currentUsername || "anonymous";
 
         const finalResult = {
             claim_id: claim_id,
             username: username,
-            client_version: `3.0.0-wasm-worker-pool-${this.maxWorkers}`,
+            client_version: "3.0.0-wasm-worker",
             unique_distribution: serverDistribution,
             nice_numbers: this.aggregatedResults.niceNumbers,
         };
+
+        console.log("Final result being sent:", finalResult);
 
         if (this.completeCallback) {
             this.completeCallback({
@@ -506,6 +502,10 @@ class WorkerPool {
                 elapsedSeconds: elapsedSeconds,
             });
         }
+
+        // Clear claim data after using it
+        this.currentClaimId = null;
+        this.currentUsername = null;
     }
 
     resetAggregatedResults() {
@@ -555,6 +555,8 @@ class WorkerPool {
         this.workers = [];
         this.isInitialized = false;
         this.activeJobs.clear();
+        this.currentClaimId = null;
+        this.currentUsername = null;
     }
 
     async getBenchmarkData() {
