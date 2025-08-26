@@ -4,11 +4,9 @@
 
 extern crate nice_common;
 use nice_common::benchmark::{get_benchmark_field, BenchmarkMode};
-use nice_common::client_api::get_field_from_server;
-use nice_common::client_api::submit_field_to_server;
-use nice_common::client_process::process_detailed_chunked;
-use nice_common::client_process::process_niceonly;
-use nice_common::{DataToServer, SearchMode, CLIENT_VERSION};
+use nice_common::client_api::{get_field_from_server, submit_field_to_server};
+use nice_common::client_process::{process_range_detailed, process_range_niceonly};
+use nice_common::{DataToServer, FieldResults, SearchMode, CLIENT_VERSION};
 
 extern crate serde_json;
 use clap::Parser;
@@ -70,23 +68,29 @@ fn main() {
     let before = Instant::now();
 
     // process range & compile results
-    let submit_data: DataToServer = match cli.mode {
-        SearchMode::Detailed => {
-            let result = process_detailed_chunked(
-                claim_data.range_start,
-                claim_data.range_end,
-                claim_data.base,
-            );
+    let result: FieldResults = match cli.mode {
+        SearchMode::Detailed => process_range_detailed(
+            claim_data.range_start,
+            claim_data.range_end,
+            claim_data.base,
+        ),
+        SearchMode::Niceonly => process_range_niceonly(
+            claim_data.range_start,
+            claim_data.range_end,
+            claim_data.base,
+        ),
+    };
 
-            DataToServer {
-                claim_id: claim_data.claim_id,
-                username: cli.username,
-                client_version: CLIENT_VERSION.to_string(),
-                unique_distribution: Some(result.distribution),
-                nice_numbers: result.nice_numbers,
-            }
-        }
-        SearchMode::Niceonly => process_niceonly(&claim_data, &cli.username),
+    let submit_data = DataToServer {
+        claim_id: claim_data.claim_id,
+        username: cli.username,
+        client_version: CLIENT_VERSION.to_string(),
+        unique_distribution: if result.distribution.is_empty() {
+            None
+        } else {
+            Some(result.distribution)
+        },
+        nice_numbers: result.nice_numbers,
     };
 
     // stop the benchmarking timer

@@ -201,7 +201,7 @@ pub struct SubmissionCandidate {
 }
 
 /// The results from processing a field or a chunk of a field.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct FieldResults {
     pub distribution: Vec<UniquesDistributionSimple>,
     pub nice_numbers: Vec<NiceNumberSimple>,

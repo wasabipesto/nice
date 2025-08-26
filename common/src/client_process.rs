@@ -51,11 +51,11 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
 
 /// The inner loop of detailed field processing. Also called by other crates like the WASM client.
 /// Automatically breaks the range into chunks for some performance gains.
-pub fn process_detailed_chunked(range_start: u128, range_end: u128, base: u32) -> FieldResults {
+pub fn process_range_detailed(range_start: u128, range_end: u128, base: u32) -> FieldResults {
     // Calculate the minimum num_unique_digits cutoff (default 90% of the base)
     let nice_list_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
 
-    // Initialize a list of nice numbers, ready to submit
+    // Initialize a list for nice and semi-nice numbers
     let mut nice_numbers: Vec<NiceNumberSimple> = Vec::new();
 
     // Initialize a map indexed by num_unique_digits with the count of each
@@ -107,7 +107,7 @@ pub fn process_detailed_chunked(range_start: u128, range_end: u128, base: u32) -
 
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
 pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToServer {
-    let results = process_detailed_chunked(
+    let results = process_range_detailed(
         claim_data.range_start,
         claim_data.range_end,
         claim_data.base,
@@ -186,25 +186,42 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
     }
 }
 
+/// Process a field by looking for completely nice numbers.
+/// Implements several optimizations over the detailed search.
+pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> FieldResults {
+    let base_u128_minusone = base as u128 - 1;
+    let residue_filter = residue_filter::get_residue_filter_u128(&base);
+
+    let nice_list = (range_start..range_end)
+        .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
+        .filter(|num| get_is_nice(*num, base))
+        .map(|number| NiceNumberSimple {
+            number,
+            num_uniques: base,
+        })
+        .collect();
+
+    FieldResults {
+        distribution: Vec::new(),
+        nice_numbers: nice_list,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn process_detailed_b10() {
-        let username = "anonymous".to_string();
-        let claim_data = DataToClient {
+        let input = DataToClient {
             claim_id: 0,
             base: 10,
             range_start: 47,
             range_end: 100,
             range_size: 53,
         };
-        let submit_data = DataToServer {
-            claim_id: claim_data.claim_id,
-            username: username.clone(),
-            client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: Some(Vec::from([
+        let result = FieldResults {
+            distribution: Vec::from([
                 UniquesDistributionSimple {
                     num_uniques: 1,
                     count: 0,
@@ -245,30 +262,29 @@ mod tests {
                     num_uniques: 10,
                     count: 1,
                 },
-            ])),
+            ]),
             nice_numbers: Vec::from([NiceNumberSimple {
                 number: 69,
                 num_uniques: 10,
             }]),
         };
-        assert_eq!(process_detailed(&claim_data, &username), submit_data);
+        assert_eq!(
+            process_range_detailed(input.range_start, input.range_end, input.base),
+            result
+        );
     }
 
     #[test]
     fn process_detailed_b40() {
-        let username = "anonymous".to_string();
-        let claim_data = DataToClient {
+        let input = DataToClient {
             claim_id: 0,
             base: 40,
             range_start: 916284264916,
             range_end: 916284264916 + 10000,
             range_size: 10000,
         };
-        let submit_data = DataToServer {
-            claim_id: claim_data.claim_id,
-            username: username.clone(),
-            client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: Some(Vec::from([
+        let result = FieldResults {
+            distribution: Vec::from([
                 UniquesDistributionSimple {
                     num_uniques: 1,
                     count: 0,
@@ -429,27 +445,26 @@ mod tests {
                     num_uniques: 40,
                     count: 0,
                 },
-            ])),
+            ]),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(process_detailed(&claim_data, &username), submit_data);
+        assert_eq!(
+            process_range_detailed(input.range_start, input.range_end, input.base),
+            result
+        );
     }
 
     #[test]
     fn process_detailed_b80() {
-        let username = "anonymous".to_string();
-        let claim_data = DataToClient {
+        let input = DataToClient {
             claim_id: 0,
             base: 80,
             range_start: 653245554420798943087177909799,
             range_end: 653245554420798943087177909799 + 10000,
             range_size: 10000,
         };
-        let submit_data = DataToServer {
-            claim_id: claim_data.claim_id,
-            username: username.clone(),
-            client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: Some(Vec::from([
+        let result = FieldResults {
+            distribution: Vec::from([
                 UniquesDistributionSimple {
                     num_uniques: 1,
                     count: 0,
@@ -770,72 +785,72 @@ mod tests {
                     num_uniques: 80,
                     count: 0,
                 },
-            ])),
+            ]),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(process_detailed(&claim_data, &username), submit_data);
+        assert_eq!(
+            process_range_detailed(input.range_start, input.range_end, input.base),
+            result
+        );
     }
 
     #[test]
     fn process_niceonly_b10() {
-        let username = "anonymous".to_string();
-        let claim_data = DataToClient {
+        let input = DataToClient {
             claim_id: 0,
             base: 10,
             range_start: 47,
             range_end: 100,
             range_size: 53,
         };
-        let submit_data = DataToServer {
-            claim_id: claim_data.claim_id,
-            username: username.clone(),
-            client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: None,
+        let result = FieldResults {
+            distribution: Vec::new(),
             nice_numbers: Vec::from([NiceNumberSimple {
                 number: 69,
                 num_uniques: 10,
             }]),
         };
-        assert_eq!(process_niceonly(&claim_data, &username), submit_data);
+        assert_eq!(
+            process_range_niceonly(input.range_start, input.range_end, input.base),
+            result
+        );
     }
 
     #[test]
     fn process_niceonly_b40() {
-        let username = "anonymous".to_string();
-        let claim_data = DataToClient {
+        let input = DataToClient {
             claim_id: 0,
             base: 40,
             range_start: 916284264916,
             range_end: 916284264916 + 10000,
             range_size: 10000,
         };
-        let submit_data = DataToServer {
-            claim_id: claim_data.claim_id,
-            username: username.clone(),
-            client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: None,
+        let result = FieldResults {
+            distribution: Vec::new(),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(process_niceonly(&claim_data, &username), submit_data);
+        assert_eq!(
+            process_range_niceonly(input.range_start, input.range_end, input.base),
+            result
+        );
     }
 
     #[test]
     fn process_niceonly_b80() {
-        let username = "anonymous".to_string();
-        let claim_data = DataToClient {
+        let input = DataToClient {
             claim_id: 0,
             base: 80,
             range_start: 653245554420798943087177909799,
             range_end: 653245554420798943087177909799 + 10000,
             range_size: 10000,
         };
-        let submit_data = DataToServer {
-            claim_id: claim_data.claim_id,
-            username: username.clone(),
-            client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: None,
+        let result = FieldResults {
+            distribution: Vec::new(),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(process_niceonly(&claim_data, &username), submit_data);
+        assert_eq!(
+            process_range_niceonly(input.range_start, input.range_end, input.base),
+            result
+        );
     }
 }

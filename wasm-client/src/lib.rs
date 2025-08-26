@@ -3,7 +3,7 @@
 //! This module provides a browser-compatible client for the distributed computing
 //! project that finds "nice numbers" (square-cube pandigitals).
 
-use nice_common::client_process::process_detailed_chunked;
+use nice_common::client_process::process_range_detailed;
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
@@ -29,7 +29,7 @@ pub fn process_chunk_wasm(range_start_str: &str, range_end_str: &str, base: u32)
     let range_end = u128::from_str(range_end_str).unwrap();
 
     // Pass off to common for processing
-    let result = process_detailed_chunked(range_start, range_end, base);
+    let result = process_range_detailed(range_start, range_end, base);
 
     // Send results back to worker
     serde_json::to_string(&result).unwrap()
