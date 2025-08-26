@@ -49,13 +49,12 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
     digits_indicator.count_ones()
 }
 
-/// Process a field by aggregating statistics on the niceness of numbers in a range.
-pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToServer {
-    // get the basic parameters
-    let base = claim_data.base;
-    let range_start = claim_data.range_start;
-    let range_end = claim_data.range_end;
-
+/// The inner loop of detailed field processing. Also called by other crates like the WASM client.
+pub fn process_detailed_unwrapped(
+    range_start: u128,
+    range_end: u128,
+    base: u32,
+) -> (Vec<UniquesDistributionSimple>, Vec<NiceNumberSimple>) {
     // calculate the minimum num_unique_digits cutoff (default 90% of the base)
     let nice_list_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
 
@@ -102,6 +101,17 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
         .map(|(num_uniques, count)| UniquesDistributionSimple { num_uniques, count })
         .collect();
     submit_distribution.sort_by_key(|d| d.num_uniques);
+
+    (submit_distribution, nice_numbers)
+}
+
+/// Process a field by aggregating statistics on the niceness of numbers in a range.
+pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToServer {
+    let (submit_distribution, nice_numbers) = process_detailed_unwrapped(
+        claim_data.range_start,
+        claim_data.range_end,
+        claim_data.base,
+    );
 
     DataToServer {
         claim_id: claim_data.claim_id,

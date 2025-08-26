@@ -9,8 +9,9 @@ readme = "README.md"
 license-file = "../LICENSE"
 
 [features]
-default = ["database"]
+default = ["database", "network"]
 database = ["dep:diesel", "dep:dotenvy"]
+network = ["dep:openssl", "dep:reqwest"]
 
 [dependencies]
 bigdecimal = { version = "0.4.5" }
@@ -21,7 +22,7 @@ dotenvy = { version = "0.15", optional = true }
 itertools = { version = "0.14" }
 malachite = { version = "0.4.14" }
 malachite-nz = { version = "0.4.14", features = ["enable_serde"] }
-openssl = { version = "0.10", features = ["vendored"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
+reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
