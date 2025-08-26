@@ -25,57 +25,53 @@ use super::*;
 pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
     // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
 
-    // create an indicator variable as a boolean array
-    // each bit represents a number, flip them with bit ops
+    // Create an indicator variable as a boolean array
+    // Each bit represents a number, flip them with bit ops
     let mut digits_indicator: u128 = 0;
 
-    // convert u128 to natural
+    // Convert u128 to natural
     let num = Natural::from(num_u128);
 
-    // square the number, convert to base and save the digits
-    // tried using foiled out versions but malachite is already pretty good
+    // Square the number, convert to base and save the digits
+    // We tried using foiled out versions but malachite is already pretty good
     let squared = (&num).pow(2);
     for digit in squared.to_digits_asc(&base) {
         digits_indicator |= 1 << digit;
     }
 
-    // cube, convert to base and save the digits
+    // Cube, convert to base and save the digits
     let cubed = squared * &num;
     for digit in cubed.to_digits_asc(&base) {
         digits_indicator |= 1 << digit;
     }
 
-    // output the number of unique digits
+    // Output the number of unique digits
     digits_indicator.count_ones()
 }
 
 /// The inner loop of detailed field processing. Also called by other crates like the WASM client.
-pub fn process_detailed_unwrapped(
-    range_start: u128,
-    range_end: u128,
-    base: u32,
-) -> (Vec<UniquesDistributionSimple>, Vec<NiceNumberSimple>) {
-    // calculate the minimum num_unique_digits cutoff (default 90% of the base)
+/// Automatically breaks the range into chunks for some performance gains.
+pub fn process_detailed_chunked(range_start: u128, range_end: u128, base: u32) -> FieldResults {
+    // Calculate the minimum num_unique_digits cutoff (default 90% of the base)
     let nice_list_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
 
-    // initialize a list of nice numbers, ready to submit
+    // Initialize a list of nice numbers, ready to submit
     let mut nice_numbers: Vec<NiceNumberSimple> = Vec::new();
 
-    // initialize a map indexed by num_unique_digits with the count of each
+    // Initialize a map indexed by num_unique_digits with the count of each
     let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
 
-    // break up the range into chunks
-    let chunk_size: usize = 10_000;
-    let chunks = (range_start..range_end).chunks(chunk_size);
+    // Break up the range into chunks
+    let chunks = (range_start..range_end).chunks(PROCESSING_CHUNK_SIZE);
 
-    // process everything, saving results and aggregating after each chunk finishes
+    // Process everything, saving results and aggregating after each chunk finishes
     for chunk in &chunks {
-        // get chunk results
+        // Get the chunk results
         let chunk_results: Vec<(u128, u32)> = chunk
             .map(|num| (num, get_num_unique_digits(num, base)))
             .collect();
 
-        // aggregate unique_distribution
+        // Aggregate unique_distribution
         for (bin_uniques, total_count) in unique_distribution_map.iter_mut() {
             let chunk_count = chunk_results
                 .iter()
@@ -84,7 +80,7 @@ pub fn process_detailed_unwrapped(
             *total_count += chunk_count;
         }
 
-        // collect nice numbers
+        // Collect nice numbers
         nice_numbers.extend(
             chunk_results
                 .into_iter()
@@ -96,18 +92,22 @@ pub fn process_detailed_unwrapped(
         );
     }
 
-    let mut submit_distribution: Vec<UniquesDistributionSimple> = unique_distribution_map
+    // Convert distribution map to sorted Vec
+    let mut distribution: Vec<UniquesDistributionSimple> = unique_distribution_map
         .into_iter()
         .map(|(num_uniques, count)| UniquesDistributionSimple { num_uniques, count })
         .collect();
-    submit_distribution.sort_by_key(|d| d.num_uniques);
+    distribution.sort_by_key(|d| d.num_uniques);
 
-    (submit_distribution, nice_numbers)
+    FieldResults {
+        distribution,
+        nice_numbers,
+    }
 }
 
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
 pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToServer {
-    let (submit_distribution, nice_numbers) = process_detailed_unwrapped(
+    let results = process_detailed_chunked(
         claim_data.range_start,
         claim_data.range_end,
         claim_data.base,
@@ -117,8 +117,8 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
         claim_id: claim_data.claim_id,
         username: username.to_owned(),
         client_version: CLIENT_VERSION.to_string(),
-        unique_distribution: Some(submit_distribution),
-        nice_numbers,
+        unique_distribution: Some(results.distribution),
+        nice_numbers: results.nice_numbers,
     }
 }
 
@@ -129,14 +129,14 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
 pub fn get_is_nice(num: u128, base: u32) -> bool {
     // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
 
-    // convert u128 to natural
+    // Convert u128 to natural
     let num = Natural::from(num);
     let base_natural = Natural::from(base);
 
-    // create a boolean array that represents all possible digits
+    // Create a boolean array that represents all possible digits
     let mut digits_indicator: Vec<bool> = vec![false; base as usize];
 
-    // square the number and check those digits
+    // Square the number and check those digits
     let squared = (&num).pow(2);
     let mut n = squared.clone();
     while n > 0 {
@@ -147,7 +147,7 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
         digits_indicator[remainder] = true;
     }
 
-    // cube the number and check those digits
+    // Cube the number and check those digits
     let mut n = squared * num;
     while n > 0 {
         let remainder = usize::try_from(&(n.div_assign_rem(&base_natural))).unwrap();

@@ -1188,8 +1188,6 @@ name = "nice-wasm-client"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
- "itertools 0.14.0",
- "malachite",
  "nice_common",
  "serde",
  "serde_json",
