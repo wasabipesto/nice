@@ -5,14 +5,14 @@ use super::*;
 /// Different benchmark strategies.
 #[derive(Debug, Copy, Clone, ValueEnum)]
 pub enum BenchmarkMode {
-    /// The default benchmark range: 1e5 @ base 40.
+    /// The default benchmark range: 1e6 @ base 40.
     Default,
-    /// A large benchmark range: 1e7 @ base 40.
+    /// A large benchmark range: 1e8 @ base 40.
     Large,
     /// A very large benchmark range: 1e9 @ base 40.
     /// This is the size of a typical field from the server.
     ExtraLarge,
-    /// A benchmark range at a higher range: 1e5 @ base 80.
+    /// A benchmark range at a higher range: 1e6 @ base 80.
     HiBase,
 }
 
@@ -28,10 +28,10 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
         .unwrap()
         .range_start;
     let range_size = match mode {
-        BenchmarkMode::Default => 100000,
-        BenchmarkMode::Large => 10000000,
-        BenchmarkMode::ExtraLarge => 1000000000,
-        BenchmarkMode::HiBase => 100000,
+        BenchmarkMode::Default => 1_000_000,
+        BenchmarkMode::Large => 100_000_000,
+        BenchmarkMode::ExtraLarge => 1_000_000_000,
+        BenchmarkMode::HiBase => 1_000_000,
     };
 
     DataToClient {
