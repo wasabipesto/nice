@@ -10,9 +10,14 @@ For more background, check out the [original article](https://beautifulthorns.wi
 
 ## Client Quickstart
 
-Download the prebuilt client binary for your system and run it:
+The easiest way to get started is by going to [https://nicenumbers.net/search/](https://nicenumbers.net/search) and running it in your browser. You'll see live results and everything will be submitted in your name.
+
+If you want to go even faster, you can run the native binaries. Currently the CI builds are disabled but you can build it fairly easily if you have the [rust toolchain](https://www.rust-lang.org/tools/install) installed.
 
 ```
+git clone git@github.com:wasabipesto/nice.git
+cargo build -r -p nice_client
+cd target/release
 ./nice_client
 ```
 
@@ -43,7 +48,7 @@ Options:
       --api-base <API_BASE>
           The base API URL to connect to
 
-          [default: https://nicenumbers.net/api]
+          [default: https://api.nicenumbers.net]
 
   -u, --username <USERNAME>
           The username to send alongside your contribution
