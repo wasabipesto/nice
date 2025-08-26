@@ -15,18 +15,22 @@ The easiest way to get started is by going to [https://nicenumbers.net/search/](
 If you want to go even faster, you can run the native binaries. Currently the CI builds are disabled but you can build it fairly easily if you have the [rust toolchain](https://www.rust-lang.org/tools/install) installed.
 
 ```
+# Clone the repository
 git clone git@github.com:wasabipesto/nice.git
+cd nice
+
+# Build the client binary
 cargo build -r -p nice_client
 cd target/release
+
+# Run once with default settings
 ./nice_client
 ```
 
-This will run once with default settings and submit your results to the server anonymously.
-
-A typical use-case involves running multiple clients continuously, in parallel, with a particular username:
+A typical use-case involves running multiple clients continuously, in background, with a particular username. You can accomplish this with a combination of something like `screen` and the built-in repeat option:
 
 ```
-screen -dm ./nice-client -r -u your_name
+screen -dm ./nice_client -r -u your_name
 ```
 
 You can find various settings and their options with the `--help` flag:
