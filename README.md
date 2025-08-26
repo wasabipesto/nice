@@ -63,19 +63,24 @@ Options:
           Run indefinitely with the current settings
 
   -q, --quiet
-          Suppress some output
+          Suppress all output
 
   -v, --verbose
           Show additional output
+
+  -t, --threads <THREADS>
+          Run parallel with this many threads
+
+          [default: 4]
 
   -b, --benchmark <BENCHMARK>
           Run an offline benchmark
 
           Possible values:
-          - default:     The default benchmark range: 1e5 @ base 40
-          - large:       A large benchmark range: 1e7 @ base 40
+          - default:     The default benchmark range: 1e6 @ base 40
+          - large:       A large benchmark range: 1e8 @ base 40
           - extra-large: A very large benchmark range: 1e9 @ base 40. This is the size of a typical field from the server
-          - hi-base:     A benchmark range at a higher range: 1e5 @ base 80
+          - hi-base:     A benchmark range at a higher range: 1e6 @ base 80
 
   -h, --help
           Print help (see a summary with '-h')
