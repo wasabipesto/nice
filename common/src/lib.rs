@@ -8,6 +8,7 @@ pub mod benchmark;
 pub mod client_api;
 pub mod client_process;
 pub mod consensus;
+#[cfg(feature = "database")]
 pub mod db_util;
 pub mod distribution_stats;
 pub mod generate_chunks;
@@ -17,6 +18,7 @@ pub mod residue_filter;
 
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
+#[cfg(feature = "database")]
 use dotenvy::dotenv;
 use itertools::Itertools;
 use malachite::natural::Natural;

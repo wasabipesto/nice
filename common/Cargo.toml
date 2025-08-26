@@ -1,6 +1,6 @@
 [package]
 name = "nice_common"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 authors = ["wasabipesto <nice@wasabipesto.com>"]
 description = "common utilities for dealing with square-cube pandigitals"
@@ -8,12 +8,16 @@ repository = "https://github.com/wasabipesto/nice"
 readme = "README.md"
 license-file = "../LICENSE"
 
+[features]
+default = ["database"]
+database = ["dep:diesel", "dep:dotenvy"]
+
 [dependencies]
 bigdecimal = { version = "0.4.5" }
 chrono = { version = "0.4.31", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
-diesel = { version = "2.2", features = ["chrono", "postgres", "r2d2", "serde_json", "numeric"] }
-dotenvy = { version = "0.15" }
+diesel = { version = "2.2", features = ["chrono", "postgres", "r2d2", "serde_json", "numeric"], optional = true }
+dotenvy = { version = "0.15", optional = true }
 itertools = { version = "0.14" }
 malachite = { version = "0.4.14" }
 malachite-nz = { version = "0.4.14", features = ["enable_serde"] }

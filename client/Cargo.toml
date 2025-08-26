@@ -1,6 +1,6 @@
 [package]
 name = "nice_client"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 authors = ["wasabipesto <nice@wasabipesto.com>"]
 description = "a client for distributed search of square-cube pandigitals"
@@ -9,6 +9,6 @@ readme = "README.md"
 license-file = "../LICENSE"
 
 [dependencies]
-nice_common = { path = "../common" }
+nice_common = { path = "../common", default-features = false }
 clap = { version = "4.5" }
 serde_json = { version = "1.0" }
