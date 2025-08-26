@@ -8,6 +8,11 @@ default:
 test:
     cargo test
 
+# Build and run a Dockerfile (for building against a specific glibc)
+docker dockerfile:
+    docker build -t nice -f {{dockerfile}} .
+    docker run -it -v {{justfile_directory()}}:/opt/nice nice
+
 # Run client continuously
 client mode='detailed':
     cargo run -r --bin nice_client -- --repeat {{mode}}
