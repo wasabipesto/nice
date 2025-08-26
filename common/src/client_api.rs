@@ -1,6 +1,7 @@
 //! A module with client-server connection utilities.
 
 use super::*;
+use reqwest::blocking::Response;
 
 /// Request a field from the server. Supplies CLI options as query strings.
 pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient {
@@ -21,7 +22,7 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
 }
 
 /// Submit field results to the server. Panic if there is an error.
-pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) {
+pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Response {
     // build the url
     let url = format!("{api_base}/submit");
 
@@ -36,10 +37,7 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) {
         Ok(response) => {
             // check for server errors
             if response.status().is_success() {
-                match response.text() {
-                    Ok(msg) => println!("Server response: {}", msg), // TODO: silence this or return as string
-                    Err(e) => panic!("Server returned success but an error occured: {}", e),
-                }
+                response
             } else {
                 match response.text() {
                     // we probably did something wrong, print anything we got from the server
