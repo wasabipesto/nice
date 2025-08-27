@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "nice_api"
-version = "3.2.0"
+version = "3.2.1"
 dependencies = [
  "chrono",
  "nice_common",
@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "nice_client"
-version = "3.2.0"
+version = "3.2.1"
 dependencies = [
  "clap",
  "nice_common",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "nice_common"
-version = "3.2.0"
+version = "3.2.1"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "nice_jobs"
-version = "3.2.0"
+version = "3.2.1"
 dependencies = [
  "clap",
  "nice_common",

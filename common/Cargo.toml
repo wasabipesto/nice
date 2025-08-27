@@ -1,6 +1,6 @@
 [package]
 name = "nice_common"
-version = "3.2.0"
+version = "3.2.1"
 edition = "2021"
 authors = ["wasabipesto <nice@wasabipesto.com>"]
 description = "common utilities for dealing with square-cube pandigitals"

@@ -73,6 +73,25 @@ fn main() {
     // Parse command line arguments
     let cli = Cli::parse();
 
+    // Configure Rayon
+    // This must be done outside the loop
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cli.threads)
+        .build_global()
+        .unwrap();
+
+    // Repeat indefinitely if requested
+    // Otherwise, run once
+    if cli.repeat {
+        loop {
+            submian(&cli);
+        }
+    } else {
+        submian(&cli);
+    }
+}
+
+fn submian(cli: &Cli) {
     // Check whether to query the server for a search range or use the benchmark
     let claim_data = if let Some(benchmark) = cli.benchmark {
         get_benchmark_field(benchmark)
@@ -95,12 +114,6 @@ fn main() {
     // Break up the range into chunks
     let chunk_size = 100 * PROCESSING_CHUNK_SIZE;
     let chunks = chunked_ranges(claim_data.range_start, claim_data.range_end, chunk_size);
-
-    // Configure Rayon
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(cli.threads)
-        .build_global()
-        .unwrap();
 
     // Configure TQDM
     #[allow(
@@ -155,7 +168,7 @@ fn main() {
     // Assemble the data package to submit to the server
     let submit_data = DataToServer {
         claim_id: claim_data.claim_id,
-        username: cli.username,
+        username: cli.username.clone(),
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution,
         nice_numbers,
@@ -180,11 +193,5 @@ fn main() {
             }
             Err(e) => println!("Server returned success but an error occured: {e}"),
         }
-    }
-
-    // Repeat indefinitely if requested
-    #[allow(clippy::main_recursion)]
-    if cli.repeat {
-        main();
     }
 }
