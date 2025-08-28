@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Get the near-miss cutoff given a base.
+/// Uses the crate-level NEAR_MISS_CUTOFF_PERCENT.
+pub fn get_near_miss_cutoff(base: u32) -> u32 {
+    (base as f32 * NEAR_MISS_CUTOFF_PERCENT).floor() as u32
+}
+
 /// Converts a list of NiceNumberSimple to NiceNumber by adding
 /// some redundant information that's helpful for other tools.
 pub fn expand_numbers(numbers: &[NiceNumberSimple], base: u32) -> Vec<NiceNumber> {

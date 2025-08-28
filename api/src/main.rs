@@ -1,4 +1,4 @@
-//! An api for coordinating the search for square-cube pandigitals.
+//! An API for coordinating the search for square-cube pandigitals.
 
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::too_many_lines)]
@@ -13,36 +13,35 @@ use nice_common::db_util::{
     try_claim_field, update_field_canon_and_cl,
 };
 use nice_common::distribution_stats::expand_distribution;
-use nice_common::number_stats::expand_numbers;
+use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
 use nice_common::{
     DataToClient, DataToServer, FieldClaimStrategy, NiceNumber, SearchMode, CLAIM_DURATION_HOURS,
-    DEFAULT_FIELD_SIZE, NEAR_MISS_CUTOFF_PERCENT,
+    DEFAULT_FIELD_SIZE,
 };
 use rand::Rng;
 use rocket::serde::json::{json, Json, Value};
 
 // TODO: Define error types (4xx, 5xx) and serialize them properly
 // TODO: Log claims, valid submissions, and invalid submissions
-// TODO: update table names to be plural
 
 #[get("/claim/<mode>")]
 fn claim(mode: &str) -> Result<Value, Value> {
-    // get database connection
-    // TODO: database connection pooling
+    // Get database connection
+    // TODO: Database connection pooling
     let mut conn = get_database_connection();
 
-    // set search mode based on path
+    // Set search mode based on path
     let search_mode = match mode {
         "detailed" => SearchMode::Detailed,
         "niceonly" => SearchMode::Niceonly,
         _ => return Err(not_found()),
     };
 
-    // get user IP
-    // TODO: actually do this
+    // Get the user's IP
+    // TODO: Actually do this
     let user_ip = "unknown".to_string();
 
-    // get rng thread
+    // Get an RNG thread for random numbers later
     let mut rng = rand::rng();
 
     let claim_strategy = if rng.random_range(0..100) < 95 {
@@ -66,14 +65,13 @@ fn claim(mode: &str) -> Result<Value, Value> {
         }
     };
 
-    // this won't affect anything since all fields will be this size or smaller
-    // TODO: implement an "online benchmarking" option for e.g. gh runners that limits this
+    // This won't affect anything since all fields will be this size or smaller
+    // TODO: Implement an "online benchmarking" option for e.g. gh runners that limits this
     let max_range_size = DEFAULT_FIELD_SIZE;
 
-    // get the field to search based on claim strategy, max check level, etc
-    // try to find a field, respecting previous claims
-    #[allow(clippy::cast_lossless)]
-    let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS as i64);
+    // Get the field to search based on claim strategy, max check level, etc.
+    // Try to find a field, respecting previous claims
+    let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
     let search_field = if let Some(claimed_field) = try_claim_field(
         &mut conn,
         claim_strategy,
@@ -94,10 +92,10 @@ fn claim(mode: &str) -> Result<Value, Value> {
         )?.ok_or_else(|| format!("Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!"))?
     };
 
-    // log the claim and get the record
+    // Save the claim and get the record
     let claim_record = insert_claim(&mut conn, &search_field, search_mode, user_ip)?;
 
-    // build the struct to send to the client
+    // Build the struct to send to the client
     let data_for_client = DataToClient {
         claim_id: claim_record.claim_id,
         base: search_field.base,
@@ -106,7 +104,7 @@ fn claim(mode: &str) -> Result<Value, Value> {
         range_size: search_field.range_size,
     };
 
-    // log & return to user
+    // Log to stdout & return to user
     println!(
         "New {:?} claim for field #{}",
         claim_record.search_mode, claim_record.field_id
@@ -117,11 +115,11 @@ fn claim(mode: &str) -> Result<Value, Value> {
 #[post("/submit", data = "<data>")]
 #[allow(clippy::needless_pass_by_value)]
 fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
-    // get database connection
-    // TODO: database connection pooling
+    // Get database connection
+    // TODO: Database connection pooling
     let mut conn = get_database_connection();
 
-    // get submission data out of json container
+    // Get submission data from JSON
     let submit_data = DataToServer {
         claim_id: data.claim_id,
         username: data.username.clone(),
@@ -130,23 +128,23 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
         nice_numbers: data.nice_numbers.clone(),
     };
 
-    // get user IP
-    // TODO: actually do this
+    // Get user IP
+    // TODO: Actually do this
     let user_ip = "unknown".to_string();
 
-    // get claim record
+    // Get the associated claim record
     let claim_record = get_claim_by_id(&mut conn, submit_data.claim_id)?;
 
-    // get field record (for base)
+    // Get the associated field record (to determine the base)
     let field_record = get_field_by_id(&mut conn, claim_record.field_id)?;
     let base = field_record.base;
 
-    // expand nice numbers
+    // Expand the nice numbers with some detailed info
     let numbers_expanded = expand_numbers(&submit_data.nice_numbers, base);
 
     match claim_record.search_mode {
         SearchMode::Niceonly => {
-            // no checks, honor system
+            // No checks for nice-only, honor system
             insert_submission(
                 &mut conn,
                 claim_record.clone(),
@@ -155,7 +153,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                 None,
                 numbers_expanded,
             )?;
-            // set CL to 1 if it's 0
+            // Set CL to 1 if it's 0
             if field_record.check_level == 0 {
                 update_field_canon_and_cl(
                     &mut conn,
@@ -166,13 +164,13 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
             }
         }
         SearchMode::Detailed => {
-            // run through some basic validity tests
+            // Run through some basic validity tests
             match &submit_data.unique_distribution {
                 Some(distribution) => {
-                    // expand distribution
+                    // Expand the distribution stats
                     let distribution_expanded = expand_distribution(distribution, base);
 
-                    // check distribution count sums to range_size
+                    // Check distribution count sums to range_size
                     let dist_total_count = distribution.iter().fold(0, |acc, d| acc + d.count);
                     if dist_total_count != field_record.range_size {
                         return Err(format!(
@@ -182,16 +180,10 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                         .into());
                     }
 
-                    // get the near-miss cutoff
-                    #[allow(
-                        clippy::cast_sign_loss,
-                        clippy::cast_possible_truncation,
-                        clippy::cast_precision_loss
-                    )]
-                    let num_uniques_cutoff =
-                        (base as f32 * NEAR_MISS_CUTOFF_PERCENT).floor() as u32;
+                    // Get the near-miss cutoff
+                    let num_uniques_cutoff = get_near_miss_cutoff(base);
 
-                    // check count of nice numbers against distribution
+                    // Check the count of nice numbers against distribution
                     for d in &distribution_expanded {
                         if d.num_uniques > num_uniques_cutoff {
                             let count_numbers = numbers_expanded
@@ -209,7 +201,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                         }
                     }
 
-                    // check total number of nice numbers
+                    // Check the total number of nice numbers
                     let num_total_count = numbers_expanded.len();
                     let dist_total_count_above_cutoff = distribution
                         .iter()
@@ -222,7 +214,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                         .into());
                     }
 
-                    // check each nice number provided
+                    // Check each nice number provided
                     for n in &numbers_expanded {
                         let calculated_num_uniques = get_num_unique_digits(n.number, base);
                         if calculated_num_uniques != n.num_uniques {
@@ -232,7 +224,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                         }
                     }
 
-                    // save it
+                    // All looks good, save it!
                     insert_submission(
                         &mut conn,
                         claim_record.clone(),
@@ -241,6 +233,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
                         Some(distribution_expanded),
                         numbers_expanded,
                     )?;
+                    // Bump the check level to 2
                     if field_record.check_level < 2 {
                         update_field_canon_and_cl(
                             &mut conn,
@@ -259,7 +252,7 @@ fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
         }
     }
 
-    // log & respond to user
+    // Log to stdout & respond to user
     println!(
         "New {:?} submission for field #{}",
         claim_record.search_mode, claim_record.field_id

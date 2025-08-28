@@ -52,8 +52,8 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
 /// The inner loop of detailed field processing. Also called by other crates like the WASM client.
 /// Automatically breaks the range into chunks for some performance gains.
 pub fn process_range_detailed(range_start: u128, range_end: u128, base: u32) -> FieldResults {
-    // Calculate the minimum num_unique_digits cutoff (default 90% of the base)
-    let nice_list_cutoff = (base as f32 * NEAR_MISS_CUTOFF_PERCENT) as u32;
+    // Calculate the minimum num_unique_digits cutoff
+    let nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
 
     // Initialize a list for nice and semi-nice numbers
     let mut nice_numbers: Vec<NiceNumberSimple> = Vec::new();
