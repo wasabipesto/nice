@@ -10,7 +10,7 @@ default:
 test:
     cargo build
     cargo build -r
-    cargo test
+    cargo test --no-fail-fast
     cargo clippy
 
 # List all available dependency upgrades

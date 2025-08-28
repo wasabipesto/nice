@@ -61,8 +61,254 @@ pub fn evaluate_consensus(
         .min_by_key(|sub| sub.submit_time)
         .ok_or_else(|| format!("No submission in majority_group: {:?}.", majority_group))?;
 
-    // Determine the check level
-    let check_level = (majority_group.len().min(u8::MAX as usize) + 1) as u8;
+    // Determine the check level, cap to u8::MAX (255)
+    let check_level_raw = majority_group.len() + 1;
+    let check_level = check_level_raw.min(u8::MAX as usize) as u8;
 
     Ok((Some(first_submission.clone()), check_level))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn create_test_field() -> FieldRecord {
+        FieldRecord {
+            field_id: 1,
+            base: 10,
+            chunk_id: Some(1),
+            range_start: 100,
+            range_end: 200,
+            range_size: 100,
+            last_claim_time: None,
+            canon_submission_id: None,
+            check_level: 1,
+            prioritize: false,
+        }
+    }
+
+    fn create_test_submission(
+        submission_id: u128,
+        distribution: Vec<UniquesDistributionSimple>,
+        numbers: Vec<NiceNumberSimple>,
+    ) -> SubmissionRecord {
+        let expanded_distribution = if distribution.is_empty() {
+            None
+        } else {
+            Some(distribution_stats::expand_distribution(&distribution, 10))
+        };
+        let expanded_numbers = number_stats::expand_numbers(&numbers, 10);
+
+        SubmissionRecord {
+            submission_id,
+            claim_id: 1,
+            field_id: 1,
+            search_mode: SearchMode::Detailed,
+            submit_time: Utc::now(),
+            elapsed_secs: 10.0,
+            username: "test".to_string(),
+            user_ip: "127.0.0.1".to_string(),
+            client_version: "1.0.0".to_string(),
+            disqualified: false,
+            distribution: expanded_distribution,
+            numbers: expanded_numbers,
+        }
+    }
+
+    #[test]
+    fn test_evaluate_consensus_no_submissions() {
+        let field = create_test_field();
+        let submissions = vec![];
+
+        let result = evaluate_consensus(&field, &submissions).unwrap();
+
+        assert_eq!(result.0, None);
+        assert_eq!(result.1, 1); // min(field.check_level, 1)
+    }
+
+    #[test]
+    fn test_evaluate_consensus_single_submission() {
+        let field = create_test_field();
+        let distribution = vec![
+            UniquesDistributionSimple {
+                num_uniques: 1,
+                count: 100,
+            },
+            UniquesDistributionSimple {
+                num_uniques: 2,
+                count: 50,
+            },
+        ];
+        let numbers = vec![NiceNumberSimple {
+            number: 123,
+            num_uniques: 3,
+        }];
+        let submission = create_test_submission(1, distribution, numbers);
+        let submissions = vec![submission.clone()];
+
+        let result = evaluate_consensus(&field, &submissions).unwrap();
+
+        assert_eq!(result.0, Some(submission));
+        assert_eq!(result.1, 2);
+    }
+
+    #[test]
+    fn test_evaluate_consensus_multiple_same_submissions() {
+        let field = create_test_field();
+        let distribution = vec![UniquesDistributionSimple {
+            num_uniques: 1,
+            count: 100,
+        }];
+        let numbers = vec![NiceNumberSimple {
+            number: 123,
+            num_uniques: 3,
+        }];
+
+        // Create multiple identical submissions
+        let submission1 = create_test_submission(1, distribution.clone(), numbers.clone());
+        let submission2 = create_test_submission(2, distribution.clone(), numbers.clone());
+        let submission3 = create_test_submission(3, distribution, numbers);
+        let submissions = vec![submission1.clone(), submission2, submission3];
+
+        let result = evaluate_consensus(&field, &submissions).unwrap();
+
+        // Should return the first (earliest) submission
+        assert_eq!(result.0.unwrap().submission_id, 1);
+        assert_eq!(result.1, 4); // 3 submissions + 1
+    }
+
+    #[test]
+    fn test_evaluate_consensus_different_submissions() {
+        let field = create_test_field();
+
+        // First group (2 submissions)
+        let distribution1 = vec![UniquesDistributionSimple {
+            num_uniques: 1,
+            count: 100,
+        }];
+        let numbers1 = vec![NiceNumberSimple {
+            number: 123,
+            num_uniques: 3,
+        }];
+
+        // Second group (1 submission)
+        let distribution2 = vec![UniquesDistributionSimple {
+            num_uniques: 2,
+            count: 200,
+        }];
+        let numbers2 = vec![NiceNumberSimple {
+            number: 456,
+            num_uniques: 5,
+        }];
+
+        let submission1 = create_test_submission(1, distribution1.clone(), numbers1.clone());
+        let submission2 = create_test_submission(2, distribution1, numbers1);
+        let submission3 = create_test_submission(3, distribution2, numbers2);
+        let submissions = vec![submission1.clone(), submission2, submission3];
+
+        let result = evaluate_consensus(&field, &submissions).unwrap();
+
+        // Should return from the majority group (first group with 2 submissions)
+        assert_eq!(result.0.unwrap().submission_id, 1);
+        assert_eq!(result.1, 3); // 2 submissions + 1
+    }
+
+    #[test]
+    fn test_evaluate_consensus_check_level_capping() {
+        let mut field = create_test_field();
+        field.check_level = 5;
+        let submissions = vec![];
+
+        let result = evaluate_consensus(&field, &submissions).unwrap();
+
+        // Should cap check_level to 1 when no submissions
+        assert_eq!(result.1, 1);
+    }
+
+    #[test]
+    fn test_evaluate_consensus_large_group() {
+        let field = create_test_field();
+        let distribution = vec![UniquesDistributionSimple {
+            num_uniques: 1,
+            count: 100,
+        }];
+        let numbers = vec![NiceNumberSimple {
+            number: 123,
+            num_uniques: 3,
+        }];
+
+        // Create many identical submissions (more than u8::MAX)
+        let mut submissions = Vec::new();
+        for i in 1..=300 {
+            submissions.push(create_test_submission(
+                i,
+                distribution.clone(),
+                numbers.clone(),
+            ));
+        }
+
+        let result = evaluate_consensus(&field, &submissions).unwrap();
+
+        // group_size is 300, which is capped to 255 to fit in a u8
+        assert_eq!(result.1, 255);
+    }
+
+    #[test]
+    fn test_evaluate_consensus_check_level_within_bounds() {
+        let field = create_test_field();
+        let distribution = vec![UniquesDistributionSimple {
+            num_uniques: 1,
+            count: 100,
+        }];
+        let numbers = vec![NiceNumberSimple {
+            number: 123,
+            num_uniques: 3,
+        }];
+
+        // Create 254 identical submissions (to stay within u8 bounds)
+        let mut submissions = Vec::new();
+        for i in 1..=254 {
+            submissions.push(create_test_submission(
+                i,
+                distribution.clone(),
+                numbers.clone(),
+            ));
+        }
+
+        let result = evaluate_consensus(&field, &submissions).unwrap();
+
+        // Check level should be 254 + 1 = 255 (u8::MAX)
+        assert_eq!(result.1, 255);
+    }
+
+    #[test]
+    fn test_evaluate_consensus_earliest_submission_selected() {
+        use std::thread;
+        use std::time::Duration;
+
+        let field = create_test_field();
+        let distribution = vec![UniquesDistributionSimple {
+            num_uniques: 1,
+            count: 100,
+        }];
+        let numbers = vec![NiceNumberSimple {
+            number: 123,
+            num_uniques: 3,
+        }];
+
+        let submission1 = create_test_submission(1, distribution.clone(), numbers.clone());
+        thread::sleep(Duration::from_millis(10));
+        let mut submission2 = create_test_submission(2, distribution, numbers);
+
+        // Make sure submission2 has a later timestamp
+        submission2.submit_time = Utc::now();
+
+        let submissions = vec![submission2, submission1.clone()]; // Note: out of order
+
+        let result = evaluate_consensus(&field, &submissions).unwrap();
+
+        // Should return the earliest submission by time, not by position in vec
+        assert_eq!(result.0.unwrap().submission_id, 1);
+    }
 }
