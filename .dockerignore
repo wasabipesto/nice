@@ -11,3 +11,4 @@
 **/*.sql
 perf.*
 core
+target/debug
