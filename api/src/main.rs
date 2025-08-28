@@ -43,9 +43,9 @@ fn claim(mode: &str) -> Result<Value, Value> {
     let user_ip = "unknown".to_string();
 
     // get rng thread
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
-    let claim_strategy = if rng.gen_range(0..100) < 95 {
+    let claim_strategy = if rng.random_range(0..100) < 95 {
         // 95% chance: get lowest valid field
         FieldClaimStrategy::Next
     } else {
@@ -55,7 +55,7 @@ fn claim(mode: &str) -> Result<Value, Value> {
 
     let max_check_level = match search_mode {
         SearchMode::Detailed => {
-            if rng.gen_range(0..100) < 95 {
+            if rng.random_range(0..100) < 95 {
                 1 // 95% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
             } else {
                 2 // 5% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)

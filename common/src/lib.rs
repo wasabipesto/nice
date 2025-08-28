@@ -22,9 +22,9 @@ use clap::ValueEnum;
 #[cfg(feature = "database")]
 use dotenvy::dotenv;
 use itertools::Itertools;
+use malachite::base::num::arithmetic::traits::{CeilingRoot, DivAssignRem, FloorRoot, Pow};
+use malachite::base::num::conversion::traits::Digits;
 use malachite::natural::Natural;
-use malachite::num::arithmetic::traits::{CeilingRoot, DivAssignRem, FloorRoot, Pow};
-use malachite::num::conversion::traits::Digits;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;

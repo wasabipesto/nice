@@ -35,7 +35,7 @@ pub fn break_range_into_fields(min: u128, max: u128, size: u128) -> Vec<FieldSiz
 #[cfg(test)]
 mod tests {
     use super::*;
-    use malachite::num::arithmetic::traits::DivMod;
+    use malachite::base::num::arithmetic::traits::DivMod;
 
     #[test]
     fn test_break_range_into_fields_b10() {
