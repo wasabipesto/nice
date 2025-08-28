@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["api", "client", "common", "jobs", "wasm-client"]
+members = ["api", "client", "common", "daemon", "jobs", "wasm-client"]
