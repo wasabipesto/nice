@@ -6,12 +6,14 @@ version := shell("toml get common/Cargo.toml package.version")
 default:
   just --list
 
-# Build all packages and run all tests
+# Build all packages, run all tests, and then run the client
 test:
     cargo build
     cargo build -r
     cargo test --no-fail-fast
     cargo clippy
+    just benchmark default
+    just client
 
 # List all available dependency upgrades
 upgrades:
