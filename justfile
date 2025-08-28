@@ -1,3 +1,8 @@
+# Requires rust:
+#   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Requires `just` and `toml-cli` to run these helpers:
+#   cargo install just toml-cli
+
 set dotenv-load
 
 version := shell("toml get common/Cargo.toml package.version")
@@ -5,6 +10,11 @@ version := shell("toml get common/Cargo.toml package.version")
 # List commands, default
 default:
   just --list
+
+# Build all packages
+build:
+    cargo build
+    cargo build -r
 
 # Build all packages, run all tests, and then run the client
 test:
@@ -15,8 +25,13 @@ test:
     just benchmark default
     just client
 
+# Update from git and rebuild if necessary
+update:
+    git pull
+    just build
+
 # List all available dependency upgrades
-upgrades:
+cargo-upgrades:
     cargo upgrades --manifest-path api/Cargo.toml
     cargo upgrades --manifest-path client/Cargo.toml
     cargo upgrades --manifest-path common/Cargo.toml
@@ -45,6 +60,10 @@ client *args:
 # Run benchmark
 benchmark size='large':
     just client --benchmark {{size}}
+
+# Run the daemon
+daemon *args:
+    cargo run -r --bin nice_daemon -- {{args}}
 
 # Run API server
 server:
