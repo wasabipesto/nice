@@ -1,6 +1,5 @@
 //! A library with common utilities for dealing with square-cube pandigitals.
 
-//#![warn(clippy::all, clippy::pedantic)] // TODO: re-enable this
 #![allow(clippy::wildcard_imports)]
 
 pub mod base_range;
