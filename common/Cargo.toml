@@ -21,7 +21,7 @@ diesel = { version = "2.2", features = ["chrono", "postgres", "r2d2", "serde_jso
 dotenvy = { version = "0.15", optional = true }
 itertools = { version = "0.14" }
 malachite = { version = "0.6" }
-malachite-nz = { version = "0.6", features = ["enable_serde"] }
+malachite-nz = { version = "0.7", features = ["enable_serde"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
