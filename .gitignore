@@ -1,4 +1,7 @@
 **/.env
 **/*.env
+postgres_data
+postgres_backups
 target*
+*.bak
 core
