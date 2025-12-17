@@ -9,5 +9,5 @@ readme.workspace = true
 license-file.workspace = true
 
 [dependencies]
-nice_common = { workspace = true, features = ["database", "network"] }
+nice_common = { workspace = true, features = ["database"] }
 clap = { version = "4.5" }

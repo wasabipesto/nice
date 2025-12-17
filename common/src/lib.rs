@@ -4,7 +4,7 @@
 
 pub mod base_range;
 pub mod benchmark;
-#[cfg(feature = "network")]
+#[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
 pub mod client_api;
 pub mod client_process;
 pub mod consensus;
