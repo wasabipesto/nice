@@ -80,8 +80,11 @@ impl CpuMonitor {
                 match low_cpu_start {
                     None => {
                         low_cpu_start = Some(Instant::now());
-                        println!("CPU usage below threshold ({:.1}%), waiting {:.1}s before starting runner...",
-                                 cpu_usage, self.wait_duration.as_secs_f32());
+                        println!(
+                            "CPU usage below threshold ({:.1}%), waiting {:.1}s before starting runner...",
+                            cpu_usage,
+                            self.wait_duration.as_secs_f32()
+                        );
                     }
                     Some(start_time) => {
                         let elapsed = start_time.elapsed();
@@ -90,7 +93,9 @@ impl CpuMonitor {
                             return Ok(());
                         } else {
                             let remaining = self.wait_duration - elapsed;
-                            if remaining.as_secs() % 5 == 0 && remaining.as_millis() % 500 < 100 {
+                            if remaining.as_secs().is_multiple_of(5)
+                                && remaining.as_millis() % 500 < 100
+                            {
                                 println!(
                                     "CPU still low ({:.1}%), {:.1}s remaining...",
                                     cpu_usage,

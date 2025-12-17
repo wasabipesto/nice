@@ -13,10 +13,10 @@ pub fn evaluate_consensus(
         return Ok((None, field.check_level.min(1)));
     }
     // If there is one submission, return it
-    if submissions.len() == 1 {
-        if let Some(sub) = submissions.first() {
-            return Ok((Some(sub.clone()), 2));
-        }
+    if submissions.len() == 1
+        && let Some(sub) = submissions.first()
+    {
+        return Ok((Some(sub.clone()), 2));
     }
 
     // Group submissions by distribution and numbers
