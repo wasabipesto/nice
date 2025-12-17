@@ -45,7 +45,7 @@ struct CpuMonitor {
 impl CpuMonitor {
     fn new(min_cpu: f32, wait_time: f32) -> Self {
         let mut system = System::new();
-        system.refresh_cpu();
+        system.refresh_cpu_all();
 
         println!(
             "CPU monitor initialized with {} cores detected",
@@ -60,7 +60,7 @@ impl CpuMonitor {
     }
 
     fn get_cpu_usage(&mut self) -> f32 {
-        self.system.refresh_cpu();
+        self.system.refresh_cpu_all();
         // Calculate average CPU usage across all cores
         let cpus = self.system.cpus();
         if cpus.is_empty() {
