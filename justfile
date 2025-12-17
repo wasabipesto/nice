@@ -11,26 +11,27 @@ version := shell("toml get common/Cargo.toml package.version")
 default:
   just --list
 
-# Build all packages
+# Update from git and rebuild if necessary
+update:
+    git pull
+    just build
+
+# Build all packages (except wasm)
 build:
     cargo build
     cargo build -r
 
 # Build all packages, run all tests, and then run the client
 test:
+    cargo clippy
     cargo build
     cargo build -r
+    just wasm-build
     cargo test --no-fail-fast
-    cargo clippy
     just benchmark default
     just client
 
-# Update from git and rebuild if necessary
-update:
-    git pull
-    just build
-
-# List all available dependency upgrades
+# List all available major dependency upgrades
 cargo-upgrades:
     cargo install cargo-upgrades
     cargo upgrades
@@ -81,9 +82,10 @@ dev:
 
 # Build WASM app and copy result to web dir
 [working-directory: 'wasm-client']
-wasm-setup:
+wasm-build:
+    cargo install wasm-pack
     wasm-pack build --target web --out-dir pkg
     cp -rv pkg {{justfile_dir()}}/web/search/
 
 # Build WASM app and start dev server
-wasm-dev: wasm-setup dev
+wasm-dev: wasm-build dev
