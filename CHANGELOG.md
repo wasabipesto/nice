@@ -6,6 +6,8 @@
 - Bump rust edition to 2024
 - Migrate openssl-tls to rustls-tls
 - Re-enable multi-platform builds and testing CI
+- Allow setting client options via environment variables
+- Add client dockerfile and publish images to GHCR
 
 ## Nice v3.2.1
 
