@@ -22,9 +22,9 @@ If you want to go even faster, you can run the [native binaries from the latest 
 docker run -it ghcr.io/wasabipesto/nice_client:3
 ```
 
-You may get slightly more performance by building the binaries yourself. Building the client only requires minimal dependencies.
+You may get slightly more performance by building the binaries yourself. Building the client requires rust and a few other dependencies.
 
-```
+```sh
 # Install rust and cargo
 sudo apt install build-essential curl git
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -39,12 +39,6 @@ cd target/release
 
 # Run once with default settings
 ./nice_client
-```
-
-A typical use-case involves running multiple clients continuously, in background, with a particular username. You can accomplish this with a combination of something like `screen` and the built-in repeat option:
-
-```
-screen -dm ./nice_client -r -u your_name
 ```
 
 You can find various settings and their options with the `--help` flag:
