@@ -94,10 +94,17 @@ jobs:
                   command: "build"
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release"
+              env:
+                  # Fix RISC-V OpenSSL build issues by disabling assembly optimizations
+                  OPENSSL_NO_ASM: ${{ contains(matrix.platform.rust_target, 'riscv') && '1' || '' }}
 
             - name: Run tests
+              # Skip tests for targets that can't run on the host system
+              if: ${{ !contains(matrix.platform.rust_target, 'freebsd') }}
               uses: houseabsolute/actions-rust-cross@v1
               with:
                   command: "test"
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
+              env:
+                  OPENSSL_NO_ASM: ${{ contains(matrix.platform.rust_target, 'riscv') && '1' || '' }}
