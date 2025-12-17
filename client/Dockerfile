@@ -1,14 +1,28 @@
-FROM rust:1 AS builder
+# Use cargo-chef for dependency caching
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
 WORKDIR /usr/src/nice
 
-# Copy workspace files
+# Prepare the recipe file
+FROM chef AS planner
 COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Build dependencies - this layer will be cached unless dependencies change
+FROM chef AS builder
+COPY --from=planner /usr/src/nice/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json -p nice_client
 
 # Build the application
-RUN cargo build -r -p nice_client
+COPY . .
+RUN cargo build --release --locked -p nice_client
 
 # Ship a slim runner image
-FROM debian:trixie-slim
+FROM debian:trixie-slim AS runtime
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary
 COPY --from=builder /usr/src/nice/target/release/nice_client /usr/local/bin/nice_client
