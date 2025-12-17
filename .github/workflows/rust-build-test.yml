@@ -97,9 +97,9 @@ jobs:
               with:
                   executable-name: nice_client
                   target: ${{ matrix.platform.rust_target }}
-                  # Use a tag like release-v1.2.3 to draft a new release
-                  release-tag-prefix: "release-v"
-                  changes-file: ""
+                  # Use a tag like vX.Y.Z to draft a new release
+                  release-tag-prefix: "v"
+                  changes-file: "CHANGELOG.md"
 
             - name: Run tests
               # Skip tests for targets that can't run on the host system

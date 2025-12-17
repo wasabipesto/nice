@@ -1,0 +1,17 @@
+# Changelog
+
+## Unreleased
+
+- Update dependencies
+- Bump rust edition to 2024
+- Migrate openssl-tls to rustls-tls
+- Re-enable multi-platform builds and testing CI
+
+## Nice v3.2.1
+
+- Fixes a bug where the native client would crash upon beginning the second iteration of a --repeat loop due to rayon's thread pool already being initialized.
+
+## Nice v3.2.0
+
+- WebAssembly module, integrated into the search page found at https://nicenumbers.net/search/
+- Native client progress bars and parallelization. Both are enabled by default, but you can silence the progress bar with --quiet and you can customize the number of threads with --threads.

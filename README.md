@@ -12,11 +12,17 @@ For more background, check out the [original article](https://beautifulthorns.wi
 
 The easiest way to get started is by going to [https://nicenumbers.net/search/](https://nicenumbers.net/search) and running it in your browser. You'll see live results and everything will be submitted in your name.
 
-If you want to go even faster, you can run the native binaries. Currently the CI builds are disabled but you can build it fairly easily if you have the [rust toolchain](https://www.rust-lang.org/tools/install) installed.
+If you want to go even faster, you can run the [native binaries from the latest release](https://github.com/wasabipesto/nice/releases). We usually see a ~2x speedup versus the browser.
+
+You may get slightly more performance by building the binaries yourself. Building the client only requires minimal dependencies.
 
 ```
-# Clone the repository
-git clone git@github.com:wasabipesto/nice.git
+# Install rust and cargo
+sudo apt install build-essential curl git
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Clone this repository
+git clone https://github.com/wasabipesto/nice.git
 cd nice
 
 # Build the client binary
@@ -42,11 +48,11 @@ Arguments:
   [MODE]
           The checkout mode to use
 
-          [default: detailed]
-
           Possible values:
           - detailed: Get detailed stats on all numbers, important for long-term analytics
           - niceonly: Implements optimizations to speed up the search, usually by a factor of around 20. Does not keep statistics and cannot be quickly verified
+
+          [default: detailed]
 
 Options:
       --api-base <API_BASE>
@@ -92,6 +98,13 @@ Options:
 ## Project Architecture
 
 This repository has a common library with most actual functionality included. There are two main binaries: the API server and the client. These can be run directly from source with `cargo run -p nice_api` or `cargo run -p nice_client`. There are also binaries for a deamon and some scheduled jobs, and a library for a wasm client.
+
+There are some feature flags that enable specific dependencies:
+
+- `nice_common/database` is set automatically from binaries that connect directly to postgres (`api` and `jobs`). This requires the `libpq-dev` package to be installed.
+- `nice_client/rustls-tls` is enabled by default and uses rustls for TLS connections, which doesn't require any external dependencies. Disable it and enable `nice_client/openssl-tls` to use `openssl`.
+
+Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack/).
 
 There are also a few scripts, to be used with [rust-script](https://rust-script.org/). You can install it with `cargo install rust-script` then run the scripts directly. It will take a while to build the first time you run it.
 
