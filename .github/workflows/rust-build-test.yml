@@ -45,12 +45,12 @@ jobs:
                       os: ubuntu-latest
                       target: arm-unknown-linux-musleabi
 
-                    - os-name: Linux-riscv64
-                      runs-on: ubuntu-latest
+                    - build_name: Linux-riscv64
+                      os: ubuntu-latest
                       target: riscv64gc-unknown-linux-gnu
 
-                    - os-name: FreeBSD-x86_64
-                      runs-on: ubuntu-latest
+                    - build_name: FreeBSD-x86_64
+                      os: ubuntu-latest
                       target: x86_64-unknown-freebsd
 
                     - build_name: WebAssembly
