@@ -38,8 +38,8 @@ cargo-upgrades:
 
 # Build and run a Dockerfile (for building against a specific glibc)
 docker dockerfile:
-    docker build -t nice-{{file_stem(dockerfile)}} -f {{dockerfile}} .
-    docker run -it -v .:/opt/nice nice-{{file_stem(dockerfile)}}
+    docker build -t nice-{{lowercase(file_stem(dockerfile))}} -f {{dockerfile}} .
+    docker run -it -v .:/opt/nice nice-{{lowercase(file_stem(dockerfile))}}
 
 # Build each version in docker and copy artifacts for release
 build-for-release:

@@ -1,4 +1,4 @@
-FROM rust:1.79 as builder
+FROM rust:1 AS builder
 WORKDIR /usr/src/nice
 
 COPY . .

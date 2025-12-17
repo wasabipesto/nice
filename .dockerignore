@@ -1,11 +1,11 @@
 **/target
 **/Dockerfile
 **/.dockerignore
+postgres_data
+postgres_backups
 .git
 .github
 .gitignore
-**/*.md
-**/*.sh
 **/*.out
 **/*.svg
 **/*.sql
