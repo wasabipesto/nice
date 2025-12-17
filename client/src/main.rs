@@ -3,12 +3,12 @@
 #![warn(clippy::all, clippy::pedantic)]
 
 extern crate nice_common;
-use nice_common::benchmark::{get_benchmark_field, BenchmarkMode};
+use nice_common::benchmark::{BenchmarkMode, get_benchmark_field};
 use nice_common::client_api::{get_field_from_server, submit_field_to_server};
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
 use nice_common::{
-    DataToServer, FieldResults, SearchMode, UniquesDistributionSimple, CLIENT_VERSION,
-    PROCESSING_CHUNK_SIZE,
+    CLIENT_VERSION, DataToServer, FieldResults, PROCESSING_CHUNK_SIZE, SearchMode,
+    UniquesDistributionSimple,
 };
 
 extern crate serde_json;
@@ -23,35 +23,39 @@ use std::collections::HashMap;
 #[allow(clippy::struct_excessive_bools)]
 pub struct Cli {
     /// The checkout mode to use
-    #[arg(value_enum, default_value = "detailed")]
+    #[arg(value_enum, default_value = "detailed", env = "NICE_MODE")]
     mode: SearchMode,
 
     /// The base API URL to connect to
-    #[arg(long, default_value = "https://api.nicenumbers.net")]
+    #[arg(
+        long,
+        default_value = "https://api.nicenumbers.net",
+        env = "NICE_API_BASE"
+    )]
     api_base: String,
 
     /// The username to send alongside your contribution
-    #[arg(short, long, default_value = "anonymous")]
+    #[arg(short, long, default_value = "anonymous", env = "NICE_USERNAME")]
     username: String,
 
     /// Run indefinitely with the current settings
-    #[arg(short, long)]
+    #[arg(short, long, env = "NICE_REPEAT")]
     repeat: bool,
 
     /// Suppress all output
-    #[arg(short, long)]
+    #[arg(short, long, env = "NICE_QUIET")]
     quiet: bool,
 
     /// Show additional output
-    #[arg(short, long)]
+    #[arg(short, long, env = "NICE_VERBOSE")]
     verbose: bool,
 
     /// Run parallel with this many threads
-    #[arg(short, long, default_value_t = 4)]
+    #[arg(short, long, default_value_t = 4, env = "NICE_THREADS")]
     threads: usize,
 
     /// Run an offline benchmark
-    #[arg(short, long)]
+    #[arg(short, long, env = "NICE_BENCHMARK")]
     benchmark: Option<BenchmarkMode>,
 }
 

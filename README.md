@@ -52,31 +52,41 @@ Arguments:
           - detailed: Get detailed stats on all numbers, important for long-term analytics
           - niceonly: Implements optimizations to speed up the search, usually by a factor of around 20. Does not keep statistics and cannot be quickly verified
 
+          [env: NICE_MODE=]
           [default: detailed]
 
 Options:
       --api-base <API_BASE>
           The base API URL to connect to
 
+          [env: NICE_API_BASE=]
           [default: https://api.nicenumbers.net]
 
   -u, --username <USERNAME>
           The username to send alongside your contribution
 
+          [env: NICE_USERNAME=]
           [default: anonymous]
 
   -r, --repeat
           Run indefinitely with the current settings
 
+          [env: NICE_REPEAT=]
+
   -q, --quiet
           Suppress all output
+
+          [env: NICE_QUIET=]
 
   -v, --verbose
           Show additional output
 
+          [env: NICE_VERBOSE=]
+
   -t, --threads <THREADS>
           Run parallel with this many threads
 
+          [env: NICE_THREADS=]
           [default: 4]
 
   -b, --benchmark <BENCHMARK>
@@ -87,6 +97,8 @@ Options:
           - large:       A large benchmark range: 1e8 @ base 40
           - extra-large: A very large benchmark range: 1e9 @ base 40. This is the size of a typical field from the server
           - hi-base:     A benchmark range at a higher range: 1e6 @ base 80
+
+          [env: NICE_BENCHMARK=default]
 
   -h, --help
           Print help (see a summary with '-h')
