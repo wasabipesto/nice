@@ -68,9 +68,6 @@ jobs:
         steps:
             - uses: actions/checkout@v4
 
-            - name: Cache cargo & target directories
-              uses: Swatinem/rust-cache@v2
-
             - name: Install musl-tools on Linux
               if: contains(matrix.platform.target, 'musl')
               run: sudo apt-get update --yes && sudo apt-get install --yes musl-tools
