@@ -29,47 +29,47 @@ jobs:
                     - build_name: Linux-x86_64-musl
                       os: ubuntu-latest
                       target: x86_64-unknown-linux-musl
-                      packages: "-p client"
+                      packages: "-p nice_client"
 
                     - build_name: Linux-aarch64
                       os: ubuntu-latest
                       target: aarch64-unknown-linux-gnu
-                      packages: "-p client"
+                      packages: "-p nice_client"
 
                     - build_name: Linux-aarch64-musl
                       os: ubuntu-latest
                       target: aarch64-unknown-linux-musl
-                      packages: "-p client"
+                      packages: "-p nice_client"
 
                     - build_name: Linux-armv7
                       os: ubuntu-latest
                       target: armv7-unknown-linux-gnueabihf
-                      packages: "-p client"
+                      packages: "-p nice_client"
 
                     - build_name: Linux-arm-musl
                       os: ubuntu-latest
                       target: arm-unknown-linux-musleabi
-                      packages: "-p client"
+                      packages: "-p nice_client"
 
                     - build_name: Linux-riscv64
                       os: ubuntu-latest
                       target: riscv64gc-unknown-linux-gnu
-                      packages: "-p client"
+                      packages: "-p nice_client"
 
                     - build_name: FreeBSD-x86_64
                       os: ubuntu-latest
                       target: x86_64-unknown-freebsd
-                      packages: "-p client"
+                      packages: "-p nice_client"
 
                     - build_name: Windows-x86_64
                       os: windows-latest
                       target: x86_64-pc-windows-msvc
-                      packages: "-p client"
+                      packages: "-p nice_client"
 
                     - build_name: Darwin-x86_64
                       os: macOS-latest
                       target: x86_64-apple-darwin
-                      packages: "-p client"
+                      packages: "-p nice_client"
 
         steps:
             - uses: actions/checkout@v4
