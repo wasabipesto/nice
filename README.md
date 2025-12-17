@@ -19,7 +19,22 @@ If you want to go even faster, you can run the [native binaries from the latest 
 ./nice_client
 
 # Run the docker image
-docker run -it ghcr.io/wasabipesto/nice_client:3
+docker run -it --init ghcr.io/wasabipesto/nice_client:3
+
+# Run with a username
+./nice_client --username gilgamesh
+
+# Run with 12 threads
+./nice_client --threads 12
+
+# Run forever
+./nice_client --repeat
+
+# The docker image supports these options too!
+docker run -it --init ghcr.io/wasabipesto/nice_client:3 --repeat
+
+# Both versions also support environment variables
+docker run -it --init -e NICE_USERNAME=gilgamesh ghcr.io/wasabipesto/nice_client:3
 ```
 
 You may get slightly more performance by building the binaries yourself. Building the client requires rust and a few other dependencies.
