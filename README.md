@@ -91,7 +91,7 @@ Options:
 
 ## Project Architecture
 
-This repository has a common library with most actual functionality included. There are two binaries: the API server and the client. These can be run directly from source with `cargo run -p nice_api` or `cargo run -p nice_client`.
+This repository has a common library with most actual functionality included. There are two main binaries: the API server and the client. These can be run directly from source with `cargo run -p nice_api` or `cargo run -p nice_client`. There are also binaries for a deamon and some scheduled jobs, and a library for a wasm client.
 
 There are also a few scripts, to be used with [rust-script](https://rust-script.org/). You can install it with `cargo install rust-script` then run the scripts directly. It will take a while to build the first time you run it.
 

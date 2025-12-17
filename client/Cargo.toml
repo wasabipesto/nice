@@ -1,15 +1,15 @@
 [package]
 name = "nice_client"
-version = "3.2.1"
-edition = "2021"
-authors = ["wasabipesto <nice@wasabipesto.com>"]
 description = "a client for distributed search of square-cube pandigitals"
-repository = "https://github.com/wasabipesto/nice"
-readme = "README.md"
-license-file = "../LICENSE"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+license-file.workspace = true
 
 [dependencies]
-nice_common = { path = "../common", features = ["network"] }
+nice_common = { workspace = true, features = ["network"] }
 clap = { version = "4.5" }
 rayon = { version = "1.11" }
 serde_json = { version = "1.0" }

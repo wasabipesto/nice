@@ -1,20 +1,19 @@
 [package]
 name = "nice_common"
-version = "3.2.1"
-edition = "2021"
-authors = ["wasabipesto <nice@wasabipesto.com>"]
 description = "common utilities for dealing with square-cube pandigitals"
-repository = "https://github.com/wasabipesto/nice"
-readme = "README.md"
-license-file = "../LICENSE"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+license-file.workspace = true
 
 [features]
-default = ["database", "network"]
-database = ["dep:diesel", "dep:dotenvy"]
+database = ["dep:diesel", "dep:dotenvy", "dep:bigdecimal"]
 network = ["dep:openssl", "dep:reqwest"]
 
 [dependencies]
-bigdecimal = { version = "0.4.5" }
+bigdecimal = { version = "0.4.5", optional = true }
 chrono = { version = "0.4.31", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 diesel = { version = "2.2", features = ["chrono", "postgres", "r2d2", "serde_json", "numeric"], optional = true }
