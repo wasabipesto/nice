@@ -12,7 +12,15 @@ For more background, check out the [original article](https://beautifulthorns.wi
 
 The easiest way to get started is by going to [https://nicenumbers.net/search/](https://nicenumbers.net/search) and running it in your browser. You'll see live results and everything will be submitted in your name.
 
-If you want to go even faster, you can run the [native binaries from the latest release](https://github.com/wasabipesto/nice/releases). We usually see a ~2x speedup versus the browser.
+If you want to go even faster, you can run the [native binaries from the latest release](https://github.com/wasabipesto/nice/releases) or run the docker image. We usually see a ~2x speedup versus the browser.
+
+```sh
+# Run the release binary
+./nice_client
+
+# Run the docker image
+docker run -it ghcr.io/wasabipesto/nice_client:3
+```
 
 You may get slightly more performance by building the binaries yourself. Building the client only requires minimal dependencies.
 
