@@ -8,7 +8,6 @@ on:
     workflow_dispatch:
 
 env:
-    OUTPUT_PREFIX: nice
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
 
@@ -85,6 +84,7 @@ jobs:
             - uses: actions/checkout@v4
 
             - name: Build binaries
+              # https://github.com/houseabsolute/actions-rust-cross
               uses: houseabsolute/actions-rust-cross@v1
               with:
                   command: "build"
@@ -92,11 +92,14 @@ jobs:
                   args: "${{ matrix.platform.packages }} --locked --release"
 
             - name: Create release artifacts
+              # https://github.com/houseabsolute/actions-rust-release
               uses: houseabsolute/actions-rust-release@v0
               with:
                   executable-name: nice_client
                   target: ${{ matrix.platform.rust_target }}
-                  archive-name: ${{ env.OUTPUT_PREFIX }}-${{ matrix.platform.build_name }}
+                  # Use a tag like release-v1.2.3 to draft a new release
+                  release-tag-prefix: "release-v"
+                  changes-file: ""
 
             - name: Run tests
               # Skip tests for targets that can't run on the host system
