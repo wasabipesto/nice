@@ -91,6 +91,13 @@ jobs:
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release"
 
+            - name: Create release artifacts
+              uses: houseabsolute/actions-rust-release@v0
+              with:
+                  executable-name: nice_client
+                  target: ${{ matrix.platform.rust_target }}
+                  archive-name: ${{ env.OUTPUT_PREFIX }}-${{ matrix.platform.build_name }}
+
             - name: Run tests
               # Skip tests for targets that can't run on the host system
               if: ${{ !contains(matrix.platform.rust_target, 'freebsd') }}
