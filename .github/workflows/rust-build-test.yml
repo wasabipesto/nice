@@ -98,6 +98,7 @@ jobs:
                   executable-name: nice_client
                   target: ${{ matrix.platform.rust_target }}
                   # Use a tag like vX.Y.Z to draft a new release
+                  # git tag -a vX.Y.Z -m "release new version" && git push origin vX.Y.Z
                   release-tag-prefix: "v"
                   changes-file: "CHANGELOG.md"
 
