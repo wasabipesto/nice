@@ -71,6 +71,7 @@ CREATE TABLE submissions (
     numbers JSONB NOT NULL DEFAULT '[]'
 );
 -- POSTGREST USER ACCESS
+CREATE ROLE web_anon NOLOGIN;
 GRANT SELECT ON bases TO web_anon;
 GRANT SELECT ON chunks TO web_anon;
 GRANT SELECT ON fields TO web_anon;
