@@ -32,11 +32,8 @@ update:
 
 # List all available dependency upgrades
 cargo-upgrades:
-    cargo upgrades --manifest-path api/Cargo.toml
-    cargo upgrades --manifest-path client/Cargo.toml
-    cargo upgrades --manifest-path common/Cargo.toml
-    cargo upgrades --manifest-path jobs/Cargo.toml
-    cargo upgrades --manifest-path wasm-client/Cargo.toml
+    cargo install cargo-upgrades
+    cargo upgrades
 
 # Build and run a Dockerfile (for building against a specific glibc)
 docker dockerfile:
