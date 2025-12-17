@@ -24,67 +24,70 @@ jobs:
                     - build_name: Linux-x86_64
                       os: ubuntu-latest
                       target: x86_64-unknown-linux-gnu
+                      packages: "" # default to all packages
 
                     - build_name: Linux-x86_64-musl
                       os: ubuntu-latest
                       target: x86_64-unknown-linux-musl
+                      packages: "-p client"
 
                     - build_name: Linux-aarch64
                       os: ubuntu-latest
                       target: aarch64-unknown-linux-gnu
+                      packages: "-p client"
 
                     - build_name: Linux-aarch64-musl
                       os: ubuntu-latest
                       target: aarch64-unknown-linux-musl
+                      packages: "-p client"
 
                     - build_name: Linux-armv7
                       os: ubuntu-latest
                       target: armv7-unknown-linux-gnueabihf
+                      packages: "-p client"
 
                     - build_name: Linux-arm-musl
                       os: ubuntu-latest
                       target: arm-unknown-linux-musleabi
+                      packages: "-p client"
 
                     - build_name: Linux-riscv64
                       os: ubuntu-latest
                       target: riscv64gc-unknown-linux-gnu
+                      packages: "-p client"
 
                     - build_name: FreeBSD-x86_64
                       os: ubuntu-latest
                       target: x86_64-unknown-freebsd
-
-                    - build_name: WebAssembly
-                      os: ubuntu-latest
-                      target: wasm32-unknown-unknown
+                      packages: "-p client"
 
                     - build_name: Windows-x86_64
                       os: windows-latest
                       target: x86_64-pc-windows-msvc
+                      packages: "-p client"
 
                     - build_name: Darwin-x86_64
                       os: macOS-latest
                       target: x86_64-apple-darwin
+                      packages: "-p client"
 
         steps:
             - uses: actions/checkout@v4
 
-            - name: Install musl-tools on Linux
+            - name: Install musl-tools
               if: contains(matrix.platform.target, 'musl')
               run: sudo apt-get update --yes && sudo apt-get install --yes musl-tools
 
-            - name: Build binary
+            - name: Build binaries
               uses: houseabsolute/actions-rust-cross@v1
               with:
                   command: "build"
                   target: ${{ matrix.platform.target }}
-                  toolchain: stable
-                  args: "--locked --release"
-                  strip: true
+                  args: "${{ matrix.platform.packages }} --locked --release"
 
             - name: Run tests
               uses: houseabsolute/actions-rust-cross@v1
               with:
                   command: "test"
                   target: ${{ matrix.platform.target }}
-                  toolchain: stable
-                  args: "--locked --release --no-fail-fast"
+                  args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
