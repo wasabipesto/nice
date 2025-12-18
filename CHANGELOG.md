@@ -1,6 +1,6 @@
 # Changelog
 
-## Nice v3.2.2
+## Nice v3.2.3
 
 - Update dependencies
 - Bump rust edition to 2024
