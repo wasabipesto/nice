@@ -1,4 +1,4 @@
-name: Rust Cross-Platform Build and Test
+name: Rust Cross-Platform Build, Test, and Release
 
 on:
     push:
@@ -11,15 +11,18 @@ on:
 permissions:
     contents: write
 
+concurrency:
+    group: rust-build-test-${{ github.ref }}
+    cancel-in-progress: false
+
 env:
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
 
 jobs:
     build:
-        name: ${{ matrix.platform.build_name }}
+        name: Build ${{ matrix.platform.build_name }}
         runs-on: ${{ matrix.platform.runs_on }}
-
         strategy:
             fail-fast: false
             matrix:
@@ -87,29 +90,114 @@ jobs:
         steps:
             - uses: actions/checkout@v4
 
+            # Build (cross when needed). This action can also install required toolchains.
             - name: Build binaries
               # https://github.com/houseabsolute/actions-rust-cross
               uses: houseabsolute/actions-rust-cross@v1
               with:
-                  command: "build"
+                  command: build
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release"
 
+            # Run tests only where they can execute on the runner (skip e.g. freebsd targets).
+            - name: Run tests
+              # Skip tests for targets that can't run on the host system (e.g. freebsd)
+              if: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && !contains(matrix.platform.rust_target, 'freebsd') }}
+              # https://github.com/houseabsolute/actions-rust-cross
+              uses: houseabsolute/actions-rust-cross@v1
+              with:
+                  command: test
+                  target: ${{ matrix.platform.rust_target }}
+                  args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
+
+            # Package a single executable as a tarball/zip plus checksum for release upload.
+            # Note: this action creates the archive in the workspace; we then upload it as a workflow artifact.
             - name: Create release artifacts
+              if: startsWith(github.ref, 'refs/tags/v')
               # https://github.com/houseabsolute/actions-rust-release
               uses: houseabsolute/actions-rust-release@v0
               with:
                   executable-name: nice_client
                   target: ${{ matrix.platform.rust_target }}
-                  # Use a tag like vX.Y.Z to draft a new release
-                  release-tag-prefix: "v"
-                  changes-file: "CHANGELOG.md"
+                  changes-file: CHANGELOG.md
 
-            - name: Run tests
-              # Skip tests for targets that can't run on the host system
-              if: ${{ !contains(matrix.platform.rust_target, 'freebsd') }}
-              uses: houseabsolute/actions-rust-cross@v1
+            - name: Upload build artifacts (always)
+              # Keep artifacts for every run (PR/main/manual/tags), even if no release is created.
+              uses: actions/upload-artifact@v4
               with:
-                  command: "test"
-                  target: ${{ matrix.platform.rust_target }}
-                  args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
+                  name: nice_client-${{ matrix.platform.build_name }}-${{ matrix.platform.rust_target }}
+                  if-no-files-found: warn
+                  retention-days: 14
+                  path: |
+                      nice_client-*.tar.gz
+                      nice_client-*.tar.gz.sha256
+                      nice_client-*.zip
+                      nice_client-*.zip.sha256
+
+    release:
+        name: Publish GitHub Release
+        runs-on: ubuntu-latest
+        needs: build
+        if: startsWith(github.ref, 'refs/tags/v')
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Download build artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: dist
+
+            # Generate release notes from CHANGELOG.md section matching the tag.
+            # Expected format: headings like "## 3.2.3" (or "## [3.2.3]") somewhere in CHANGELOG.md.
+            - name: Generate release notes from CHANGELOG.md
+              id: notes
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  TAG="${GITHUB_REF_NAME}"        # e.g. v3.2.3
+                  VER="${TAG#v}"                  # e.g. 3.2.3
+
+                  # Find start line for this version's section.
+                  start="$(grep -nE "^##[[:space:]]+Nice[[:space:]]+v${VER}([[:space:]]|$)" CHANGELOG.md | head -n1 | cut -d: -f1 || true)"
+                  if [ -z "${start}" ]; then
+                    echo "Could not find a CHANGELOG section header for version '${VER}'."
+                    echo "Expected a line like: '## Nice v${VER}'."
+                    exit 1
+                  fi
+
+                  # Find next section header after start (exclusive)
+                  next="$(tail -n +$((start+1)) CHANGELOG.md | grep -nE "^##[[:space:]]" | head -n1 | cut -d: -f1 || true)"
+                  if [ -n "${next}" ]; then
+                    end=$((start + next - 2))
+                  else
+                    end="$(wc -l < CHANGELOG.md)"
+                  fi
+
+                  # Extract notes (skip the header line itself)
+                  notes_file="release-notes.md"
+                  awk -v s="${start}" -v e="${end}" 'NR>s && NR<=e {print}' CHANGELOG.md > "${notes_file}"
+
+                  # If the section is empty (e.g. only whitespace), fail to avoid publishing blank notes.
+                  if ! grep -q '[^[:space:]]' "${notes_file}"; then
+                    echo "CHANGELOG section for ${VER} is empty."
+                    exit 1
+                  fi
+
+                  echo "notes_file=${notes_file}" >> "${GITHUB_OUTPUT}"
+
+            - name: Create GitHub release and upload assets
+              # https://github.com/softprops/action-gh-release
+              uses: softprops/action-gh-release@v2
+              with:
+                  draft: true
+                  tag_name: ${{ github.ref_name }}
+                  name: ${{ github.ref_name }}
+                  body_path: ${{ steps.notes.outputs.notes_file }}
+                  fail_on_unmatched_files: true
+                  files: |
+                      dist/**/nice_client-*.tar.gz
+                      dist/**/nice_client-*.tar.gz.sha256
+                      dist/**/nice_client-*.zip
+                      dist/**/nice_client-*.zip.sha256
