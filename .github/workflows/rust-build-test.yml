@@ -99,10 +99,9 @@ jobs:
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release"
 
-            # Run tests only where they can execute on the runner (skip e.g. freebsd targets).
             - name: Run tests
               # Skip tests for targets that can't run on the host system (e.g. freebsd)
-              if: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && !contains(matrix.platform.rust_target, 'freebsd') }}
+              if: ${{ !contains(matrix.platform.rust_target, 'freebsd') }}
               # https://github.com/houseabsolute/actions-rust-cross
               uses: houseabsolute/actions-rust-cross@v1
               with:
@@ -111,9 +110,7 @@ jobs:
                   args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
 
             # Package a single executable as a tarball/zip plus checksum for release upload.
-            # Note: this action creates the archive in the workspace; we then upload it as a workflow artifact.
             - name: Create release artifacts
-              if: startsWith(github.ref, 'refs/tags/v')
               # https://github.com/houseabsolute/actions-rust-release
               uses: houseabsolute/actions-rust-release@v0
               with:
@@ -121,18 +118,18 @@ jobs:
                   target: ${{ matrix.platform.rust_target }}
                   changes-file: CHANGELOG.md
 
-            - name: Upload build artifacts (always)
-              # Keep artifacts for every run (PR/main/manual/tags), even if no release is created.
+            - name: Upload build artifacts
+              # https://github.com/actions/upload-artifact
               uses: actions/upload-artifact@v4
               with:
                   name: nice_client-${{ matrix.platform.build_name }}-${{ matrix.platform.rust_target }}
-                  if-no-files-found: warn
+                  if-no-files-found: error
                   retention-days: 14
                   path: |
-                      nice_client-*.tar.gz
-                      nice_client-*.tar.gz.sha256
-                      nice_client-*.zip
-                      nice_client-*.zip.sha256
+                      */nice_client-*.tar.gz
+                      */nice_client-*.tar.gz.sha256
+                      */nice_client-*.zip
+                      */nice_client-*.zip.sha256
 
     release:
         name: Publish GitHub Release
