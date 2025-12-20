@@ -3,18 +3,24 @@
 # Requires `just` and `toml-cli` to run these helpers:
 #   cargo install just toml-cli
 
-set dotenv-load
+set dotenv-load := true
 
 version := shell("toml get common/Cargo.toml package.version")
 
 # List commands, default
 default:
-  just --list
+    just --list
 
 # Update from git and rebuild if necessary
 update:
     git pull
     just build
+
+# Tag and push a new release
+[confirm]
+tag-release version:
+    git tag -a v{{ version }} -m "release new version"
+    git push origin v{{ version }}
 
 # Build all packages (except wasm)
 build:
@@ -38,30 +44,30 @@ cargo-upgrades:
 
 # Build and run a Dockerfile (for building against a specific glibc)
 docker dockerfile:
-    docker build -t nice-{{lowercase(file_stem(dockerfile))}} -f {{dockerfile}} .
-    docker run -it -v .:/opt/nice nice-{{lowercase(file_stem(dockerfile))}}
+    docker build -t nice-{{ lowercase(file_stem(dockerfile)) }} -f {{ dockerfile }} .
+    docker run -it -v .:/opt/nice nice-{{ lowercase(file_stem(dockerfile)) }}
 
 # Build each version in docker and copy artifacts for release
 build-for-release:
     mkdir -p release
     just docker docker/bullseye.Dockerfile
-    cp target-bullseye/release/nice_client release/nice-client-{{version}}-x86_64-bullseye
+    cp target-bullseye/release/nice_client release/nice-client-{{ version }}-x86_64-bullseye
     just docker docker/bookworm.Dockerfile
-    cp target-bookworm/release/nice_client release/nice-client-{{version}}-x86_64-bookworm
+    cp target-bookworm/release/nice_client release/nice-client-{{ version }}-x86_64-bookworm
     just docker docker/trixie.Dockerfile
-    cp target-trixie/release/nice_client release/nice-client-{{version}}-x86_64-trixie
+    cp target-trixie/release/nice_client release/nice-client-{{ version }}-x86_64-trixie
 
 # Run client with given options
 client *args:
-    cargo run -r --bin nice_client -- {{args}}
+    cargo run -r --bin nice_client -- {{ args }}
 
 # Run benchmark
 benchmark size='large':
-    just client --benchmark {{size}}
+    just client --benchmark {{ size }}
 
 # Run the daemon
 daemon *args:
-    cargo run -r --bin nice_daemon -- {{args}}
+    cargo run -r --bin nice_daemon -- {{ args }}
 
 # Run API server
 server:
@@ -76,16 +82,16 @@ deploy-site:
     rclone sync web $RCLONE_SITE_TARGET --progress
 
 # Start dev server for website
-[working-directory: 'web']
+[working-directory('web')]
 dev:
     python3 -m http.server
 
 # Build WASM app and copy result to web dir
-[working-directory: 'wasm-client']
+[working-directory('wasm-client')]
 wasm-build:
     cargo install wasm-pack
     wasm-pack build --target web --out-dir pkg
-    cp -rv pkg {{justfile_dir()}}/web/search/
+    cp -rv pkg {{ justfile_dir() }}/web/search/
 
 # Build WASM app and start dev server
 wasm-dev: wasm-build dev
