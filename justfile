@@ -91,7 +91,7 @@ dev:
 wasm-build:
     cargo install wasm-pack
     wasm-pack build --target web --out-dir pkg
-    cp -rv pkg {{ justfile_dir() }}/web/search/
+    cp -rv pkg {{ justfile_directory() }}/web/search/
 
 # Build WASM app and start dev server
 wasm-dev: wasm-build dev
