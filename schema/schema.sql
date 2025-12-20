@@ -4,6 +4,7 @@ DROP TABLE IF EXISTS claims;
 DROP TABLE IF EXISTS fields;
 DROP TABLE IF EXISTS chunks;
 DROP TABLE IF EXISTS bases;
+
 -- BASES: ENTRIE BASE RANGE
 CREATE TABLE bases (
     -- ID is the acual base
@@ -19,6 +20,7 @@ CREATE TABLE bases (
     distribution JSONB NOT NULL DEFAULT '[]',
     numbers JSONB NOT NULL DEFAULT '[]'
 );
+
 -- CHUNKS: AGGREGATE FIELDS FOR ANALYTICS
 CREATE TABLE chunks (
     id SERIAL PRIMARY KEY,
@@ -34,6 +36,7 @@ CREATE TABLE chunks (
     distribution JSONB NOT NULL DEFAULT '[]',
     numbers JSONB NOT NULL DEFAULT '[]'
 );
+
 -- FIELDS: INDIVIDUAL SEARCH RANGES
 CREATE TABLE fields (
     id BIGSERIAL PRIMARY KEY,
@@ -47,6 +50,7 @@ CREATE TABLE fields (
     check_level INTEGER NOT NULL DEFAULT 0,
     prioritize BOOLEAN NOT NULL DEFAULT 'false'
 );
+
 -- CLAIMS: LOG OF CLAIM REQUESTS
 CREATE TABLE claims (
     id BIGSERIAL PRIMARY KEY,
@@ -55,6 +59,7 @@ CREATE TABLE claims (
     claim_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     user_ip VARCHAR NOT NULL
 );
+
 -- SUBMISSIONS: LOG OF ALL VALIDATED SUIBMISSIONS
 CREATE TABLE submissions (
     id BIGSERIAL PRIMARY KEY,
@@ -70,6 +75,7 @@ CREATE TABLE submissions (
     distribution JSONB,
     numbers JSONB NOT NULL DEFAULT '[]'
 );
+
 -- POSTGREST USER ACCESS
 CREATE ROLE web_anon NOLOGIN;
 GRANT SELECT ON bases TO web_anon;
@@ -77,8 +83,15 @@ GRANT SELECT ON chunks TO web_anon;
 GRANT SELECT ON fields TO web_anon;
 GRANT SELECT ON claims TO web_anon;
 GRANT SELECT ON submissions TO web_anon;
+
 -- ADDITIONAL INDEXES
-CREATE INDEX idx_fields_base_id ON fields(base_id);
-CREATE INDEX idx_fields_range_start ON fields(range_start);
-CREATE INDEX idx_fields_range_end ON fields(range_end);
-CREATE INDEX idx_fields_check_level ON fields(check_level);
+CREATE INDEX IF NOT EXISTS idx_fields_base_id ON fields(base_id);
+CREATE INDEX IF NOT EXISTS idx_fields_range_start ON fields(range_start);
+CREATE INDEX IF NOT EXISTS idx_fields_range_end ON fields(range_end);
+CREATE INDEX IF NOT EXISTS idx_fields_check_level ON fields(check_level);
+CREATE INDEX IF NOT EXISTS idx_fields_base_check_level ON fields(base_id, check_level);
+CREATE INDEX IF NOT EXISTS idx_fields_range_start_end ON fields(range_start, range_end);
+CREATE INDEX IF NOT EXISTS idx_fields_base_range ON fields(base_id, range_start, range_end);
+CREATE INDEX IF NOT EXISTS idx_fields_canon_submission ON fields(canon_submission_id) WHERE canon_submission_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_submissions_field_mode_disq ON submissions(field_id, search_mode, disqualified);
+CREATE INDEX IF NOT EXISTS idx_submissions_id_field ON submissions(id, field_id);
