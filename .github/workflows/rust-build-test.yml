@@ -117,7 +117,7 @@ jobs:
                   executable-name: nice_client
                   target: ${{ matrix.platform.rust_target }}
                   changes-file: CHANGELOG.md
-                  release-tag-prefix: "don't make releases"
+                  release-tag-prefix: "dont-make-releases"
 
     release:
         name: Publish GitHub Release
