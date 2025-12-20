@@ -3,11 +3,11 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::too_many_lines)]
 
+use nice_common::DOWNSAMPLE_CUTOFF_PERCENT;
 use nice_common::consensus;
 use nice_common::db_util;
 use nice_common::distribution_stats;
 use nice_common::number_stats;
-use nice_common::DOWNSAMPLE_CUTOFF_PERCENT;
 use nice_common::{FieldRecord, SubmissionRecord};
 use std::io::{self, Write};
 
@@ -42,9 +42,12 @@ fn main() {
                 None => {
                     if field.canon_submission_id.is_some() || field.check_level > 1 {
                         println!(
-                        "WARNING: Field #{} claimed to be checked (Submission #{:?}, CL{}) but no submissions were found, so it was reset to CL{}.",
-                        field.field_id, field.canon_submission_id, field.check_level, check_level
-                    );
+                            "WARNING: Field #{} claimed to be checked (Submission #{:?}, CL{}) but no submissions were found, so it was reset to CL{}.",
+                            field.field_id,
+                            field.canon_submission_id,
+                            field.check_level,
+                            check_level
+                        );
                         db_util::update_field_canon_and_cl(
                             &mut conn,
                             field.field_id,
@@ -82,7 +85,7 @@ fn main() {
         println!();
         println!("=== BASE {base} DOWNSAMPLING ===");
 
-        // get basic stats like how much has been cheked
+        // get basic stats like how much has been checked
         let base_checked_niceonly = db_util::get_count_checked_by_range(
             &mut conn,
             1,
