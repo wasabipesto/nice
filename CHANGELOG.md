@@ -1,5 +1,9 @@
 # Changelog
 
+## Nice v3.2.5
+
+- Bump to force CI test release
+
 ## Nice v3.2.4
 
 - Additional retries and exponential backoff in client
