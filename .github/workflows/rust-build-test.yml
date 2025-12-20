@@ -118,19 +118,6 @@ jobs:
                   target: ${{ matrix.platform.rust_target }}
                   changes-file: CHANGELOG.md
 
-            - name: Upload build artifacts
-              # https://github.com/actions/upload-artifact
-              uses: actions/upload-artifact@v4
-              with:
-                  name: nice_client-${{ matrix.platform.build_name }}-${{ matrix.platform.rust_target }}
-                  if-no-files-found: error
-                  retention-days: 14
-                  path: |
-                      */nice_client-*.tar.gz
-                      */nice_client-*.tar.gz.sha256
-                      */nice_client-*.zip
-                      */nice_client-*.zip.sha256
-
     release:
         name: Publish GitHub Release
         runs-on: ubuntu-latest
