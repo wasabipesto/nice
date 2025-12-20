@@ -121,10 +121,13 @@ fn main() {
             print!("Chunk #{}: ", chunk.chunk_id);
             io::stdout().flush().unwrap();
 
-            // get basic stats like how much has been cheked
+            // get basic stats like how much has been checked
             let minimum_cl =
                 db_util::get_minimum_cl_by_range(&mut conn, chunk.range_start, chunk.range_end)
                     .unwrap();
+            print!("CL{minimum_cl}, ");
+            io::stdout().flush().unwrap();
+
             // if the min check level is X or more, we've already searched everything
             let checked_niceonly = if minimum_cl >= 1 {
                 chunk.range_size
@@ -152,13 +155,10 @@ fn main() {
                 )
                 .unwrap()
             };
+
             #[allow(clippy::cast_precision_loss)]
             let chunk_percent_checked_detailed = checked_detailed as f32 / chunk_size as f32;
-            print!(
-                "CL{}, Checked {:.1}%, ",
-                minimum_cl,
-                chunk_percent_checked_detailed * 100f32
-            );
+            print!("Checked {:.1}%, ", chunk_percent_checked_detailed * 100f32);
             io::stdout().flush().unwrap();
 
             // get all submissions for the chunk
