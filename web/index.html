@@ -26,7 +26,7 @@
                     <div class="column">
                         <div class="box content p-6">
                             <p class="subtitle is-3">
-                                <strong>4134931983708</strong> is
+                                <strong>4,134,931,983,708</strong> is
                                 <strong>97.5%</strong> nice.
                             </p>
                             <p class="title is-2">
@@ -153,8 +153,11 @@
                         <div class="box content">
                             <h1 class="title is-4 mb-1">Chunk Completion</h1>
                             <p>
-                                How many chunks have we searched, and how many
-                                do we have left?
+                                How many chunks have we searched? The first few
+                                bases are small and can be checked in a few
+                                seconds each, but the higher bases have
+                                quintillions of numbers and take many months of
+                                CPU time.
                             </p>
                             <div id="completion"></div>
                         </div>
@@ -299,7 +302,7 @@
                         }),
                         Plot.tip(
                             [
-                                "The first few chunks in each range start low before returning to normal.",
+                                "The niceness of the first few chunks in each range starts low before returning to the expected value.",
                             ],
                             { x: 9.5e10, y: 0.563, anchor: "top" },
                         ),
@@ -307,7 +310,7 @@
                             [
                                 "The ranges seem to be approaching a niceness of 0.632, which is what we would expect for a random distribution.",
                             ],
-                            { x: 4.5e12, y: 0.685, anchor: "bottom-right" },
+                            { x: 5.5e13, y: 0.685, anchor: "bottom-right" },
                         ),
                         Plot.ruleY([0.632], { stroke: "black", opacity: 0.3 }),
                     ],
@@ -315,15 +318,27 @@
                 const niceness_div = document.querySelector("#niceness");
                 niceness_div.append(niceness_plot);
 
+                let currentBase = null;
+                let x = -1;
+                const chunks_for_completion_plot = chunks.map((chunk) => {
+                    if (chunk.base_id !== currentBase) {
+                        currentBase = chunk.base_id;
+                        x = 0;
+                    } else {
+                        x += 1;
+                    }
+                    return { ...chunk, chunk_x: x };
+                });
+
                 const completion_plot = Plot.plot({
                     width: 900,
                     //height: 700,
                     x: { axis: null },
-                    y: { axis: null },
+                    y: { label: "Base" },
                     marks: [
-                        Plot.rect(chunks, {
-                            x: (i) => chunks.indexOf(i) % 50,
-                            y: (i) => Math.floor(chunks.indexOf(i) / 50),
+                        Plot.rect(chunks_for_completion_plot, {
+                            y: "base_id",
+                            x: "chunk_x",
                             fill: (i) =>
                                 i.minimum_cl > 1
                                     ? "Searched (Detailed)"
@@ -331,7 +346,6 @@
                                       ? "Searched (Nice Only)"
                                       : "Unsearched",
                             channels: {
-                                Base: "base_id",
                                 Size: "range_size",
                                 Status: "fill",
                             },
@@ -340,28 +354,10 @@
                                     base: true,
                                     size: true,
                                     x: false,
-                                    y: false,
+                                    y: true,
                                 },
                             },
                         }),
-                        Plot.tip(
-                            [
-                                "The first few chunks are small and can easily be searched in a few seconds.",
-                            ],
-                            { x: 1, y: 1, anchor: "top-left" },
-                        ),
-                        Plot.tip(
-                            [
-                                "Starting here the chunks are 47 billion numbers, taking around 3 hours each.",
-                            ],
-                            { x: 23, y: 6, anchor: "bottom" },
-                        ),
-                        Plot.tip(
-                            [
-                                "Starting here the chunks are 5.5 trillion numbers, taking around 2 weeks each.",
-                            ],
-                            { x: 22, y: 14, anchor: "left" },
-                        ),
                     ],
                 });
                 const completion_div = document.querySelector("#completion");
