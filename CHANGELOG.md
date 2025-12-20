@@ -1,5 +1,10 @@
 # Changelog
 
+## Nice v3.2.4
+
+- Additional retries and exponential backoff in client
+- Faster docker builds in CI
+
 ## Nice v3.2.3
 
 - Update dependencies
