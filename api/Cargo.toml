@@ -1,12 +1,12 @@
 [package]
 name = "nice_api"
-version = "3.2.1"
-edition = "2021"
-authors = ["wasabipesto <nice@wasabipesto.com>"]
 description = "an api for coordinating the search for square-cube pandigitals"
-repository = "https://github.com/wasabipesto/nice"
-readme = "README.md"
-license-file = "../LICENSE"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+license-file.workspace = true
 
 [dependencies]
 nice_common = { workspace = true, features = ["database", "rustls-tls"] }

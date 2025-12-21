@@ -9,8 +9,8 @@ extern crate rocket;
 use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
-    get_claim_by_id, get_database_connection, get_field_by_id, insert_claim, insert_submission,
-    try_claim_field, update_field_canon_and_cl,
+    get_claim_by_id, get_database_pool, get_field_by_id, get_pooled_database_connection,
+    insert_claim, insert_submission, try_claim_field, update_field_canon_and_cl, PgPool,
 };
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
@@ -20,15 +20,15 @@ use nice_common::{
 };
 use rand::Rng;
 use rocket::serde::json::{json, Json, Value};
+use rocket::State;
 
 // TODO: Define error types (4xx, 5xx) and serialize them properly
 // TODO: Log claims, valid submissions, and invalid submissions
 
 #[get("/claim/<mode>")]
-fn claim(mode: &str) -> Result<Value, Value> {
-    // Get database connection
-    // TODO: Database connection pooling
-    let mut conn = get_database_connection();
+fn claim(mode: &str, pool: &State<PgPool>) -> Result<Value, Value> {
+    // Get database connection from the shared pool
+    let mut conn = get_pooled_database_connection(pool);
 
     // Set search mode based on path
     let search_mode = match mode {
@@ -114,10 +114,9 @@ fn claim(mode: &str) -> Result<Value, Value> {
 
 #[post("/submit", data = "<data>")]
 #[allow(clippy::needless_pass_by_value)]
-fn submit(data: Json<DataToServer>) -> Result<Value, Value> {
-    // Get database connection
-    // TODO: Database connection pooling
-    let mut conn = get_database_connection();
+fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value> {
+    // Get database connection from the shared pool
+    let mut conn = get_pooled_database_connection(pool);
 
     // Get submission data from JSON
     let submit_data = DataToServer {
@@ -272,7 +271,10 @@ fn not_found() -> Value {
 
 #[launch]
 fn rocket() -> _ {
+    let pool = get_database_pool();
+
     rocket::build()
+        .manage(pool)
         .mount("/", routes![claim, submit, index])
         .register("/", catchers![not_found])
 }
