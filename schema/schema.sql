@@ -24,7 +24,7 @@ CREATE TABLE bases (
 -- CHUNKS: AGGREGATE FIELDS FOR ANALYTICS
 CREATE TABLE chunks (
     id SERIAL PRIMARY KEY,
-    base_id INTEGER NOT NULL REFERENCES base(id),
+    base_id INTEGER NOT NULL REFERENCES bases(id),
     range_start DECIMAL NOT NULL,
     range_end DECIMAL NOT NULL,
     range_size DECIMAL NOT NULL,
@@ -40,8 +40,8 @@ CREATE TABLE chunks (
 -- FIELDS: INDIVIDUAL SEARCH RANGES
 CREATE TABLE fields (
     id BIGSERIAL PRIMARY KEY,
-    base_id INTEGER NOT NULL REFERENCES base(id),
-    chunk_id INTEGER REFERENCES chunk(id),
+    base_id INTEGER NOT NULL REFERENCES bases(id),
+    chunk_id INTEGER REFERENCES chunks(id),
     range_start DECIMAL NOT NULL,
     range_end DECIMAL NOT NULL,
     range_size DECIMAL NOT NULL,
@@ -54,7 +54,7 @@ CREATE TABLE fields (
 -- CLAIMS: LOG OF CLAIM REQUESTS
 CREATE TABLE claims (
     id BIGSERIAL PRIMARY KEY,
-    field_id INTEGER NOT NULL REFERENCES field(id),
+    field_id INTEGER NOT NULL REFERENCES fields(id),
     search_mode VARCHAR NOT NULL,
     claim_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     user_ip VARCHAR NOT NULL
@@ -63,8 +63,8 @@ CREATE TABLE claims (
 -- SUBMISSIONS: LOG OF ALL VALIDATED SUIBMISSIONS
 CREATE TABLE submissions (
     id BIGSERIAL PRIMARY KEY,
-    claim_id INTEGER NOT NULL REFERENCES claim(id),
-    field_id INTEGER NOT NULL REFERENCES field(id),
+    claim_id INTEGER NOT NULL REFERENCES claims(id),
+    field_id INTEGER NOT NULL REFERENCES fields(id),
     search_mode VARCHAR NOT NULL,
     submit_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     elapsed_secs REAL NOT NULL,
