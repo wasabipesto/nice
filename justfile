@@ -71,7 +71,10 @@ daemon *args:
 
 # Run API server
 server:
-    cargo run -r --bin nice_api
+    ROCKET_ADDRESS="0.0.0.0" cargo run -r --bin nice_api
+
+# Run API server
+api: server
 
 # Run scheduled jobs
 jobs:

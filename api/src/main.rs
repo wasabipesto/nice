@@ -9,18 +9,20 @@ extern crate rocket;
 use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
-    get_claim_by_id, get_database_pool, get_field_by_id, get_pooled_database_connection,
-    insert_claim, insert_submission, try_claim_field, update_field_canon_and_cl, PgPool,
+    PgPool, get_claim_by_id, get_database_pool, get_field_by_id, get_pooled_database_connection,
+    insert_claim, insert_submission, try_claim_field, update_field_canon_and_cl,
 };
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
 use nice_common::{
-    DataToClient, DataToServer, FieldClaimStrategy, NiceNumber, SearchMode, CLAIM_DURATION_HOURS,
-    DEFAULT_FIELD_SIZE,
+    CLAIM_DURATION_HOURS, DEFAULT_FIELD_SIZE, DataToClient, DataToServer, FieldClaimStrategy,
+    NiceNumber, SearchMode,
 };
 use rand::Rng;
-use rocket::serde::json::{json, Json, Value};
 use rocket::State;
+use rocket::serde::json::{Json, Value, json};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 // TODO: Define error types (4xx, 5xx) and serialize them properly
 // TODO: Log claims, valid submissions, and invalid submissions
@@ -104,10 +106,12 @@ fn claim(mode: &str, pool: &State<PgPool>) -> Result<Value, Value> {
         range_size: search_field.range_size,
     };
 
-    // Log to stdout & return to user
-    println!(
-        "New {:?} claim for field #{}",
-        claim_record.search_mode, claim_record.field_id
+    // Log + return to user
+    info!(
+        search_mode = ?claim_record.search_mode,
+        field_id = claim_record.field_id,
+        claim_id = claim_record.claim_id,
+        "New Claim"
     );
     Ok(json!(data_for_client))
 }
@@ -245,16 +249,18 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
                 None => {
                     return Err(json!(
                         "Unique distribution must be present for detailed searches."
-                    ))
+                    ));
                 }
             }
         }
     }
 
-    // Log to stdout & respond to user
-    println!(
-        "New {:?} submission for field #{}",
-        claim_record.search_mode, claim_record.field_id
+    // Log + respond to user
+    info!(
+        search_mode = ?claim_record.search_mode,
+        field_id = claim_record.field_id,
+        claim_id = claim_record.claim_id,
+        "New Submission"
     );
     Ok("OK".into())
 }
@@ -271,6 +277,10 @@ fn not_found() -> Value {
 
 #[launch]
 fn rocket() -> _ {
+    // Initialize structured logging (respects RUST_LOG, defaults to "info")
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
     let pool = get_database_pool();
 
     rocket::build()
