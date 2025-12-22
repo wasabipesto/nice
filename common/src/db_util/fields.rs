@@ -197,35 +197,55 @@ pub fn try_claim_field(
     let maximum_check_level = conversions::u8_to_i32(maximum_check_level)?;
     let maximum_size = conversions::u128_to_bigdec(maximum_size)?;
 
+    // Use a single-statement "claim" with row locking to avoid thundering herd / lock contention.
+    // `FOR UPDATE SKIP LOCKED` ensures concurrent claimers don't block on the same "next" row.
+    //
+    // IMPORTANT: Special-case `maximum_check_level == 0` to use `check_level = 0` rather than
+    // `check_level <= $2`. This helps Postgres match/choose the partial index
+    // `... ON fields(id) WHERE check_level = 0` for nice-only claims where otherwise it would
+    // have to scan through the first ~8 million rows.
+    let check_level_predicate = if maximum_check_level == 0 {
+        "check_level = 0"
+    } else {
+        "check_level <= $2"
+    };
+
     let query = match claim_strategy {
-        FieldClaimStrategy::Next => {
-            "UPDATE fields
-            SET last_claim_time = NOW()
-            WHERE id = (
-                SELECT id FROM fields
-                WHERE (last_claim_time <= $1 OR last_claim_time IS NULL)
-                AND check_level <= $2
-                AND range_size <= $3
+        FieldClaimStrategy::Next => format!(
+            "WITH candidate AS (
+                SELECT id
+                FROM fields
+                WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                  AND {check_level_predicate}
+                  AND range_size <= $3
                 ORDER BY id ASC
+                FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
-            RETURNING *;"
-        }
-        FieldClaimStrategy::Random => {
-            "UPDATE fields
+            UPDATE fields f
             SET last_claim_time = NOW()
-            WHERE id = (
-                SELECT id FROM fields
-                WHERE (last_claim_time <= $1 OR last_claim_time IS NULL)
-                AND check_level <= $2
-                AND range_size <= $3
+            FROM candidate
+            WHERE f.id = candidate.id
+            RETURNING f.*;"
+        ),
+        FieldClaimStrategy::Random => format!(
+            "WITH candidate AS (
+                SELECT id
+                FROM fields
+                WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                  AND {check_level_predicate}
+                  AND range_size <= $3
                 ORDER BY RANDOM() ASC
+                FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
-            RETURNING *;"
-        }
-    }
-    .to_string();
+            UPDATE fields f
+            SET last_claim_time = NOW()
+            FROM candidate
+            WHERE f.id = candidate.id
+            RETURNING f.*;"
+        ),
+    };
 
     sql_query(query)
         .bind::<Timestamptz, _>(maximum_timestamp)
