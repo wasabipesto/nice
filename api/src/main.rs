@@ -143,24 +143,25 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     // Get an RNG thread for random numbers later
     let mut rng = rand::rng();
 
-    let claim_strategy = if rng.random_range(0..100) < 95 {
-        // 95% chance: get lowest valid field
-        FieldClaimStrategy::Next
-    } else {
-        // 5% chance: get random valid field
-        FieldClaimStrategy::Random
+    let claim_strategy = match rng.random_range(1..=100) {
+        // 99% chance: get lowest valid field
+        1..=99 => FieldClaimStrategy::Next,
+        // 1% chance: get random valid field
+        _ => FieldClaimStrategy::Random,
     };
 
     let max_check_level = match search_mode {
         SearchMode::Detailed => {
-            if rng.random_range(0..100) < 95 {
-                1 // 95% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
-            } else {
-                2 // 5% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
+            match rng.random_range(1..=100) {
+                // 95% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
+                1..=95 => 1,
+                // 5% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
+                _ => 2,
             }
         }
         SearchMode::Niceonly => {
-            0 // get CL0 (unchecked), never anything more
+            // get CL0 (unchecked), never anything more
+            0
         }
     };
 
