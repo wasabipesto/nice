@@ -95,15 +95,7 @@ jobs:
         steps:
             - uses: actions/checkout@v4
 
-            # Build (cross when needed). This action can also install required toolchains.
-            - name: Build binaries
-              # https://github.com/houseabsolute/actions-rust-cross
-              uses: houseabsolute/actions-rust-cross@v1
-              with:
-                  command: build
-                  target: ${{ matrix.platform.rust_target }}
-                  args: "${{ matrix.platform.packages }} --locked --release"
-
+            # Test, using cross when needed. This action can also install required toolchains.
             - name: Run tests
               # Skip tests for targets that can't run on the host system (e.g. freebsd)
               if: ${{ !contains(matrix.platform.rust_target, 'freebsd') }}
@@ -113,6 +105,15 @@ jobs:
                   command: test
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
+
+            # Build, using cross when needed. This will explicitly put the binaries in a stable location.
+            - name: Build binaries
+              # https://github.com/houseabsolute/actions-rust-cross
+              uses: houseabsolute/actions-rust-cross@v1
+              with:
+                  command: build
+                  target: ${{ matrix.platform.rust_target }}
+                  args: "${{ matrix.platform.packages }} --locked --release"
 
             # Package a single executable as a tarball/zip plus checksum for release upload.
             - name: Create release artifacts
