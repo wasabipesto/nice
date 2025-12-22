@@ -73,8 +73,15 @@ daemon *args:
 server:
     ROCKET_ADDRESS="0.0.0.0" cargo run -r --bin nice_api
 
-# Run API server
+# Run API server (alias)
 api: server
+
+# Run a SQL file on the database
+run-sql file:
+    docker exec -i nice-postgres psql \
+    --username=nice \
+    --dbname=nice \
+    < {{ file }}
 
 # Run scheduled jobs
 jobs:
