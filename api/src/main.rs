@@ -183,8 +183,11 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     {
         claimed_field
     } else {
+        info!(
+            "Unable to find an unclaimed or expired field, falling back to one that may have been claimed recently."
+        );
         let maximum_timestamp = Utc::now();
-        let claim_strategy = FieldClaimStrategy::Random;
+        let claim_strategy = FieldClaimStrategy::Next;
         try_claim_field(
             &mut conn,
             claim_strategy,
