@@ -29,8 +29,9 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
                     if attempts < MAX_ATTEMPTS {
                         let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                         eprintln!(
-                            "Server error ({}), retrying in {} seconds... (attempt {}/{})",
+                            "Server error ({} {}), retrying in {} seconds... (attempt {}/{})",
                             response.status(),
+                            response.text().unwrap_or_default(),
                             sleep_secs,
                             attempts,
                             MAX_ATTEMPTS
@@ -97,13 +98,14 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Resp
                     if attempts < MAX_ATTEMPTS {
                         let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                         eprintln!(
-                            "Server error ({}), retrying in {} seconds... (attempt {}/{})",
+                            "Server error ({} {}), retrying in {} seconds... (attempt {}/{})",
                             response.status(),
+                            response.text().unwrap_or_default(),
                             sleep_secs,
                             attempts,
                             MAX_ATTEMPTS
                         );
-                        thread::sleep(Duration::from_secs(1));
+                        thread::sleep(Duration::from_secs(sleep_secs));
                         continue;
                     } else {
                         // Get error message from server if possible
