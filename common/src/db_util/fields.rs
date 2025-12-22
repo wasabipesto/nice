@@ -428,3 +428,45 @@ pub fn update_field_canon_and_cl(
 
     Ok(())
 }
+
+/// Struct to hold chunk statistics from batch query
+#[derive(Debug, QueryableByName)]
+pub struct ChunkStats {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    pub chunk_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    pub minimum_cl: i32,
+    #[diesel(sql_type = diesel::sql_types::Numeric)]
+    pub checked_niceonly: BigDecimal,
+    #[diesel(sql_type = diesel::sql_types::Numeric)]
+    pub checked_detailed: BigDecimal,
+}
+
+/// Get statistics for all chunks in a base in a single query.
+/// This is much more efficient than querying each chunk individually.
+pub fn get_chunk_stats_batch(
+    conn: &mut PgConnection,
+    base: u32,
+) -> Result<Vec<ChunkStats>, String> {
+    use diesel::sql_query;
+    use diesel::sql_types::Integer;
+
+    let base = conversions::u32_to_i32(base)?;
+
+    let query = "
+        SELECT
+            chunk_id,
+            MIN(check_level) as minimum_cl,
+            COALESCE(SUM(CASE WHEN check_level >= 1 THEN range_size ELSE 0 END), 0) as checked_niceonly,
+            COALESCE(SUM(CASE WHEN check_level >= 2 THEN range_size ELSE 0 END), 0) as checked_detailed
+        FROM fields
+        WHERE base_id = $1 AND chunk_id IS NOT NULL
+        GROUP BY chunk_id
+        ORDER BY chunk_id;
+    ";
+
+    sql_query(query)
+        .bind::<Integer, _>(base)
+        .load(conn)
+        .map_err(|err| err.to_string())
+}

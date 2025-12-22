@@ -198,3 +198,78 @@ pub fn get_submissions_qualified_detailed_for_field(
         .map(private_to_public)
         .collect::<Result<Vec<SubmissionRecord>, String>>()
 }
+
+/// Struct to hold submission with chunk_id from batch query
+#[derive(Debug, QueryableByName)]
+pub struct SubmissionWithChunk {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub id: i64,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    pub claim_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    pub field_id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub search_mode: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    pub submit_time: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Float)]
+    pub elapsed_secs: f32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub username: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub user_ip: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub client_version: String,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    pub disqualified: bool,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+    pub distribution: Option<Value>,
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub numbers: Value,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    pub chunk_id: Option<i32>,
+}
+
+/// Get all canon submissions for a base with their chunk_ids in a single query.
+/// This is much more efficient than querying each chunk individually.
+pub fn get_canon_submissions_with_chunks_by_base(
+    conn: &mut PgConnection,
+    base: u32,
+) -> Result<Vec<(SubmissionRecord, Option<u32>)>, String> {
+    use diesel::sql_query;
+    use diesel::sql_types::Integer;
+
+    let base = conversions::u32_to_i32(base)?;
+
+    let query = "SELECT s.*, f.chunk_id
+        FROM fields f
+        JOIN submissions s ON f.canon_submission_id = s.id
+        WHERE f.base_id = $1;";
+
+    let items: Vec<SubmissionWithChunk> = sql_query(query)
+        .bind::<Integer, _>(base)
+        .load(conn)
+        .map_err(|err| err.to_string())?;
+
+    items
+        .into_iter()
+        .map(|item| {
+            let submission = SubmissionRecord {
+                submission_id: conversions::i64_to_u128(item.id)?,
+                claim_id: conversions::i32_to_u128(item.claim_id)?,
+                field_id: conversions::i32_to_u128(item.field_id)?,
+                search_mode: conversions::deserialize_searchmode(item.search_mode)?,
+                submit_time: item.submit_time,
+                elapsed_secs: item.elapsed_secs,
+                username: item.username,
+                user_ip: item.user_ip,
+                client_version: item.client_version,
+                disqualified: item.disqualified,
+                distribution: conversions::deserialize_opt_distribution(item.distribution)?,
+                numbers: conversions::deserialize_numbers(item.numbers)?,
+            };
+            let chunk_id = conversions::opti32_to_optu32(item.chunk_id)?;
+            Ok((submission, chunk_id))
+        })
+        .collect::<Result<Vec<_>, String>>()
+}

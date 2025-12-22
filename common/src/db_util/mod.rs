@@ -255,3 +255,21 @@ pub fn get_canon_submissions_by_range(
 ) -> Result<Vec<SubmissionRecord>, String> {
     submissions::get_canon_submissions_by_range(conn, start, end)
 }
+
+/// Get statistics for all chunks in a base in a single query.
+/// This is much more efficient than querying each chunk individually.
+pub fn get_chunk_stats_batch(
+    conn: &mut PgConnection,
+    base: u32,
+) -> Result<Vec<fields::ChunkStats>, String> {
+    fields::get_chunk_stats_batch(conn, base)
+}
+
+/// Get all canon submissions for a base with their chunk_ids in a single query.
+/// This is much more efficient than querying each chunk individually.
+pub fn get_canon_submissions_with_chunks_by_base(
+    conn: &mut PgConnection,
+    base: u32,
+) -> Result<Vec<(SubmissionRecord, Option<u32>)>, String> {
+    submissions::get_canon_submissions_with_chunks_by_base(conn, base)
+}
