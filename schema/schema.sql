@@ -95,6 +95,7 @@ CREATE INDEX IF NOT EXISTS idx_fields_range_start_end ON fields(range_start, ran
 CREATE INDEX IF NOT EXISTS idx_fields_base_range ON fields(base_id, range_start, range_end);
 CREATE INDEX IF NOT EXISTS idx_fields_check_level_range_size_last_claim_time_id ON fields(check_level, range_size, last_claim_time, id);
 CREATE INDEX IF NOT EXISTS idx_fields_canon_submission ON fields(canon_submission_id) WHERE canon_submission_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_fields_cl0_id ON fields(id) WHERE check_level = 0;
 CREATE INDEX IF NOT EXISTS idx_submissions_search_mode_field_id ON submissions(search_mode, field_id);
 CREATE INDEX IF NOT EXISTS idx_submissions_field_mode_disq ON submissions(field_id, search_mode, disqualified);
 CREATE INDEX IF NOT EXISTS idx_submissions_id_field ON submissions(id, field_id);
