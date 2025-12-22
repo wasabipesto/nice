@@ -102,16 +102,7 @@ jobs:
               with:
                   command: build
                   target: ${{ matrix.platform.rust_target }}
-                  args: "-p nice_client --bin nice_client --locked --release"
-
-            - name: Debug check that binaries exist
-              if: ${{ contains(matrix.platform.rust_target, 'linux') }}
-              run: |
-                  find . -name 'nice_client' -type f
-                  ls -l target/
-                  ls -l target/release/
-                  ls -l target/${{ matrix.platform.rust_target }}/release/
-                  ls -l target/${{ matrix.platform.rust_target }}/release/deps/
+                  args: "${{ matrix.platform.packages }} --locked --release"
 
             # Package a single executable as a tarball/zip plus checksum for release upload.
             - name: Create release artifacts
