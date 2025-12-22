@@ -1,5 +1,15 @@
 # Changelog
 
+## Nice v3.2.6
+
+- Update web chart formatting
+- Add additional indexes to the database
+- Add database connection pooling to the API server
+- Add better logging, tracing, and error handling to the API server
+- Drastically speed up claims via the API
+- Show API server error responses in the client
+- Add CI builds for 32-bit Linux
+
 ## Nice v3.2.5
 
 - Bump to force CI test release
