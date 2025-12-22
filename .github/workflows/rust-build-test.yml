@@ -38,28 +38,38 @@ jobs:
                       packages: "-p nice_common -p nice_client"
 
                     - build_name: Linux-aarch64
-                      runs_on: ubuntu-latest
+                      runs_on: ubuntu-24.04-arm
                       rust_target: aarch64-unknown-linux-gnu
                       packages: "-p nice_common -p nice_client"
 
                     - build_name: Linux-aarch64-musl
-                      runs_on: ubuntu-latest
+                      runs_on: ubuntu-24.04-arm
                       rust_target: aarch64-unknown-linux-musl
                       packages: "-p nice_common -p nice_client"
 
                     - build_name: Linux-armv7
-                      runs_on: ubuntu-latest
+                      runs_on: ubuntu-24.04-arm
                       rust_target: armv7-unknown-linux-gnueabihf
                       packages: "-p nice_common -p nice_client"
 
                     - build_name: Linux-arm-musl
-                      runs_on: ubuntu-latest
+                      runs_on: ubuntu-24.04-arm
                       rust_target: arm-unknown-linux-musleabi
                       packages: "-p nice_common -p nice_client"
 
                     - build_name: Linux-riscv64
                       runs_on: ubuntu-latest
                       rust_target: riscv64gc-unknown-linux-gnu
+                      packages: "-p nice_common -p nice_client"
+
+                    - build_name: Linux-loongarch64-gnu
+                      runs_on: ubuntu-latest
+                      rust_target: loongarch64-unknown-linux-gnu
+                      packages: "-p nice_common -p nice_client"
+
+                    - build_name: Linux-i686-gnu
+                      runs_on: ubuntu-latest
+                      rust_target: i686-unknown-linux-gnu
                       packages: "-p nice_common -p nice_client"
 
                     - build_name: FreeBSD-x86_64
@@ -108,6 +118,9 @@ jobs:
                   command: test
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
+
+            - name: Debug check that binaries exist
+              run: find . -name 'nice_client' -type f
 
             # Package a single executable as a tarball/zip plus checksum for release upload.
             - name: Create release artifacts
