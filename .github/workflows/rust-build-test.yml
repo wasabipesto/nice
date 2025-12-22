@@ -102,7 +102,7 @@ jobs:
               with:
                   command: build
                   target: ${{ matrix.platform.rust_target }}
-                  args: "${{ matrix.platform.packages }} --locked --release"
+                  args: "${{ matrix.platform.packages }} --bin nice_client --locked --release"
 
             - name: Run tests
               # Skip tests for targets that can't run on the host system (e.g. freebsd)
@@ -115,6 +115,7 @@ jobs:
                   args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
 
             - name: Debug check that binaries exist
+              if: ${{ contains(matrix.platform.rust_target, 'linux') }}
               run: |
                   find . -name 'nice_client' -type f
                   ls -l target/
