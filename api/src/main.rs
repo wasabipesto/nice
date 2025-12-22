@@ -20,15 +20,108 @@ use nice_common::{
 };
 use rand::Rng;
 use rocket::State;
+use rocket::fairing::{Fairing, Info, Kind};
+use rocket::http::Status;
+use rocket::request::Request;
+use rocket::response::{Response, status as rocket_status};
 use rocket::serde::json::{Json, Value, json};
+use rocket::serde::{Deserialize, Serialize};
+use std::time::Instant;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-// TODO: Define error types (4xx, 5xx) and serialize them properly
-// TODO: Log claims, valid submissions, and invalid submissions
+#[derive(Clone, Copy)]
+struct RequestTimingFairing;
+
+#[rocket::async_trait]
+impl Fairing for RequestTimingFairing {
+    fn info(&self) -> Info {
+        Info {
+            name: "Request timing",
+            kind: Kind::Request | Kind::Response,
+        }
+    }
+
+    async fn on_request(&self, request: &mut Request<'_>, _data: &mut rocket::Data<'_>) {
+        request.local_cache(Instant::now);
+    }
+
+    async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
+        let started_at = request.local_cache(Instant::now);
+        let elapsed = started_at.elapsed();
+        let status = response.status().code;
+
+        info!(
+            method = %request.method(),
+            path = %request.uri(),
+            status = status,
+            elapsed_ms = elapsed.as_millis(),
+            "Request Completed"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "rocket::serde")]
+#[serde(rename_all = "snake_case")]
+enum ApiErrorKind {
+    NotFound,
+    BadRequest,
+    Conflict,
+    UnprocessableEntity,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "rocket::serde")]
+struct ApiErrorBody {
+    error: ApiErrorKind,
+    message: String,
+}
+
+impl ApiErrorBody {
+    fn new(error: ApiErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            error,
+            message: message.into(),
+        }
+    }
+}
+
+type ApiResult<T> = Result<Json<T>, rocket_status::Custom<Json<ApiErrorBody>>>;
+
+fn api_error(
+    status: Status,
+    kind: ApiErrorKind,
+    message: impl Into<String>,
+) -> rocket_status::Custom<Json<ApiErrorBody>> {
+    rocket_status::Custom(status, Json(ApiErrorBody::new(kind, message)))
+}
+
+fn not_found_error(message: impl Into<String>) -> rocket_status::Custom<Json<ApiErrorBody>> {
+    api_error(Status::NotFound, ApiErrorKind::NotFound, message)
+}
+
+fn bad_request_error(message: impl Into<String>) -> rocket_status::Custom<Json<ApiErrorBody>> {
+    api_error(Status::BadRequest, ApiErrorKind::BadRequest, message)
+}
+
+fn unprocessable_entity_error(
+    message: impl Into<String>,
+) -> rocket_status::Custom<Json<ApiErrorBody>> {
+    api_error(
+        Status::UnprocessableEntity,
+        ApiErrorKind::UnprocessableEntity,
+        message,
+    )
+}
+
+fn internal_error(message: impl Into<String>) -> rocket_status::Custom<Json<ApiErrorBody>> {
+    api_error(Status::InternalServerError, ApiErrorKind::Internal, message)
+}
 
 #[get("/claim/<mode>")]
-fn claim(mode: &str, pool: &State<PgPool>) -> Result<Value, Value> {
+fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     // Get database connection from the shared pool
     let mut conn = get_pooled_database_connection(pool);
 
@@ -36,7 +129,11 @@ fn claim(mode: &str, pool: &State<PgPool>) -> Result<Value, Value> {
     let search_mode = match mode {
         "detailed" => SearchMode::Detailed,
         "niceonly" => SearchMode::Niceonly,
-        _ => return Err(not_found()),
+        _ => {
+            return Err(not_found_error(
+                "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, and /submit. Visit https://nicenumbers.net for more information.",
+            ));
+        }
     };
 
     // Get the user's IP
@@ -80,7 +177,9 @@ fn claim(mode: &str, pool: &State<PgPool>) -> Result<Value, Value> {
         maximum_timestamp,
         max_check_level,
         max_range_size,
-    )? {
+    )
+    .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
+    {
         claimed_field
     } else {
         let maximum_timestamp = Utc::now();
@@ -91,11 +190,18 @@ fn claim(mode: &str, pool: &State<PgPool>) -> Result<Value, Value> {
             maximum_timestamp,
             max_check_level,
             max_range_size,
-        )?.ok_or_else(|| format!("Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!"))?
+        )
+        .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
+        .ok_or_else(|| {
+            internal_error(format!(
+                "Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!"
+            ))
+        })?
     };
 
     // Save the claim and get the record
-    let claim_record = insert_claim(&mut conn, &search_field, search_mode, user_ip)?;
+    let claim_record = insert_claim(&mut conn, &search_field, search_mode, user_ip)
+        .map_err(|e| internal_error(format!("Database error while inserting claim: {e}")))?;
 
     // Build the struct to send to the client
     let data_for_client = DataToClient {
@@ -109,16 +215,18 @@ fn claim(mode: &str, pool: &State<PgPool>) -> Result<Value, Value> {
     // Log + return to user
     info!(
         search_mode = ?claim_record.search_mode,
+        claim_strategy = ?claim_strategy,
+        max_check_level = max_check_level,
         field_id = claim_record.field_id,
         claim_id = claim_record.claim_id,
         "New Claim"
     );
-    Ok(json!(data_for_client))
+    Ok(Json(data_for_client))
 }
 
 #[post("/submit", data = "<data>")]
 #[allow(clippy::needless_pass_by_value)]
-fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value> {
+fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
     // Get database connection from the shared pool
     let mut conn = get_pooled_database_connection(pool);
 
@@ -136,10 +244,17 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
     let user_ip = "unknown".to_string();
 
     // Get the associated claim record
-    let claim_record = get_claim_by_id(&mut conn, submit_data.claim_id)?;
+    let claim_record = get_claim_by_id(&mut conn, submit_data.claim_id).map_err(|e| {
+        bad_request_error(format!("Invalid claim_id {}: {e}", submit_data.claim_id))
+    })?;
 
     // Get the associated field record (to determine the base)
-    let field_record = get_field_by_id(&mut conn, claim_record.field_id)?;
+    let field_record = get_field_by_id(&mut conn, claim_record.field_id).map_err(|e| {
+        internal_error(format!(
+            "Database error while loading field {}: {e}",
+            claim_record.field_id
+        ))
+    })?;
     let base = field_record.base;
 
     // Expand the nice numbers with some detailed info
@@ -155,7 +270,10 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
                 user_ip,
                 None,
                 numbers_expanded,
-            )?;
+            )
+            .map_err(|e| {
+                internal_error(format!("Database error while inserting submission: {e}"))
+            })?;
             // Set CL to 1 if it's 0
             if field_record.check_level == 0 {
                 update_field_canon_and_cl(
@@ -163,7 +281,8 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
                     field_record.field_id,
                     field_record.canon_submission_id,
                     1,
-                )?;
+                )
+                .map_err(|e| internal_error(format!("Database error while updating field: {e}")))?;
             }
         }
         SearchMode::Detailed => {
@@ -176,11 +295,10 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
                     // Check distribution count sums to range_size
                     let dist_total_count = distribution.iter().fold(0, |acc, d| acc + d.count);
                     if dist_total_count != field_record.range_size {
-                        return Err(format!(
+                        return Err(unprocessable_entity_error(format!(
                             "Total distribution count is incorrect (submitted {}, range was {}).",
                             dist_total_count, field_record.range_size
-                        )
-                        .into());
+                        )));
                     }
 
                     // Get the near-miss cutoff
@@ -195,11 +313,10 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
                                 .collect::<Vec<&NiceNumber>>()
                                 .len();
                             if count_numbers as u128 != d.count {
-                                return Err(format!(
+                                return Err(unprocessable_entity_error(format!(
                                     "Count of nice numbers with {} uniques does not match distribution (submitted {}, distribution claimed {}).",
                                     d.num_uniques, count_numbers, d.count
-                                )
-                                .into());
+                                )));
                             }
                         }
                     }
@@ -211,19 +328,19 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
                         .filter(|d| d.num_uniques > num_uniques_cutoff)
                         .fold(0, |acc, d| acc + d.count);
                     if num_total_count as u128 != dist_total_count_above_cutoff {
-                        return Err(format!(
+                        return Err(unprocessable_entity_error(format!(
                             "Count of nice numbers does not match distribution (submitted {num_total_count}, distribution claimed {dist_total_count_above_cutoff})."
-                        )
-                        .into());
+                        )));
                     }
 
                     // Check each nice number provided
                     for n in &numbers_expanded {
                         let calculated_num_uniques = get_num_unique_digits(n.number, base);
                         if calculated_num_uniques != n.num_uniques {
-                            return Err(format!(
-                                "Unique count for {} is incorrect (submitted as {}, sever calculated {}).", n.number, n.num_uniques, calculated_num_uniques
-                            ).into());
+                            return Err(unprocessable_entity_error(format!(
+                                "Unique count for {} is incorrect (submitted as {}, server calculated {}).",
+                                n.number, n.num_uniques, calculated_num_uniques
+                            )));
                         }
                     }
 
@@ -235,7 +352,10 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
                         user_ip,
                         Some(distribution_expanded),
                         numbers_expanded,
-                    )?;
+                    )
+                    .map_err(|e| {
+                        internal_error(format!("Database error while inserting submission: {e}"))
+                    })?;
                     // Bump the check level to 2
                     if field_record.check_level < 2 {
                         update_field_canon_and_cl(
@@ -243,12 +363,15 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
                             field_record.field_id,
                             field_record.canon_submission_id,
                             2,
-                        )?;
+                        )
+                        .map_err(|e| {
+                            internal_error(format!("Database error while updating field: {e}"))
+                        })?;
                     }
                 }
                 None => {
-                    return Err(json!(
-                        "Unique distribution must be present for detailed searches."
+                    return Err(unprocessable_entity_error(
+                        "Unique distribution must be present for detailed searches.",
                     ));
                 }
             }
@@ -262,17 +385,21 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> Result<Value, Value
         claim_id = claim_record.claim_id,
         "New Submission"
     );
-    Ok("OK".into())
+    Ok(Json(json!("OK")))
 }
 
 #[get("/")]
-fn index() -> Value {
-    not_found()
+fn index() -> rocket_status::Custom<Json<ApiErrorBody>> {
+    not_found_error(
+        "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, and /submit. Visit https://nicenumbers.net for more information.",
+    )
 }
 
 #[catch(404)]
-fn not_found() -> Value {
-    "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, and /submit. Visit https://nicenumbers.net for more information.".into()
+fn not_found() -> rocket_status::Custom<Json<ApiErrorBody>> {
+    not_found_error(
+        "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, and /submit. Visit https://nicenumbers.net for more information.",
+    )
 }
 
 #[launch]
@@ -284,6 +411,7 @@ fn rocket() -> _ {
     let pool = get_database_pool();
 
     rocket::build()
+        .attach(RequestTimingFairing)
         .manage(pool)
         .mount("/", routes![claim, submit, index])
         .register("/", catchers![not_found])
