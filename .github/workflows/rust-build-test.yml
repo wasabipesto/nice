@@ -48,12 +48,12 @@ jobs:
                       packages: "-p nice_common -p nice_client"
 
                     - build_name: Linux-armv7
-                      runs_on: ubuntu-24.04-arm
+                      runs_on: ubuntu-latest
                       rust_target: armv7-unknown-linux-gnueabihf
                       packages: "-p nice_common -p nice_client"
 
                     - build_name: Linux-arm-musl
-                      runs_on: ubuntu-24.04-arm
+                      runs_on: ubuntu-latest
                       rust_target: arm-unknown-linux-musleabi
                       packages: "-p nice_common -p nice_client"
 
@@ -120,6 +120,7 @@ jobs:
                   ls -l target/
                   ls -l target/release/
                   ls -l target/${{ matrix.platform.rust_target }}/release/
+                  ls -l target/${{ matrix.platform.rust_target }}/release/deps/
 
             # Package a single executable as a tarball/zip plus checksum for release upload.
             - name: Create release artifacts
