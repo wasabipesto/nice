@@ -21,7 +21,7 @@ use nice_common::{
 use rand::Rng;
 use rocket::State;
 use rocket::fairing::{Fairing, Info, Kind};
-use rocket::http::Status;
+use rocket::http::{Header, Status};
 use rocket::request::Request;
 use rocket::response::{Response, status as rocket_status};
 use rocket::serde::json::{Json, Value, json};
@@ -59,6 +59,35 @@ impl Fairing for RequestTimingFairing {
             "Request Completed"
         );
     }
+}
+
+#[derive(Clone, Copy)]
+struct CorsFairing;
+
+#[rocket::async_trait]
+impl Fairing for CorsFairing {
+    fn info(&self) -> Info {
+        Info {
+            name: "CORS",
+            kind: Kind::Response,
+        }
+    }
+
+    async fn on_response<'r>(&self, _request: &'r Request<'_>, response: &mut Response<'r>) {
+        response.set_header(Header::new("Access-Control-Allow-Origin", "*"));
+        response.set_header(Header::new(
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD",
+        ));
+        response.set_header(Header::new("Access-Control-Allow-Headers", "*"));
+        response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+        response.set_header(Header::new("Access-Control-Max-Age", "86400"));
+    }
+}
+
+#[options("/<_..>")]
+fn options_handler() -> Status {
+    Status::NoContent
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,8 +444,9 @@ fn rocket() -> _ {
     let pool = get_database_pool();
 
     rocket::build()
+        .attach(CorsFairing)
         .attach(RequestTimingFairing)
         .manage(pool)
-        .mount("/", routes![claim, submit, index])
+        .mount("/", routes![claim, submit, index, options_handler])
         .register("/", catchers![not_found])
 }
