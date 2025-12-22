@@ -1443,6 +1443,7 @@ dependencies = [
  "malachite",
  "malachite-nz",
  "openssl",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",

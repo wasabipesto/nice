@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::*;
+use rand::Rng;
 
 table! {
     fields (id) {
@@ -106,6 +107,24 @@ pub fn insert_fields(
     Ok(())
 }
 
+/// Returns the maximum `fields.id` (as u128). Assumes ids are contiguous and monotonically increasing.
+pub fn get_max_field_id(conn: &mut PgConnection) -> Result<u128, String> {
+    use diesel::sql_query;
+    use diesel::sql_types::BigInt;
+
+    #[derive(QueryableByName)]
+    struct MaxIdRow {
+        #[diesel(sql_type = BigInt)]
+        max_id: i64,
+    }
+
+    let row: MaxIdRow = sql_query("SELECT MAX(id) AS max_id FROM fields;")
+        .get_result(conn)
+        .map_err(|err| err.to_string())?;
+
+    conversions::i64_to_u128(row.max_id)
+}
+
 pub fn get_field_by_id(conn: &mut PgConnection, row_id: u128) -> Result<FieldRecord, String> {
     use self::fields::dsl::*;
 
@@ -192,10 +211,11 @@ pub fn try_claim_field(
     maximum_size: u128,
 ) -> Result<Option<FieldRecord>, String> {
     use diesel::sql_query;
-    use diesel::sql_types::{Integer, Numeric, Timestamptz};
+    use diesel::sql_types::{BigInt, Integer, Numeric, Timestamptz};
 
     let maximum_check_level = conversions::u8_to_i32(maximum_check_level)?;
     let maximum_size = conversions::u128_to_bigdec(maximum_size)?;
+    let maximum_size_clone = maximum_size.clone();
 
     // Use a single-statement "claim" with row locking to avoid thundering herd / lock contention.
     // `FOR UPDATE SKIP LOCKED` ensures concurrent claimers don't block on the same "next" row.
@@ -210,51 +230,115 @@ pub fn try_claim_field(
         "check_level <= $2"
     };
 
-    let query = match claim_strategy {
-        FieldClaimStrategy::Next => format!(
-            "WITH candidate AS (
-                SELECT id
-                FROM fields
-                WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
-                  AND {check_level_predicate}
-                  AND range_size <= $3
-                ORDER BY id ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            UPDATE fields f
-            SET last_claim_time = NOW()
-            FROM candidate
-            WHERE f.id = candidate.id
-            RETURNING f.*;"
-        ),
-        FieldClaimStrategy::Random => format!(
-            "WITH candidate AS (
-                SELECT id
-                FROM fields
-                WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
-                  AND {check_level_predicate}
-                  AND range_size <= $3
-                ORDER BY RANDOM() ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            UPDATE fields f
-            SET last_claim_time = NOW()
-            FROM candidate
-            WHERE f.id = candidate.id
-            RETURNING f.*;"
-        ),
-    };
+    match claim_strategy {
+        FieldClaimStrategy::Next => {
+            let query = format!(
+                "WITH candidate AS (
+                    SELECT id
+                    FROM fields
+                    WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                      AND {check_level_predicate}
+                      AND range_size <= $3
+                    ORDER BY id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE fields f
+                SET last_claim_time = NOW()
+                FROM candidate
+                WHERE f.id = candidate.id
+                RETURNING f.*;"
+            );
 
-    sql_query(query)
-        .bind::<Timestamptz, _>(maximum_timestamp)
-        .bind::<Integer, _>(maximum_check_level)
-        .bind::<Numeric, _>(maximum_size)
-        .get_result::<FieldPrivate>(conn)
-        .optional()
-        .map_err(|err| err.to_string())
-        .and_then(|opt| opt.map_or(Ok(None), |rec| private_to_public(rec).map(Some)))
+            sql_query(query)
+                .bind::<Timestamptz, _>(maximum_timestamp)
+                .bind::<Integer, _>(maximum_check_level)
+                .bind::<Numeric, _>(maximum_size)
+                .get_result::<FieldPrivate>(conn)
+                .optional()
+                .map_err(|err| err.to_string())
+                .and_then(|opt| opt.map_or(Ok(None), |rec| private_to_public(rec).map(Some)))
+        }
+        FieldClaimStrategy::Random => {
+            // Pseudorandom strategy: choose a random pivot id and take the next eligible row.
+            // If none are found at/after the pivot, wrap around and take the first eligible row.
+            //
+            // This avoids `ORDER BY RANDOM()`, which requires assigning random values and sorting
+            // over the eligible set.
+            //
+            // Note: Postgres does not allow `FOR UPDATE` with UNION/INTERSECT/EXCEPT, so the
+            // wraparound is implemented as a second query if the pivot query finds no rows.
+            let query_from_pivot = format!(
+                "WITH candidate AS (
+                    SELECT id
+                    FROM fields
+                    WHERE id >= $4
+                      AND COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                      AND {check_level_predicate}
+                      AND range_size <= $3
+                    ORDER BY id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE fields f
+                SET last_claim_time = NOW()
+                FROM candidate
+                WHERE f.id = candidate.id
+                RETURNING f.*;"
+            );
+
+            let query_wraparound = format!(
+                "WITH candidate AS (
+                    SELECT id
+                    FROM fields
+                    WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                      AND {check_level_predicate}
+                      AND range_size <= $3
+                    ORDER BY id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE fields f
+                SET last_claim_time = NOW()
+                FROM candidate
+                WHERE f.id = candidate.id
+                RETURNING f.*;"
+            );
+
+            // Compute a pivot in [1, max_id]. Caller guarantees no id gaps.
+            // If max_id is 0 (empty table), use 0 so the pivot branch yields no rows and we wrap.
+            let max_id = get_max_field_id(conn).unwrap_or(0);
+            let pivot: i64 = if max_id == 0 {
+                0
+            } else {
+                let mut rng = rand::thread_rng();
+                conversions::u128_to_i64(rng.gen_range(1..=max_id)).unwrap_or(0)
+            };
+
+            // First attempt: claim from pivot
+            if let Some(rec) = sql_query(query_from_pivot)
+                .bind::<Timestamptz, _>(maximum_timestamp)
+                .bind::<Integer, _>(maximum_check_level)
+                .bind::<Numeric, _>(maximum_size)
+                .bind::<BigInt, _>(pivot)
+                .get_result::<FieldPrivate>(conn)
+                .optional()
+                .map_err(|err| err.to_string())?
+            {
+                return private_to_public(rec).map(Some);
+            }
+
+            // Second attempt: wraparound (claim from the beginning)
+            sql_query(query_wraparound)
+                .bind::<Timestamptz, _>(maximum_timestamp)
+                .bind::<Integer, _>(maximum_check_level)
+                .bind::<Numeric, _>(maximum_size_clone)
+                .get_result::<FieldPrivate>(conn)
+                .optional()
+                .map_err(|err| err.to_string())
+                .and_then(|opt| opt.map_or(Ok(None), |rec| private_to_public(rec).map(Some)))
+        }
+    }
 }
 
 pub fn get_count_checked_by_range(
