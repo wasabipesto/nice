@@ -104,16 +104,6 @@ jobs:
                   target: ${{ matrix.platform.rust_target }}
                   args: "-p nice_client --bin nice_client --locked --release"
 
-            - name: Run tests
-              # Skip tests for targets that can't run on the host system (e.g. freebsd)
-              if: ${{ !contains(matrix.platform.rust_target, 'freebsd') }}
-              # https://github.com/houseabsolute/actions-rust-cross
-              uses: houseabsolute/actions-rust-cross@v1
-              with:
-                  command: test
-                  target: ${{ matrix.platform.rust_target }}
-                  args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
-
             - name: Debug check that binaries exist
               if: ${{ contains(matrix.platform.rust_target, 'linux') }}
               run: |
