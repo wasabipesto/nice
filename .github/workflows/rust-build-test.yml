@@ -104,6 +104,16 @@ jobs:
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release"
 
+            - name: Run tests
+              # Skip tests for targets that can't run on the host system (e.g. freebsd)
+              if: ${{ !contains(matrix.platform.rust_target, 'freebsd') }}
+              # https://github.com/houseabsolute/actions-rust-cross
+              uses: houseabsolute/actions-rust-cross@v1
+              with:
+                  command: test
+                  target: ${{ matrix.platform.rust_target }}
+                  args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
+
             # Package a single executable as a tarball/zip plus checksum for release upload.
             - name: Create release artifacts
               # https://github.com/houseabsolute/actions-rust-release
