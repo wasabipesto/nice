@@ -340,11 +340,13 @@
                             y: "base_id",
                             x: "chunk_x",
                             fill: (i) =>
-                                i.minimum_cl > 1
-                                    ? "Searched (Detailed)"
-                                    : i.minimum_cl > 0
-                                      ? "Searched (Nice Only)"
-                                      : "Unsearched",
+                                i.minimum_cl > 2
+                                    ? "Searched (Confirmed)"
+                                    : i.minimum_cl > 1
+                                      ? "Searched (Detailed)"
+                                      : i.minimum_cl > 0
+                                        ? "Searched (Nice Only)"
+                                        : "Unsearched",
                             channels: {
                                 Size: "range_size",
                                 Status: "fill",
