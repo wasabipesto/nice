@@ -5,8 +5,6 @@
 
 set dotenv-load := true
 
-version := shell("toml get common/Cargo.toml package.version")
-
 # List commands, default
 default:
     just --list
@@ -17,8 +15,8 @@ update:
     just build
 
 # Tag and push a new release
-[confirm]
-tag-release version:
+tag-release version: update
+    # shell("[[ `toml get Cargo.toml workspace.package.version` == {{ version }} ]]")
     git tag -a v{{ version }} -m "release new version"
     git push origin v{{ version }}
 
@@ -41,21 +39,6 @@ test:
 cargo-upgrades:
     cargo install cargo-upgrades
     cargo upgrades
-
-# Build and run a Dockerfile (for building against a specific glibc)
-docker dockerfile:
-    docker build -t nice-{{ lowercase(file_stem(dockerfile)) }} -f {{ dockerfile }} .
-    docker run -it -v .:/opt/nice nice-{{ lowercase(file_stem(dockerfile)) }}
-
-# Build each version in docker and copy artifacts for release
-build-for-release:
-    mkdir -p release
-    just docker docker/bullseye.Dockerfile
-    cp target-bullseye/release/nice_client release/nice-client-{{ version }}-x86_64-bullseye
-    just docker docker/bookworm.Dockerfile
-    cp target-bookworm/release/nice_client release/nice-client-{{ version }}-x86_64-bookworm
-    just docker docker/trixie.Dockerfile
-    cp target-trixie/release/nice_client release/nice-client-{{ version }}-x86_64-trixie
 
 # Run client with given options
 client *args:
