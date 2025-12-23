@@ -1,5 +1,14 @@
 # Changelog
 
+## Nice v3.2.7
+
+- Allow the client to retry on request errors and add a bit more logging in case failures continue
+- Add CORS headers directly to the API instead of through CDN
+- Add some more logging in the server for an edge case
+- Drastically improve scheduled job downsampling performance
+- Fix WASM builds by gating the rand crate behind the database feature
+- Update dependencies
+
 ## Nice v3.2.6
 
 - Update web chart formatting
