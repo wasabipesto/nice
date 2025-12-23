@@ -4,6 +4,31 @@ use super::*;
 use reqwest::blocking::Response;
 use std::{thread, time::Duration};
 
+/// Helper function to determine if an error is retry-able
+/// - is_timeout() catches typical network timeouts
+/// - is_connect() catches typical connection failures
+/// - is_request() catches DNS resolution failures and other transient request errors
+fn is_retryable_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// Helper function to classify reqwest error types
+fn error_type_str(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connection"
+    } else if e.is_request() {
+        "request/DNS"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else {
+        "unknown"
+    }
+}
+
 /// Request a field from the server and returns the deserialized data.
 /// Retries for 5xx errors or network timeouts.
 pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient {
@@ -54,19 +79,25 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
                 }
             }
             Err(e) => {
-                // Check if it's a timeout or connection error that we should retry
-                let should_retry = e.is_timeout() || e.is_connect();
-
-                if should_retry && attempts < MAX_ATTEMPTS {
+                if is_retryable_error(&e) && attempts < MAX_ATTEMPTS {
                     let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                     eprintln!(
-                        "Network error, retrying in {} seconds... (attempt {}/{}): {}",
-                        sleep_secs, attempts, MAX_ATTEMPTS, e
+                        "Network error ({}), retrying in {} seconds... (attempt {}/{}): {}",
+                        error_type_str(&e),
+                        sleep_secs,
+                        attempts,
+                        MAX_ATTEMPTS,
+                        e
                     );
                     thread::sleep(Duration::from_secs(sleep_secs));
                     continue;
                 } else {
-                    panic!("Network error after {} attempts: {}", attempts, e);
+                    panic!(
+                        "Network error ({}) after {} attempts: {}",
+                        error_type_str(&e),
+                        attempts,
+                        e
+                    );
                 }
             }
         }
@@ -136,19 +167,25 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Resp
                 return response;
             }
             Err(e) => {
-                // Check if it's a timeout or connection error that we should retry
-                let should_retry = e.is_timeout() || e.is_connect();
-
-                if should_retry && attempts < MAX_ATTEMPTS {
+                if is_retryable_error(&e) && attempts < MAX_ATTEMPTS {
                     let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                     eprintln!(
-                        "Network error, retrying in {} seconds... (attempt {}/{}): {}",
-                        sleep_secs, attempts, MAX_ATTEMPTS, e
+                        "NNetwork error ({}), retrying in {} seconds... (attempt {}/{}): {}",
+                        error_type_str(&e),
+                        sleep_secs,
+                        attempts,
+                        MAX_ATTEMPTS,
+                        e
                     );
                     thread::sleep(Duration::from_secs(sleep_secs));
                     continue;
                 } else {
-                    panic!("Network error after {} attempts: {}", attempts, e);
+                    panic!(
+                        "Network error ({}) after {} attempts: {}",
+                        error_type_str(&e),
+                        attempts,
+                        e
+                    );
                 }
             }
         }
