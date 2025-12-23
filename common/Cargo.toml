@@ -9,7 +9,7 @@ readme.workspace = true
 license-file.workspace = true
 
 [features]
-database = ["dep:diesel", "dep:dotenvy", "dep:bigdecimal"]
+database = ["dep:diesel", "dep:dotenvy", "dep:bigdecimal", "dep:rand"]
 openssl-tls = ["reqwest/default-tls", "dep:openssl"]
 rustls-tls = ["reqwest/rustls-tls"]
 
@@ -26,4 +26,4 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 reqwest = { version = "0.12", features = ["blocking", "json"], optional = true, default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
-rand = { version = "0.8" }
+rand = { version = "0.8", optional = true }
