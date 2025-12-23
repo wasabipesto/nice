@@ -182,10 +182,10 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     let max_check_level = match search_mode {
         SearchMode::Detailed => {
             match rng.random_range(1..=100) {
-                // 95% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
-                1..=95 => 1,
+                // 99% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
+                1..=99 => 1,
                 // 5% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
-                _ => 2,
+                _ => 1,
             }
         }
         SearchMode::Niceonly => {
