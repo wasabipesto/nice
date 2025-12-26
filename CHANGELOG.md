@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add some release profile configuration options for a little more performance
+
 ## Nice v3.2.7
 
 - Allow the client to retry on request errors and add a bit more logging in case failures continue
