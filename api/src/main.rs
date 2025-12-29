@@ -184,8 +184,8 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
             match rng.random_range(1..=100) {
                 // 99% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
                 1..=99 => 1,
-                // 5% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
-                _ => 1,
+                // 1% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
+                _ => 2,
             }
         }
         SearchMode::Niceonly => {
