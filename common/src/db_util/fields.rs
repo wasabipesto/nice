@@ -311,8 +311,8 @@ pub fn try_claim_field(
             let pivot: i64 = if max_id == 0 {
                 0
             } else {
-                let mut rng = rand::thread_rng();
-                conversions::u128_to_i64(rng.gen_range(1..=max_id)).unwrap_or(0)
+                let mut rng = rand::rng();
+                conversions::u128_to_i64(rng.random_range(1..=max_id)).unwrap_or(0)
             };
 
             // First attempt: claim from pivot
