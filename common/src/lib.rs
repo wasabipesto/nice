@@ -48,11 +48,15 @@ pub enum SearchMode {
     Niceonly,
 }
 
-/// Whether we should pick the next or random field when claiming.
+/// How we should pick a field when claiming.
 #[derive(Debug, Copy, Clone)]
 pub enum FieldClaimStrategy {
+    /// Simply get the next available field
     Next,
+    /// Get a random available field from any chunk
     Random,
+    /// Get a random available field in the next chunk with <X% complete
+    Thin,
 }
 
 /// Data on the bounds of a search range.

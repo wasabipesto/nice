@@ -232,6 +232,7 @@ pub fn try_claim_field(
 
     match claim_strategy {
         FieldClaimStrategy::Next => {
+            // Simply get the next available field
             let query = format!(
                 "WITH candidate AS (
                     SELECT id
@@ -333,6 +334,53 @@ pub fn try_claim_field(
                 .bind::<Timestamptz, _>(maximum_timestamp)
                 .bind::<Integer, _>(maximum_check_level)
                 .bind::<Numeric, _>(maximum_size_clone)
+                .get_result::<FieldPrivate>(conn)
+                .optional()
+                .map_err(|err| err.to_string())
+                .and_then(|opt| opt.map_or(Ok(None), |rec| private_to_public(rec).map(Some)))
+        }
+        FieldClaimStrategy::Thin => {
+            // First, finds the first chunk with less than X% of the chunk checked:
+            //   When maximum_check_level == 0, use chunk.checked_niceonly
+            //   When maximum_check_level >= 1, use chunk.checked_detailed
+            // Then find and return a random field within that chunk
+            let chunk_completion_cutoff_pct =
+                conversions::f32_to_bigdec(DOWNSAMPLE_CUTOFF_PERCENT)?;
+
+            let query = format!(
+                "WITH eligible_chunk AS (
+                    SELECT id
+                    FROM chunks
+                    WHERE CASE
+                        WHEN $2 = 0 THEN checked_niceonly / NULLIF(range_size, 0) < $4
+                        ELSE checked_detailed / NULLIF(range_size, 0) < $4
+                    END
+                    ORDER BY id ASC
+                    LIMIT 1
+                ),
+                candidate AS (
+                    SELECT id
+                    FROM fields
+                    WHERE chunk_id = (SELECT id FROM eligible_chunk)
+                      AND COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                      AND {check_level_predicate}
+                      AND range_size <= $3
+                    ORDER BY id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE fields f
+                SET last_claim_time = NOW()
+                FROM candidate
+                WHERE f.id = candidate.id
+                RETURNING f.*;"
+            );
+
+            sql_query(query)
+                .bind::<Timestamptz, _>(maximum_timestamp)
+                .bind::<Integer, _>(maximum_check_level)
+                .bind::<Numeric, _>(maximum_size)
+                .bind::<Numeric, _>(chunk_completion_cutoff_pct)
                 .get_result::<FieldPrivate>(conn)
                 .optional()
                 .map_err(|err| err.to_string())

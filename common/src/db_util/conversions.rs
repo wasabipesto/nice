@@ -81,6 +81,9 @@ pub fn bigdec_to_u128(i: BigDecimal) -> Result<u128, String> {
 pub fn u128_to_bigdec(i: u128) -> Result<BigDecimal, String> {
     Ok(BigDecimal::from(i))
 }
+pub fn f32_to_bigdec(i: f32) -> Result<BigDecimal, String> {
+    BigDecimal::from_f32(i).ok_or_else(|| "Failed to convert f32 to BigDecimal".to_string())
+}
 
 pub fn opti32_to_optu32(i: Option<i32>) -> Result<Option<u32>, String> {
     match i {
