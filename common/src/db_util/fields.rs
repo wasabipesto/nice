@@ -343,25 +343,74 @@ pub fn try_claim_field(
             // First, finds the first chunk with less than X% of the chunk checked:
             //   When maximum_check_level == 0, use chunk.checked_niceonly
             //   When maximum_check_level >= 1, use chunk.checked_detailed
-            // Then find and return a random field within that chunk
+            // Then find and return a pseudorandom field within that chunk using pivot strategy
+
             let chunk_completion_cutoff_pct =
                 conversions::f32_to_bigdec(DOWNSAMPLE_CUTOFF_PERCENT)?;
 
-            let query = format!(
-                "WITH eligible_chunk AS (
+            // Single query to get eligible chunk and field ID range within it
+            let chunk_info_query = "
+                WITH eligible_chunk AS (
                     SELECT id
                     FROM chunks
                     WHERE CASE
-                        WHEN $2 = 0 THEN checked_niceonly / NULLIF(range_size, 0) < $4
-                        ELSE checked_detailed / NULLIF(range_size, 0) < $4
+                        WHEN $1 = 0 THEN checked_niceonly / NULLIF(range_size, 0) < $2
+                        ELSE checked_detailed / NULLIF(range_size, 0) < $2
                     END
                     ORDER BY id ASC
                     LIMIT 1
-                ),
-                candidate AS (
+                )
+                SELECT
+                    ec.id as chunk_id,
+                    MIN(f.id) as min_field_id,
+                    MAX(f.id) as max_field_id
+                FROM eligible_chunk ec
+                JOIN fields f ON f.chunk_id = ec.id
+                GROUP BY ec.id
+            ";
+
+            #[derive(QueryableByName)]
+            struct ChunkInfo {
+                #[diesel(sql_type = diesel::sql_types::Integer)]
+                chunk_id: i32,
+                #[diesel(sql_type = diesel::sql_types::Nullable<BigInt>)]
+                min_field_id: Option<i64>,
+                #[diesel(sql_type = diesel::sql_types::Nullable<BigInt>)]
+                max_field_id: Option<i64>,
+            }
+
+            let chunk_info: Option<ChunkInfo> = sql_query(chunk_info_query)
+                .bind::<Integer, _>(maximum_check_level)
+                .bind::<Numeric, _>(chunk_completion_cutoff_pct)
+                .get_result(conn)
+                .optional()
+                .map_err(|err| err.to_string())?;
+
+            let chunk_info = match chunk_info {
+                Some(info) => info,
+                None => return Ok(None), // No eligible chunk found
+            };
+
+            let (min_id, max_id) = match (chunk_info.min_field_id, chunk_info.max_field_id) {
+                (Some(min), Some(max)) if min <= max => (min, max),
+                _ => return Ok(None), // Empty chunk
+            };
+
+            // Pick a random pivot between min and max field IDs
+            let mut rng = rand::rng();
+            let pivot = if min_id == max_id {
+                min_id
+            } else {
+                rng.random_range(min_id..=max_id)
+            };
+
+            // Attempt to claim from pivot onward
+            let query_from_pivot = format!(
+                "WITH candidate AS (
                     SELECT id
                     FROM fields
-                    WHERE chunk_id = (SELECT id FROM eligible_chunk)
+                    WHERE chunk_id = $4
+                      AND id >= $5
                       AND COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
                       AND {check_level_predicate}
                       AND range_size <= $3
@@ -376,11 +425,44 @@ pub fn try_claim_field(
                 RETURNING f.*;"
             );
 
-            sql_query(query)
+            if let Some(rec) = sql_query(query_from_pivot)
                 .bind::<Timestamptz, _>(maximum_timestamp)
                 .bind::<Integer, _>(maximum_check_level)
                 .bind::<Numeric, _>(maximum_size)
-                .bind::<Numeric, _>(chunk_completion_cutoff_pct)
+                .bind::<Integer, _>(chunk_info.chunk_id)
+                .bind::<BigInt, _>(pivot)
+                .get_result::<FieldPrivate>(conn)
+                .optional()
+                .map_err(|err| err.to_string())?
+            {
+                return private_to_public(rec).map(Some);
+            }
+
+            // Wraparound: try from beginning of chunk
+            let query_wraparound = format!(
+                "WITH candidate AS (
+                    SELECT id
+                    FROM fields
+                    WHERE chunk_id = $4
+                      AND COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                      AND {check_level_predicate}
+                      AND range_size <= $3
+                    ORDER BY id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE fields f
+                SET last_claim_time = NOW()
+                FROM candidate
+                WHERE f.id = candidate.id
+                RETURNING f.*;"
+            );
+
+            sql_query(query_wraparound)
+                .bind::<Timestamptz, _>(maximum_timestamp)
+                .bind::<Integer, _>(maximum_check_level)
+                .bind::<Numeric, _>(maximum_size_clone)
+                .bind::<Integer, _>(chunk_info.chunk_id)
                 .get_result::<FieldPrivate>(conn)
                 .optional()
                 .map_err(|err| err.to_string())

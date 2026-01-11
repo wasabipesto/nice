@@ -90,6 +90,7 @@ CREATE INDEX IF NOT EXISTS idx_fields_range_start ON fields(range_start);
 CREATE INDEX IF NOT EXISTS idx_fields_range_end ON fields(range_end);
 CREATE INDEX IF NOT EXISTS idx_fields_check_level ON fields(check_level);
 CREATE INDEX IF NOT EXISTS idx_fields_last_claim_time ON fields(last_claim_time);
+CREATE INDEX IF NOT EXISTS idx_fields_chunk_id ON fields(chunk_id);
 CREATE INDEX IF NOT EXISTS idx_fields_base_check_level ON fields(base_id, check_level);
 CREATE INDEX IF NOT EXISTS idx_fields_range_start_end ON fields(range_start, range_end);
 CREATE INDEX IF NOT EXISTS idx_fields_base_range ON fields(base_id, range_start, range_end);
