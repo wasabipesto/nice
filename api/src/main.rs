@@ -172,25 +172,23 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     // Get an RNG thread for random numbers later
     let mut rng = rand::rng();
 
-    let claim_strategy = match rng.random_range(1..=100) {
-        // 99% chance: get lowest valid field
-        1..=99 => FieldClaimStrategy::Next,
-        // 1% chance: get random valid field
-        _ => FieldClaimStrategy::Random,
-    };
-
-    let max_check_level = match search_mode {
-        SearchMode::Detailed => {
-            match rng.random_range(1..=100) {
-                // 99% chance: get CL0 (unchecked) or CL1 (nice only) but not CL2 (detailed) or CL3 (consensus)
-                1..=99 => 1,
-                // 1% chance: get CL0 (unchecked) or CL1 (nice only) or CL2 (detailed) but not CL3 (consensus)
-                _ => 2,
-            }
-        }
+    let (claim_strategy, max_check_level) = match search_mode {
         SearchMode::Niceonly => {
-            // get CL0 (unchecked), never anything more
-            0
+            // For Niceonly, only ever get the next unchecked field
+            (FieldClaimStrategy::Next, 0)
+        }
+        SearchMode::Detailed => {
+            // For Detailed, only ever get the next unchecked field
+            match rng.random_range(1..=100) {
+                // 60% chance: get random field in a thin chunk
+                1..=60 => (FieldClaimStrategy::Thin, 1),
+                // 30% chance: get next field in any chunk
+                61..=90 => (FieldClaimStrategy::Next, 1),
+                // 5% chance: recheck a previously checked field
+                91..=96 => (FieldClaimStrategy::Next, 2),
+                // 5% chance: get random unchecked field
+                _ => (FieldClaimStrategy::Random, 1),
+            }
         }
     };
 
