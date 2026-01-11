@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## Nice v3.2.9
+
+- Increase maximum retry attempts from 6 (max delay 32 seconds) to 10 (max delay 512 seconds)
+- Add some checks to ensure that git tag pushing is done cleanly
+
+## Nice v3.2.8
 
 - Add some release profile configuration options for a little more performance
 - Add new claim strategy "Thin" which gets a random unchecked field in the next chunk with under a certain percent checked
