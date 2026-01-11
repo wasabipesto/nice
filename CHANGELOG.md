@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Add some release profile configuration options for a little more performance
+- Add new claim strategy "Thin" which gets a random unchecked field in the next chunk with under a certain percent checked
 
 ## Nice v3.2.7
 
