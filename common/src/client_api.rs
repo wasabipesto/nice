@@ -4,6 +4,8 @@ use super::*;
 use reqwest::blocking::Response;
 use std::{thread, time::Duration};
 
+const MAX_CONNECTION_ATTEMPTS: u32 = 10;
+
 /// Helper function to determine if an error is retry-able
 /// - is_timeout() catches typical network timeouts
 /// - is_connect() catches typical connection failures
@@ -37,9 +39,7 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
         SearchMode::Detailed => format!("{api_base}/claim/detailed"),
         SearchMode::Niceonly => format!("{api_base}/claim/niceonly"),
     };
-
     let mut attempts = 0;
-    const MAX_ATTEMPTS: u32 = 6;
 
     loop {
         attempts += 1;
@@ -51,7 +51,7 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
             Ok(response) => {
                 // Check if it's a 5xx server error
                 if response.status().is_server_error() {
-                    if attempts < MAX_ATTEMPTS {
+                    if attempts < MAX_CONNECTION_ATTEMPTS {
                         let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                         eprintln!(
                             "Server error ({} {}), retrying in {} seconds... (attempt {}/{})",
@@ -59,7 +59,7 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
                             response.text().unwrap_or_default(),
                             sleep_secs,
                             attempts,
-                            MAX_ATTEMPTS
+                            MAX_CONNECTION_ATTEMPTS
                         );
                         thread::sleep(Duration::from_secs(sleep_secs));
                         continue;
@@ -79,14 +79,14 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
                 }
             }
             Err(e) => {
-                if is_retryable_error(&e) && attempts < MAX_ATTEMPTS {
+                if is_retryable_error(&e) && attempts < MAX_CONNECTION_ATTEMPTS {
                     let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                     eprintln!(
                         "Network error ({}), retrying in {} seconds... (attempt {}/{}): {}",
                         error_type_str(&e),
                         sleep_secs,
                         attempts,
-                        MAX_ATTEMPTS,
+                        MAX_CONNECTION_ATTEMPTS,
                         e
                     );
                     thread::sleep(Duration::from_secs(sleep_secs));
@@ -109,9 +109,7 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
 pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Response {
     // Build the url
     let url = format!("{api_base}/submit");
-
     let mut attempts = 0;
-    const MAX_ATTEMPTS: u32 = 6;
 
     loop {
         attempts += 1;
@@ -126,7 +124,7 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Resp
             Ok(response) => {
                 // Check if it's a 5xx server error
                 if response.status().is_server_error() {
-                    if attempts < MAX_ATTEMPTS {
+                    if attempts < MAX_CONNECTION_ATTEMPTS {
                         let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                         eprintln!(
                             "Server error ({} {}), retrying in {} seconds... (attempt {}/{})",
@@ -134,7 +132,7 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Resp
                             response.text().unwrap_or_default(),
                             sleep_secs,
                             attempts,
-                            MAX_ATTEMPTS
+                            MAX_CONNECTION_ATTEMPTS
                         );
                         thread::sleep(Duration::from_secs(sleep_secs));
                         continue;
@@ -142,11 +140,14 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Resp
                         // Get error message from server if possible
                         match response.text() {
                             Ok(msg) => {
-                                panic!("Server error after {} attempts: {}", MAX_ATTEMPTS, msg)
+                                panic!(
+                                    "Server error after {} attempts: {}",
+                                    MAX_CONNECTION_ATTEMPTS, msg
+                                )
                             }
                             Err(e) => panic!(
                                 "Server error after {} attempts, and error reading response: {}",
-                                MAX_ATTEMPTS, e
+                                MAX_CONNECTION_ATTEMPTS, e
                             ),
                         }
                     }
@@ -167,14 +168,14 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Resp
                 return response;
             }
             Err(e) => {
-                if is_retryable_error(&e) && attempts < MAX_ATTEMPTS {
+                if is_retryable_error(&e) && attempts < MAX_CONNECTION_ATTEMPTS {
                     let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                     eprintln!(
                         "NNetwork error ({}), retrying in {} seconds... (attempt {}/{}): {}",
                         error_type_str(&e),
                         sleep_secs,
                         attempts,
-                        MAX_ATTEMPTS,
+                        MAX_CONNECTION_ATTEMPTS,
                         e
                     );
                     thread::sleep(Duration::from_secs(sleep_secs));
