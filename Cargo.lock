@@ -1213,26 +1213,14 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "malachite"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb12c5db7d642baea3ea7ee54a2c9f2a80e05e4c8992c1f561ee02c50d1b071c"
+checksum = "e4a44b9abebbed66d1b43671f1f2badec398c208dab6b98270c7a01aade24e2d"
 dependencies = [
- "malachite-base 0.8.0",
+ "malachite-base",
  "malachite-float",
- "malachite-nz 0.8.0",
+ "malachite-nz",
  "malachite-q",
-]
-
-[[package]]
-name = "malachite-base"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0c91cb6071ed9ac48669d3c79bd2792db596c7e542dbadd217b385bb359f42d"
-dependencies = [
- "hashbrown 0.16.0",
- "itertools",
- "libm",
- "ryu",
 ]
 
 [[package]]
@@ -1249,26 +1237,14 @@ dependencies = [
 
 [[package]]
 name = "malachite-float"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8ab9da4c06d34dc05f7ea459d338e94d4da8bee3dc9ef2dc19fd1357385032e"
+checksum = "ef3dfdcaabc1e9c59b7e4ba04d17a22d91944f2f22afcdeb04d43e03415fefb4"
 dependencies = [
  "itertools",
- "malachite-base 0.8.0",
- "malachite-nz 0.8.0",
+ "malachite-base",
+ "malachite-nz",
  "malachite-q",
-]
-
-[[package]]
-name = "malachite-nz"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d9ecf4dd76246fd622de4811097966106aa43f9cd7cc36cb85e774fe84c8adc"
-dependencies = [
- "itertools",
- "libm",
- "malachite-base 0.8.0",
- "wide",
 ]
 
 [[package]]
@@ -1279,20 +1255,20 @@ checksum = "ab7c0ddc4e2681459d70591baf30ca5abd31c25969e76d3605838bec794c8077"
 dependencies = [
  "itertools",
  "libm",
- "malachite-base 0.9.0",
+ "malachite-base",
  "serde",
  "wide",
 ]
 
 [[package]]
 name = "malachite-q"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7bc9d9adf5b0a7999d84f761c809bec3dc46fe983e4de547725d2b7730462a0"
+checksum = "e13d19f04fc672f251d477c8d58c13c6c5550553dfba6a665c9ad3604466ac9a"
 dependencies = [
  "itertools",
- "malachite-base 0.8.0",
- "malachite-nz 0.8.0",
+ "malachite-base",
+ "malachite-nz",
 ]
 
 [[package]]
@@ -1409,7 +1385,7 @@ dependencies = [
  "dotenvy",
  "itertools",
  "malachite",
- "malachite-nz 0.9.0",
+ "malachite-nz",
  "openssl",
  "rand 0.9.2",
  "reqwest",
