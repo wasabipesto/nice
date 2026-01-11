@@ -105,10 +105,7 @@ fn main() {
         for (sub, chunk_id_opt) in submissions_with_chunks {
             all_submissions.push(sub.clone());
             if let Some(chunk_id) = chunk_id_opt {
-                submissions_by_chunk
-                    .entry(chunk_id)
-                    .or_insert_with(Vec::new)
-                    .push(sub);
+                submissions_by_chunk.entry(chunk_id).or_default().push(sub);
             }
         }
 
