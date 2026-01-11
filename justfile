@@ -15,10 +15,48 @@ update:
     just build
 
 # Tag and push a new release
-tag-release version: update
-    # shell("[[ `toml get Cargo.toml workspace.package.version` == {{ version }} ]]")
+tag-release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Checking version {{ version }}..."
+
+    # Check that everything is committed and pushed
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "Error: Working directory is not clean. Commit or stash changes first."
+        exit 1
+    fi
+    if [ -n "$(git log @{u}.. 2>/dev/null)" ]; then
+        echo "Error: Local commits have not been pushed to remote."
+        exit 1
+    fi
+    echo "✓ Working directory is clean and pushed"
+
+    # Check that tag does not already exist
+    if git rev-parse "v{{ version }}" >/dev/null 2>&1; then
+        echo "Error: Tag v{{ version }} already exists"
+        exit 1
+    fi
+    echo "✓ Tag v{{ version }} does not yet exist"
+
+    # Check that version matches Cargo.toml
+    cargo_version=$(toml get Cargo.toml workspace.package.version --raw)
+    if [ "$cargo_version" != "{{ version }}" ]; then
+        echo "Error: Version {{ version }} does not match Cargo.toml version $cargo_version"
+        exit 1
+    fi
+    echo "✓ Version matches Cargo.toml"
+
+    # Check that version is in CHANGELOG.md
+    if ! grep -q "## Nice v{{ version }}" CHANGELOG.md; then
+        echo "Error: Version {{ version }} not found in CHANGELOG.md"
+        exit 1
+    fi
+    echo "✓ Version found in CHANGELOG.md"
+
+    # Create and push tag
     git tag -a v{{ version }} -m "release new version"
     git push origin v{{ version }}
+    echo "✓ Tagged and pushed v{{ version }}"
 
 # Build all packages (except wasm)
 build:
