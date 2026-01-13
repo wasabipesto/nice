@@ -7,6 +7,7 @@ pub mod benchmark;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
 pub mod client_api;
 pub mod client_process;
+pub mod client_process_gpu;
 pub mod consensus;
 #[cfg(feature = "database")]
 pub mod db_util;
@@ -18,8 +19,6 @@ pub mod residue_filter;
 
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-#[cfg(feature = "database")]
-use dotenvy::dotenv;
 use itertools::Itertools;
 use malachite::base::num::arithmetic::traits::{CeilingRoot, DivAssignRem, FloorRoot, Pow};
 use malachite::base::num::conversion::traits::Digits;

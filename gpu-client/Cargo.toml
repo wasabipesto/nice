@@ -1,0 +1,20 @@
+[package]
+name = "nice_gpu_client"
+description = "a GPU-accelerated client for distributed search of square-cube pandigitals"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+license-file.workspace = true
+
+[features]
+default = ["rustls-tls"]
+openssl-tls = ["nice_common/openssl-tls"]
+rustls-tls = ["nice_common/rustls-tls"]
+
+[dependencies]
+nice_common = { workspace = true, features = ["gpu"] }
+clap = { version = "4.5", features = ["env", "derive"] }
+cudarc = { version = "0.18", features = ["dynamic-loading", "cuda-version-from-build-system", "fallback-latest"] }
+serde_json = { version = "1.0" }
