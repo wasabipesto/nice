@@ -12,7 +12,7 @@
 use super::*;
 use anyhow::{Context as _, Result};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use std::sync::Arc;
 
 /// GPU context and compiled kernels.
@@ -53,8 +53,8 @@ impl GpuContext {
         // Load CUDA kernel source
         let kernel_src = include_str!("cuda/nice_kernels.cu");
 
-        // Compile kernels using NVRTC
-        let ptx = compile_ptx(kernel_src).context("Failed to compile CUDA kernels")?;
+        // Compile kernels using NVRTC with include path
+        let ptx = compile_ptx_with_include(kernel_src).context("Failed to compile CUDA kernels")?;
 
         // Load compiled module
         let module = device.load_module(ptx)?;
@@ -72,6 +72,22 @@ impl GpuContext {
             filter_kernel,
         })
     }
+}
+
+/// Compile PTX with CUDA include paths for NVRTC.
+fn compile_ptx_with_include(src: &str) -> Result<Ptx> {
+    // Get CUDA_HOME from environment, or use default
+    let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    let include_path = format!("{}/include", cuda_home);
+
+    // Compile with include path options
+    let opts = CompileOptions {
+        include_paths: vec![include_path],
+        ..Default::default()
+    };
+
+    compile_ptx_with_opts(src, opts)
+        .map_err(|e| anyhow::anyhow!("NVRTC compilation failed: {:?}", e))
 }
 
 /// Convert u128 numbers to separate lo/hi u64 arrays for GPU transfer.
