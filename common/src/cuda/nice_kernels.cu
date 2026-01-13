@@ -1,8 +1,10 @@
 // CUDA kernels for nice number checking
 // Implements GPU-accelerated versions of the hot loop operations
 
-#include <cuda_runtime.h>
-#include <stdint.h>
+// Use CUDA built-in types instead of stdint.h
+typedef unsigned long long uint64_t;
+typedef unsigned int uint32_t;
+typedef unsigned char uint8_t;
 
 // ============================================================================
 // u128 Arithmetic Helpers
