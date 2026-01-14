@@ -169,6 +169,19 @@ pub struct DataToServer {
     pub nice_numbers: Vec<NiceNumberSimple>,
 }
 
+/// Both the field info for processing and the compiled results
+/// (for the validation self-check endpoint)
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct ValidationData {
+    pub base: u32,
+    pub field_id: u128,
+    pub range_start: u128,
+    pub range_end: u128,
+    pub range_size: u128,
+    pub unique_distribution: Vec<UniquesDistributionSimple>,
+    pub nice_numbers: Vec<NiceNumberSimple>,
+}
+
 /// A basic claim log from the database.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ClaimRecord {

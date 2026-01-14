@@ -115,7 +115,12 @@ Options:
           - extra-large: A very large benchmark range: 1e9 @ base 40. This is the size of a typical field from the server
           - hi-base:     A benchmark range at a higher range: 1e6 @ base 80
 
-          [env: NICE_BENCHMARK=default]
+          [env: NICE_BENCHMARK=]
+
+      --validate
+          Validate results against the server before submitting
+
+          [env: NICE_VALIDATE=]
 
   -h, --help
           Print help (see a summary with '-h')

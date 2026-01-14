@@ -471,6 +471,74 @@ pub fn try_claim_field(
     }
 }
 
+pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData, String> {
+    use diesel::sql_query;
+    use diesel::sql_types::{BigInt, Integer};
+
+    let min_check_level = 2;
+
+    let mut rng = rand::rng();
+
+    // Set pivot between field IDs 10k-50k, which are all base 42-43 and double-checked
+    let pivot: i64 = conversions::u128_to_i64(rng.random_range(10_000..50_000)).unwrap_or(1);
+
+    // Try to find a field starting from the pivot
+    let query_from_pivot = "SELECT * FROM fields
+         WHERE id >= $1
+           AND check_level >= $2
+           AND canon_submission_id IS NOT NULL
+         ORDER BY id ASC
+         LIMIT 1";
+
+    let field_result = sql_query(query_from_pivot)
+        .bind::<BigInt, _>(pivot)
+        .bind::<Integer, _>(min_check_level)
+        .get_result::<FieldPrivate>(conn)
+        .optional()
+        .map_err(|err| err.to_string())?;
+
+    // If no field found from pivot, wrap around to the beginning
+    let field = if let Some(f) = field_result {
+        f
+    } else {
+        let query_wraparound = "SELECT * FROM fields
+             WHERE check_level >= $1
+               AND canon_submission_id IS NOT NULL
+             ORDER BY id ASC
+             LIMIT 1";
+
+        sql_query(query_wraparound)
+            .bind::<Integer, _>(min_check_level)
+            .get_result::<FieldPrivate>(conn)
+            .map_err(|err| err.to_string())?
+    };
+
+    let field_pub = private_to_public(field)?;
+
+    // Get the canonical submission
+    let submission_id = field_pub
+        .canon_submission_id
+        .ok_or_else(|| "Field has no canonical submission".to_string())?;
+    let submission = submissions::get_submission_by_id(conn, submission_id as u128)?;
+
+    // Convert submission data to simple format for ValidationData
+    let unique_distribution = match submission.distribution {
+        Some(dist) => distribution_stats::shrink_distribution(&dist),
+        None => return Err("Canonical submission has no distribution data".to_string()),
+    };
+    let nice_numbers = number_stats::shrink_numbers(&submission.numbers);
+
+    Ok(ValidationData {
+        base: field_pub.base,
+        field_id: field_pub.field_id,
+        range_start: field_pub.range_start,
+        range_end: field_pub.range_end,
+        range_size: field_pub.range_size,
+        unique_distribution,
+        nice_numbers,
+    })
+}
+
 pub fn get_count_checked_by_range(
     conn: &mut PgConnection,
     in_check_level: u8,

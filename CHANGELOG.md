@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add validate function to client and server to confirm that new results are consistent with past submissions
+
 ## Nice v3.2.9
 
 - Increase maximum retry attempts from 6 (max delay 32 seconds) to 10 (max delay 512 seconds)

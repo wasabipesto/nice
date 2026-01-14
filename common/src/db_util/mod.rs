@@ -218,6 +218,11 @@ pub fn insert_submission(
         numbers,
     )
 }
+/// Gets a pesudo-random field with the minimum check level, then grabs the
+/// canonical submission to include the results in the response.
+pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData, String> {
+    fields::get_validation_field(conn)
+}
 
 /// Get all submission records for a particular field.
 /// Only returns qualified and detailed submissions.
