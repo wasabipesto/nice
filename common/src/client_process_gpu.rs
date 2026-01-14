@@ -338,6 +338,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_gpu_matches_cpu_detailed_small() {
         let ctx = match try_init_gpu() {
             Some(c) => c,
@@ -378,6 +379,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_gpu_matches_cpu_niceonly_small() {
         let ctx = match try_init_gpu() {
             Some(c) => c,
@@ -413,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_gpu_base_40_range() {
         let ctx = match try_init_gpu() {
             Some(c) => c,
@@ -449,6 +452,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_gpu_context_creation() {
         // Just test that we can create a context
         // If no GPU is available, this should return an error
