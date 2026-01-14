@@ -174,6 +174,7 @@ pub struct DataToServer {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ValidationData {
     pub base: u32,
+    pub field_id: u128,
     pub range_start: u128,
     pub range_end: u128,
     pub range_size: u128,

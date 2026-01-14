@@ -530,6 +530,7 @@ pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData, S
 
     Ok(ValidationData {
         base: field_pub.base,
+        field_id: field_pub.field_id,
         range_start: field_pub.range_start,
         range_end: field_pub.range_end,
         range_size: field_pub.range_size,

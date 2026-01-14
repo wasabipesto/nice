@@ -1,13 +1,16 @@
 //! A simple CLI for the nice library.
 
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::too_many_lines)]
 
 extern crate nice_common;
 use nice_common::benchmark::{BenchmarkMode, get_benchmark_field};
-use nice_common::client_api::{get_field_from_server, submit_field_to_server};
+use nice_common::client_api::{
+    get_field_from_server, get_validation_data_from_server, submit_field_to_server,
+};
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
 use nice_common::{
-    CLIENT_VERSION, DataToServer, FieldResults, PROCESSING_CHUNK_SIZE, SearchMode,
+    CLIENT_VERSION, DataToClient, DataToServer, FieldResults, PROCESSING_CHUNK_SIZE, SearchMode,
     UniquesDistributionSimple,
 };
 
@@ -57,6 +60,10 @@ pub struct Cli {
     /// Run an offline benchmark
     #[arg(short, long, env = "NICE_BENCHMARK")]
     benchmark: Option<BenchmarkMode>,
+
+    /// Validate results against the server before submitting
+    #[arg(long, env = "NICE_VALIDATE")]
+    validate: bool,
 }
 
 /// Break up the range into chunks, returning the start and end of each.
@@ -84,16 +91,35 @@ fn main() {
         .build_global()
         .unwrap();
 
+    if cli.validate && cli.mode == SearchMode::Niceonly {
+        eprintln!("Configuration not supported: Validation && Niceonly");
+    }
+
     loop {
         // Check whether to query the server for a search range or use the benchmark
-        let claim_data = if let Some(benchmark) = cli.benchmark {
-            get_benchmark_field(benchmark)
+        let (claim_data, validation_data_opt) = if cli.validate {
+            let validation_data = get_validation_data_from_server(&cli.api_base);
+            let claim_data = DataToClient {
+                claim_id: 0,
+                base: validation_data.base,
+                range_start: validation_data.range_start,
+                range_end: validation_data.range_end,
+                range_size: validation_data.range_size,
+            };
+            (claim_data, Some(validation_data))
+        } else if let Some(benchmark) = cli.benchmark {
+            (get_benchmark_field(benchmark), None)
         } else {
-            get_field_from_server(&cli.mode, &cli.api_base)
+            (get_field_from_server(&cli.mode, &cli.api_base), None)
         };
 
         // Print some debug info
-        if cli.benchmark.is_some() {
+        if validation_data_opt.is_some() {
+            println!(
+                "Beginning validation: {:?}",
+                validation_data_opt.clone().unwrap().field_id
+            );
+        } else if cli.benchmark.is_some() {
             println!("Beginning benchmark:  {:?}", cli.benchmark.unwrap());
         } else if cli.verbose {
             println!(
@@ -175,8 +201,47 @@ fn main() {
             );
         }
 
-        // Submit the results if it's not a benchmark
-        if cli.benchmark.is_none() {
+        // Validate results if requested
+        if cli.validate {
+            // Check if our results match the server's expected results
+            let validation_data = validation_data_opt.expect("Validation data not found");
+            let mut validation_passed = true;
+
+            // Compare nice numbers
+            let mut our_numbers = submit_data.nice_numbers.clone();
+            let mut server_numbers = validation_data.nice_numbers.clone();
+            our_numbers.sort_by_key(|n| n.number);
+            server_numbers.sort_by_key(|n| n.number);
+
+            if our_numbers != server_numbers {
+                println!("VALIDATION FAILED: Semi-nice numbers don't match!");
+                validation_passed = false;
+            }
+
+            // Compare distribution (only for detailed mode)
+            if cli.mode == SearchMode::Detailed
+                && let Some(ref our_dist) = submit_data.unique_distribution
+            {
+                let mut our_dist_sorted = our_dist.clone();
+                let mut server_dist_sorted = validation_data.unique_distribution.clone();
+                our_dist_sorted.sort_by_key(|d| d.num_uniques);
+                server_dist_sorted.sort_by_key(|d| d.num_uniques);
+
+                if our_dist_sorted != server_dist_sorted {
+                    println!("VALIDATION FAILED: Distribution doesn't match!");
+                    validation_passed = false;
+                }
+            }
+
+            if validation_passed {
+                println!("Validation passed! Results match the canoncical submission.");
+            } else {
+                println!("Validation failed! Results do not match the canoncical submission.");
+                println!("  Our submission data: {submit_data:?}");
+                println!("  Canoncical submission: {validation_data:?}");
+            }
+        } else if cli.benchmark.is_none() {
+            // Submit the results if it's not a benchmark
             let response = submit_field_to_server(&cli.api_base, submit_data);
             match response.text() {
                 Ok(msg) => {
@@ -193,4 +258,3 @@ fn main() {
         }
     }
 }
-
