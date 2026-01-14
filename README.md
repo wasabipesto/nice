@@ -133,12 +133,6 @@ Options:
           [env: NICE_GPU_DEVICE=]
           [default: 0]
 
-      --batch-size <BATCH_SIZE>
-          Batch size for GPU processing (number of ranges to process per kernel launch)
-
-          [env: NICE_BATCH_SIZE=]
-          [default: 10000000]
-
   -h, --help
           Print help (see a summary with '-h')
 
@@ -154,6 +148,7 @@ There are some feature flags that enable specific dependencies:
 
 - `nice_common/database` is set automatically from binaries that connect directly to postgres (`api` and `jobs`). This requires the `libpq-dev` package to be installed.
 - `nice_client/rustls-tls` is enabled by default and uses rustls for TLS connections, which doesn't require any external dependencies. Disable it and enable `nice_client/openssl-tls` to use `openssl`.
+- In order to build the client with GPU acceleration, enable the `nice_client/gpu` feature. This requires no additional build-time dependencies, but it does require the CUDA toolkit to be available at runtime for kernel compilation.
 
 Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack/).
 

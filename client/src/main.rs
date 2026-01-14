@@ -77,10 +77,6 @@ pub struct Cli {
     /// CUDA device to use for GPU processing (0 for first GPU, 1 for second, etc.)
     #[arg(long, default_value_t = 0, env = "NICE_GPU_DEVICE")]
     gpu_device: usize,
-
-    /// Batch size for GPU processing (number of ranges to process per kernel launch)
-    #[arg(long, default_value_t = 10_000_000, env = "NICE_BATCH_SIZE")]
-    batch_size: usize,
 }
 
 /// Break up the range into chunks, returning the start and end of each.
