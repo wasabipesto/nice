@@ -21,7 +21,7 @@ fn main() {
         // running the binary on machines with CUDA GPUs.
 
         println!(
-            "cargo:warning=CUDA kernels will be compiled at runtime via NVRTC so the host MUST have CUDA Toolkit 11.4+ and drivers available"
+            "cargo:warning=CUDA kernels will be compiled at runtime via NVRTC so the host MUST have CUDA Toolkit 11.4+ and drivers available for GPU operation."
         );
     }
 

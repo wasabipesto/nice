@@ -9,13 +9,15 @@ readme.workspace = true
 license-file.workspace = true
 
 [features]
-default = ["rustls-tls"]
+default = ["rustls-tls", "gpu"]
 openssl-tls = ["nice_common/openssl-tls"]
 rustls-tls = ["nice_common/rustls-tls"]
+gpu = ["nice_common/gpu", "dep:cudarc"]
 
 [dependencies]
 nice_common = { workspace = true }
-clap = { version = "4.5", features = ["env"] }
+clap = { version = "4.5", features = ["env", "derive"] }
 rayon = { version = "1.11" }
 serde_json = { version = "1.0" }
 simple-tqdm = {version = "0.2", features = ["rayon"]}
+cudarc = { version = "0.18", features = ["dynamic-loading", "cuda-version-from-build-system", "fallback-latest"], optional = true }

@@ -14,6 +14,11 @@ use nice_common::{
     UniquesDistributionSimple,
 };
 
+#[cfg(feature = "gpu")]
+use nice_common::client_process_gpu::{
+    GpuContext, process_range_detailed_gpu, process_range_niceonly_gpu,
+};
+
 extern crate serde_json;
 use clap::Parser;
 use rayon::prelude::*;
@@ -64,6 +69,18 @@ pub struct Cli {
     /// Validate results against the server before submitting
     #[arg(long, env = "NICE_VALIDATE")]
     validate: bool,
+
+    /// Use GPU acceleration (requires gpu feature)
+    #[arg(long, env = "NICE_GPU")]
+    gpu: bool,
+
+    /// CUDA device to use for GPU processing (0 for first GPU, 1 for second, etc.)
+    #[arg(long, default_value_t = 0, env = "NICE_GPU_DEVICE")]
+    gpu_device: usize,
+
+    /// Batch size for GPU processing (number of ranges to process per kernel launch)
+    #[arg(long, default_value_t = 10_000_000, env = "NICE_BATCH_SIZE")]
+    batch_size: usize,
 }
 
 /// Break up the range into chunks, returning the start and end of each.
@@ -84,15 +101,57 @@ fn main() {
     // Parse command line arguments
     let cli = Cli::parse();
 
-    // Configure Rayon
-    // This must be done outside the loop
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(cli.threads)
-        .build_global()
-        .unwrap();
+    // Check for GPU support
+    #[cfg(not(feature = "gpu"))]
+    if cli.gpu {
+        eprintln!("Error: GPU support not enabled. Rebuild with --features gpu");
+        std::process::exit(1);
+    }
 
     if cli.validate && cli.mode == SearchMode::Niceonly {
         eprintln!("Configuration not supported: Validation && Niceonly");
+        std::process::exit(1);
+    }
+
+    // Initialize GPU context if requested
+    #[cfg(feature = "gpu")]
+    let gpu_ctx = if cli.gpu {
+        match GpuContext::new(cli.gpu_device) {
+            Ok(ctx) => {
+                if !cli.quiet {
+                    println!("GPU initialized successfully on device {}", cli.gpu_device);
+                    // Try to get GPU name if possible
+                    if let Ok(device) = cudarc::driver::CudaContext::new(cli.gpu_device)
+                        && let Ok(name) = device.name()
+                    {
+                        println!("  GPU: {name}");
+                    }
+                }
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to initialize GPU on device {}: {:?}",
+                    cli.gpu_device, e
+                );
+                eprintln!("\nTroubleshooting:");
+                eprintln!("1. Ensure NVIDIA GPU drivers are installed");
+                eprintln!("2. Verify CUDA toolkit is installed (nvcc --version)");
+                eprintln!("3. Check that GPU {} exists (nvidia-smi)", cli.gpu_device);
+                eprintln!("4. Try a different device with --gpu-device <N>");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Configure Rayon for CPU processing
+    if !cli.gpu {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cli.threads)
+            .build_global()
+            .unwrap();
     }
 
     loop {
@@ -130,30 +189,86 @@ fn main() {
             println!("Acquired claim:  {}", claim_data.claim_id);
         }
 
-        // Break up the range into chunks
-        let chunk_size = 100 * PROCESSING_CHUNK_SIZE;
-        let chunks = chunked_ranges(claim_data.range_start, claim_data.range_end, chunk_size);
+        // Record start time for performance stats
+        let start_time = std::time::Instant::now();
 
-        // Configure TQDM
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation
-        )]
-        let chunk_scale = (chunk_size as f32).log10() as u32;
-        let tqdm_config = simple_tqdm::Config::new()
-            .with_unit(format!("e{chunk_scale}"))
-            .with_disable(cli.quiet);
+        // Process based on GPU or CPU mode
+        let results: Vec<FieldResults> = if cli.gpu {
+            // GPU processing path
+            #[cfg(feature = "gpu")]
+            {
+                let gpu_ctx = gpu_ctx.as_ref().expect("GPU context failed to initialize");
 
-        // Process each chunk and gather the results
-        let results: Vec<FieldResults> = chunks
-            .par_iter()
-            .tqdm_config(tqdm_config)
-            .map(|(start, end)| match cli.mode {
-                SearchMode::Detailed => process_range_detailed(*start, *end, claim_data.base),
-                SearchMode::Niceonly => process_range_niceonly(*start, *end, claim_data.base),
-            })
-            .collect();
+                let gpu_results = match cli.mode {
+                    SearchMode::Detailed => process_range_detailed_gpu(
+                        gpu_ctx,
+                        claim_data.range_start,
+                        claim_data.range_end,
+                        claim_data.base,
+                    ),
+                    SearchMode::Niceonly => process_range_niceonly_gpu(
+                        gpu_ctx,
+                        claim_data.range_start,
+                        claim_data.range_end,
+                        claim_data.base,
+                    ),
+                };
+
+                match gpu_results {
+                    Ok(result) => vec![result],
+                    Err(e) => {
+                        eprintln!("GPU processing error: {e:?}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                eprintln!("GPU support not compiled in");
+                std::process::exit(1);
+            }
+        } else {
+            // CPU processing path
+            // Break up the range into chunks
+            let chunk_size = 100 * PROCESSING_CHUNK_SIZE;
+            let chunks = chunked_ranges(claim_data.range_start, claim_data.range_end, chunk_size);
+
+            // Configure TQDM
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation
+            )]
+            let chunk_scale = (chunk_size as f32).log10() as u32;
+            let tqdm_config = simple_tqdm::Config::new()
+                .with_unit(format!("e{chunk_scale}"))
+                .with_disable(cli.quiet);
+
+            // Process each chunk and gather the results
+            chunks
+                .par_iter()
+                .tqdm_config(tqdm_config)
+                .map(|(start, end)| match cli.mode {
+                    SearchMode::Detailed => process_range_detailed(*start, *end, claim_data.base),
+                    SearchMode::Niceonly => process_range_niceonly(*start, *end, claim_data.base),
+                })
+                .collect()
+        };
+
+        let elapsed = start_time.elapsed();
+
+        // Print performance stats for GPU
+        #[allow(clippy::cast_precision_loss)]
+        if cli.gpu && !cli.quiet {
+            let range_size = claim_data.range_end - claim_data.range_start;
+            let numbers_per_sec = range_size as f64 / elapsed.as_secs_f64();
+            println!(
+                "✓ Processed {:.2e} numbers in {:.2}s ({:.2e} numbers/sec)",
+                range_size as f64,
+                elapsed.as_secs_f64(),
+                numbers_per_sec
+            );
+        }
 
         // Compile results from all chunks
         let nice_numbers = results
