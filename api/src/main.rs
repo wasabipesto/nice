@@ -10,13 +10,14 @@ use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
     PgPool, get_claim_by_id, get_database_pool, get_field_by_id, get_pooled_database_connection,
-    insert_claim, insert_submission, try_claim_field, update_field_canon_and_cl,
+    get_validation_field, insert_claim, insert_submission, try_claim_field,
+    update_field_canon_and_cl,
 };
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
 use nice_common::{
     CLAIM_DURATION_HOURS, DEFAULT_FIELD_SIZE, DataToClient, DataToServer, FieldClaimStrategy,
-    NiceNumber, SearchMode,
+    NiceNumber, SearchMode, ValidationData,
 };
 use rand::Rng;
 use rocket::State;
@@ -31,6 +32,21 @@ use helpers::{
     not_found_error, unprocessable_entity_error,
 };
 
+#[get("/claim/validate")]
+fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
+    // Get database connection from the shared pool
+    let mut conn = get_pooled_database_connection(pool);
+
+    // For validation requests, we return a random completed field and the
+    // results so the client can perform a self-check.
+    let data = get_validation_field(&mut conn).map_err(|e| {
+        internal_error(format!(
+            "Database error while finding validation field: {e}"
+        ))
+    })?;
+    Ok(Json(data))
+}
+
 #[get("/claim/<mode>")]
 fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     // Get database connection from the shared pool
@@ -42,7 +58,7 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
         "niceonly" => SearchMode::Niceonly,
         _ => {
             return Err(not_found_error(
-                "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, and /submit. Visit https://nicenumbers.net for more information.",
+                "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, /claim/validate, and /submit. Visit https://nicenumbers.net for more information.",
             ));
         }
     };
@@ -75,7 +91,7 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     };
 
     // This won't affect anything since all fields will be this size or smaller
-    // TODO: Implement an "online benchmarking" option for e.g. gh runners that limits this
+    // TODO: Implement an "online benchmarking" option for e.g. GH runners that limits this
     let max_range_size = DEFAULT_FIELD_SIZE;
 
     // Get the field to search based on claim strategy, max check level, etc.
@@ -92,7 +108,7 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     {
         claimed_field
     } else {
-        info!(
+        tracing::info!(
             "Unable to find an unclaimed or expired field, falling back to one that may have been claimed recently."
         );
         let maximum_timestamp = Utc::now();
@@ -304,14 +320,14 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
 #[get("/")]
 fn index() -> rocket_status::Custom<Json<ApiErrorBody>> {
     not_found_error(
-        "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, and /submit. Visit https://nicenumbers.net for more information.",
+        "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, /claim/validate, and /submit. Visit https://nicenumbers.net for more information.",
     )
 }
 
 #[catch(404)]
 fn not_found() -> rocket_status::Custom<Json<ApiErrorBody>> {
     not_found_error(
-        "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, and /submit. Visit https://nicenumbers.net for more information.",
+        "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, /claim/validate, and /submit. Visit https://nicenumbers.net for more information.",
     )
 }
 
@@ -332,6 +348,9 @@ fn rocket() -> _ {
         .attach(CorsFairing)
         .attach(RequestTimingFairing)
         .manage(pool)
-        .mount("/", routes![claim, submit, index, options_handler])
+        .mount(
+            "/",
+            routes![claim, validate, submit, index, options_handler],
+        )
         .register("/", catchers![not_found])
 }
