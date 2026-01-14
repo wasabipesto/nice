@@ -5,3 +5,4 @@ postgres_backups
 target*
 *.bak
 core
+.lake
