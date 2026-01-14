@@ -122,6 +122,23 @@ Options:
 
           [env: NICE_VALIDATE=]
 
+      --gpu
+          Use GPU acceleration (requires gpu feature)
+
+          [env: NICE_GPU=]
+
+      --gpu-device <GPU_DEVICE>
+          CUDA device to use for GPU processing (0 for first GPU, 1 for second, etc.)
+
+          [env: NICE_GPU_DEVICE=]
+          [default: 0]
+
+      --batch-size <BATCH_SIZE>
+          Batch size for GPU processing (number of ranges to process per kernel launch)
+
+          [env: NICE_BATCH_SIZE=]
+          [default: 10000000]
+
   -h, --help
           Print help (see a summary with '-h')
 
