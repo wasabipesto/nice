@@ -1433,16 +1433,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nice_gpu_client"
-version = "3.2.9"
-dependencies = [
- "clap",
- "cudarc",
- "nice_common",
- "serde_json",
-]
-
-[[package]]
 name = "nice_jobs"
 version = "3.2.9"
 dependencies = [
