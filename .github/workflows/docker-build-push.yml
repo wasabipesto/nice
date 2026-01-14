@@ -40,7 +40,7 @@ jobs:
                   restore-keys: |
                       cargo-amd64-${{ runner.os }}-
 
-            - name: Build nice_client (release)
+            - name: Build nice_client (release, CPU-only)
               run: |
                   cargo build --release --locked -p nice_client
 
@@ -49,7 +49,7 @@ jobs:
                   rm -rf /tmp/docker-context
                   mkdir -p /tmp/docker-context
                   cp target/release/nice_client /tmp/docker-context/nice_client
-                  cp client/Dockerfile.runtime /tmp/docker-context/Dockerfile
+                  cp client/cpu.Dockerfile /tmp/docker-context/Dockerfile
 
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v3
@@ -71,6 +71,65 @@ jobs:
                   push: true
                   tags: |
                       ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
+
+    build-and-push-amd64-gpu:
+        name: Build (amd64, GPU) + Push arch image
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            packages: write
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: stable
+
+            - name: Cache Cargo (amd64-gpu)
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: cargo-amd64-gpu-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                      cargo-amd64-gpu-${{ runner.os }}-
+
+            - name: Build nice_client (release, GPU-enabled)
+              run: |
+                  cargo build --release --locked -p nice_client --features gpu
+
+            - name: Stage Docker build context
+              run: |
+                  rm -rf /tmp/docker-context-gpu
+                  mkdir -p /tmp/docker-context-gpu
+                  cp target/release/nice_client /tmp/docker-context-gpu/nice_client
+                  cp client/gpu.Dockerfile /tmp/docker-context-gpu/Dockerfile
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to GitHub Container Registry
+              uses: docker/login-action@v3
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            # Per-arch tag. Manifest job will later create the multi-arch tags.
+            - name: Build and push arch image (amd64, GPU)
+              uses: docker/build-push-action@v5
+              with:
+                  context: /tmp/docker-context-gpu
+                  file: /tmp/docker-context-gpu/Dockerfile
+                  platforms: linux/amd64
+                  push: true
+                  tags: |
+                      ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64-gpu
 
     build-and-push-arm64:
         name: Build (arm64) + Push arch image
@@ -99,7 +158,7 @@ jobs:
                   restore-keys: |
                       cargo-arm64-${{ runner.os }}-
 
-            - name: Build nice_client (release)
+            - name: Build nice_client (release, CPU-only)
               run: |
                   cargo build --release --locked -p nice_client
 
@@ -108,7 +167,7 @@ jobs:
                   rm -rf /tmp/docker-context
                   mkdir -p /tmp/docker-context
                   cp target/release/nice_client /tmp/docker-context/nice_client
-                  cp client/Dockerfile.runtime /tmp/docker-context/Dockerfile
+                  cp client/cpu.Dockerfile /tmp/docker-context/Dockerfile
 
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v3
@@ -131,8 +190,8 @@ jobs:
                   tags: |
                       ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64
 
-    publish-manifest:
-        name: Publish multi-arch manifest
+    publish-manifest-cpu:
+        name: Publish multi-arch manifest (CPU)
         runs-on: ubuntu-latest
         needs: [build-and-push-amd64, build-and-push-arm64]
         permissions:
@@ -190,4 +249,64 @@ jobs:
                       -t "${tag}" \
                       "${AMD_IMAGE}" \
                       "${ARM_IMAGE}"
+                  done
+
+    publish-manifest-gpu:
+        name: Publish multi-arch manifest (GPU)
+        runs-on: ubuntu-latest
+        needs: [build-and-push-amd64-gpu]
+        permissions:
+            contents: read
+            packages: write
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Log in to GitHub Container Registry
+              uses: docker/login-action@v3
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Extract metadata (final tags for GPU)
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+                  flavor: |
+                      suffix=-gpu,onlatest=true
+                  tags: |
+                      type=ref,event=branch
+                      type=ref,event=pr,prefix=pr-
+                      type=semver,pattern={{version}}
+                      type=semver,pattern={{major}}.{{minor}}
+                      type=semver,pattern={{major}}
+                      type=raw,value=latest,enable={{is_default_branch}}
+                      type=sha
+
+            - name: Set up Docker Buildx (for imagetools)
+              uses: docker/setup-buildx-action@v3
+
+            - name: Create and push GPU manifests
+              env:
+                  FINAL_TAGS: ${{ steps.meta.outputs.tags }}
+                  IMAGE_BASE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+                  SHA: ${{ github.sha }}
+              run: |
+                  set -euo pipefail
+
+                  AMD_IMAGE="${IMAGE_BASE}:${SHA}-amd64-gpu"
+
+                  echo "Source image:"
+                  echo "  ${AMD_IMAGE}"
+
+                  # metadata-action outputs tags separated by newlines
+                  echo "${FINAL_TAGS}" | while IFS= read -r tag; do
+                    [ -n "${tag}" ] || continue
+                    echo "Publishing GPU tag: ${tag}"
+                    docker buildx imagetools create \
+                      -t "${tag}" \
+                      "${AMD_IMAGE}"
                   done
