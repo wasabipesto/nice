@@ -350,6 +350,7 @@ fn main() {
                 println!("Validation failed! Results do not match the canoncical submission.");
                 println!("  Our submission data: {submit_data:?}");
                 println!("  Canoncical submission: {validation_data:?}");
+                std::process::exit(1);
             }
         } else if cli.benchmark.is_none() {
             // Submit the results if it's not a benchmark
