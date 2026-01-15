@@ -30,7 +30,7 @@ use std::sync::Arc;
 /// - Total: ~0.5 ms (vs ~0.01 ms overhead for <1K numbers)
 ///
 /// Larger batches (500K-1M) may improve throughput further but increase latency.
-const GPU_BATCH_SIZE: usize = 100_000;
+const GPU_BATCH_SIZE: usize = 1_000_000;
 
 /// GPU context and compiled kernels.
 /// This struct manages the CUDA device and compiled kernel functions.
@@ -44,9 +44,6 @@ const GPU_BATCH_SIZE: usize = 100_000;
 pub struct GpuContext {
     _device: Arc<CudaContext>,
     stream: Arc<CudaStream>,
-    // Additional streams for overlapped execution
-    stream1: Arc<CudaStream>,
-    stream2: Arc<CudaStream>,
     count_kernel: CudaFunction,
     nice_kernel: CudaFunction,
     filter_kernel: CudaFunction,
@@ -73,13 +70,8 @@ impl GpuContext {
         // Initialize CUDA context
         let device = CudaContext::new(device_ordinal)?;
 
-        // Create multiple streams for overlapped execution
-        // Stream 0: Primary compute stream
-        // Stream 1: Overlapped compute for pipelining
-        // Stream 2: Async memory transfers
+        // Get default stream
         let stream = device.default_stream();
-        let stream1 = device.fork_default_stream()?;
-        let stream2 = device.fork_default_stream()?;
 
         // Load CUDA kernel source
         let kernel_src = include_str!("cuda/nice_kernels.cu");
@@ -98,8 +90,6 @@ impl GpuContext {
         Ok(GpuContext {
             _device: device,
             stream,
-            stream1,
-            stream2,
             count_kernel,
             nice_kernel,
             filter_kernel,
@@ -155,7 +145,7 @@ pub fn process_range_detailed_gpu(
     range_end: u128,
     base: u32,
 ) -> Result<FieldResults> {
-    let nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
+    let _nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
     let range_size = (range_end - range_start) as usize;
 
     // For small ranges, process in one batch to minimize overhead
@@ -176,7 +166,8 @@ pub fn process_range_detailed_gpu(
         let batch_start = range_start + (batch_idx * GPU_BATCH_SIZE) as u128;
         let batch_end = (range_start + ((batch_idx + 1) * GPU_BATCH_SIZE) as u128).min(range_end);
 
-        let batch_results = process_range_detailed_gpu_single_batch(ctx, batch_start, batch_end, base)?;
+        let batch_results =
+            process_range_detailed_gpu_single_batch(ctx, batch_start, batch_end, base)?;
 
         // Aggregate results
         for dist in batch_results.distribution {
@@ -225,10 +216,10 @@ fn process_range_detailed_gpu_single_batch(
     // Split u128 into lo/hi components
     let (numbers_lo, numbers_hi) = split_u128_vec(&numbers);
 
-    // Transfer to GPU (use stream1 for potential overlap)
-    let d_numbers_lo = ctx.stream1.clone_htod(&numbers_lo)?;
-    let d_numbers_hi = ctx.stream1.clone_htod(&numbers_hi)?;
-    let mut d_unique_counts = ctx.stream1.alloc_zeros::<u32>(range_size)?;
+    // Transfer to GPU
+    let d_numbers_lo = ctx.stream.clone_htod(&numbers_lo)?;
+    let d_numbers_hi = ctx.stream.clone_htod(&numbers_hi)?;
+    let mut d_unique_counts = ctx.stream.alloc_zeros::<u32>(range_size)?;
 
     // Launch kernel with optimized grid size
     // Use 256 threads per block (good occupancy for most GPUs)
@@ -239,7 +230,7 @@ fn process_range_detailed_gpu_single_batch(
     };
 
     // Launch kernel using builder pattern
-    let mut launch_args = ctx.stream1.launch_builder(&ctx.count_kernel);
+    let mut launch_args = ctx.stream.launch_builder(&ctx.count_kernel);
     launch_args.arg(&d_numbers_lo);
     launch_args.arg(&d_numbers_hi);
     launch_args.arg(&mut d_unique_counts);
@@ -250,7 +241,7 @@ fn process_range_detailed_gpu_single_batch(
     }
 
     // Copy results back
-    let unique_counts = ctx.stream1.clone_dtoh(&d_unique_counts)?;
+    let unique_counts = ctx.stream.clone_dtoh(&d_unique_counts)?;
 
     // Aggregate results (same as CPU version)
     let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
@@ -307,7 +298,7 @@ pub fn process_range_niceonly_gpu(
     // For very small ranges or after filtering, batch processing may not help
     // Use adaptive batching based on range size
     let effective_batch_size = if range_size < GPU_BATCH_SIZE / 2 {
-        range_size  // Process all at once for small ranges
+        range_size // Process all at once for small ranges
     } else {
         GPU_BATCH_SIZE
     };
@@ -361,10 +352,10 @@ fn process_candidates_niceonly_gpu(
     // Split u128 into lo/hi components
     let (numbers_lo, numbers_hi) = split_u128_vec(candidates);
 
-    // Transfer to GPU using stream2 for potential overlap
-    let d_numbers_lo = ctx.stream2.clone_htod(&numbers_lo)?;
-    let d_numbers_hi = ctx.stream2.clone_htod(&numbers_hi)?;
-    let mut d_is_nice = ctx.stream2.alloc_zeros::<u8>(candidate_count)?;
+    // Transfer to GPU
+    let d_numbers_lo = ctx.stream.clone_htod(&numbers_lo)?;
+    let d_numbers_hi = ctx.stream.clone_htod(&numbers_hi)?;
+    let mut d_is_nice = ctx.stream.alloc_zeros::<u8>(candidate_count)?;
 
     // Launch kernel with optimized configuration
     let cfg = LaunchConfig {
@@ -374,7 +365,7 @@ fn process_candidates_niceonly_gpu(
     };
 
     // Launch kernel using builder pattern
-    let mut launch_args = ctx.stream2.launch_builder(&ctx.nice_kernel);
+    let mut launch_args = ctx.stream.launch_builder(&ctx.nice_kernel);
     launch_args.arg(&d_numbers_lo);
     launch_args.arg(&d_numbers_hi);
     launch_args.arg(&mut d_is_nice);
@@ -385,7 +376,7 @@ fn process_candidates_niceonly_gpu(
     }
 
     // Copy results back
-    let is_nice = ctx.stream2.clone_dtoh(&d_is_nice)?;
+    let is_nice = ctx.stream.clone_dtoh(&d_is_nice)?;
 
     // Collect nice numbers
     let nice_numbers: Vec<NiceNumberSimple> = candidates
