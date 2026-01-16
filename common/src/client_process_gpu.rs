@@ -94,6 +94,7 @@ fn compile_ptx_with_include(src: &str) -> Result<Ptx> {
     let opts = CompileOptions {
         include_paths: vec![include_path],
         options: vec!["--ptxas-options=-v".to_string()],
+        maxrregcount: Some(64),
         ..Default::default()
     };
 
