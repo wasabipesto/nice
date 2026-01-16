@@ -93,6 +93,7 @@ fn compile_ptx_with_include(src: &str) -> Result<Ptx> {
     // Compile with include path options
     let opts = CompileOptions {
         include_paths: vec![include_path],
+        options: vec!["--ptxas-options=-v".to_string()],
         ..Default::default()
     };
 
