@@ -11,9 +11,12 @@
 
 use super::*;
 use anyhow::{Context as _, Result};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+};
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 /// Optimal batch size for GPU processing to maximize throughput
 /// Larger batches amortize kernel launch overhead and enable better PCIe utilization
@@ -40,6 +43,9 @@ const GPU_BATCH_SIZE: usize = 100_000;
 /// - Stream 0/1: Compute on batch N while copying batch N+1 to GPU
 /// - Stream 2: Copy batch N-1 results back to CPU in parallel
 /// This can hide PCIe latency and increase GPU utilization
+///
+/// Persistent buffers are pre-allocated to avoid allocation overhead on every batch.
+/// For 1 billion numbers in 100K batches = 10,000 batches, avoiding 10,000 alloc/free cycles.
 #[allow(dead_code)]
 pub struct GpuContext {
     _device: Arc<CudaContext>,
@@ -47,6 +53,11 @@ pub struct GpuContext {
     count_kernel: CudaFunction,
     nice_kernel: CudaFunction,
     filter_kernel: CudaFunction,
+    // Pre-allocated persistent buffers (wrapped in RefCell for interior mutability)
+    buffer_numbers_lo: RefCell<CudaSlice<u64>>,
+    buffer_numbers_hi: RefCell<CudaSlice<u64>>,
+    buffer_unique_counts: RefCell<CudaSlice<u32>>,
+    buffer_is_nice: RefCell<CudaSlice<u8>>,
 }
 
 impl GpuContext {
@@ -87,12 +98,23 @@ impl GpuContext {
         let nice_kernel = module.load_function("check_is_nice_kernel")?;
         let filter_kernel = module.load_function("filter_by_residue_kernel")?;
 
+        // Pre-allocate persistent GPU buffers sized for GPU_BATCH_SIZE
+        // These are reused across all batches to eliminate allocation overhead
+        let buffer_numbers_lo = stream.alloc_zeros::<u64>(GPU_BATCH_SIZE)?;
+        let buffer_numbers_hi = stream.alloc_zeros::<u64>(GPU_BATCH_SIZE)?;
+        let buffer_unique_counts = stream.alloc_zeros::<u32>(GPU_BATCH_SIZE)?;
+        let buffer_is_nice = stream.alloc_zeros::<u8>(GPU_BATCH_SIZE)?;
+
         Ok(GpuContext {
             _device: device,
             stream,
             count_kernel,
             nice_kernel,
             filter_kernel,
+            buffer_numbers_lo: RefCell::new(buffer_numbers_lo),
+            buffer_numbers_hi: RefCell::new(buffer_numbers_hi),
+            buffer_unique_counts: RefCell::new(buffer_unique_counts),
+            buffer_is_nice: RefCell::new(buffer_is_nice),
         })
     }
 }
@@ -210,16 +232,22 @@ fn process_range_detailed_gpu_single_batch(
     let nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
     let range_size = (range_end - range_start) as usize;
 
-    // Generate the range of numbers to check
-    let numbers: Vec<u128> = (range_start..range_end).collect();
+    // Generate and split numbers directly without intermediate Vec allocation
+    let mut numbers_lo = Vec::with_capacity(range_size);
+    let mut numbers_hi = Vec::with_capacity(range_size);
+    for num in range_start..range_end {
+        numbers_lo.push(num as u64);
+        numbers_hi.push((num >> 64) as u64);
+    }
 
-    // Split u128 into lo/hi components
-    let (numbers_lo, numbers_hi) = split_u128_vec(&numbers);
+    // Use pre-allocated persistent buffers (borrow mutably)
+    let mut d_numbers_lo = ctx.buffer_numbers_lo.borrow_mut();
+    let mut d_numbers_hi = ctx.buffer_numbers_hi.borrow_mut();
+    let mut d_unique_counts = ctx.buffer_unique_counts.borrow_mut();
 
-    // Transfer to GPU
-    let d_numbers_lo = ctx.stream.clone_htod(&numbers_lo)?;
-    let d_numbers_hi = ctx.stream.clone_htod(&numbers_hi)?;
-    let mut d_unique_counts = ctx.stream.alloc_zeros::<u32>(range_size)?;
+    // Copy data into the pre-allocated buffers (only copy what we need)
+    ctx.stream.clone_into_htod(&numbers_lo, &mut d_numbers_lo)?;
+    ctx.stream.clone_into_htod(&numbers_hi, &mut d_numbers_hi)?;
 
     // Launch kernel with optimized grid size
     // Use 256 threads per block (good occupancy for most GPUs)
@@ -231,17 +259,17 @@ fn process_range_detailed_gpu_single_batch(
 
     // Launch kernel using builder pattern
     let mut launch_args = ctx.stream.launch_builder(&ctx.count_kernel);
-    launch_args.arg(&d_numbers_lo);
-    launch_args.arg(&d_numbers_hi);
-    launch_args.arg(&mut d_unique_counts);
+    launch_args.arg(&*d_numbers_lo);
+    launch_args.arg(&*d_numbers_hi);
+    launch_args.arg(&mut *d_unique_counts);
     launch_args.arg(&base);
     launch_args.arg(&range_size);
     unsafe {
         launch_args.launch(cfg)?;
     }
 
-    // Copy results back
-    let unique_counts = ctx.stream.clone_dtoh(&d_unique_counts)?;
+    // Copy only the results we need back (not the full buffer)
+    let unique_counts: Vec<u32> = ctx.stream.clone_from_dtoh(&d_unique_counts, range_size)?;
 
     // Aggregate results (same as CPU version)
     let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
@@ -349,13 +377,22 @@ fn process_candidates_niceonly_gpu(
 ) -> Result<FieldResults> {
     let candidate_count = candidates.len();
 
-    // Split u128 into lo/hi components
-    let (numbers_lo, numbers_hi) = split_u128_vec(candidates);
+    // Split u128 into lo/hi components directly
+    let mut numbers_lo = Vec::with_capacity(candidate_count);
+    let mut numbers_hi = Vec::with_capacity(candidate_count);
+    for &num in candidates {
+        numbers_lo.push(num as u64);
+        numbers_hi.push((num >> 64) as u64);
+    }
 
-    // Transfer to GPU
-    let d_numbers_lo = ctx.stream.clone_htod(&numbers_lo)?;
-    let d_numbers_hi = ctx.stream.clone_htod(&numbers_hi)?;
-    let mut d_is_nice = ctx.stream.alloc_zeros::<u8>(candidate_count)?;
+    // Use pre-allocated persistent buffers
+    let mut d_numbers_lo = ctx.buffer_numbers_lo.borrow_mut();
+    let mut d_numbers_hi = ctx.buffer_numbers_hi.borrow_mut();
+    let mut d_is_nice = ctx.buffer_is_nice.borrow_mut();
+
+    // Copy data into the pre-allocated buffers
+    ctx.stream.clone_into_htod(&numbers_lo, &mut d_numbers_lo)?;
+    ctx.stream.clone_into_htod(&numbers_hi, &mut d_numbers_hi)?;
 
     // Launch kernel with optimized configuration
     let cfg = LaunchConfig {
@@ -366,17 +403,17 @@ fn process_candidates_niceonly_gpu(
 
     // Launch kernel using builder pattern
     let mut launch_args = ctx.stream.launch_builder(&ctx.nice_kernel);
-    launch_args.arg(&d_numbers_lo);
-    launch_args.arg(&d_numbers_hi);
-    launch_args.arg(&mut d_is_nice);
+    launch_args.arg(&*d_numbers_lo);
+    launch_args.arg(&*d_numbers_hi);
+    launch_args.arg(&mut *d_is_nice);
     launch_args.arg(&base);
     launch_args.arg(&candidate_count);
     unsafe {
         launch_args.launch(cfg)?;
     }
 
-    // Copy results back
-    let is_nice = ctx.stream.clone_dtoh(&d_is_nice)?;
+    // Copy only the results we need back
+    let is_nice: Vec<u8> = ctx.stream.clone_from_dtoh(&d_is_nice, candidate_count)?;
 
     // Collect nice numbers
     let nice_numbers: Vec<NiceNumberSimple> = candidates
