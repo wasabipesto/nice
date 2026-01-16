@@ -60,13 +60,21 @@ __device__ __forceinline__ void mul_u128_u128(const u128& a, const u128& b, uint
     // Accumulate results
     result[0] = lo_lo_lo;
 
-    uint64_t carry = 0;
-    result[1] = lo_lo_hi + lo_hi_lo + hi_lo_lo;
-    carry = (result[1] < lo_lo_hi) + (result[1] < lo_hi_lo);
+    // result[1] = lo_lo_hi + lo_hi_lo + hi_lo_lo
+    uint64_t temp1 = lo_lo_hi + lo_hi_lo;
+    uint64_t carry1 = (temp1 < lo_lo_hi) ? 1 : 0;
+    result[1] = temp1 + hi_lo_lo;
+    uint64_t carry2 = (result[1] < temp1) ? 1 : 0;
+    uint64_t carry = carry1 + carry2;
 
-    uint64_t temp = lo_hi_hi + hi_lo_hi + hi_hi_lo + carry;
-    carry = (temp < lo_hi_hi) + (temp < hi_lo_hi);
-    result[2] = temp;
+    // result[2] = lo_hi_hi + hi_lo_hi + hi_hi_lo + carry
+    uint64_t temp2 = lo_hi_hi + hi_lo_hi;
+    uint64_t carry3 = (temp2 < lo_hi_hi) ? 1 : 0;
+    uint64_t temp3 = temp2 + hi_hi_lo;
+    uint64_t carry4 = (temp3 < temp2) ? 1 : 0;
+    result[2] = temp3 + carry;
+    uint64_t carry5 = (result[2] < temp3) ? 1 : 0;
+    carry = carry3 + carry4 + carry5;
 
     result[3] = hi_hi_hi + carry;
 }
@@ -113,8 +121,13 @@ __device__ __forceinline__ u256 square_u128_fast(const u128& n) {
     result.limbs[0] = lo_sq_lo;
     result.limbs[1] = lo_sq_hi + cross2_lo;
     uint64_t carry = (result.limbs[1] < lo_sq_hi) ? 1 : 0;
-    result.limbs[2] = cross2_hi + hi_sq_lo + carry;
-    carry = (result.limbs[2] < cross2_hi) ? 1 : 0;
+
+    uint64_t temp = cross2_hi + hi_sq_lo;
+    uint64_t carry2 = (temp < cross2_hi) ? 1 : 0;
+    result.limbs[2] = temp + carry;
+    uint64_t carry3 = (result.limbs[2] < temp) ? 1 : 0;
+    carry = carry2 + carry3;
+
     result.limbs[3] = hi_sq_hi + cross2_carry + carry;
 
     return result;
@@ -137,29 +150,33 @@ __device__ __forceinline__ u256 cube_u128_fast(const u128& n) {
     // n_sq.limbs[1] * n.lo + n_sq.limbs[0] * n.hi + carry
     uint64_t temp_lo, temp_hi;
     mul64x64_128(n_sq.limbs[1], n.lo, temp_lo, temp_hi);
-    result.limbs[1] = temp_lo + carry;
-    carry = temp_hi + (result.limbs[1] < temp_lo ? 1 : 0);
+    uint64_t sum1 = temp_lo + carry;
+    uint64_t carry1 = (sum1 < temp_lo) ? 1 : 0;
+    carry = temp_hi + carry1;
 
     mul64x64_128(n_sq.limbs[0], n.hi, temp_lo, temp_hi);
-    result.limbs[1] += temp_lo;
-    carry += temp_hi + (result.limbs[1] < temp_lo ? 1 : 0);
+    result.limbs[1] = sum1 + temp_lo;
+    uint64_t carry2 = (result.limbs[1] < sum1) ? 1 : 0;
+    carry += temp_hi + carry2;
 
     // n_sq.limbs[2] * n.lo + n_sq.limbs[1] * n.hi + carry
     mul64x64_128(n_sq.limbs[2], n.lo, temp_lo, temp_hi);
-    result.limbs[2] = temp_lo + carry;
-    carry = temp_hi + (result.limbs[2] < temp_lo ? 1 : 0);
+    uint64_t sum2 = temp_lo + carry;
+    carry1 = (sum2 < temp_lo) ? 1 : 0;
+    carry = temp_hi + carry1;
 
     mul64x64_128(n_sq.limbs[1], n.hi, temp_lo, temp_hi);
-    result.limbs[2] += temp_lo;
-    carry += temp_hi + (result.limbs[2] < temp_lo ? 1 : 0);
+    result.limbs[2] = sum2 + temp_lo;
+    carry2 = (result.limbs[2] < sum2) ? 1 : 0;
+    carry += temp_hi + carry2;
 
     // n_sq.limbs[3] * n.lo + n_sq.limbs[2] * n.hi + carry
     mul64x64_128(n_sq.limbs[3], n.lo, temp_lo, temp_hi);
-    result.limbs[3] = temp_lo + carry;
+    uint64_t sum3 = temp_lo + carry;
     // Ignore overflow beyond 256 bits
 
     mul64x64_128(n_sq.limbs[2], n.hi, temp_lo, temp_hi);
-    result.limbs[3] += temp_lo;
+    result.limbs[3] = sum3 + temp_lo;
 
     return result;
 }
@@ -168,13 +185,7 @@ __device__ __forceinline__ u256 cube_u128_fast(const u128& n) {
 // Division by Base
 // ============================================================================
 
-__device__ __forceinline__ uint32_t fast_div_u64_by_base(uint64_t n, uint32_t base,
-                                                          uint64_t magic_lo, uint64_t magic_hi) {
-    // Standard modulo - compiler will optimize power-of-2 cases
-    return n % base;
-}
-
-// Generic division for u256 by small base (when magic doesn't apply)
+// Generic division for u256 by small base
 __device__ __forceinline__ uint32_t div_u256_by_base_generic(u256& n, uint32_t base) {
     uint64_t remainder = 0;
 
@@ -199,32 +210,8 @@ __device__ __forceinline__ uint32_t div_u256_by_base_generic(u256& n, uint32_t b
     return (uint32_t)remainder;
 }
 
-// Specialized fast path for base 10 using reciprocal multiplication
-__device__ __forceinline__ uint32_t div_u256_by_10(u256& n) {
-    uint64_t remainder = 0;
-    const uint64_t magic = 0xCCCCCCCCCCCCCCCDULL;
-
-    #pragma unroll
-    for (int i = 3; i >= 0; i--) {
-        uint64_t dividend = (remainder << 32) | (n.limbs[i] >> 32);
-        uint64_t quot_hi = (__umul64hi(dividend, magic) >> 3);
-        remainder = dividend - quot_hi * 10;
-
-        dividend = (remainder << 32) | (n.limbs[i] & 0xFFFFFFFFULL);
-        uint64_t quot_lo = (__umul64hi(dividend, magic) >> 3);
-        remainder = dividend - quot_lo * 10;
-
-        n.limbs[i] = (quot_hi << 32) | quot_lo;
-    }
-
-    return (uint32_t)remainder;
-}
-
-// Dispatcher for optimized division
+// Division dispatcher (currently just uses generic, can add specialized versions for common bases)
 __device__ __forceinline__ uint32_t div_u256_by_base(u256& n, uint32_t base) {
-    if (base == 10) {
-        return div_u256_by_10(n);
-    }
     return div_u256_by_base_generic(n, base);
 }
 
