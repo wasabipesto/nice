@@ -30,7 +30,7 @@ use std::sync::Arc;
 /// - Total: ~0.5 ms (vs ~0.01 ms overhead for <1K numbers)
 ///
 /// Larger batches (500K-1M) may improve throughput further but increase latency.
-const GPU_BATCH_SIZE: usize = 1_000_000;
+const GPU_BATCH_SIZE: usize = 100_000;
 
 /// GPU context and compiled kernels.
 /// This struct manages the CUDA device and compiled kernel functions.
