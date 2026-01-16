@@ -6,6 +6,13 @@
 //!
 //! The GPU kernels are compiled at runtime using NVRTC (NVIDIA Runtime Compiler),
 //! which means the CUDA toolkit must be installed on the system.
+//!
+//! The GPU doesn't have built-in capability for arbitrary-precision arithmetic,
+//! so we manually implement u256 and some operations. This does hurt performance
+//! but the GPUs are fast enough that it's not really a bottleneck. It does limit
+//! our max base, however. A u256 can hold up to 1e77, which means the max input
+//! number we can safely hold is (1e77)^(1/3) = 4.6e25. Ironically, that means the
+//! highest base we can process with this strategy is base 69 (6.7e24 to 1.4e25).
 
 #![cfg(feature = "gpu")]
 
