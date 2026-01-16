@@ -89,10 +89,12 @@ struct u256 {
 };
 
 // Fast squaring: n^2 using optimized multiplication
+// Uses algebraic expansion: (a + b)^2 = a^2 + 2ab + b^2
+// where a = hi * 2^64 and b = lo
 __device__ __forceinline__ u256 square_u128_fast(const u128& n) {
     u256 result;
 
-    // n^2 = (hi * 2^64 + lo)^2
+    // n^2 = (hi * 2^64 + lo)^2 = hi^2 * 2^128 + 2*hi*lo * 2^64 + lo^2
     uint64_t lo_sq_lo, lo_sq_hi;
     mul64x64_128(n.lo, n.lo, lo_sq_lo, lo_sq_hi);
 
@@ -163,23 +165,12 @@ __device__ __forceinline__ u256 cube_u128_fast(const u128& n) {
 }
 
 // ============================================================================
-// Optimized Division by Base - Using Reciprocal Multiplication
+// Division by Base
 // ============================================================================
-
-// Precomputed magic numbers for fast division by common bases
-// For base b, we compute: magic = floor(2^96 / b)
-// Then: n / b ≈ (n * magic) >> 96
 
 __device__ __forceinline__ uint32_t fast_div_u64_by_base(uint64_t n, uint32_t base,
                                                           uint64_t magic_lo, uint64_t magic_hi) {
-    // Approximate division using multiplication
-    // This works well for bases up to about 100
-    if (base <= 64 && (base & (base - 1)) == 0) {
-        // Power of 2 - use shift
-        return n % base;
-    }
-
-    // Standard modulo for now - compiler will optimize
+    // Standard modulo - compiler will optimize power-of-2 cases
     return n % base;
 }
 
@@ -208,9 +199,8 @@ __device__ __forceinline__ uint32_t div_u256_by_base_generic(u256& n, uint32_t b
     return (uint32_t)remainder;
 }
 
-// Specialized fast path for base 10
+// Specialized fast path for base 10 using reciprocal multiplication
 __device__ __forceinline__ uint32_t div_u256_by_10(u256& n) {
-    // Use multiply by reciprocal: 1/10 ≈ 0xCCCCCCCCCCCCCCCD / 2^67
     uint64_t remainder = 0;
     const uint64_t magic = 0xCCCCCCCCCCCCCCCDULL;
 
@@ -383,12 +373,11 @@ extern "C" __global__ void filter_by_residue_kernel(
     uint64_t num_hi = numbers_hi[idx];
     uint64_t base_minus_one = base - 1;
 
-    // Fast modulo for u128: (hi * 2^64 + lo) % (base-1)
-    // Optimized using the fact that 2^64 % (base-1) can be computed
+    // Compute u128 modulo (base-1): (hi * 2^64 + lo) % (base-1)
     uint64_t hi_mod = num_hi % base_minus_one;
     uint64_t lo_mod = num_lo % base_minus_one;
 
-    // Compute 2^64 % (base-1) more efficiently
+    // Compute 2^64 % (base-1)
     uint64_t power_mod = ((1ULL << 63) % base_minus_one);
     power_mod = (power_mod + power_mod) % base_minus_one;
 
