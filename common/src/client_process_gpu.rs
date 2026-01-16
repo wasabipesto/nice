@@ -23,7 +23,7 @@ use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use std::sync::Arc;
 
 /// Batch size for GPU kernel processing
-const GPU_BATCH_SIZE: usize = 100_000;
+const GPU_BATCH_SIZE: usize = 10_000_000;
 
 /// GPU context and compiled kernels.
 /// This struct manages the CUDA device and compiled kernel functions.
