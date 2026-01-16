@@ -6,6 +6,7 @@ use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
 use diesel::table;
+use dotenvy::dotenv;
 use serde_json::Value;
 
 mod bases;

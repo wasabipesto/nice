@@ -30,7 +30,7 @@ jobs:
                     - build_name: Linux-x86_64
                       runs_on: ubuntu-latest
                       rust_target: x86_64-unknown-linux-gnu
-                      packages: "" # default to all packages
+                      packages: "" # Default to all packages
 
                     - build_name: Linux-x86_64-musl
                       runs_on: ubuntu-latest

@@ -60,16 +60,16 @@ tag-release version:
 
 # Build all packages (except wasm)
 build:
-    cargo build
-    cargo build -r
+    cargo build -p "*"
+    cargo build -p "*" -r
 
 # Build all packages, run all tests, and then run the client
 test:
-    cargo clippy
-    cargo build
-    cargo build -r
+    cargo clippy -p "*"
+    cargo build -p "*"
+    cargo build -p "*" -r
     just wasm-build
-    cargo test --no-fail-fast
+    cargo test -p "*" --no-fail-fast
     just benchmark default
     just client
 

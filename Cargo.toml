@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["api", "client", "common", "daemon", "jobs", "wasm-client"]
+default-members = ["client", "common"]
 
 [workspace.package]
 version = "3.2.9"
