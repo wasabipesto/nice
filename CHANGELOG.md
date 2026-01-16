@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## Nice v3.2.10
 
 - Add validate function to client and server to confirm that new results are consistent with past submissions
 - Add experimental support for GPU acceleration with CUDA
