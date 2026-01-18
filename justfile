@@ -88,11 +88,11 @@ benchmark size='large':
 
 # Run the daemon
 daemon *args:
-    cargo run -r --bin nice_daemon -- {{ args }}
+    cargo run -r -p nice_daemon -- {{ args }}
 
 # Run API server
 server:
-    ROCKET_ADDRESS="0.0.0.0" cargo run -r --bin nice_api
+    ROCKET_ADDRESS="0.0.0.0" cargo run -r -p nice_api
 
 # Run API server (alias)
 api: server
@@ -106,7 +106,7 @@ run-sql file:
 
 # Run scheduled jobs
 jobs:
-    cargo run -r --bin nice_jobs
+    cargo run -r -p nice_jobs
 
 # Deploy the website and bundled assets
 deploy-site:
