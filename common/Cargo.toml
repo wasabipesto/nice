@@ -16,7 +16,7 @@ gpu = ["dep:cudarc", "dep:anyhow"]
 
 [dependencies]
 bigdecimal = { version = "0.4.10", optional = true }
-chrono = { version = "0.4.42", features = ["serde"] }
+chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 diesel = { version = "2.3", features = ["chrono", "postgres", "r2d2", "serde_json", "numeric"], optional = true }
 dotenvy = { version = "0.15", optional = true }
