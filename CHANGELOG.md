@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix an issue where the largest numbers (instead of nicest) are preserved during downsampling
+
 ## Nice v3.2.10
 
 - Add validate function to client and server to confirm that new results are consistent with past submissions
