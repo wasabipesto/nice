@@ -16,7 +16,7 @@ use nice_common::{
 
 #[cfg(feature = "gpu")]
 use nice_common::client_process_gpu::{
-    GpuContext, process_range_detailed_gpu, process_range_niceonly_gpu,
+    GPU_BATCH_SIZE, GpuContext, process_range_detailed_gpu, process_range_niceonly_gpu,
 };
 
 extern crate serde_json;
@@ -25,7 +25,7 @@ use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
 use std::collections::HashMap;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 #[allow(clippy::struct_excessive_bools)]
@@ -98,8 +98,7 @@ fn main() {
     let cli = Cli::parse();
 
     // Check for GPU support
-    #[cfg(not(feature = "gpu"))]
-    if cli.gpu {
+    if cli.gpu && !cfg!(feature = "gpu") {
         eprintln!("Error: GPU support not enabled. Rebuild with --features gpu");
         std::process::exit(1);
     }
@@ -107,6 +106,30 @@ fn main() {
     if cli.validate && cli.mode == SearchMode::Niceonly {
         eprintln!("Configuration not supported: Validation && Niceonly");
         std::process::exit(1);
+    }
+
+    if !cli.quiet {
+        #[allow(unused_mut)]
+        let mut cpu_or_gpu = format!("CPU with {} threads", cli.threads);
+
+        #[cfg(feature = "gpu")]
+        if cli.gpu {
+            cpu_or_gpu = format!(
+                "GPU device {} and batch size {}",
+                cli.gpu_device, GPU_BATCH_SIZE
+            );
+        };
+
+        println!(
+            "Nice Client v{} started in {} mode, using {}.",
+            CLIENT_VERSION, cli.mode, cpu_or_gpu
+        );
+        if cli.validate {
+            println!("Validating correctness by checking against accepted field.");
+        }
+    }
+    if cli.verbose {
+        println!("CLI Inputs: {cli:?}");
     }
 
     // Initialize GPU context if requested
@@ -182,7 +205,10 @@ fn main() {
                 serde_json::to_string_pretty(&claim_data).unwrap()
             );
         } else if !cli.quiet {
-            println!("Acquired claim:  {}", claim_data.claim_id);
+            println!(
+                "Acquired claim:  {}, Base {}",
+                claim_data.claim_id, claim_data.base
+            );
         }
 
         // Record start time for performance stats

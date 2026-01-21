@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Fix an issue where the largest numbers (instead of nicest) are preserved during downsampling
+- Print some debug information when the client starts
 
 ## Nice v3.2.10
 

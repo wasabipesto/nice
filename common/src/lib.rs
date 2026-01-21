@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::env;
+use std::fmt::Display;
 use std::ops::Add;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -45,6 +46,14 @@ pub enum SearchMode {
     /// Implements optimizations to speed up the search, usually by a factor of around 20.
     /// Does not keep statistics and cannot be quickly verified.
     Niceonly,
+}
+impl Display for SearchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SearchMode::Detailed => write!(f, "Detailed"),
+            SearchMode::Niceonly => write!(f, "Nice-only"),
+        }
+    }
 }
 
 /// How we should pick a field when claiming.
