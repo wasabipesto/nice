@@ -32,8 +32,8 @@ pub fn downsample_numbers(submissions: &[SubmissionRecord]) -> Vec<NiceNumber> {
         acc
     });
 
-    // sort and take the top few
-    all_numbers.sort_by(|a, b| b.number.cmp(&a.number));
+    // sort by number of uniques and take the top few
+    all_numbers.sort_by(|a, b| b.num_uniques.cmp(&a.num_uniques));
     all_numbers
         .iter()
         .take(SAVE_TOP_N_NUMBERS)
