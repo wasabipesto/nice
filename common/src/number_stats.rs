@@ -195,10 +195,10 @@ mod tests {
         // Should collect all numbers from both submissions
         assert_eq!(result.len(), 4);
 
-        // Numbers should be sorted by number value in descending order
-        assert!(result[0].number >= result[1].number);
-        assert!(result[1].number >= result[2].number);
-        assert!(result[2].number >= result[3].number);
+        // Numbers should be sorted by number value by descending num_uniques
+        assert!(result[0].num_uniques >= result[1].num_uniques);
+        assert!(result[1].num_uniques >= result[2].num_uniques);
+        assert!(result[2].num_uniques >= result[3].num_uniques);
 
         // Check that all numbers are present
         let numbers: Vec<u128> = result.iter().map(|n| n.number).collect();
@@ -221,6 +221,15 @@ mod tests {
             });
         }
 
+        // Add one more that's nicer than the rest
+        let nicest_number = (SAVE_TOP_N_NUMBERS + 101) as u128;
+        large_numbers.push(NiceNumber {
+            number: nicest_number,
+            num_uniques: 9,
+            base: 10,
+            niceness: 0.9,
+        });
+
         let submission = SubmissionRecord {
             submission_id: 1,
             claim_id: 1,
@@ -241,9 +250,8 @@ mod tests {
         // Should only keep SAVE_TOP_N_NUMBERS
         assert_eq!(result.len(), SAVE_TOP_N_NUMBERS);
 
-        // Should be the highest numbers (sorted descending)
-        assert_eq!(result[0].number, (SAVE_TOP_N_NUMBERS + 100) as u128);
-        assert_eq!(result[SAVE_TOP_N_NUMBERS - 1].number, 101);
+        // Nicest saved number is first (sorted descending by num_uniques)
+        assert_eq!(result[0].number, nicest_number);
     }
 
     #[test]
