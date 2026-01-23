@@ -125,13 +125,26 @@ print("For a Gaussian distribution:")
 z_score = (1.0 - base["niceness_mean"]) / base["niceness_stdev"]
 prob_greater = stats.norm.sf(z_score)
 print(f"Probability of a number being 100% nice (Z={z_score:.4f}): {prob_greater:.4e}")
+nums_searched = base["checked_niceonly"]
+expected_found = nums_searched * prob_greater
 nice_nums_found = [d for d in distribution if d["num_uniques"] == base_num][0]["count"]
-print(f"  Numbers searched: {base["checked_niceonly"]:.2e}, Nice numbers found: {nice_nums_found}")
+print(f"  Numbers searched: {nums_searched:.2e}, Expected found: {expected_found:.2f}, Actual nice numbers found: {nice_nums_found}")
 
 # Calculate the z-score for an off-by-one
 off_by_one_niceness = (base_num - 1) / base_num
 z_score = (off_by_one_niceness - base["niceness_mean"]) / base["niceness_stdev"]
 prob_greater = stats.norm.sf(z_score) - prob_greater
 print(f"Probability of an off-by-one ({100*off_by_one_niceness:.1f}% nice) (Z={z_score:.4f}): {prob_greater:.4e}")
+nums_searched = base["checked_detailed"]
+expected_found = nums_searched * prob_greater
 off_by_ones_found = [d for d in distribution if d["num_uniques"] == base_num - 1][0]["count"]
-print(f"  Numbers searched: {base["checked_detailed"]:.2e}, Off-by-ones found: {off_by_ones_found}\n")
+print(f"  Numbers searched: {nums_searched:.2e}, Expected found: {expected_found:.2f}, Actual off-by-ones found: {off_by_ones_found}")
+
+# Calculate the z-score for an off-by-two
+off_by_two_niceness = (base_num - 2) / base_num
+z_score = (off_by_two_niceness - base["niceness_mean"]) / base["niceness_stdev"]
+prob_greater = stats.norm.sf(z_score) - prob_greater
+print(f"Probability of an off-by-two ({100*off_by_two_niceness:.1f}% nice) (Z={z_score:.4f}): {prob_greater:.4e}")
+expected_found = nums_searched * prob_greater
+off_by_twos_found = [d for d in distribution if d["num_uniques"] == base_num - 2][0]["count"]
+print(f"  Numbers searched: {nums_searched:.2e}, Expected found: {expected_found:.2f}, Actual off-by-twos found: {off_by_twos_found}\n")
