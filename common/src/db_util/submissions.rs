@@ -87,8 +87,8 @@ fn public_to_private(p: SubmissionRecord) -> Result<SubmissionPrivate, String> {
 }
 
 fn build_new_row(
-    claim_record: ClaimRecord,
-    submit_data: DataToServer,
+    claim_record: &ClaimRecord,
+    submit_data: &DataToServer,
     user_ip: String,
     distribution: Option<Vec<UniquesDistribution>>,
     numbers: Vec<NiceNumber>,
@@ -99,9 +99,9 @@ fn build_new_row(
         field_id: u128_to_i32(claim_record.field_id)?,
         search_mode: serialize_searchmode(claim_record.search_mode),
         elapsed_secs: (Utc::now() - claim_record.claim_time).num_milliseconds() as f32 / 1000f32,
-        username: submit_data.username,
+        username: submit_data.username.clone(),
         user_ip,
-        client_version: submit_data.client_version,
+        client_version: submit_data.client_version.clone(),
         distribution: serialize_opt_distribution(distribution)?,
         numbers: serialize_numbers(numbers)?,
     })
@@ -109,8 +109,8 @@ fn build_new_row(
 
 pub fn insert_submission(
     conn: &mut PgConnection,
-    claim_record: ClaimRecord,
-    submit_data: DataToServer,
+    claim_record: &ClaimRecord,
+    submit_data: &DataToServer,
     input_user_ip: String,
     input_distribution: Option<Vec<UniquesDistribution>>,
     input_numbers: Vec<NiceNumber>,

@@ -204,8 +204,8 @@ pub fn get_claim_by_id(conn: &mut PgConnection, claim_id: u128) -> Result<ClaimR
 /// This is assumed to pass some basic validation but it is not considered canon until the consensus is reached.
 pub fn insert_submission(
     conn: &mut PgConnection,
-    claim_record: ClaimRecord,
-    submit_data: DataToServer,
+    claim_record: &ClaimRecord,
+    submit_data: &DataToServer,
     user_ip: String,
     distribution: Option<Vec<UniquesDistribution>>,
     numbers: Vec<NiceNumber>,

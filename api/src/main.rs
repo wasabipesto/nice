@@ -194,8 +194,8 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
             // No checks for nice-only, honor system
             insert_submission(
                 &mut conn,
-                claim_record.clone(),
-                submit_data,
+                &claim_record,
+                &submit_data,
                 user_ip,
                 None,
                 numbers_expanded,
@@ -276,8 +276,8 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
                     // All looks good, save it!
                     insert_submission(
                         &mut conn,
-                        claim_record.clone(),
-                        submit_data,
+                        &claim_record,
+                        &submit_data,
                         user_ip,
                         Some(distribution_expanded),
                         numbers_expanded,
@@ -312,6 +312,7 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
         search_mode = ?claim_record.search_mode,
         field_id = claim_record.field_id,
         claim_id = claim_record.claim_id,
+        username = submit_data.username,
         "New Submission"
     );
     Ok(Json(json!("OK")))
