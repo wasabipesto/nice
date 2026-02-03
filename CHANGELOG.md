@@ -2,8 +2,9 @@
 
 ## Unreleased
 
+- Implement some coarse but massive optimizations to nice-only processing based on patterns in the most significant digits of each range
 - Fix an issue where the largest numbers (instead of nicest) are preserved during downsampling
-- Print some debug information when the client starts
+- Start using proper rust logging systems such as env_logger and test-log
 
 ## Nice v3.2.10
 
