@@ -126,3 +126,8 @@ wasm-build:
 
 # Build WASM app and start dev server
 wasm-dev: wasm-build dev
+
+# Profile using samply, requires `cargo install samply`
+profile *args:
+    cargo build --profile profiling --bin nice_client
+    samply record cargo run --profile profiling --bin nice_client -- --benchmark large {{ args }}
