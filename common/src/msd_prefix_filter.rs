@@ -92,10 +92,27 @@ fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
 /// This function checks if all squares and cubes in the range share a common most significant
 /// digit prefix that contains duplicates or overlaps, which would make all numbers in the
 /// range invalid.
-pub fn has_duplicate_msd_prefix(range_start: u128, range_end: u128, base: u32) -> bool {
+///
+/// Note that this is half-open, meaning that the range is inclusive of the start value and
+/// exclusive of the end value. This follows the Rust convention for ranges.
+pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u32) -> bool {
+    // Check for edge cases
+    assert!(
+        range_start <= arg_range_end,
+        "Range has invalid bounds, range_start must be <= range_end"
+    );
+    assert!(base <= 256, "Base must be 256 or less");
+
+    // Can't check for duplicate values when there is only one element
+    let true_range_end = arg_range_end - 1;
+    if range_start == true_range_end {
+        debug!("Range has only a single value, no duplicates are possible.");
+        return false;
+    }
+
     // Convert range boundaries to digit representations and find common prefixes of most significant digits
     let range_start_square = Natural::from(range_start).pow(2).to_digits_asc(&base);
-    let range_end_square = Natural::from(range_end - 1).pow(2).to_digits_asc(&base);
+    let range_end_square = Natural::from(true_range_end).pow(2).to_digits_asc(&base);
 
     // If the number of digits changes, it's harder to evaluate the prefix
     // For now we reject these to avoid false positives
@@ -115,7 +132,7 @@ pub fn has_duplicate_msd_prefix(range_start: u128, range_end: u128, base: u32) -
 
     // Check the same thing for the cubes
     let range_start_cube = Natural::from(range_start).pow(3).to_digits_asc(&base);
-    let range_end_cube = Natural::from(range_end - 1).pow(3).to_digits_asc(&base);
+    let range_end_cube = Natural::from(true_range_end).pow(3).to_digits_asc(&base);
 
     // If the number of digits changes, it's harder to evaluate the prefix
     // For now we reject these to avoid false positives
@@ -247,18 +264,42 @@ mod tests {
     #[test_log::test]
     fn test_early_exit_demonstration() {
         // This test demonstrates the early exit optimization
-        // Range: 3163-3164, base 10
+        // Range: 3163-3165, base 10 (i.e., [3163, 3165) which includes 3163 and 3164)
         // 3163² = 10,004,569 → to_digits_asc: [9,6,5,4,0,0,0,1]
         // 3164² = 10,010,896 → to_digits_asc: [6,9,8,0,1,0,0,1]
         // Common MSD prefix: [1,0,0] which has duplicate 0s
 
         let range_start = 3163; // 3163² = 10,004,569
-        let range_end = 3164; // 3164² = 10,010,896
+        let range_end = 3165; // So range is [3163, 3165), last number is 3164: 3164² = 10,010,896
         let base = 10;
         let can_skip = has_duplicate_msd_prefix(range_start, range_end, base);
 
         // Should return true because squares share MSD prefix [1,0,0] with duplicate 0s
         assert!(can_skip);
+    }
+
+    #[test_log::test]
+    fn test_single_element_range() {
+        // This test demonstrates the bug: when range_end = range_start + 1,
+        // the range contains only one element [range_start, range_start+1)
+        // This means the "common prefix" is the entire number, not a real prefix.
+
+        let range_start = 3163;
+        let range_end = 3164; // Range is [3163, 3164), which contains only 3163
+        let base = 10;
+
+        let can_skip = has_duplicate_msd_prefix(range_start, range_end, base);
+        assert!(!can_skip);
+    }
+
+    #[test_log::test]
+    #[should_panic]
+    fn test_invalid_bounds() {
+        let range_start = 3163;
+        let range_end = 3163;
+        let base = 10;
+
+        let _can_skip = has_duplicate_msd_prefix(range_start, range_end, base);
     }
 
     #[test_log::test]
