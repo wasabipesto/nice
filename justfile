@@ -69,7 +69,7 @@ test:
     cargo build -p "*"
     cargo build -p "*" -r
     just wasm-build
-    cargo test -p "*" --no-fail-fast
+    RUST_LOG="debug" cargo test -p "*" --no-fail-fast
     just benchmark default
     just client
 
