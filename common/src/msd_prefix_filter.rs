@@ -1,71 +1,29 @@
-//! An experimental version of the client nice-only process.
-//! Compare to `crate::client_process::process_niceonly` as the reference
-//! implementation.
-//!
-//! # Optimization Strategy
+//! A filter module for detecting ranges that can be skipped based on most significant digits (MSD).
 //!
 //! The main source of processing time for the reference client is converting
 //! each square and cube to the base representation and checking for unique digits.
 //!
-//! This experiment implements a **common MSD prefix pre-check optimization**:
-//! Before processing the entire range, we check if all numbers in the range
+//! This module implements a common MSD prefix pre-check filter:
+//! Before processing an entire range, we check if all numbers in the range
 //! can be eliminated based on their most significant digits (MSD).
 //!
 //! ## How It Works
 //!
-//! 1. Convert `range_start²`, `range_end²`, `range_start³`, and `range_end³` to base digits
-//!    - **IMPORTANT**: `to_digits_asc` returns digits in ascending order (LSD first, MSD last)
+//! 1. Convert `range_start²`, `range_end²`, `range_start³`, and `range_end³` to base digits.
+//!    - IMPORTANT: `to_digits_asc` returns digits in ascending order (LSD first, MSD last)
 //!    - For 10,004,569 in base 10: returns [9,6,5,4,0,0,0,1] not [1,0,0,0,4,5,6,9]
 //!    - We work backwards from the end of vectors to examine most significant digits
-//! 2. Find the longest common MSD prefix shared by all squares in the range
-//! 3. Find the longest common MSD prefix shared by all cubes in the range
+//! 2. Find the longest common MSD prefix shared by all squares in the range.
+//! 3. Find the longest common MSD prefix shared by all cubes in the range.
 //! 4. Check three early-exit conditions:
 //!    - If the square MSD prefix contains duplicate digits → all numbers invalid
 //!    - If the cube MSD prefix contains duplicate digits → all numbers invalid
 //!    - If square and cube MSD prefixes share any digits → all numbers invalid
-//! 5. If any condition triggers, return empty results immediately
-//! 6. Otherwise, fall back to the reference implementation
-//!
-//! ## Example
-//!
-//! For range 3163-3164 in base 10:
-//! - 3163² = 10,004,569
-//!   - `to_digits_asc(&10)` returns [9,6,5,4,0,0,0,1] (LSD at index 0, MSD at index 7)
-//!   - Most significant digits (reading from end): 1, 0, 0, ...
-//! - 3164² = 10,010,896
-//!   - `to_digits_asc(&10)` returns [6,9,8,0,1,0,0,1] (LSD at index 0, MSD at index 7)
-//!   - Most significant digits (reading from end): 1, 0, 0, ...
-//! - Common MSD prefix: [1,0,0] which contains duplicate 0s
-//! - **Early exit**: All squares in this range have duplicate 0s in their MSD
-//!
-//! ## Performance Characteristics
-//!
-//! - **Best case**: O(log n) when early exit triggers (just 4 conversions + prefix check)
-//! - **Worst case**: O(n) when no early exit (falls back to reference implementation)
-//! - **Overhead**: Minimal - just 4 extra `Natural::pow()` and digit conversions
-//! - **Win rate**: Depends on the distribution of ranges; higher bases and larger
-//!   ranges are more likely to have common MSD prefix patterns
-//!
-//! ## When This Helps
-//!
-//! This optimization is most effective when:
-//! - The range is relatively small compared to the magnitude of numbers
-//! - Numbers in the range share many most significant digits
-//! - The shared digits contain duplicates or overlaps between squares and cubes
-//!
-//! ## Limitations
-//!
-//! - Only checks the common MSD prefix; can't detect patterns in middle/trailing digits
-//! - Requires computing 4 extra exponentiations (though these are cheap for endpoints)
-//! - Empty prefixes (no common MSD) provide no benefit
-//!
-//! ## Key Implementation Detail
-//!
-//! Because `to_digits_asc` returns [LSD, ..., MSD], we must work from the END of the
-//! digit vectors backwards to find common most significant digits. The helper function
-//! `find_common_msd_prefix` handles this by comparing digits from the end of both vectors.
+//! 5. If any condition triggers, return `true` (range can be skipped).
+//! 6. Otherwise, return `false` (range must be processed normally).
 
 use super::*;
+use log::debug;
 
 /// Find the longest common prefix of the most significant digits.
 ///
@@ -74,8 +32,6 @@ use super::*;
 ///
 /// For example, if `to_digits_asc(&10)` returns [9,6,5,4,0,0,0,1] for 10,004,569,
 /// the most significant digits are at the end: [1,0,0,0,...].
-///
-/// Returns the common prefix in MSD-first order [MSD, ..., LSD].
 fn find_common_msd_prefix(digits1: &[u32], digits2: &[u32]) -> Vec<u32> {
     let len1 = digits1.len();
     let len2 = digits2.len();
@@ -93,13 +49,13 @@ fn find_common_msd_prefix(digits1: &[u32], digits2: &[u32]) -> Vec<u32> {
         }
     }
 
-    // Already in MSD-first order (we pushed from end backwards)
     common_prefix
 }
 
 /// Check if a sequence of digits contains any duplicates.
+/// Support bases up to 256.
 fn has_duplicate_digits(digits: &[u32]) -> bool {
-    let mut seen = vec![false; 256]; // Support bases up to 256
+    let mut seen = vec![false; 256];
     for &digit in digits {
         if digit < 256 {
             if seen[digit as usize] {
@@ -112,6 +68,7 @@ fn has_duplicate_digits(digits: &[u32]) -> bool {
 }
 
 /// Check if two digit sequences share any common digits.
+/// Support bases up to 256.
 fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
     let mut seen = vec![false; 256];
     for &digit in digits1 {
@@ -127,73 +84,68 @@ fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
     false
 }
 
-/// Process a field by looking for completely nice numbers.
-/// Implements a quick pre-check optimization before falling back to the reference implementation.
-pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> FieldResults {
-    // Convert range boundaries to digit representations
+/// Check if a range can be skipped based on duplicate or overlapping digits in the MSD prefix.
+///
+/// Returns `true` if the range can be skipped entirely (all numbers will fail the nice check),
+/// `false` if the range needs to be processed normally.
+///
+/// This function checks if all squares and cubes in the range share a common most significant
+/// digit prefix that contains duplicates or overlaps, which would make all numbers in the
+/// range invalid.
+pub fn has_duplicate_msd_prefix(range_start: u128, range_end: u128, base: u32) -> bool {
+    // Convert range boundaries to digit representations and find common prefixes of most significant digits
     let range_start_square = Natural::from(range_start).pow(2).to_digits_asc(&base);
-    let range_start_cube = Natural::from(range_start).pow(3).to_digits_asc(&base);
     let range_end_square = Natural::from(range_end).pow(2).to_digits_asc(&base);
-    let range_end_cube = Natural::from(range_end).pow(3).to_digits_asc(&base);
-
-    // Quick pre-check: Find common prefixes of most significant digits
     let square_prefix = find_common_msd_prefix(&range_start_square, &range_end_square);
-    let cube_prefix = find_common_msd_prefix(&range_start_cube, &range_end_cube);
 
     // If the common prefix has duplicate digits, all numbers in range are invalid
     if has_duplicate_digits(&square_prefix) {
-        /*
-        println!(
-            "Early exit: All squares share prefix {:?} with duplicates",
-            square_prefix
-        );
-        */
-        return FieldResults {
-            distribution: Vec::new(),
-            nice_numbers: Vec::new(),
-        };
+        debug!("Square prefix has duplicate digits: {square_prefix:?}");
+        return true;
     }
 
+    // Check the same thing for the cubes
+    let range_start_cube = Natural::from(range_start).pow(3).to_digits_asc(&base);
+    let range_end_cube = Natural::from(range_end).pow(3).to_digits_asc(&base);
+    let cube_prefix = find_common_msd_prefix(&range_start_cube, &range_end_cube);
+
     if has_duplicate_digits(&cube_prefix) {
-        /*
-        println!(
-            "Early exit: All cubes share prefix {:?} with duplicates",
-            cube_prefix
-        );
-        */
-        return FieldResults {
-            distribution: Vec::new(),
-            nice_numbers: Vec::new(),
-        };
+        debug!("Cube prefix has duplicate digits: {cube_prefix:?}");
+        return true;
     }
 
     // If the square and cube prefixes overlap, all numbers in range are invalid
     if has_overlapping_digits(&square_prefix, &cube_prefix) {
-        /*
-        println!(
-            "Early exit: Square prefix {:?} and cube prefix {:?} overlap",
-            square_prefix, cube_prefix
+        debug!(
+            "Square and cube prefixes have overlapping digits: {square_prefix:?}, {cube_prefix:?}"
         );
-        */
-        return FieldResults {
-            distribution: Vec::new(),
-            nice_numbers: Vec::new(),
-        };
+        return true;
     }
 
-    // No early exit possible, fall back to the reference implementation
-    println!(
-        "No early exit: square prefix {:?}, cube prefix {:?}",
-        square_prefix, cube_prefix
-    );
-    crate::client_process::process_range_niceonly(range_start, range_end, base)
+    // No early exit possible
+    debug!("No early exit possible. Prefixes: {square_prefix:?}, {cube_prefix:?}");
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
+    /// Break up the range into chunks, returning the start and end of each.
+    fn chunked_ranges(range_start: u128, range_end: u128, chunk_size: u128) -> Vec<(u128, u128)> {
+        let mut chunks = Vec::new();
+        let mut start = range_start;
+
+        while start < range_end {
+            let end = (start + chunk_size).min(range_end);
+            chunks.push((start, end));
+            start = end;
+        }
+
+        chunks
+    }
+
+    #[test_log::test]
     fn test_find_common_msd_prefix() {
         // Simulate to_digits_asc format: [LSD, ..., MSD]
         // 12345 in base 10 = [5, 4, 3, 2, 1]
@@ -234,7 +186,7 @@ mod tests {
         assert_eq!(find_common_msd_prefix(&digits1, &digits2), vec![1, 0]);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_has_duplicate_digits() {
         assert!(!has_duplicate_digits(&[1, 2, 3, 4]));
         assert!(has_duplicate_digits(&[1, 2, 1, 4]));
@@ -244,7 +196,7 @@ mod tests {
         assert!(has_duplicate_digits(&[7, 7, 1, 2, 3]));
     }
 
-    #[test]
+    #[test_log::test]
     fn test_has_overlapping_digits() {
         assert!(!has_overlapping_digits(&[1, 2, 3], &[4, 5, 6]));
         assert!(has_overlapping_digits(&[1, 2, 3], &[3, 4, 5]));
@@ -254,7 +206,7 @@ mod tests {
         assert!(has_overlapping_digits(&[7], &[7]));
     }
 
-    #[test]
+    #[test_log::test]
     fn test_digit_order_verification() {
         // Verify that to_digits_asc returns LSD first
         let num = Natural::from(10004569u32);
@@ -273,7 +225,7 @@ mod tests {
         assert!(has_duplicate_digits(&msd_prefix));
     }
 
-    #[test]
+    #[test_log::test]
     fn test_early_exit_demonstration() {
         // This test demonstrates the early exit optimization
         // Range: 3163-3164, base 10
@@ -284,69 +236,47 @@ mod tests {
         let range_start = 3163; // 3163² = 10,004,569
         let range_end = 3164; // 3164² = 10,010,896
         let base = 10;
-        let result = process_range_niceonly(range_start, range_end, base);
+        let can_skip = has_duplicate_msd_prefix(range_start, range_end, base);
 
-        // Should return empty because squares share MSD prefix [1,0,0] with duplicate 0s
-        assert_eq!(result.nice_numbers, Vec::new());
+        // Should return true because squares share MSD prefix [1,0,0] with duplicate 0s
+        assert!(can_skip);
     }
 
-    #[test]
-    fn process_niceonly_b10() {
-        let input = DataToClient {
-            claim_id: 0,
-            base: 10,
-            range_start: 47,
-            range_end: 100,
-            range_size: 53,
-        };
-        let result = FieldResults {
-            distribution: Vec::new(),
-            nice_numbers: Vec::from([NiceNumberSimple {
-                number: 69,
-                num_uniques: 10,
-            }]),
-        };
-        assert_eq!(
-            process_range_niceonly(input.range_start, input.range_end, input.base),
-            result
-        );
+    #[test_log::test]
+    fn test_early_exit_b10() {
+        let base = 10;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let can_skip = has_duplicate_msd_prefix(base_range.range_start, base_range.range_end, base);
+        assert!(!can_skip);
     }
 
-    #[test]
-    fn process_niceonly_b40() {
-        let input = DataToClient {
-            claim_id: 0,
-            base: 40,
-            range_start: 916284264916,
-            range_end: 916284264916 + 10000,
-            range_size: 10000,
-        };
-        let result = FieldResults {
-            distribution: Vec::new(),
-            nice_numbers: Vec::new(),
-        };
-        assert_eq!(
-            process_range_niceonly(input.range_start, input.range_end, input.base),
-            result
-        );
+    #[test_log::test]
+    fn test_early_exit_b40_all() {
+        let base = 40;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let can_skip = has_duplicate_msd_prefix(base_range.range_start, base_range.range_end, base);
+        assert!(!can_skip);
     }
 
-    #[test]
-    fn process_niceonly_b80() {
-        let input = DataToClient {
-            claim_id: 0,
-            base: 80,
-            range_start: 653245554420798943087177909799,
-            range_end: 653245554420798943087177909799 + 10000,
-            range_size: 10000,
-        };
-        let result = FieldResults {
-            distribution: Vec::new(),
-            nice_numbers: Vec::new(),
-        };
-        assert_eq!(
-            process_range_niceonly(input.range_start, input.range_end, input.base),
-            result
-        );
+    #[test_log::test]
+    fn test_early_exit_b50_all() {
+        let base = 50;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let can_skip = has_duplicate_msd_prefix(base_range.range_start, base_range.range_end, base);
+        assert!(!can_skip);
+    }
+
+    #[test_log::test]
+    fn test_early_exit_b50_segments() {
+        let base = 50;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let chunk_size = base_range.range_size / 100;
+        let segments = chunked_ranges(base_range.range_start, base_range.range_end, chunk_size);
+
+        for segment in segments {
+            debug!("Testing base {base} segment: ({segment:?})");
+            let can_skip = has_duplicate_msd_prefix(segment.0, segment.1, base);
+            assert!(!can_skip);
+        }
     }
 }

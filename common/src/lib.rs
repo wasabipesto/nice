@@ -7,7 +7,6 @@ pub mod benchmark;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
 pub mod client_api;
 pub mod client_process;
-pub mod client_process_experimental;
 pub mod client_process_gpu;
 pub mod consensus;
 #[cfg(feature = "database")]
@@ -15,6 +14,7 @@ pub mod db_util;
 pub mod distribution_stats;
 pub mod generate_chunks;
 pub mod generate_fields;
+pub mod msd_prefix_filter;
 pub mod number_stats;
 pub mod residue_filter;
 

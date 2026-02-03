@@ -174,6 +174,20 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
     let base_u128_minusone = base as u128 - 1;
     let range_start = claim_data.range_start;
     let range_end = claim_data.range_end;
+
+    // Check if the base has duplicate MSD prefixes
+    if msd_prefix_filter::has_duplicate_msd_prefix(range_start, range_end, base) {
+        // If so, return early
+        return DataToServer {
+            claim_id: claim_data.claim_id,
+            username: username.to_owned(),
+            client_version: CLIENT_VERSION.to_string(),
+            unique_distribution: None,
+            nice_numbers: Vec::new(),
+        };
+    }
+
+    // Get residue filters to reduce search range
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
 
     let nice_list = (range_start..range_end)
@@ -197,7 +211,19 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
 pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> FieldResults {
+    // Check if the base has duplicate MSD prefixes
+    if msd_prefix_filter::has_duplicate_msd_prefix(range_start, range_end, base) {
+        // If so, return early
+        return FieldResults {
+            distribution: Vec::new(),
+            nice_numbers: Vec::new(),
+        };
+    }
+
+    // Precompute this for residue filter checking
     let base_u128_minusone = base as u128 - 1;
+
+    // Get residue filters to reduce search range
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
 
     let nice_list = (range_start..range_end)
