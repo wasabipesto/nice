@@ -57,6 +57,7 @@ fn find_common_msd_prefix(digits1: &[u32], digits2: &[u32]) -> Vec<u32> {
 fn has_duplicate_digits(digits: &[u32]) -> bool {
     let mut seen = vec![false; 256];
     for &digit in digits {
+        debug_assert!(digit < 256, "Digit {} exceeds base limit", digit);
         if digit < 256 {
             if seen[digit as usize] {
                 return true;
@@ -72,11 +73,13 @@ fn has_duplicate_digits(digits: &[u32]) -> bool {
 fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
     let mut seen = vec![false; 256];
     for &digit in digits1 {
+        debug_assert!(digit < 256, "Digit {} exceeds base limit", digit);
         if digit < 256 {
             seen[digit as usize] = true;
         }
     }
     for &digit in digits2 {
+        debug_assert!(digit < 256, "Digit {} exceeds base limit", digit);
         if digit < 256 && seen[digit as usize] {
             return true;
         }
@@ -98,15 +101,15 @@ fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
 pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u32) -> bool {
     // Check for edge cases
     assert!(
-        range_start <= arg_range_end,
-        "Range has invalid bounds, range_start must be <= range_end"
+        range_start < arg_range_end,
+        "Range has invalid bounds, range_start must be < range_end (half-open interval)"
     );
     assert!(base <= 256, "Base must be 256 or less");
 
     // Can't check for duplicate values when there is only one element
     let true_range_end = arg_range_end - 1;
     if range_start == true_range_end {
-        debug!("Range has only a single value, no duplicates are possible.");
+        debug!("Range has only a single value, cannot use prefix optimization.");
         return false;
     }
 
