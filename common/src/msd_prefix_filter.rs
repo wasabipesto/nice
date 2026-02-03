@@ -95,10 +95,19 @@ fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
 pub fn has_duplicate_msd_prefix(range_start: u128, range_end: u128, base: u32) -> bool {
     // Convert range boundaries to digit representations and find common prefixes of most significant digits
     let range_start_square = Natural::from(range_start).pow(2).to_digits_asc(&base);
-    let range_end_square = Natural::from(range_end).pow(2).to_digits_asc(&base);
-    let square_prefix = find_common_msd_prefix(&range_start_square, &range_end_square);
+    let range_end_square = Natural::from(range_end - 1).pow(2).to_digits_asc(&base);
+
+    // If the number of digits changes, it's harder to evaluate the prefix
+    // For now we reject these to avoid false positives
+    if range_start_square.len() != range_end_square.len() {
+        debug!(
+            "Range start and end squares have a different number of digits, erring on the side of caution."
+        );
+        return false;
+    }
 
     // If the common prefix has duplicate digits, all numbers in range are invalid
+    let square_prefix = find_common_msd_prefix(&range_start_square, &range_end_square);
     if has_duplicate_digits(&square_prefix) {
         debug!("Square prefix has duplicate digits: {square_prefix:?}");
         return true;
@@ -106,9 +115,19 @@ pub fn has_duplicate_msd_prefix(range_start: u128, range_end: u128, base: u32) -
 
     // Check the same thing for the cubes
     let range_start_cube = Natural::from(range_start).pow(3).to_digits_asc(&base);
-    let range_end_cube = Natural::from(range_end).pow(3).to_digits_asc(&base);
-    let cube_prefix = find_common_msd_prefix(&range_start_cube, &range_end_cube);
+    let range_end_cube = Natural::from(range_end - 1).pow(3).to_digits_asc(&base);
 
+    // If the number of digits changes, it's harder to evaluate the prefix
+    // For now we reject these to avoid false positives
+    if range_start_cube.len() != range_end_cube.len() {
+        debug!(
+            "Range start and end cubes have a different number of digits, erring on the side of caution."
+        );
+        return false;
+    }
+
+    // If the common prefix has duplicate digits, all numbers in range are invalid
+    let cube_prefix = find_common_msd_prefix(&range_start_cube, &range_end_cube);
     if has_duplicate_digits(&cube_prefix) {
         debug!("Cube prefix has duplicate digits: {cube_prefix:?}");
         return true;
@@ -251,7 +270,7 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_early_exit_b40_all() {
+    fn test_early_exit_b40_whole() {
         let base = 40;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
         let can_skip = has_duplicate_msd_prefix(base_range.range_start, base_range.range_end, base);
@@ -259,7 +278,7 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_early_exit_b50_all() {
+    fn test_early_exit_b50_whole() {
         let base = 50;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
         let can_skip = has_duplicate_msd_prefix(base_range.range_start, base_range.range_end, base);
@@ -267,16 +286,56 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_early_exit_b50_segments() {
+    fn test_early_exit_b50_segments_large() {
         let base = 50;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
         let chunk_size = base_range.range_size / 100;
         let segments = chunked_ranges(base_range.range_start, base_range.range_end, chunk_size);
 
-        for segment in segments {
-            debug!("Testing base {base} segment: ({segment:?})");
+        let expected_results = vec![
+            (0, false),
+            (10, false),
+            (30, false),
+            (40, false),
+            (50, false),
+            (60, false),
+            (70, false),
+            (80, false),
+            (90, false),
+            (100, true),
+        ];
+        for (segment_num, expected_result) in expected_results {
+            let segment = segments[segment_num];
+            debug!("Testing base {base} segment #{segment_num}: ({segment:?})");
             let can_skip = has_duplicate_msd_prefix(segment.0, segment.1, base);
-            assert!(!can_skip);
+            assert_eq!(can_skip, expected_result);
+        }
+    }
+
+    #[test_log::test]
+    fn test_early_exit_b50_segments_small() {
+        let base = 50;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let chunk_size = base_range.range_size / 10_000;
+        let segments = chunked_ranges(base_range.range_start, base_range.range_end, chunk_size);
+
+        let expected_results = vec![
+            (0, false),
+            (10, false),
+            (30, true),
+            (40, true),
+            (50, false),
+            (60, false),
+            (70, false),
+            (80, true),
+            (90, true),
+            (100, false),
+        ];
+        for (segment_num, expected_result) in expected_results {
+            let segment = segments[segment_num];
+            debug!("Testing base {base} segment #{segment_num}: ({segment:?})");
+            let can_skip = has_duplicate_msd_prefix(segment.0, segment.1, base);
+            assert_eq!(can_skip, expected_result);
         }
     }
 }
