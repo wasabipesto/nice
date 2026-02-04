@@ -8,10 +8,9 @@
 
 use clap::Parser;
 use log::{debug, info, trace, warn};
-use malachite::base::num::arithmetic::traits::Pow;
+use malachite::base::num::arithmetic::traits::{DivRem, Pow};
 use malachite::natural::Natural;
 use rayon::prelude::*;
-use std::ops::Div;
 use std::sync::Arc;
 
 use nice_common::FieldSize;
@@ -31,6 +30,51 @@ pub struct Cli {
 /// A bitmask to track which digits (0 through base-1) have been used.
 /// Each bit position represents whether a particular digit has appeared.
 type DigitMask = u128;
+
+/// Statistics tracking for search tree exploration.
+#[derive(Debug, Default, Clone)]
+struct SearchStats {
+    /// Total nodes explored in the search tree
+    nodes_explored: u64,
+
+    /// Nodes pruned due to collision detection
+    nodes_pruned: u64,
+
+    /// Candidates tested with get_is_nice()
+    candidates_tested: u64,
+
+    /// Candidates skipped due to range filtering
+    candidates_skipped_range: u64,
+
+    /// Candidates skipped due to leading zeros
+    candidates_skipped_leading_zeros: u64,
+}
+
+impl SearchStats {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn log_summary(&self, worker_id: u32) {
+        let total_nodes = self.nodes_explored + self.nodes_pruned;
+        let prune_rate = if total_nodes > 0 {
+            (self.nodes_pruned as f64 / total_nodes as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        debug!(
+            "Worker {} stats: explored={}, pruned={} ({:.1}%), tested={}, skipped_range={}, skipped_zeros={}",
+            worker_id,
+            self.nodes_explored,
+            self.nodes_pruned,
+            prune_rate,
+            self.candidates_tested,
+            self.candidates_skipped_range,
+            self.candidates_skipped_leading_zeros
+        );
+    }
+}
 
 /// Configuration and state for searching nice numbers in a specific base.
 struct NiceNumberSearcher {
@@ -106,29 +150,77 @@ fn main() {
 
     // Parallelize the search by starting each CPU core with a different least significant digit
     // This distributes the workload evenly across available cores
-    let all_candidates: Vec<u128> = (0..base)
+    let results: Vec<(Vec<u128>, SearchStats)> = (0..base)
         .into_par_iter()
-        .flat_map(|least_significant_digit| {
-            trace!("Worker starting with LSD = {}", least_significant_digit);
+        .map(|least_significant_digit| {
+            debug!("Worker {} starting...", least_significant_digit);
             let mut candidates_found = Vec::new();
+            let mut stats = SearchStats::new();
+
             searcher.search_with_backtracking(
                 0,                               // Start at digit position 0 (least significant)
                 least_significant_digit as u128, // Initial candidate value
                 0,                               // No digits used yet
                 &mut candidates_found,
+                &mut stats,
             );
-            trace!(
-                "Worker with LSD = {} found {} candidates",
+
+            stats.log_summary(least_significant_digit);
+            debug!(
+                "Worker {} complete: found {} nice numbers",
                 least_significant_digit,
                 candidates_found.len()
             );
-            candidates_found
+            (candidates_found, stats)
         })
         .collect();
+
+    // Separate candidates and stats
+    let (all_candidates, all_stats): (Vec<Vec<u128>>, Vec<SearchStats>) =
+        results.into_iter().unzip();
+    let all_candidates: Vec<u128> = all_candidates.into_iter().flatten().collect();
+
+    // Aggregate statistics
+    let total_stats = all_stats.iter().fold(SearchStats::new(), |mut acc, stats| {
+        acc.nodes_explored += stats.nodes_explored;
+        acc.nodes_pruned += stats.nodes_pruned;
+        acc.candidates_tested += stats.candidates_tested;
+        acc.candidates_skipped_range += stats.candidates_skipped_range;
+        acc.candidates_skipped_leading_zeros += stats.candidates_skipped_leading_zeros;
+        acc
+    });
 
     info!(
         "Parallel search complete. Found {} total candidates (may include duplicates)",
         all_candidates.len()
+    );
+
+    // Log aggregate statistics
+    let total_nodes = total_stats.nodes_explored + total_stats.nodes_pruned;
+    let prune_rate = if total_nodes > 0 {
+        (total_stats.nodes_pruned as f64 / total_nodes as f64) * 100.0
+    } else {
+        0.0
+    };
+    info!("=== Search Tree Statistics ===");
+    info!("  Total nodes visited: {}", total_nodes);
+    info!("  Nodes explored: {}", total_stats.nodes_explored);
+    info!(
+        "  Nodes pruned: {} ({:.1}%)",
+        total_stats.nodes_pruned, prune_rate
+    );
+    info!("  Candidates tested: {}", total_stats.candidates_tested);
+    info!(
+        "  Candidates skipped (range): {}",
+        total_stats.candidates_skipped_range
+    );
+    info!(
+        "  Candidates skipped (leading zeros): {}",
+        total_stats.candidates_skipped_leading_zeros
+    );
+    info!(
+        "  Pruning efficiency: {:.1}% of branches eliminated early",
+        prune_rate
     );
 
     // Deduplicate and filter results to the valid range
@@ -183,25 +275,25 @@ impl NiceNumberSearcher {
     /// - `current_candidate`: The number built so far
     /// - `used_digits_mask`: Bitmask tracking which digits have appeared in n² or n³
     /// - `results`: Accumulator for nice numbers found
+    /// - `stats`: Statistics tracker for this search branch
     fn search_with_backtracking(
         &self,
         digit_position: u32,
         current_candidate: u128,
         used_digits_mask: DigitMask,
         results: &mut Vec<u128>,
+        stats: &mut SearchStats,
     ) {
-        // Step 1: Extract the digit at this position from n² and n³
+        stats.nodes_explored += 1;
+        // Step 1: Compute n² and n³ once for this recursion level
+        let n_natural = Natural::from(current_candidate);
+        let n_cubed = (&n_natural).pow(3);
+        let n_squared = n_natural.pow(2);
+
+        // Extract the digit at this position from n² and n³
         // These digits are "locked in" - they won't change as we add higher-order digits
-        let square_digit = self.extract_digit_at_position(
-            current_candidate,
-            digit_position,
-            2, // n²
-        );
-        let cube_digit = self.extract_digit_at_position(
-            current_candidate,
-            digit_position,
-            3, // n³
-        );
+        let square_digit = self.extract_digit_from_power(&n_squared, digit_position);
+        let cube_digit = self.extract_digit_from_power(&n_cubed, digit_position);
 
         trace!(
             "Evaluating node - Position {}: candidate={}, square_digit={}, cube_digit={}",
@@ -210,6 +302,7 @@ impl NiceNumberSearcher {
 
         // Step 2: Early pruning - check for digit collisions
         if self.has_digit_collision(square_digit, cube_digit, used_digits_mask) {
+            stats.nodes_pruned += 1;
             trace!(
                 "✗ Pruned at position {} (collision detected: sq={}, cu={}, mask={:b})",
                 digit_position, square_digit, cube_digit, used_digits_mask
@@ -234,11 +327,13 @@ impl NiceNumberSearcher {
             if actual_digit_count == current_digit_count {
                 // Early range check - skip candidates outside valid range
                 if current_candidate < self.range_start || current_candidate > self.range_end {
+                    stats.candidates_skipped_range += 1;
                     trace!(
                         "Skipping candidate {} (outside range [{}, {}])",
                         current_candidate, self.range_start, self.range_end
                     );
                 } else {
+                    stats.candidates_tested += 1;
                     trace!(
                         "Testing candidate {} (digits={})",
                         current_candidate, current_digit_count
@@ -251,6 +346,7 @@ impl NiceNumberSearcher {
                     }
                 }
             } else {
+                stats.candidates_skipped_leading_zeros += 1;
                 trace!(
                     "Skipping candidate {} (has {} actual digits, but at position {})",
                     current_candidate, actual_digit_count, current_digit_count
@@ -270,28 +366,30 @@ impl NiceNumberSearcher {
                     next_candidate,
                     updated_mask,
                     results,
+                    stats,
                 );
             }
         }
     }
 
-    /// Extracts a specific digit from n^power at the given position.
+    /// Extracts a specific digit from an already-computed power at the given position.
     ///
     /// # Arguments
-    /// - `n`: The base number
+    /// - `n_power`: The precomputed power (n² or n³)
     /// - `position`: Which digit to extract (0 = least significant)
-    /// - `power`: The exponent (2 for n², 3 for n³)
     ///
     /// # Returns
-    /// The digit value at that position in the specified power of n
-    fn extract_digit_at_position(&self, n: u128, position: u32, power: u64) -> u128 {
+    /// The digit value at that position
+    fn extract_digit_from_power(&self, n_power: &Natural, position: u32) -> u128 {
         let base_natural = Natural::from(self.base);
         let divisor = Natural::from(self.base_powers[position as usize]);
-        let n_to_power = Natural::from(n).pow(power);
 
-        // Formula: digit = (n^power / base^position) mod base
-        u128::try_from(&(n_to_power.div(&divisor) % &base_natural))
-            .expect("Digit should fit in u128")
+        // Formula: digit = (n_power / base^position) mod base
+        // Use div_rem to compute both quotient and remainder in one operation
+        let (quotient, _remainder) = n_power.div_rem(&divisor);
+        let digit_natural = quotient % base_natural;
+
+        u128::try_from(&digit_natural).expect("Digit should fit in u128")
     }
 
     /// Constructs a number by adding a digit at a specific position.
