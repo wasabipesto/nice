@@ -70,7 +70,7 @@ pub fn process_range_detailed(range_start: u128, range_end: u128, base: u32) -> 
     let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
 
     // Break up the range into chunks
-    let chunks = (range_start..range_end).chunks(PROCESSING_CHUNK_SIZE);
+    let chunks = (range_start..range_end).chunks(DETAILED_MINI_CHUNK_SIZE);
 
     // Process everything, saving results and aggregating after each chunk finishes
     for chunk in &chunks {
