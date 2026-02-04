@@ -37,7 +37,7 @@ pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 pub const DOWNSAMPLE_CUTOFF_PERCENT: f32 = 0.2;
 pub const CLAIM_DURATION_HOURS: i64 = 1;
 pub const DEFAULT_FIELD_SIZE: u128 = 1_000_000_000;
-pub const PROCESSING_CHUNK_SIZE: usize = 10_000;
+pub const PROCESSING_CHUNK_SIZE: usize = 100_000;
 pub const DETAILED_MINI_CHUNK_SIZE: usize = 10_000;
 pub const SAVE_TOP_N_NUMBERS: usize = 10_000;
 
