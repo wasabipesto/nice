@@ -171,7 +171,8 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
 /// Implements several optimizations over the detailed search.
 pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToServer {
     let base = claim_data.base;
-    let base_u128_minusone = base as u128 - 1;
+    let base_u128 = base as u128;
+    let base_u128_minusone = base_u128 - 1;
     let range_start = claim_data.range_start;
     let range_end = claim_data.range_end;
 
@@ -187,10 +188,14 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
         };
     }
 
+    // Get LSD filter to eliminate invalid least significant digits
+    let lsd_filter = lsd_filter::get_valid_lsds_u128(&base);
+
     // Get residue filters to reduce search range
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
 
     let nice_list = (range_start..range_end)
+        .filter(|num| lsd_filter.contains(&(num % base_u128)))
         .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
         .filter(|num| get_is_nice(*num, base))
         .map(|number| NiceNumberSimple {

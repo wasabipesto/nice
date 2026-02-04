@@ -14,6 +14,7 @@ pub mod db_util;
 pub mod distribution_stats;
 pub mod generate_chunks;
 pub mod generate_fields;
+pub mod lsd_filter;
 pub mod msd_prefix_filter;
 pub mod number_stats;
 pub mod residue_filter;
