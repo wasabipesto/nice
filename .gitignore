@@ -6,3 +6,4 @@ target*
 *.bak
 core
 .lake
+profile.json.gz

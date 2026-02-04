@@ -97,6 +97,9 @@ fn main() {
     // Parse command line arguments
     let cli = Cli::parse();
 
+    // Set up logger
+    env_logger::init();
+
     // Check for GPU support
     if cli.gpu && !cfg!(feature = "gpu") {
         eprintln!("Error: GPU support not enabled. Rebuild with --features gpu");
