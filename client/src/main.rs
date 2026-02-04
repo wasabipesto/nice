@@ -6,7 +6,8 @@
 extern crate nice_common;
 use nice_common::benchmark::{BenchmarkMode, get_benchmark_field};
 use nice_common::client_api::{
-    get_field_from_server, get_validation_data_from_server, submit_field_to_server,
+    get_field_from_server, get_fields_from_server, get_validation_data_from_server,
+    submit_field_to_server,
 };
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
 use nice_common::{
@@ -77,6 +78,10 @@ pub struct Cli {
     /// CUDA device to use for GPU processing (0 for first GPU, 1 for second, etc.)
     #[arg(long, default_value_t = 0, env = "NICE_GPU_DEVICE")]
     gpu_device: usize,
+
+    /// Number of fields to request in a single batch (1-10, reduces connection overhead)
+    #[arg(long, default_value_t = 1, env = "NICE_BATCH_SIZE")]
+    batch_size: usize,
 }
 
 /// Break up the range into chunks, returning the start and end of each.
@@ -177,220 +182,249 @@ fn main() {
     }
 
     loop {
-        // Check whether to query the server for a search range or use the benchmark
-        let (claim_data, validation_data_opt) = if cli.validate {
+        // Get claims (either batch or single) based on the mode
+        let claims_to_process = if cli.validate {
             let validation_data = get_validation_data_from_server(&cli.api_base);
-            let claim_data = DataToClient {
+            vec![DataToClient {
                 claim_id: 0,
                 base: validation_data.base,
                 range_start: validation_data.range_start,
                 range_end: validation_data.range_end,
                 range_size: validation_data.range_size,
-            };
-            (claim_data, Some(validation_data))
+            }]
         } else if let Some(benchmark) = cli.benchmark {
-            (get_benchmark_field(benchmark), None)
+            vec![get_benchmark_field(benchmark)]
+        } else if cli.batch_size > 1 {
+            get_fields_from_server(&cli.mode, &cli.api_base, cli.batch_size)
         } else {
-            (get_field_from_server(&cli.mode, &cli.api_base), None)
+            vec![get_field_from_server(&cli.mode, &cli.api_base)]
         };
 
-        // Print some debug info
-        if validation_data_opt.is_some() {
-            println!(
-                "Beginning validation: {:?}",
-                validation_data_opt.clone().unwrap().field_id
-            );
-        } else if cli.benchmark.is_some() {
-            println!("Beginning benchmark:  {:?}", cli.benchmark.unwrap());
-        } else if cli.verbose {
-            println!(
-                "Claim Data: {}",
-                serde_json::to_string_pretty(&claim_data).unwrap()
-            );
-        } else if !cli.quiet {
-            println!(
-                "Acquired claim:  {}, Base {}",
-                claim_data.claim_id, claim_data.base
-            );
+        if !cli.quiet && claims_to_process.len() > 1 {
+            println!("Acquired {} claims in batch", claims_to_process.len());
         }
 
-        // Record start time for performance stats
-        let start_time = std::time::Instant::now();
+        // Process each claim
+        for (idx, claim_data) in claims_to_process.iter().enumerate() {
+            let validation_data_opt = if cli.validate {
+                Some(get_validation_data_from_server(&cli.api_base))
+            } else {
+                None
+            };
 
-        // Process based on GPU or CPU mode
-        let results: Vec<FieldResults> = if cli.gpu {
-            // GPU processing path
-            #[cfg(feature = "gpu")]
-            {
-                let gpu_ctx = gpu_ctx.as_ref().expect("GPU context failed to initialize");
-
-                let gpu_results = match cli.mode {
-                    SearchMode::Detailed => process_range_detailed_gpu(
-                        gpu_ctx,
-                        claim_data.range_start,
-                        claim_data.range_end,
-                        claim_data.base,
-                    ),
-                    SearchMode::Niceonly => process_range_niceonly_gpu(
-                        gpu_ctx,
-                        claim_data.range_start,
-                        claim_data.range_end,
-                        claim_data.base,
-                    ),
-                };
-
-                match gpu_results {
-                    Ok(result) => vec![result],
-                    Err(e) => {
-                        eprintln!("GPU processing error: {e:?}");
-                        std::process::exit(1);
-                    }
+            // Print some debug info
+            if validation_data_opt.is_some() {
+                println!(
+                    "Beginning validation: {:?}",
+                    validation_data_opt.clone().unwrap().field_id
+                );
+            } else if cli.benchmark.is_some() {
+                println!("Beginning benchmark:  {:?}", cli.benchmark.unwrap());
+            } else if cli.verbose {
+                println!(
+                    "Claim Data: {}",
+                    serde_json::to_string_pretty(&claim_data).unwrap()
+                );
+            } else if !cli.quiet {
+                if claims_to_process.len() > 1 {
+                    println!(
+                        "Processing claim {}/{}: {}, Base {}",
+                        idx + 1,
+                        claims_to_process.len(),
+                        claim_data.claim_id,
+                        claim_data.base
+                    );
+                } else {
+                    println!(
+                        "Acquired claim:  {}, Base {}",
+                        claim_data.claim_id, claim_data.base
+                    );
                 }
             }
-            #[cfg(not(feature = "gpu"))]
-            {
-                eprintln!("GPU support not compiled in");
-                std::process::exit(1);
+
+            // Record start time for performance stats
+            let start_time = std::time::Instant::now();
+
+            // Process based on GPU or CPU mode
+            let results: Vec<FieldResults> = if cli.gpu {
+                // GPU processing path
+                #[cfg(feature = "gpu")]
+                {
+                    let gpu_ctx = gpu_ctx.as_ref().expect("GPU context failed to initialize");
+
+                    let gpu_results = match cli.mode {
+                        SearchMode::Detailed => process_range_detailed_gpu(
+                            gpu_ctx,
+                            claim_data.range_start,
+                            claim_data.range_end,
+                            claim_data.base,
+                        ),
+                        SearchMode::Niceonly => process_range_niceonly_gpu(
+                            gpu_ctx,
+                            claim_data.range_start,
+                            claim_data.range_end,
+                            claim_data.base,
+                        ),
+                    };
+
+                    match gpu_results {
+                        Ok(result) => vec![result],
+                        Err(e) => {
+                            eprintln!("GPU processing error: {e:?}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    eprintln!("GPU support not compiled in");
+                    std::process::exit(1);
+                }
+            } else {
+                // CPU processing path
+                // Break up the range into chunks
+                let chunk_size = 100 * PROCESSING_CHUNK_SIZE;
+                let chunks =
+                    chunked_ranges(claim_data.range_start, claim_data.range_end, chunk_size);
+
+                // Configure TQDM
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation
+                )]
+                let chunk_scale = (chunk_size as f32).log10() as u32;
+                let tqdm_config = simple_tqdm::Config::new()
+                    .with_unit(format!("e{chunk_scale}"))
+                    .with_disable(cli.quiet);
+
+                // Process each chunk and gather the results
+                chunks
+                    .par_iter()
+                    .tqdm_config(tqdm_config)
+                    .map(|(start, end)| match cli.mode {
+                        SearchMode::Detailed => {
+                            process_range_detailed(*start, *end, claim_data.base)
+                        }
+                        SearchMode::Niceonly => {
+                            process_range_niceonly(*start, *end, claim_data.base)
+                        }
+                    })
+                    .collect()
+            };
+
+            let elapsed = start_time.elapsed();
+
+            // Print performance stats for GPU
+            #[allow(clippy::cast_precision_loss)]
+            if cli.gpu && !cli.quiet {
+                let range_size = claim_data.range_end - claim_data.range_start;
+                let numbers_per_sec = range_size as f64 / elapsed.as_secs_f64();
+                println!(
+                    "✓ Processed {:.2e} numbers in {:.2}s ({:.2e} numbers/sec)",
+                    range_size as f64,
+                    elapsed.as_secs_f64(),
+                    numbers_per_sec
+                );
             }
-        } else {
-            // CPU processing path
-            // Break up the range into chunks
-            let chunk_size = 100 * PROCESSING_CHUNK_SIZE;
-            let chunks = chunked_ranges(claim_data.range_start, claim_data.range_end, chunk_size);
 
-            // Configure TQDM
-            #[allow(
-                clippy::cast_precision_loss,
-                clippy::cast_sign_loss,
-                clippy::cast_possible_truncation
-            )]
-            let chunk_scale = (chunk_size as f32).log10() as u32;
-            let tqdm_config = simple_tqdm::Config::new()
-                .with_unit(format!("e{chunk_scale}"))
-                .with_disable(cli.quiet);
-
-            // Process each chunk and gather the results
-            chunks
-                .par_iter()
-                .tqdm_config(tqdm_config)
-                .map(|(start, end)| match cli.mode {
-                    SearchMode::Detailed => process_range_detailed(*start, *end, claim_data.base),
-                    SearchMode::Niceonly => process_range_niceonly(*start, *end, claim_data.base),
-                })
-                .collect()
-        };
-
-        let elapsed = start_time.elapsed();
-
-        // Print performance stats for GPU
-        #[allow(clippy::cast_precision_loss)]
-        if cli.gpu && !cli.quiet {
-            let range_size = claim_data.range_end - claim_data.range_start;
-            let numbers_per_sec = range_size as f64 / elapsed.as_secs_f64();
-            println!(
-                "✓ Processed {:.2e} numbers in {:.2}s ({:.2e} numbers/sec)",
-                range_size as f64,
-                elapsed.as_secs_f64(),
-                numbers_per_sec
-            );
-        }
-
-        // Compile results from all chunks
-        let nice_numbers = results
-            .iter()
-            .flat_map(|result| result.nice_numbers.clone())
-            .collect();
-        let unique_distribution = if cli.mode == SearchMode::Niceonly {
-            None
-        } else {
-            // Flatten all distribution sets from the results
-            let result_distributions: Vec<UniquesDistributionSimple> = results
+            // Compile results from all chunks
+            let nice_numbers = results
                 .iter()
-                .flat_map(|result| result.distribution.clone())
+                .flat_map(|result| result.nice_numbers.clone())
                 .collect();
+            let unique_distribution = if cli.mode == SearchMode::Niceonly {
+                None
+            } else {
+                // Flatten all distribution sets from the results
+                let result_distributions: Vec<UniquesDistributionSimple> = results
+                    .iter()
+                    .flat_map(|result| result.distribution.clone())
+                    .collect();
 
-            // Collect the counts into a map
-            let mut dist_map: HashMap<u32, u128> = HashMap::new();
-            for dist in result_distributions {
-                *dist_map.entry(dist.num_uniques).or_insert(0) += dist.count;
+                // Collect the counts into a map
+                let mut dist_map: HashMap<u32, u128> = HashMap::new();
+                for dist in result_distributions {
+                    *dist_map.entry(dist.num_uniques).or_insert(0) += dist.count;
+                }
+
+                // Convert the counts back into a formatted, sorted list
+                let mut distribution: Vec<UniquesDistributionSimple> = dist_map
+                    .into_iter()
+                    .map(|(num_uniques, count)| UniquesDistributionSimple { num_uniques, count })
+                    .collect();
+                distribution.sort_by_key(|d| d.num_uniques);
+                Some(distribution)
+            };
+
+            // Assemble the data package to submit to the server
+            let submit_data = DataToServer {
+                claim_id: claim_data.claim_id,
+                username: cli.username.clone(),
+                client_version: CLIENT_VERSION.to_string(),
+                unique_distribution,
+                nice_numbers,
+            };
+
+            // Print some debug info
+            if cli.verbose {
+                println!(
+                    "Submit Data: {}",
+                    serde_json::to_string_pretty(&submit_data).unwrap()
+                );
             }
 
-            // Convert the counts back into a formatted, sorted list
-            let mut distribution: Vec<UniquesDistributionSimple> = dist_map
-                .into_iter()
-                .map(|(num_uniques, count)| UniquesDistributionSimple { num_uniques, count })
-                .collect();
-            distribution.sort_by_key(|d| d.num_uniques);
-            Some(distribution)
-        };
+            // Validate results if requested
+            if cli.validate {
+                // Check if our results match the server's expected results
+                let validation_data = validation_data_opt.expect("Validation data not found");
+                let mut validation_passed = true;
 
-        // Assemble the data package to submit to the server
-        let submit_data = DataToServer {
-            claim_id: claim_data.claim_id,
-            username: cli.username.clone(),
-            client_version: CLIENT_VERSION.to_string(),
-            unique_distribution,
-            nice_numbers,
-        };
+                // Compare nice numbers
+                let mut our_numbers = submit_data.nice_numbers.clone();
+                let mut server_numbers = validation_data.nice_numbers.clone();
+                our_numbers.sort_by_key(|n| n.number);
+                server_numbers.sort_by_key(|n| n.number);
 
-        // Print some debug info
-        if cli.verbose {
-            println!(
-                "Submit Data: {}",
-                serde_json::to_string_pretty(&submit_data).unwrap()
-            );
-        }
-
-        // Validate results if requested
-        if cli.validate {
-            // Check if our results match the server's expected results
-            let validation_data = validation_data_opt.expect("Validation data not found");
-            let mut validation_passed = true;
-
-            // Compare nice numbers
-            let mut our_numbers = submit_data.nice_numbers.clone();
-            let mut server_numbers = validation_data.nice_numbers.clone();
-            our_numbers.sort_by_key(|n| n.number);
-            server_numbers.sort_by_key(|n| n.number);
-
-            if our_numbers != server_numbers {
-                println!("VALIDATION FAILED: Semi-nice numbers don't match!");
-                validation_passed = false;
-            }
-
-            // Compare distribution (only for detailed mode)
-            if cli.mode == SearchMode::Detailed
-                && let Some(ref our_dist) = submit_data.unique_distribution
-            {
-                let mut our_dist_sorted = our_dist.clone();
-                let mut server_dist_sorted = validation_data.unique_distribution.clone();
-                our_dist_sorted.sort_by_key(|d| d.num_uniques);
-                server_dist_sorted.sort_by_key(|d| d.num_uniques);
-
-                if our_dist_sorted != server_dist_sorted {
-                    println!("VALIDATION FAILED: Distribution doesn't match!");
+                if our_numbers != server_numbers {
+                    println!("VALIDATION FAILED: Semi-nice numbers don't match!");
                     validation_passed = false;
                 }
-            }
 
-            if validation_passed {
-                println!("Validation passed! Results match the canoncical submission.");
-            } else {
-                println!("Validation failed! Results do not match the canoncical submission.");
-                println!("  Our submission data: {submit_data:?}");
-                println!("  Canoncical submission: {validation_data:?}");
-                std::process::exit(1);
-            }
-        } else if cli.benchmark.is_none() {
-            // Submit the results if it's not a benchmark
-            let response = submit_field_to_server(&cli.api_base, submit_data);
-            match response.text() {
-                Ok(msg) => {
-                    if !cli.quiet {
-                        println!("Server response: {msg}");
+                // Compare distribution (only for detailed mode)
+                if cli.mode == SearchMode::Detailed
+                    && let Some(ref our_dist) = submit_data.unique_distribution
+                {
+                    let mut our_dist_sorted = our_dist.clone();
+                    let mut server_dist_sorted = validation_data.unique_distribution.clone();
+                    our_dist_sorted.sort_by_key(|d| d.num_uniques);
+                    server_dist_sorted.sort_by_key(|d| d.num_uniques);
+
+                    if our_dist_sorted != server_dist_sorted {
+                        println!("VALIDATION FAILED: Distribution doesn't match!");
+                        validation_passed = false;
                     }
                 }
-                Err(e) => println!("Server returned success but an error occured: {e}"),
+
+                if validation_passed {
+                    println!("Validation passed! Results match the canoncical submission.");
+                } else {
+                    println!("Validation failed! Results do not match the canoncical submission.");
+                    println!("  Our submission data: {submit_data:?}");
+                    println!("  Canoncical submission: {validation_data:?}");
+                    std::process::exit(1);
+                }
+            } else if cli.benchmark.is_none() {
+                // Submit the results if it's not a benchmark
+                let response = submit_field_to_server(&cli.api_base, submit_data);
+                match response.text() {
+                    Ok(msg) => {
+                        if !cli.quiet {
+                            println!("Server response: {msg}");
+                        }
+                    }
+                    Err(e) => println!("Server returned success but an error occured: {e}"),
+                }
             }
         }
 

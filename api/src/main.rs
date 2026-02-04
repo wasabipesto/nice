@@ -49,6 +49,33 @@ fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
 
 #[get("/claim/<mode>")]
 fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
+    claim_single(mode, pool)
+}
+
+#[get("/claim/<mode>/<count>")]
+fn claim_batch(mode: &str, count: usize, pool: &State<PgPool>) -> ApiResult<Vec<DataToClient>> {
+    // Cap maximum batch size to prevent abuse
+    let count = count.clamp(1, 10);
+
+    let mut results = Vec::new();
+
+    for _ in 0..count {
+        if let Ok(Json(claim_data)) = claim_single(mode, pool) {
+            results.push(claim_data);
+        } else {
+            // If we can't get more fields, return what we have
+            // At least return one result or propagate the error
+            if results.is_empty() {
+                return Err(internal_error("Could not claim any fields"));
+            }
+            break;
+        }
+    }
+
+    Ok(Json(results))
+}
+
+fn claim_single(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     // Get database connection from the shared pool
     let mut conn = get_pooled_database_connection(pool);
 
@@ -351,7 +378,7 @@ fn rocket() -> _ {
         .manage(pool)
         .mount(
             "/",
-            routes![claim, validate, submit, index, options_handler],
+            routes![claim, claim_batch, validate, submit, index, options_handler],
         )
         .register("/", catchers![not_found])
 }

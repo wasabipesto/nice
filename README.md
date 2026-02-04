@@ -27,6 +27,9 @@ docker run -it --init ghcr.io/wasabipesto/nice_client:3
 # Run with 12 threads
 ./nice_client --threads 12
 
+# Request 5 fields at once (reduces connection overhead)
+./nice_client --batch-size 5
+
 # Run forever
 ./nice_client --repeat
 

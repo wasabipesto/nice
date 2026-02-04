@@ -115,6 +115,27 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
     )
 }
 
+/// Request multiple fields from the server at once and returns the deserialized data.
+/// Retries for 5xx errors or network timeouts.
+pub fn get_fields_from_server(
+    mode: &SearchMode,
+    api_base: &str,
+    count: usize,
+) -> Vec<DataToClient> {
+    let url = match mode {
+        SearchMode::Detailed => format!("{api_base}/claim/detailed/{count}"),
+        SearchMode::Niceonly => format!("{api_base}/claim/niceonly/{count}"),
+    };
+
+    retry_request(
+        || reqwest::blocking::get(&url),
+        |response| match response.json::<Vec<DataToClient>>() {
+            Ok(data) => data,
+            Err(e) => panic!("Error deserializing response: {}", e),
+        },
+    )
+}
+
 /// Submit field results to the server. Panic if there is an error.
 /// Retries for 5xx errors or network timeouts.
 pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Response {
