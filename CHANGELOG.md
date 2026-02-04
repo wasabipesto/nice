@@ -5,6 +5,7 @@
 - Implement some coarse but massive optimizations to nice-only processing based on patterns in the most and least significant digits of each range. The exact amount varies by search range but in the current area of interest it is about 2.5x as fast.
 - Implement an in-memory queue for nice-only claims so the server can keep up with the increased processing speed. This takes nice-only claim endpoint times from 90-100ms to 3-5ms.
 - Fix an issue where the largest numbers (instead of nicest) are preserved during downsampling
+- Decouple detailed chunk processing size from rayon chunk processing size, allowing us to reduce the rayon chunk size for more efficient MSD filtering
 - Start using proper rust logging systems such as env_logger and test-log
 
 ## Nice v3.2.10
