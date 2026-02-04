@@ -24,6 +24,7 @@ use rocket::State;
 use rocket::http::Status;
 use rocket::response::status as rocket_status;
 use rocket::serde::json::{Json, Value, json};
+use rocket_prometheus::PrometheusMetrics;
 use tracing_subscriber::EnvFilter;
 
 mod field_queue;
@@ -59,21 +60,14 @@ fn status(queue: &State<FieldQueue>) -> Json<Value> {
     }))
 }
 
-#[get("/claim/<mode>")]
-fn claim(mode: &str, pool: &State<PgPool>, queue: &State<FieldQueue>) -> ApiResult<DataToClient> {
+/// Helper function that handles the claim logic for both detailed and niceonly modes
+fn claim_helper(
+    search_mode: SearchMode,
+    pool: &State<PgPool>,
+    queue: &State<FieldQueue>,
+) -> ApiResult<DataToClient> {
     // Get database connection from the shared pool
     let mut conn = get_pooled_database_connection(pool);
-
-    // Set search mode based on path
-    let search_mode = match mode {
-        "detailed" => SearchMode::Detailed,
-        "niceonly" => SearchMode::Niceonly,
-        _ => {
-            return Err(not_found_error(
-                "The requested resource could not be found. Available resources include /claim/detailed, /claim/niceonly, /claim/validate, and /submit. Visit https://nicenumbers.net for more information.",
-            ));
-        }
-    };
 
     // Get the user's IP
     // TODO: Actually do this
@@ -187,6 +181,16 @@ fn claim(mode: &str, pool: &State<PgPool>, queue: &State<FieldQueue>) -> ApiResu
         "New Claim"
     );
     Ok(Json(data_for_client))
+}
+
+#[get("/claim/detailed")]
+fn claim_detailed(pool: &State<PgPool>, queue: &State<FieldQueue>) -> ApiResult<DataToClient> {
+    claim_helper(SearchMode::Detailed, pool, queue)
+}
+
+#[get("/claim/niceonly")]
+fn claim_niceonly(pool: &State<PgPool>, queue: &State<FieldQueue>) -> ApiResult<DataToClient> {
+    claim_helper(SearchMode::Niceonly, pool, queue)
 }
 
 #[post("/submit", data = "<data>")]
@@ -385,14 +389,27 @@ fn rocket() -> _ {
     let queue = FieldQueue::new(pool.clone());
     queue.prefill_niceonly();
 
+    // Initialize Prometheus metrics
+    let prometheus = PrometheusMetrics::new();
+
     rocket::build()
+        .attach(prometheus.clone())
         .attach(CorsFairing)
         .attach(RequestTimingFairing)
         .manage(pool)
         .manage(queue)
         .mount(
             "/",
-            routes![claim, validate, submit, status, index, options_handler],
+            routes![
+                claim_detailed,
+                claim_niceonly,
+                validate,
+                submit,
+                status,
+                index,
+                options_handler
+            ],
         )
+        .mount("/metrics", prometheus)
         .register("/", catchers![not_found])
 }
