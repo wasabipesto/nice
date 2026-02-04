@@ -1483,6 +1483,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nice_experiment"
+version = "3.2.11"
+dependencies = [
+ "clap",
+ "env_logger",
+ "log",
+ "malachite",
+ "malachite-nz",
+ "nice_common",
+ "rayon",
+]
+
+[[package]]
 name = "nice_jobs"
 version = "3.2.11"
 dependencies = [
