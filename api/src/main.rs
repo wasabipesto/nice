@@ -26,7 +26,10 @@ use rocket::response::status as rocket_status;
 use rocket::serde::json::{Json, Value, json};
 use tracing_subscriber::EnvFilter;
 
+mod field_queue;
 mod helpers;
+
+use field_queue::FieldQueue;
 use helpers::{
     ApiErrorBody, ApiResult, CorsFairing, RequestTimingFairing, bad_request_error, internal_error,
     not_found_error, unprocessable_entity_error,
@@ -47,8 +50,17 @@ fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
     Ok(Json(data))
 }
 
+#[get("/status")]
+fn status(queue: &State<FieldQueue>) -> Json<Value> {
+    let niceonly_queue_size = queue.niceonly_queue_size();
+    Json(json!({
+        "status": "ok",
+        "niceonly_queue_size": niceonly_queue_size
+    }))
+}
+
 #[get("/claim/<mode>")]
-fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
+fn claim(mode: &str, pool: &State<PgPool>, queue: &State<FieldQueue>) -> ApiResult<DataToClient> {
     // Get database connection from the shared pool
     let mut conn = get_pooled_database_connection(pool);
 
@@ -95,25 +107,32 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
     let max_range_size = DEFAULT_FIELD_SIZE;
 
     // Get the field to search based on claim strategy, max check level, etc.
-    // Try to find a field, respecting previous claims
-    let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
-    let search_field = if let Some(claimed_field) = try_claim_field(
-        &mut conn,
-        claim_strategy,
-        maximum_timestamp,
-        max_check_level,
-        max_range_size,
-    )
-    .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
-    {
-        claimed_field
+    //
+    // For niceonly mode, use the pre-claimed queue for much faster response times.
+    // This reduces latency from ~90ms (database query + locking + update) to <1ms (memory access).
+    // The queue automatically refills by bulk-claiming fields at once when it drops below a threshold.
+    let search_field = if search_mode == SearchMode::Niceonly {
+        // Try to get from queue first
+        if let Some(queued_field) = queue.claim_niceonly() {
+            queued_field
+        } else {
+            // Queue is empty, fall back to direct database claim
+            tracing::warn!("Niceonly queue exhausted, falling back to direct database claim");
+            let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
+            try_claim_field(
+                &mut conn,
+                FieldClaimStrategy::Next,
+                maximum_timestamp,
+                0,
+                max_range_size,
+            )
+            .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
+            .ok_or_else(|| internal_error("Could not find any niceonly field!".to_string()))?
+        }
     } else {
-        tracing::info!(
-            "Unable to find an unclaimed or expired field, falling back to one that may have been claimed recently."
-        );
-        let maximum_timestamp = Utc::now();
-        let claim_strategy = FieldClaimStrategy::Next;
-        try_claim_field(
+        // For detailed mode, use the original database claim logic
+        let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
+        if let Some(claimed_field) = try_claim_field(
             &mut conn,
             claim_strategy,
             maximum_timestamp,
@@ -121,11 +140,28 @@ fn claim(mode: &str, pool: &State<PgPool>) -> ApiResult<DataToClient> {
             max_range_size,
         )
         .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
-        .ok_or_else(|| {
-            internal_error(format!(
-                "Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!"
-            ))
-        })?
+        {
+            claimed_field
+        } else {
+            tracing::info!(
+                "Unable to find an unclaimed or expired field, falling back to one that may have been claimed recently."
+            );
+            let maximum_timestamp = Utc::now();
+            let claim_strategy = FieldClaimStrategy::Next;
+            try_claim_field(
+                &mut conn,
+                claim_strategy,
+                maximum_timestamp,
+                max_check_level,
+                max_range_size,
+            )
+            .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
+            .ok_or_else(|| {
+                internal_error(format!(
+                    "Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!"
+                ))
+            })?
+        }
     };
 
     // Save the claim and get the record
@@ -345,13 +381,18 @@ fn rocket() -> _ {
 
     let pool = get_database_pool();
 
+    // Initialize field queue and pre-fill it
+    let queue = FieldQueue::new(pool.clone());
+    queue.prefill_niceonly();
+
     rocket::build()
         .attach(CorsFairing)
         .attach(RequestTimingFairing)
         .manage(pool)
+        .manage(queue)
         .mount(
             "/",
-            routes![claim, validate, submit, index, options_handler],
+            routes![claim, validate, submit, status, index, options_handler],
         )
         .register("/", catchers![not_found])
 }

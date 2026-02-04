@@ -471,6 +471,58 @@ pub fn try_claim_field(
     }
 }
 
+/// Bulk claim multiple fields at once for queue pre-filling.
+/// This is much more efficient than calling try_claim_field repeatedly.
+pub fn bulk_claim_fields(
+    conn: &mut PgConnection,
+    count: usize,
+    maximum_timestamp: DateTime<Utc>,
+    maximum_check_level: u8,
+    maximum_size: u128,
+) -> Result<Vec<FieldRecord>, String> {
+    use diesel::sql_query;
+    use diesel::sql_types::{BigInt, Integer, Numeric, Timestamptz};
+
+    let maximum_check_level = conversions::u8_to_i32(maximum_check_level)?;
+    let maximum_size = conversions::u128_to_bigdec(maximum_size)?;
+    let count_i64 = i64::try_from(count).map_err(|e| e.to_string())?;
+
+    // Use the same optimization for check_level = 0 to match the partial index
+    let check_level_predicate = if maximum_check_level == 0 {
+        "check_level = 0"
+    } else {
+        "check_level <= $2"
+    };
+
+    let query = format!(
+        "WITH candidates AS (
+            SELECT id
+            FROM fields
+            WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+              AND {check_level_predicate}
+              AND range_size <= $3
+            ORDER BY id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT $4
+        )
+        UPDATE fields f
+        SET last_claim_time = NOW()
+        FROM candidates
+        WHERE f.id = candidates.id
+        RETURNING f.*;"
+    );
+
+    let results = sql_query(query)
+        .bind::<Timestamptz, _>(maximum_timestamp)
+        .bind::<Integer, _>(maximum_check_level)
+        .bind::<Numeric, _>(maximum_size)
+        .bind::<BigInt, _>(count_i64)
+        .load::<FieldPrivate>(conn)
+        .map_err(|err| err.to_string())?;
+
+    results.into_iter().map(private_to_public).collect()
+}
+
 pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData, String> {
     use diesel::sql_query;
     use diesel::sql_types::{BigInt, Integer};

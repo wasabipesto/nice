@@ -165,6 +165,24 @@ pub fn try_claim_field(
     )
 }
 
+/// Bulk claim multiple fields at once for queue pre-filling.
+/// This is much more efficient than calling try_claim_field repeatedly.
+pub fn bulk_claim_fields(
+    conn: &mut PgConnection,
+    count: usize,
+    maximum_timestamp: DateTime<Utc>,
+    maximum_check_level: u8,
+    maximum_size: u128,
+) -> Result<Vec<FieldRecord>, String> {
+    fields::bulk_claim_fields(
+        conn,
+        count,
+        maximum_timestamp,
+        maximum_check_level,
+        maximum_size,
+    )
+}
+
 /// Insert a bunch of new fields.
 /// Only called by admin scripts.
 pub fn insert_new_fields(
