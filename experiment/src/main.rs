@@ -6,6 +6,7 @@
 //! The algorithm builds candidate numbers digit-by-digit from least significant to most
 //! significant, pruning branches early when digit collisions are detected.
 
+use clap::Parser;
 use log::{debug, info, trace, warn};
 use malachite::base::num::arithmetic::traits::Pow;
 use malachite::natural::Natural;
@@ -16,6 +17,16 @@ use std::sync::Arc;
 use nice_common::FieldSize;
 use nice_common::base_range::get_base_range_u128;
 use nice_common::client_process::get_is_nice;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+#[command(propagate_version = true)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct Cli {
+    /// The base to search
+    #[arg(short, long)]
+    base: u32,
+}
 
 /// A bitmask to track which digits (0 through base-1) have been used.
 /// Each bit position represents whether a particular digit has appeared.
@@ -44,10 +55,13 @@ struct NiceNumberSearcher {
 }
 
 fn main() {
+    // Parse command line arguments
+    let cli = Cli::parse();
+
     // Initialize logger from environment variables (RUST_LOG)
     env_logger::init();
 
-    let base = 25;
+    let base = cli.base;
     info!("=== Starting Nice Number Search ===");
     info!("Base: {}", base);
 
