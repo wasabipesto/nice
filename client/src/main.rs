@@ -255,7 +255,7 @@ fn main() {
         } else {
             // CPU processing path
             // Break up the range into chunks
-            let chunk_size = 100 * PROCESSING_CHUNK_SIZE;
+            let chunk_size = PROCESSING_CHUNK_SIZE;
             let chunks = chunked_ranges(claim_data.range_start, claim_data.range_end, chunk_size);
 
             // Configure TQDM

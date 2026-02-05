@@ -166,6 +166,107 @@ pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u3
     false
 }
 
+/// Recursively subdivide a range to find sub-ranges that need to be processed.
+///
+/// This function applies the MSD prefix filter recursively:
+/// 1. If the entire range can be skipped (has duplicate MSD prefix), return empty vec
+/// 2. If the range is small or max depth reached, return the range (needs processing)
+/// 3. Otherwise, subdivide into smaller ranges and recursively check each
+///
+/// Returns a vector of (start, end) tuples representing ranges that need processing.
+/// All ranges are half-open intervals [start, end).
+///
+/// # Arguments
+/// * `range_start` - Start of the range (inclusive)
+/// * `range_end` - End of the range (exclusive)
+/// * `base` - The base to check
+/// * `current_depth` - Current recursion depth (should start at 0)
+/// * `max_depth` - Maximum recursion depth to prevent excessive subdivision
+/// * `min_range_size` - Minimum range size before stopping subdivision
+/// * `subdivision_factor` - Number of parts to subdivide into (2-4 recommended)
+pub fn get_valid_ranges_recursive(
+    range_start: u128,
+    range_end: u128,
+    base: u32,
+    current_depth: u32,
+    max_depth: u32,
+    min_range_size: u128,
+    subdivision_factor: usize,
+) -> Vec<(u128, u128)> {
+    // Check if range is too small or we've hit max depth
+    let range_size = range_end - range_start;
+    if range_size <= min_range_size || current_depth >= max_depth {
+        // Return this range for processing
+        debug!(
+            "Depth {current_depth}: Range [{range_start}, {range_end}) too small or max depth reached, returning for processing"
+        );
+        return vec![(range_start, range_end)];
+    }
+
+    // Check if the entire range can be skipped
+    if has_duplicate_msd_prefix(range_start, range_end, base) {
+        debug!("Depth {current_depth}: Range [{range_start}, {range_end}) can be skipped entirely");
+        return vec![]; // Skip this entire range
+    }
+
+    // Check if subdivision would be worthwhile
+    // If the range is not much larger than min_range_size, don't bother subdividing
+    if range_size < min_range_size * (subdivision_factor as u128) {
+        debug!(
+            "Depth {current_depth}: Range [{range_start}, {range_end}) not worth subdividing, returning for processing"
+        );
+        return vec![(range_start, range_end)];
+    }
+
+    // Subdivide the range and recursively check each part
+    debug!(
+        "Depth {current_depth}: Subdividing range [{range_start}, {range_end}) into {subdivision_factor} parts"
+    );
+
+    let chunk_size = range_size / (subdivision_factor as u128);
+    let mut valid_ranges = Vec::new();
+
+    for i in 0..subdivision_factor {
+        let sub_start = range_start + (i as u128) * chunk_size;
+        let sub_end = if i == subdivision_factor - 1 {
+            range_end // Last chunk gets any remainder
+        } else {
+            sub_start + chunk_size
+        };
+
+        if sub_start < sub_end {
+            let sub_ranges = get_valid_ranges_recursive(
+                sub_start,
+                sub_end,
+                base,
+                current_depth + 1,
+                max_depth,
+                min_range_size,
+                subdivision_factor,
+            );
+            valid_ranges.extend(sub_ranges);
+        }
+    }
+
+    valid_ranges
+}
+
+/// Convenience wrapper for get_valid_ranges_recursive using default parameters from lib.rs.
+///
+/// Returns a vector of (start, end) tuples representing ranges that need processing.
+/// Ranges that can be skipped based on MSD prefix are not included.
+pub fn get_valid_ranges(range_start: u128, range_end: u128, base: u32) -> Vec<(u128, u128)> {
+    get_valid_ranges_recursive(
+        range_start,
+        range_end,
+        base,
+        0,
+        MSD_RECURSIVE_MAX_DEPTH,
+        MSD_RECURSIVE_MIN_RANGE_SIZE,
+        MSD_RECURSIVE_SUBDIVISION_FACTOR,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

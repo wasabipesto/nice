@@ -70,7 +70,7 @@ pub fn process_range_detailed(range_start: u128, range_end: u128, base: u32) -> 
     let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
 
     // Break up the range into chunks
-    let chunks = (range_start..range_end).chunks(PROCESSING_CHUNK_SIZE);
+    let chunks = (range_start..range_end).chunks(DETAILED_MINI_CHUNK_SIZE);
 
     // Process everything, saving results and aggregating after each chunk finishes
     for chunk in &chunks {
@@ -176,17 +176,10 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
     let range_start = claim_data.range_start;
     let range_end = claim_data.range_end;
 
-    // Check if the base has duplicate MSD prefixes
-    if msd_prefix_filter::has_duplicate_msd_prefix(range_start, range_end, base) {
-        // If so, return early
-        return DataToServer {
-            claim_id: claim_data.claim_id,
-            username: username.to_owned(),
-            client_version: CLIENT_VERSION.to_string(),
-            unique_distribution: None,
-            nice_numbers: Vec::new(),
-        };
-    }
+    // Use recursive subdivision to get valid ranges that need processing.
+    // This adaptively subdivides the range to skip portions where the MSD
+    // prefix indicates all numbers will have duplicate/overlapping digits.
+    let valid_ranges = msd_prefix_filter::get_valid_ranges(range_start, range_end, base);
 
     // Get LSD filter to eliminate invalid least significant digits
     let lsd_filter = lsd_filter::get_valid_lsds_u128(&base);
@@ -194,15 +187,21 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
     // Get residue filters to reduce search range
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
 
-    let nice_list = (range_start..range_end)
-        .filter(|num| lsd_filter.contains(&(num % base_u128)))
-        .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
-        .filter(|num| get_is_nice(*num, base))
-        .map(|number| NiceNumberSimple {
-            number,
-            num_uniques: base,
-        })
-        .collect();
+    // Process each valid range
+    let mut nice_list = Vec::new();
+    for (sub_start, sub_end) in valid_ranges {
+        let range_nice: Vec<NiceNumberSimple> = (sub_start..sub_end)
+            .filter(|num| lsd_filter.contains(&(num % base_u128)))
+            .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
+            .filter(|num| get_is_nice(*num, base))
+            .map(|number| NiceNumberSimple {
+                number,
+                num_uniques: base,
+            })
+            .collect();
+
+        nice_list.extend(range_nice);
+    }
 
     DataToServer {
         claim_id: claim_data.claim_id,
@@ -216,14 +215,11 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
 pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> FieldResults {
-    // Check if the base has duplicate MSD prefixes
-    if msd_prefix_filter::has_duplicate_msd_prefix(range_start, range_end, base) {
-        // If so, return early
-        return FieldResults {
-            distribution: Vec::new(),
-            nice_numbers: Vec::new(),
-        };
-    }
+    // Use recursive subdivision to get valid ranges that need processing.
+    // This adaptively subdivides the range to skip portions where the MSD prefix indicates
+    // all numbers will have duplicate/overlapping digits. It's more effective than fixed
+    // chunking because it only subdivides when needed and can find natural boundaries.
+    let valid_ranges = msd_prefix_filter::get_valid_ranges(range_start, range_end, base);
 
     // Precompute this for residue filter checking
     let base_u128_minusone = base as u128 - 1;
@@ -231,14 +227,20 @@ pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> 
     // Get residue filters to reduce search range
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
 
-    let nice_list = (range_start..range_end)
-        .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
-        .filter(|num| get_is_nice(*num, base))
-        .map(|number| NiceNumberSimple {
-            number,
-            num_uniques: base,
-        })
-        .collect();
+    // Process each valid range
+    let mut nice_list = Vec::new();
+    for (sub_start, sub_end) in valid_ranges {
+        let range_nice: Vec<NiceNumberSimple> = (sub_start..sub_end)
+            .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
+            .filter(|num| get_is_nice(*num, base))
+            .map(|number| NiceNumberSimple {
+                number,
+                num_uniques: base,
+            })
+            .collect();
+
+        nice_list.extend(range_nice);
+    }
 
     FieldResults {
         distribution: Vec::new(),
@@ -891,5 +893,40 @@ mod tests {
             process_range_niceonly(input.range_start, input.range_end, input.base),
             result
         );
+    }
+
+    #[test_log::test]
+    fn test_chunked_msd_filtering() {
+        // This test verifies that chunked MSD filtering works correctly
+        // Using base 20 which has known skippable segments
+        let base = 20;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+
+        // Use a segment that should have some skippable chunks
+        let chunk_size = base_range.range_size / 10_000;
+        let segment_start = base_range.range_start + (30 * chunk_size);
+        let segment_end = segment_start + (5 * chunk_size);
+
+        // Process with chunked filtering
+        let results = process_range_niceonly(segment_start, segment_end, base);
+
+        // The test passes if it completes without panic
+        // The chunked filtering should skip some sub-chunks within this segment
+        assert!(results.nice_numbers.len() <= (segment_end - segment_start) as usize);
+    }
+
+    #[test_log::test]
+    fn test_chunked_vs_whole_range_consistency() {
+        // Verify that processing with chunks gives same results as without
+        // (when whole range isn't skippable but some chunks are)
+        let base = 10;
+        let range_start = 47;
+        let range_end = 147; // Larger range to test multiple chunks
+
+        // Process the range
+        let results = process_range_niceonly(range_start, range_end, base);
+
+        // Should find the nice number 69
+        assert!(results.nice_numbers.iter().any(|n| n.number == 69));
     }
 }

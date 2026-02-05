@@ -19,6 +19,10 @@ pub enum BenchmarkMode {
     Massive,
     /// A benchmark range at a higher range: 1e6 @ base 80.
     HiBase,
+    /// A range where MSD filtering is quite effective: 1e12 @ base 50.
+    MsdEffective,
+    /// A range where MSD filtering is ineffective: 1e11 @ base 50.
+    MsdIneffective,
 }
 
 pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
@@ -29,8 +33,15 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
         BenchmarkMode::ExtraLarge => 40,
         BenchmarkMode::Massive => 50,
         BenchmarkMode::HiBase => 80,
+        BenchmarkMode::MsdEffective => 50,
+        BenchmarkMode::MsdIneffective => 50,
     };
     let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+    let range_start = match mode {
+        BenchmarkMode::MsdEffective => 26507984537059635,
+        BenchmarkMode::MsdIneffective => 94760515586064977,
+        _ => base_range.range_start,
+    };
     let range_size = match mode {
         BenchmarkMode::BaseTen => base_range.range_size,
         BenchmarkMode::Default => 1_000_000,
@@ -38,13 +49,15 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
         BenchmarkMode::ExtraLarge => 1_000_000_000,
         BenchmarkMode::Massive => 1e13 as u128,
         BenchmarkMode::HiBase => 1_000_000_000,
+        BenchmarkMode::MsdEffective => 1e12 as u128,
+        BenchmarkMode::MsdIneffective => 1e7 as u128,
     };
 
     DataToClient {
         claim_id: 0,
         base,
-        range_start: base_range.range_start,
-        range_end: base_range.range_start + range_size,
+        range_start,
+        range_end: range_start + range_size,
         range_size,
     }
 }
