@@ -1454,6 +1454,7 @@ dependencies = [
  "rayon",
  "serde_json",
  "simple-tqdm",
+ "tokio",
 ]
 
 [[package]]
@@ -1478,6 +1479,7 @@ dependencies = [
  "serde",
  "serde_json",
  "test-log",
+ "tokio",
 ]
 
 [[package]]

@@ -6,6 +6,10 @@ use std::{thread, time::Duration};
 
 const MAX_CONNECTION_ATTEMPTS: u32 = 10;
 
+// Re-export tokio for async functions
+#[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
+pub use tokio;
+
 /// Helper function to determine if an error is retry-able
 /// - is_timeout() catches typical network timeouts
 /// - is_connect() catches typical connection failures
@@ -156,6 +160,171 @@ pub fn get_validation_data_from_server(api_base: &str) -> ValidationData {
             Err(e) => panic!("Error deserializing validation response: {}", e),
         },
     )
+}
+
+// ============================================================================
+// ASYNC VERSIONS OF API FUNCTIONS
+// ============================================================================
+
+/// Helper function to determine if an error is retry-able (async version)
+fn is_retryable_error_async(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// Helper function to classify reqwest error types (async version)
+fn error_type_str_async(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connection"
+    } else if e.is_request() {
+        "request/DNS"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else {
+        "unknown"
+    }
+}
+
+/// Generic retry logic for async HTTP requests with exponential backoff.
+/// Handles both network errors and 5xx server errors.
+async fn retry_request_async<F, Fut, P, FutP, T>(request_fn: F, process_response: P) -> T
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    P: Fn(reqwest::Response) -> FutP,
+    FutP: std::future::Future<Output = T>,
+{
+    let mut attempts = 0;
+
+    loop {
+        attempts += 1;
+
+        match request_fn().await {
+            Ok(response) => {
+                // Check if it's a 5xx server error
+                if response.status().is_server_error() {
+                    if attempts < MAX_CONNECTION_ATTEMPTS {
+                        let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
+                        eprintln!(
+                            "Server error ({} {}), retrying in {} seconds... (attempt {}/{})",
+                            response.status(),
+                            response.text().await.unwrap_or_default(),
+                            sleep_secs,
+                            attempts,
+                            MAX_CONNECTION_ATTEMPTS
+                        );
+                        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                        continue;
+                    } else {
+                        panic!(
+                            "Server error after {} attempts: {}",
+                            attempts,
+                            response.status()
+                        );
+                    }
+                }
+
+                // Process the successful response
+                return process_response(response).await;
+            }
+            Err(e) => {
+                if is_retryable_error_async(&e) && attempts < MAX_CONNECTION_ATTEMPTS {
+                    let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
+                    eprintln!(
+                        "Network error ({}), retrying in {} seconds... (attempt {}/{}): {}",
+                        error_type_str_async(&e),
+                        sleep_secs,
+                        attempts,
+                        MAX_CONNECTION_ATTEMPTS,
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                    continue;
+                } else {
+                    panic!(
+                        "Network error ({}) after {} attempts: {}",
+                        error_type_str_async(&e),
+                        attempts,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Async version: Request a field from the server and returns the deserialized data.
+/// Retries for 5xx errors or network timeouts.
+pub async fn get_field_from_server_async(mode: &SearchMode, api_base: &str) -> DataToClient {
+    let url = match mode {
+        SearchMode::Detailed => format!("{api_base}/claim/detailed"),
+        SearchMode::Niceonly => format!("{api_base}/claim/niceonly"),
+    };
+
+    retry_request_async(
+        || async { reqwest::get(&url).await },
+        |response| async move {
+            match response.json::<DataToClient>().await {
+                Ok(data) => data,
+                Err(e) => panic!("Error deserializing response: {}", e),
+            }
+        },
+    )
+    .await
+}
+
+/// Async version: Submit field results to the server. Panic if there is an error.
+/// Retries for 5xx errors or network timeouts.
+pub async fn submit_field_to_server_async(
+    api_base: &str,
+    submit_data: DataToServer,
+) -> reqwest::Response {
+    let url = format!("{api_base}/submit");
+
+    retry_request_async(
+        || async {
+            reqwest::Client::new()
+                .post(&url)
+                .json(&submit_data)
+                .send()
+                .await
+        },
+        |response| async move {
+            // Check for other client/server errors (4xx, etc.)
+            if !response.status().is_success() {
+                match response.text().await {
+                    Ok(msg) => panic!("Server returned an error: {}", msg),
+                    Err(e) => panic!(
+                        "Server returned an error, but another error occurred: {}",
+                        e
+                    ),
+                }
+            }
+            response
+        },
+    )
+    .await
+}
+
+/// Async version: Request validation data from the server for a specific claim.
+/// Returns the deserialized ValidationData which includes the expected results.
+/// Retries for 5xx errors or network timeouts.
+pub async fn get_validation_data_from_server_async(api_base: &str) -> ValidationData {
+    let url = format!("{api_base}/claim/validate");
+
+    retry_request_async(
+        || async { reqwest::get(&url).await },
+        |response| async move {
+            match response.json::<ValidationData>().await {
+                Ok(data) => data,
+                Err(e) => panic!("Error deserializing validation response: {}", e),
+            }
+        },
+    )
+    .await
 }
 
 // TODO: add tests
