@@ -19,13 +19,14 @@ use nice_common::{
 use nice_common::client_process_gpu::{
     GPU_BATCH_SIZE, GpuContext, process_range_detailed_gpu, process_range_niceonly_gpu,
 };
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 
 extern crate serde_json;
 use clap::Parser;
 use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
