@@ -33,7 +33,7 @@ cudarc = { version = "0.18", features = ["cuda-12000"], optional = true }
 anyhow = { version = "1.0", optional = true }
 
 [build-dependencies]
-cc = { version = "1.0", optional = true }
+cc = { version = "1.2", optional = true }
 
 [dev-dependencies]
 test-log = "0.2.19"
