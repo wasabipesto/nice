@@ -42,7 +42,7 @@ pub const DETAILED_MINI_CHUNK_SIZE: usize = 1_000;
 pub const SAVE_TOP_N_NUMBERS: usize = 10_000;
 
 // Recursive MSD filter subdivision parameters
-pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 2;
+pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 11;
 pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 1000;
 pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 

@@ -372,6 +372,35 @@ fn main() {
         println!("  // Worst case: filter cannot help, full processing needed");
         println!("  let worst_case_start = {};", ineff.start);
         println!("  let worst_case_end = {};", ineff.end);
+
+        println!("  // Worse case filter effectiveness at varying depth:");
+        for depth in 0..21 {
+            let valid_ranges = get_valid_ranges_recursive(
+                ineff.start,
+                ineff.end,
+                base,
+                0,
+                depth,
+                MSD_RECURSIVE_MIN_RANGE_SIZE,
+                MSD_RECURSIVE_SUBDIVISION_FACTOR,
+            );
+            let ranges_after_subdivision = valid_ranges.len();
+            let total_valid_size: u128 = valid_ranges.iter().map(|(s, e)| e - s).sum();
+            let subdivision_effectiveness = 1.0 - (total_valid_size as f64 / ineff.size as f64);
+            let curstring = if MSD_RECURSIVE_MAX_DEPTH == depth {
+                "(current setting)"
+            } else {
+                ""
+            };
+
+            println!(
+                "  // Depth {}: {} ranges, {:.1}% effective {}",
+                depth,
+                ranges_after_subdivision,
+                subdivision_effectiveness * 100.0,
+                curstring
+            );
+        }
         println!();
     }
 }
