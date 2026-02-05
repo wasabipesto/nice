@@ -5,6 +5,7 @@ use reqwest::blocking::Response;
 use std::{thread, time::Duration};
 
 const MAX_CONNECTION_ATTEMPTS: u32 = 10;
+const REQUEST_TIMEOUT_SECS: u64 = 5;
 
 // Re-export tokio for async functions
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
@@ -111,7 +112,14 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
     };
 
     retry_request(
-        || reqwest::blocking::get(&url),
+        || {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .build()
+                .unwrap()
+                .get(&url)
+                .send()
+        },
         |response| match response.json::<DataToClient>() {
             Ok(data) => data,
             Err(e) => panic!("Error deserializing response: {}", e),
@@ -126,7 +134,10 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Resp
 
     retry_request(
         || {
-            reqwest::blocking::Client::new()
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .build()
+                .unwrap()
                 .post(&url)
                 .json(&submit_data)
                 .send()
@@ -154,7 +165,14 @@ pub fn get_validation_data_from_server(api_base: &str) -> ValidationData {
     let url = format!("{api_base}/claim/validate");
 
     retry_request(
-        || reqwest::blocking::get(&url),
+        || {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .build()
+                .unwrap()
+                .get(&url)
+                .send()
+        },
         |response| match response.json::<ValidationData>() {
             Ok(data) => data,
             Err(e) => panic!("Error deserializing validation response: {}", e),
@@ -265,7 +283,15 @@ pub async fn get_field_from_server_async(mode: &SearchMode, api_base: &str) -> D
     };
 
     retry_request_async(
-        || async { reqwest::get(&url).await },
+        || async {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .build()
+                .unwrap()
+                .get(&url)
+                .send()
+                .await
+        },
         |response| async move {
             match response.json::<DataToClient>().await {
                 Ok(data) => data,
@@ -286,7 +312,10 @@ pub async fn submit_field_to_server_async(
 
     retry_request_async(
         || async {
-            reqwest::Client::new()
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .build()
+                .unwrap()
                 .post(&url)
                 .json(&submit_data)
                 .send()
@@ -316,7 +345,15 @@ pub async fn get_validation_data_from_server_async(api_base: &str) -> Validation
     let url = format!("{api_base}/claim/validate");
 
     retry_request_async(
-        || async { reqwest::get(&url).await },
+        || async {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .build()
+                .unwrap()
+                .get(&url)
+                .send()
+                .await
+        },
         |response| async move {
             match response.json::<ValidationData>().await {
                 Ok(data) => data,

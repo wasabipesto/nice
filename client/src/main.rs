@@ -25,6 +25,7 @@ use clap::Parser;
 use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -100,13 +101,13 @@ fn process_field_sync(
     claim_data: &DataToClient,
     mode: SearchMode,
     cli: &Cli,
-    #[cfg(feature = "gpu")] gpu_ctx: &Option<GpuContext>,
+    #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
 ) -> Vec<FieldResults> {
     if cli.gpu {
         // GPU processing path
         #[cfg(feature = "gpu")]
         {
-            let gpu_ctx = gpu_ctx.as_ref().expect("GPU context failed to initialize");
+            let gpu_ctx = gpu_ctx.expect("GPU context failed to initialize");
 
             let gpu_results = match mode {
                 SearchMode::Detailed => process_range_detailed_gpu(
@@ -249,7 +250,10 @@ fn validate_results(
 }
 
 /// Run a single iteration in non-pipelined mode (validation or benchmark).
-async fn run_single_iteration(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: &Option<GpuContext>) {
+async fn run_single_iteration(
+    cli: &Cli,
+    #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
+) {
     // Get the field (synchronously for validation/benchmark)
     let (claim_data, validation_data_opt) = if cli.validate {
         let validation_data = get_validation_data_from_server(&cli.api_base);
@@ -304,11 +308,11 @@ async fn run_single_iteration(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: &Optio
             gpu_device: cli.gpu_device,
         };
         #[cfg(feature = "gpu")]
-        let gpu_ctx_clone = gpu_ctx.as_ref().map(|_| ());
+        let gpu_ctx_clone = gpu_ctx.cloned();
         move || {
             #[cfg(feature = "gpu")]
             {
-                process_field_sync(&claim_data, mode, &cli_clone, gpu_ctx)
+                process_field_sync(&claim_data, mode, &cli_clone, gpu_ctx_clone.as_ref())
             }
             #[cfg(not(feature = "gpu"))]
             {
@@ -371,7 +375,7 @@ async fn run_single_iteration(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: &Optio
 }
 
 /// Run in pipelined mode: overlap API calls with processing.
-async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: &Option<GpuContext>) {
+async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>) {
     // State for the pipeline
     let mut pending_submit: Option<DataToServer> = None;
     let mut current_claim: Option<DataToClient> = None;
@@ -421,11 +425,18 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: &Option<
                     gpu: cli.gpu,
                     gpu_device: cli.gpu_device,
                 };
+                #[cfg(feature = "gpu")]
+                let gpu_ctx_clone = gpu_ctx.cloned();
                 move || {
                     let results = {
                         #[cfg(feature = "gpu")]
                         {
-                            process_field_sync(&claim_data, mode, &cli_clone, gpu_ctx)
+                            process_field_sync(
+                                &claim_data,
+                                mode,
+                                &cli_clone,
+                                gpu_ctx_clone.as_ref(),
+                            )
                         }
                         #[cfg(not(feature = "gpu"))]
                         {
@@ -580,7 +591,7 @@ async fn main() {
                         println!("  GPU: {name}");
                     }
                 }
-                Some(ctx)
+                Some(Arc::new(ctx))
             }
             Err(e) => {
                 eprintln!(
@@ -613,7 +624,7 @@ async fn main() {
         loop {
             #[cfg(feature = "gpu")]
             {
-                run_single_iteration(&cli, &gpu_ctx).await;
+                run_single_iteration(&cli, gpu_ctx.as_ref()).await;
             }
             #[cfg(not(feature = "gpu"))]
             {
@@ -629,7 +640,7 @@ async fn main() {
         if cli.repeat {
             #[cfg(feature = "gpu")]
             {
-                run_pipelined_loop(&cli, &gpu_ctx).await;
+                run_pipelined_loop(&cli, gpu_ctx.as_ref()).await;
             }
             #[cfg(not(feature = "gpu"))]
             {
@@ -638,7 +649,7 @@ async fn main() {
         } else {
             #[cfg(feature = "gpu")]
             {
-                run_single_iteration(&cli, &gpu_ctx).await;
+                run_single_iteration(&cli, gpu_ctx.as_ref()).await;
             }
             #[cfg(not(feature = "gpu"))]
             {
