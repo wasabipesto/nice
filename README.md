@@ -79,6 +79,12 @@ Options:
           [env: NICE_API_BASE=]
           [default: https://api.nicenumbers.net]
 
+      --api-max-retries <API_MAX_RETRIES>
+          If an API call encounters a retryable error, retry with exponential backoff this many times
+
+          [env: NICE_API_MAX_RETRIES=]
+          [default: 10]
+
   -u, --username <USERNAME>
           The username to send alongside your contribution
 
@@ -90,15 +96,10 @@ Options:
 
           [env: NICE_REPEAT=]
 
-  -q, --quiet
-          Suppress all output
+  -n, --no-progress
+          Hide the progress bar
 
-          [env: NICE_QUIET=]
-
-  -v, --verbose
-          Show additional output
-
-          [env: NICE_VERBOSE=]
+          [env: NICE_NO_PROGRESS=]
 
   -t, --threads <THREADS>
           Run parallel with this many threads
@@ -110,10 +111,14 @@ Options:
           Run an offline benchmark
 
           Possible values:
-          - default:     The default benchmark range: 1e6 @ base 40
-          - large:       A large benchmark range: 1e8 @ base 40
-          - extra-large: A very large benchmark range: 1e9 @ base 40. This is the size of a typical field from the server
-          - hi-base:     A benchmark range at a higher range: 1e6 @ base 80
+          - base-ten:        Checking on base ten with a known nice number
+          - default:         The default benchmark range: 1e6 @ base 40
+          - large:           A large benchmark range: 1e8 @ base 40
+          - extra-large:     A very large benchmark range: 1e9 @ base 40. This is the size of a typical field from the server
+          - massive:         A massive range, much larger than any field you would get from the API: 1e13 @ base 50
+          - hi-base:         A benchmark range at a higher range: 1e6 @ base 80
+          - msd-effective:   A range where MSD filtering is quite effective: 1e12 @ base 50
+          - msd-ineffective: A range where MSD filtering is ineffective: 1e11 @ base 50
 
           [env: NICE_BENCHMARK=]
 
@@ -132,6 +137,12 @@ Options:
 
           [env: NICE_GPU_DEVICE=]
           [default: 0]
+
+  -l, --log-level <LOG_LEVEL>
+          Set the log level (overrides `RUST_LOG` environment variable)
+
+          [env: NICE_LOG_LEVEL=]
+          [possible values: off, error, warn, info, debug, trace]
 
   -h, --help
           Print help (see a summary with '-h')
