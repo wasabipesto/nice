@@ -15,11 +15,17 @@
 //! highest base we can process with this strategy is base 69 (6.7e24 to 1.4e25).
 
 #![cfg(feature = "gpu")]
+#![allow(clippy::cast_possible_truncation)]
 
-use super::*;
+use crate::{
+    CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
+    UniquesDistributionSimple,
+};
+use crate::{number_stats, residue_filter};
 use anyhow::{Context as _, Result};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Batch size for GPU kernel processing
@@ -43,7 +49,7 @@ impl GpuContext {
     /// * `device_ordinal` - Which GPU to use (0 for first GPU, 1 for second, etc.)
     ///
     /// # Returns
-    /// A GpuContext ready for processing, or an error if initialization fails.
+    /// A `GpuContext` ready for processing, or an error if initialization fails.
     ///
     /// # Example
     /// ```no_run
@@ -53,6 +59,9 @@ impl GpuContext {
     /// let ctx = GpuContext::new(0).expect("Failed to initialize GPU");
     /// # }
     /// ```
+    ///
+    /// # Errors
+    /// This function will return an error if the CUDA context cannot be initialized or if the CUDA kernels cannot be compiled.
     pub fn new(device_ordinal: usize) -> Result<Self> {
         // Initialize CUDA context
         let device = CudaContext::new(device_ordinal)?;
@@ -88,7 +97,7 @@ impl GpuContext {
 fn compile_ptx_with_include(src: &str) -> Result<Ptx> {
     // Get CUDA_HOME from environment, or use default
     let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
-    let include_path = format!("{}/include", cuda_home);
+    let include_path = format!("{cuda_home}/include");
 
     // Compile with include path options
     let opts = CompileOptions {
@@ -96,8 +105,7 @@ fn compile_ptx_with_include(src: &str) -> Result<Ptx> {
         ..Default::default()
     };
 
-    compile_ptx_with_opts(src, opts)
-        .map_err(|e| anyhow::anyhow!("NVRTC compilation failed: {:?}", e))
+    compile_ptx_with_opts(src, opts).map_err(|e| anyhow::anyhow!("NVRTC compilation failed: {e:?}"))
 }
 
 /// Split u128 values into low and high u64 components for GPU transfer.
@@ -115,10 +123,13 @@ fn split_u128_vec(numbers: &[u128]) -> (Vec<u64>, Vec<u64>) {
     (lo, hi)
 }
 
-/// GPU implementation of process_range_detailed.
+/// GPU implementation of `process_range_detailed`.
 ///
 /// Processes a range of numbers on the GPU, calculating statistics on the niceness
 /// of each number. This is the GPU equivalent of `client_process::process_range_detailed`.
+///
+/// **Range semantics**: Expects a half-open range [`range_start`, `range_end`) where `range_start`
+/// is inclusive and `range_end` is exclusive, following Rust's standard convention.
 ///
 /// # Arguments
 /// * `ctx` - GPU context with compiled kernels
@@ -127,22 +138,23 @@ fn split_u128_vec(numbers: &[u128]) -> (Vec<u64>, Vec<u64>) {
 /// * `base` - Number base to use for pandigital checking
 ///
 /// # Returns
-/// FieldResults containing distribution statistics and nice numbers found
+/// `FieldResults` containing distribution statistics and nice numbers found
+///
+/// # Errors
+/// Returns an error if the GPU context is not initialized or if there is an issue with the GPU kernel execution.
 pub fn process_range_detailed_gpu(
     ctx: &GpuContext,
-    range_start: u128,
-    range_end: u128,
+    range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
-    let _nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
-    let range_size = (range_end - range_start) as usize;
+    let range_size = range.size() as usize;
 
     // For small ranges, process in one batch to minimize overhead
     // For large ranges, use batched processing with overlap to maximize throughput
     // The breakeven point is typically around 50K-100K numbers where kernel launch
     // overhead becomes negligible compared to compute time
     if range_size <= GPU_BATCH_SIZE {
-        return process_range_detailed_gpu_single_batch(ctx, range_start, range_end, base);
+        return process_range_detailed_gpu_single_batch(ctx, range, base);
     }
 
     // Batched processing with stream overlap
@@ -152,11 +164,12 @@ pub fn process_range_detailed_gpu(
     let num_batches = range_size.div_ceil(GPU_BATCH_SIZE);
 
     for batch_idx in 0..num_batches {
-        let batch_start = range_start + (batch_idx * GPU_BATCH_SIZE) as u128;
-        let batch_end = (range_start + ((batch_idx + 1) * GPU_BATCH_SIZE) as u128).min(range_end);
+        let batch_start = range.range_start + (batch_idx * GPU_BATCH_SIZE) as u128;
+        let batch_end =
+            (range.range_start + ((batch_idx + 1) * GPU_BATCH_SIZE) as u128).min(range.range_end);
+        let batch = FieldSize::new(batch_start, batch_end);
 
-        let batch_results =
-            process_range_detailed_gpu_single_batch(ctx, batch_start, batch_end, base)?;
+        let batch_results = process_range_detailed_gpu_single_batch(ctx, &batch, base)?;
 
         // Aggregate results
         for dist in batch_results.distribution {
@@ -182,17 +195,17 @@ pub fn process_range_detailed_gpu(
 /// This is the core GPU processing function that handles one batch at a time.
 fn process_range_detailed_gpu_single_batch(
     ctx: &GpuContext,
-    range_start: u128,
-    range_end: u128,
+    range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
     let nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
-    let range_size = (range_end - range_start) as usize;
+    let range_size = range.size() as usize;
 
     // Split u128 range into lo/hi u64 arrays for GPU (CUDA lacks native u128 support)
+    // Note: (range_start..range_end) is a half-open range [range_start, range_end)
     let mut numbers_lo = Vec::with_capacity(range_size);
     let mut numbers_hi = Vec::with_capacity(range_size);
-    for num in range_start..range_end {
+    for num in range.range_iter() {
         numbers_lo.push(num as u64);
         numbers_hi.push((num >> 64) as u64);
     }
@@ -234,7 +247,7 @@ fn process_range_detailed_gpu_single_batch(
 
         if num_uniques > nice_list_cutoff {
             nice_numbers.push(NiceNumberSimple {
-                number: range_start + i as u128,
+                number: range.range_start + i as u128,
                 num_uniques,
             });
         }
@@ -253,11 +266,14 @@ fn process_range_detailed_gpu_single_batch(
     })
 }
 
-/// GPU implementation of process_range_niceonly.
+/// GPU implementation of `process_range_niceonly`.
 ///
 /// Processes a range looking only for 100% nice numbers. This is much faster than
 /// the detailed version because it uses early-exit optimizations. This is the GPU
 /// equivalent of `client_process::process_range_niceonly`.
+///
+/// **Range semantics**: Expects a half-open range [`range_start`, `range_end`) where `range_start`
+/// is inclusive and `range_end` is exclusive, following Rust's standard convention.
 ///
 /// # Arguments
 /// * `ctx` - GPU context with compiled kernels
@@ -266,16 +282,18 @@ fn process_range_detailed_gpu_single_batch(
 /// * `base` - Number base to use for pandigital checking
 ///
 /// # Returns
-/// FieldResults containing only the nice numbers found (distribution is empty)
+/// `FieldResults` containing only the nice numbers found (distribution is empty)
+///
+/// # Errors
+/// TODO
 pub fn process_range_niceonly_gpu(
     ctx: &GpuContext,
-    range_start: u128,
-    range_end: u128,
+    range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
-    let base_u128_minusone = base as u128 - 1;
+    let base_u128_minusone = u128::from(base) - 1;
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
-    let range_size = (range_end - range_start) as usize;
+    let range_size = range.size() as usize;
 
     // For very small ranges or after filtering, batch processing may not help
     // Use adaptive batching based on range size
@@ -288,7 +306,9 @@ pub fn process_range_niceonly_gpu(
     // Apply residue filter on CPU to reduce GPU workload.
     // The filter typically eliminates 70-90% of candidates, and doing this on CPU
     // avoids transferring non-candidates to GPU memory, saving PCIe bandwidth.
-    let candidates: Vec<u128> = (range_start..range_end)
+    // Note: (range_start..range_end) is a half-open range [range_start, range_end)
+    let candidates: Vec<u128> = range
+        .range_iter()
         .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
         .collect();
 
@@ -387,17 +407,15 @@ fn process_candidates_niceonly_gpu(
 ///
 /// This is a convenience wrapper that matches the signature of
 /// `client_process::process_detailed`.
+///
+/// # Errors
+/// TODO
 pub fn process_detailed_gpu(
     ctx: &GpuContext,
     claim_data: &DataToClient,
     username: &String,
 ) -> Result<DataToServer> {
-    let results = process_range_detailed_gpu(
-        ctx,
-        claim_data.range_start,
-        claim_data.range_end,
-        claim_data.base,
-    )?;
+    let results = process_range_detailed_gpu(ctx, &claim_data.into(), claim_data.base)?;
 
     Ok(DataToServer {
         claim_id: claim_data.claim_id,
@@ -412,17 +430,15 @@ pub fn process_detailed_gpu(
 ///
 /// This is a convenience wrapper that matches the signature of
 /// `client_process::process_niceonly`.
+///
+/// # Errors
+/// TODO
 pub fn process_niceonly_gpu(
     ctx: &GpuContext,
     claim_data: &DataToClient,
     username: &String,
 ) -> Result<DataToServer> {
-    let results = process_range_niceonly_gpu(
-        ctx,
-        claim_data.range_start,
-        claim_data.range_end,
-        claim_data.base,
-    )?;
+    let results = process_range_niceonly_gpu(ctx, &claim_data.into(), claim_data.base)?;
 
     Ok(DataToServer {
         claim_id: claim_data.claim_id,
@@ -448,28 +464,26 @@ mod tests {
     fn combine_u64_to_u128(lo: &[u64], hi: &[u64]) -> Vec<u128> {
         lo.iter()
             .zip(hi.iter())
-            .map(|(&l, &h)| ((h as u128) << 64) | (l as u128))
+            .map(|(&l, &h)| ((u128::from(h)) << 64) | (u128::from(l)))
             .collect()
     }
 
-    #[test]
-    #[ignore]
+    #[test_log::test]
+    #[ignore = "GPU not available"]
     fn test_gpu_matches_cpu_detailed_small() {
-        let ctx = match try_init_gpu() {
-            Some(c) => c,
-            None => {
-                println!("GPU not available, skipping test");
-                return;
-            }
+        let Some(ctx) = try_init_gpu() else {
+            println!("GPU not available, skipping test");
+            return;
         };
 
         let range_start = 1_000_000u128;
         let range_end = 1_001_000u128;
+        let range = FieldSize::new(range_start, range_end);
         let base = 10u32;
 
-        let cpu_result = process_range_detailed(range_start, range_end, base);
-        let gpu_result = process_range_detailed_gpu(&ctx, range_start, range_end, base)
-            .expect("GPU processing failed");
+        let cpu_result = process_range_detailed(&range, base);
+        let gpu_result =
+            process_range_detailed_gpu(&ctx, &range, base).expect("GPU processing failed");
 
         // Check that distributions match
         assert_eq!(
@@ -493,24 +507,22 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore]
+    #[test_log::test]
+    #[ignore = "GPU not available"]
     fn test_gpu_matches_cpu_niceonly_small() {
-        let ctx = match try_init_gpu() {
-            Some(c) => c,
-            None => {
-                println!("GPU not available, skipping test");
-                return;
-            }
+        let Some(ctx) = try_init_gpu() else {
+            println!("GPU not available, skipping test");
+            return;
         };
 
         let range_start = 1_000_000u128;
         let range_end = 1_010_000u128;
+        let range = FieldSize::new(range_start, range_end);
         let base = 10u32;
 
-        let cpu_result = process_range_niceonly(range_start, range_end, base);
-        let gpu_result = process_range_niceonly_gpu(&ctx, range_start, range_end, base)
-            .expect("GPU processing failed");
+        let cpu_result = process_range_niceonly(&range, base);
+        let gpu_result =
+            process_range_niceonly_gpu(&ctx, &range, base).expect("GPU processing failed");
 
         // Sort both results for comparison (order might differ)
         let mut cpu_nice = cpu_result.nice_numbers;
@@ -529,25 +541,23 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore]
+    #[test_log::test]
+    #[ignore = "GPU not available"]
     fn test_gpu_base_40_range() {
-        let ctx = match try_init_gpu() {
-            Some(c) => c,
-            None => {
-                println!("GPU not available, skipping test");
-                return;
-            }
+        let Some(ctx) = try_init_gpu() else {
+            println!("GPU not available, skipping test");
+            return;
         };
 
         // Test with a base 40 range (more realistic for the actual problem)
         let range_start = 2_000_000_000_000u128;
         let range_end = 2_000_100_000u128;
+        let range = FieldSize::new(range_start, range_end);
         let base = 40u32;
 
-        let cpu_result = process_range_niceonly(range_start, range_end, base);
-        let gpu_result = process_range_niceonly_gpu(&ctx, range_start, range_end, base)
-            .expect("GPU processing failed");
+        let cpu_result = process_range_niceonly(&range, base);
+        let gpu_result =
+            process_range_niceonly_gpu(&ctx, &range, base).expect("GPU processing failed");
 
         // Sort for comparison
         let mut cpu_nice = cpu_result.nice_numbers;
@@ -558,16 +568,16 @@ mod tests {
         assert_eq!(cpu_nice, gpu_nice, "Results differ for base 40");
     }
 
-    #[test]
+    #[test_log::test]
     fn test_split_combine_u128() {
-        let numbers = vec![0u128, 1u128, 12345u128, u64::MAX as u128, u128::MAX];
+        let numbers = vec![0u128, 1u128, 12345u128, u128::from(u64::MAX), u128::MAX];
         let (lo, hi) = split_u128_vec(&numbers);
         let recombined = combine_u64_to_u128(&lo, &hi);
         assert_eq!(numbers, recombined);
     }
 
-    #[test]
-    #[ignore]
+    #[test_log::test]
+    #[ignore = "GPU not available"]
     fn test_gpu_context_creation() {
         // Just test that we can create a context
         // If no GPU is available, this should return an error
@@ -576,7 +586,7 @@ mod tests {
                 println!("GPU context created successfully");
             }
             Err(e) => {
-                println!("Expected failure without GPU: {:?}", e);
+                println!("Expected failure without GPU: {e:?}");
             }
         }
     }

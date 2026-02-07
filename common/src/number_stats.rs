@@ -1,15 +1,25 @@
 //! Expand basic numbers with some redundant stats.
 
-use super::*;
+use crate::{NEAR_MISS_CUTOFF_PERCENT, NiceNumber, NiceNumberSimple, SubmissionRecord};
+
+pub const SAVE_TOP_N_NUMBERS: usize = 10_000;
 
 /// Get the near-miss cutoff given a base.
-/// Uses the crate-level NEAR_MISS_CUTOFF_PERCENT.
+/// Uses the crate-level `NEAR_MISS_CUTOFF_PERCENT`.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 pub fn get_near_miss_cutoff(base: u32) -> u32 {
     (base as f32 * NEAR_MISS_CUTOFF_PERCENT).floor() as u32
 }
 
-/// Converts a list of NiceNumberSimple to NiceNumber by adding
+/// Converts a list of `NiceNumberSimple` to `NiceNumber` by adding
 /// some redundant information that's helpful for other tools.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
 pub fn expand_numbers(numbers: &[NiceNumberSimple], base: u32) -> Vec<NiceNumber> {
     let base_f32 = base as f32;
     numbers
@@ -23,16 +33,17 @@ pub fn expand_numbers(numbers: &[NiceNumberSimple], base: u32) -> Vec<NiceNumber
         .collect()
 }
 
-/// Take a bunch of SubmissionRecords, which each have their own NiceNumbers, and aggregate
+/// Take a bunch of `SubmissionRecords`, which each have their own `NiceNumbers`, and aggregate
 /// them all into a single list. Then filters to the top 10k for a sanity check.
+#[must_use]
 pub fn downsample_numbers(submissions: &[SubmissionRecord]) -> Vec<NiceNumber> {
-    // collate all numbers
+    // Collate all numbers
     let mut all_numbers = submissions.iter().fold(Vec::new(), |mut acc, sub| {
         acc.extend(sub.numbers.iter().cloned());
         acc
     });
 
-    // sort by number of uniques and take the top few
+    // Sort by number of uniques and take the top few
     all_numbers.sort_by(|a, b| b.num_uniques.cmp(&a.num_uniques));
     all_numbers
         .iter()
@@ -41,7 +52,8 @@ pub fn downsample_numbers(submissions: &[SubmissionRecord]) -> Vec<NiceNumber> {
         .collect()
 }
 
-/// Removes some information from a list of NiceNumbers to make NiceNumberSimple.
+/// Removes some information from a list of `NiceNumbers` to make `NiceNumberSimple`.
+#[must_use]
 pub fn shrink_numbers(numbers: &[NiceNumber]) -> Vec<NiceNumberSimple> {
     numbers
         .iter()
@@ -55,6 +67,7 @@ pub fn shrink_numbers(numbers: &[NiceNumber]) -> Vec<NiceNumberSimple> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SearchMode;
     use chrono::Utc;
 
     fn create_test_numbers_simple() -> Vec<NiceNumberSimple> {
@@ -137,7 +150,8 @@ mod tests {
         ]
     }
 
-    #[test]
+    #[test_log::test]
+    #[allow(clippy::float_cmp)]
     fn test_expand_numbers() {
         let simple_numbers = create_test_numbers_simple();
         let base = 10;
@@ -164,7 +178,8 @@ mod tests {
         assert_eq!(expanded[2].niceness, 0.7); // 7/10
     }
 
-    #[test]
+    #[test_log::test]
+    #[allow(clippy::float_cmp)]
     fn test_expand_numbers_different_bases() {
         let numbers = vec![NiceNumberSimple {
             number: 100,
@@ -178,7 +193,7 @@ mod tests {
         assert_eq!(expanded_base_20[0].niceness, 0.25); // 5/20
     }
 
-    #[test]
+    #[test_log::test]
     fn test_expand_numbers_empty() {
         let empty_numbers = vec![];
         let base = 10;
@@ -187,7 +202,7 @@ mod tests {
         assert_eq!(expanded.len(), 0);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_downsample_numbers() {
         let submissions = create_test_submissions();
         let result = downsample_numbers(&submissions);
@@ -208,7 +223,7 @@ mod tests {
         assert!(numbers.contains(&999));
     }
 
-    #[test]
+    #[test_log::test]
     fn test_downsample_numbers_large_set() {
         // Create submissions with more than SAVE_TOP_N_NUMBERS
         let mut large_numbers = Vec::new();
@@ -254,7 +269,7 @@ mod tests {
         assert_eq!(result[0].number, nicest_number);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_downsample_numbers_empty_submissions() {
         let empty_submissions = vec![];
         let result = downsample_numbers(&empty_submissions);
@@ -262,7 +277,7 @@ mod tests {
         assert_eq!(result.len(), 0);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_shrink_numbers() {
         let numbers = vec![
             NiceNumber {
@@ -288,7 +303,7 @@ mod tests {
         assert_eq!(shrunk[1].num_uniques, 5);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_expand_shrink_roundtrip() {
         let original = create_test_numbers_simple();
         let base = 10;

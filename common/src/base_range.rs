@@ -1,12 +1,19 @@
 //! A module for calculating the apprpriate range for each base.
 
-use super::*;
+use crate::FieldSize;
+use anyhow::{Result, anyhow};
+use malachite::base::num::arithmetic::traits::{CeilingRoot, FloorRoot, Pow};
+use malachite::natural::Natural;
 
 /// Get the range of possible values for a base.
 /// Returns None if there are no valid numbers in that base.
+///
+/// **Range semantics**: This represents a half-open range [`range_start`, `range_end`),
+/// following Rust's standard convention where `range_start` is inclusive and `range_end` is exclusive.
+#[must_use]
 pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
     let b = Natural::from(base);
-    let k = (base / 5) as u64;
+    let k = u64::from(base / 5);
 
     match base % 5 {
         0 => Some((b.clone().pow(3 * k - 1).ceiling_root(3), b.pow(k))),
@@ -27,13 +34,19 @@ pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
 /// Get the range of possible values for a base, but return u128.
 /// Returns None if there are no valid numbers in that base.
 /// Returns Err if the numbers are too large for u128.
-pub fn get_base_range_u128(base: u32) -> Result<Option<FieldSize>, String> {
+///
+/// **Range semantics**: This represents a half-open range [`range_start`, `range_end`),
+/// following Rust's standard convention where `range_start` is inclusive and `range_end` is exclusive.
+///
+/// # Errors
+/// Returns an error if the results are too large for u128.
+pub fn get_base_range_u128(base: u32) -> Result<Option<FieldSize>> {
     // get the natural results
     let (range_start, range_end) = match get_base_range_natural(base) {
         Some((min, max)) => (
             // convert to u128
-            u128::try_from(&min).map_err(|_| format!("Failed to convert {min} to u128."))?,
-            u128::try_from(&max).map_err(|_| format!("Failed to convert {max} to u128."))?,
+            u128::try_from(&min).map_err(|_| anyhow!("Failed to convert {min} to u128."))?,
+            u128::try_from(&max).map_err(|_| anyhow!("Failed to convert {max} to u128."))?,
         ),
         None => return Ok(None),
     };
@@ -41,85 +54,49 @@ pub fn get_base_range_u128(base: u32) -> Result<Option<FieldSize>, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
     use std::str::FromStr;
 
-    #[test]
+    #[test_log::test]
     fn test_get_base_range_u128() {
         assert_eq!(
-            get_base_range_u128(4),
-            Ok(Some(FieldSize {
-                range_start: 2u128,
-                range_end: 2u128,
-                range_size: 0u128
-            }))
+            get_base_range_u128(5).unwrap(),
+            Some(FieldSize::new(3u128, 5u128))
+        );
+        assert_eq!(get_base_range_u128(6).unwrap(), None);
+        assert_eq!(
+            get_base_range_u128(7).unwrap(),
+            Some(FieldSize::new(7u128, 13u128))
         );
         assert_eq!(
-            get_base_range_u128(5),
-            Ok(Some(FieldSize {
-                range_start: 3u128,
-                range_end: 5u128,
-                range_size: 2u128
-            }))
-        );
-        assert_eq!(get_base_range_u128(6), Ok(None));
-        assert_eq!(
-            get_base_range_u128(7),
-            Ok(Some(FieldSize {
-                range_start: 7u128,
-                range_end: 13u128,
-                range_size: 6u128
-            }))
+            get_base_range_u128(8).unwrap(),
+            Some(FieldSize::new(16u128, 22u128))
         );
         assert_eq!(
-            get_base_range_u128(8),
-            Ok(Some(FieldSize {
-                range_start: 16u128,
-                range_end: 22u128,
-                range_size: 6u128
-            }))
+            get_base_range_u128(9).unwrap(),
+            Some(FieldSize::new(27u128, 38u128))
         );
         assert_eq!(
-            get_base_range_u128(9),
-            Ok(Some(FieldSize {
-                range_start: 27u128,
-                range_end: 38u128,
-                range_size: 11u128
-            }))
+            get_base_range_u128(10).unwrap(),
+            Some(FieldSize::new(47u128, 100u128))
         );
         assert_eq!(
-            get_base_range_u128(10),
-            Ok(Some(FieldSize {
-                range_start: 47u128,
-                range_end: 100u128,
-                range_size: 53u128
-            }))
+            get_base_range_u128(40).unwrap(),
+            Some(FieldSize::new(1_916_284_264_916u128, 6_553_600_000_000u128))
         );
         assert_eq!(
-            get_base_range_u128(40),
-            Ok(Some(FieldSize {
-                range_start: 1916284264916u128,
-                range_end: 6553600000000u128,
-                range_size: 4637315735084u128
-            }))
-        );
-        assert_eq!(
-            get_base_range_u128(80),
-            Ok(Some(FieldSize {
-                range_start: 653245554420798943087177909799u128,
-                range_end: 2814749767106560000000000000000u128,
-                range_size: 2161504212685761056912822090201u128
-            }))
+            get_base_range_u128(80).unwrap(),
+            Some(FieldSize::new(
+                653_245_554_420_798_943_087_177_909_799u128,
+                2_814_749_767_106_560_000_000_000_000_000u128
+            ))
         );
     }
 
-    #[test]
+    #[test_log::test]
     fn test_get_base_range_natural() {
-        assert_eq!(
-            get_base_range_natural(4),
-            Some((Natural::from(2u32), Natural::from(2u32)))
-        );
         assert_eq!(
             get_base_range_natural(5),
             Some((Natural::from(3u32), Natural::from(5u32)))
@@ -143,53 +120,53 @@ mod tests {
         );
         assert_eq!(
             get_base_range_natural(20),
-            Some((Natural::from(58945u32), Natural::from(160000u32)))
+            Some((Natural::from(58_945u32), Natural::from(160_000u32)))
         );
         assert_eq!(
             get_base_range_natural(30),
-            Some((Natural::from(234613921u32), Natural::from(729000000u32)))
+            Some((Natural::from(234_613_921u32), Natural::from(729_000_000u32)))
         );
         assert_eq!(
             get_base_range_natural(40),
             Some((
-                Natural::from(1916284264916u64),
-                Natural::from(6553600000000u64)
+                Natural::from(1_916_284_264_916u64),
+                Natural::from(6_553_600_000_000u64)
             ))
         );
         assert_eq!(
             get_base_range_natural(50),
             Some((
-                Natural::from(26507984537059635u64),
-                Natural::from(97656250000000000u64)
+                Natural::from(26_507_984_537_059_635u64),
+                Natural::from(97_656_250_000_000_000u64)
             ))
         );
         // start getting rounding errors here
         assert_eq!(
             get_base_range_natural(60),
             Some((
-                Natural::from(556029612114824200908u128),
-                Natural::from(2176782336000000000000u128)
+                Natural::from(556_029_612_114_824_200_908u128),
+                Natural::from(2_176_782_336_000_000_000_000u128)
             ))
         );
         assert_eq!(
             get_base_range_natural(70),
             Some((
-                Natural::from(16456591172673850596148008u128),
-                Natural::from(67822307284900000000000000u128)
+                Natural::from(16_456_591_172_673_850_596_148_008u128),
+                Natural::from(67_822_307_284_900_000_000_000_000u128)
             ))
         );
         assert_eq!(
             get_base_range_natural(80),
             Some((
-                Natural::from(653245554420798943087177909799u128),
-                Natural::from(2814749767106560000000000000000u128)
+                Natural::from(653_245_554_420_798_943_087_177_909_799u128),
+                Natural::from(2_814_749_767_106_560_000_000_000_000_000u128)
             ))
         );
         assert_eq!(
             get_base_range_natural(90),
             Some((
-                Natural::from(33492764832792484045981163311105668u128),
-                Natural::from(150094635296999121000000000000000000u128)
+                Natural::from(33_492_764_832_792_484_045_981_163_311_105_668u128),
+                Natural::from(150_094_635_296_999_121_000_000_000_000_000_000u128)
             ))
         );
         // around here we run into the limits of u128

@@ -4,7 +4,7 @@
 //! allowing the API to serve field claims with minimal latency (~1ms instead of ~90ms).
 
 use chrono::{TimeDelta, Utc};
-use nice_common::db_util::{PgPool, bulk_claim_fields, get_pooled_database_connection};
+use nice_common::db_util::{PgPool, fields::bulk_claim_fields, get_pooled_database_connection};
 use nice_common::{CLAIM_DURATION_HOURS, DEFAULT_FIELD_SIZE, FieldRecord};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

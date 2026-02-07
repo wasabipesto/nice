@@ -30,7 +30,7 @@ struct ClaimPrivateNew {
     user_ip: String,
 }
 
-fn private_to_public(p: ClaimPrivate) -> Result<ClaimRecord, String> {
+fn private_to_public(p: ClaimPrivate) -> Result<ClaimRecord> {
     use conversions::*;
     Ok(ClaimRecord {
         claim_id: i64_to_u128(p.id)?,
@@ -41,7 +41,7 @@ fn private_to_public(p: ClaimPrivate) -> Result<ClaimRecord, String> {
     })
 }
 
-fn public_to_private(p: ClaimRecord) -> Result<ClaimPrivate, String> {
+fn public_to_private(p: ClaimRecord) -> Result<ClaimPrivate> {
     use conversions::*;
     Ok(ClaimPrivate {
         id: u128_to_i64(p.claim_id)?,
@@ -56,7 +56,7 @@ fn build_new_row(
     field_id: u128,
     search_mode: SearchMode,
     user_ip: String,
-) -> Result<ClaimPrivateNew, String> {
+) -> Result<ClaimPrivateNew> {
     use conversions::*;
     Ok(ClaimPrivateNew {
         field_id: u128_to_i32(field_id)?,
@@ -70,26 +70,26 @@ pub fn insert_claim(
     input_field_id: u128,
     input_search_mode: SearchMode,
     input_user_ip: String,
-) -> Result<ClaimRecord, String> {
+) -> Result<ClaimRecord> {
     use self::claims::dsl::*;
 
     let insert_row = build_new_row(input_field_id, input_search_mode, input_user_ip)?;
 
-    diesel::insert_into(claims)
+    let result = diesel::insert_into(claims)
         .values(&insert_row)
         .get_result(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }
 
-pub fn get_claim_by_id(conn: &mut PgConnection, row_id: u128) -> Result<ClaimRecord, String> {
+pub fn get_claim_by_id(conn: &mut PgConnection, row_id: u128) -> Result<ClaimRecord> {
     use self::claims::dsl::*;
 
     let row_id = conversions::u128_to_i64(row_id)?;
 
-    claims
+    let result = claims
         .filter(id.eq(row_id))
         .first::<ClaimPrivate>(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }

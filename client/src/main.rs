@@ -5,14 +5,14 @@
 
 extern crate nice_common;
 use nice_common::benchmark::{BenchmarkMode, get_benchmark_field};
-use nice_common::client_api::{
-    get_field_from_server, get_field_from_server_async, get_validation_data_from_server,
-    submit_field_to_server_async,
+use nice_common::client_api_async::{
+    Client, get_field_from_server_async, submit_field_to_server_async,
 };
+use nice_common::client_api_sync::{get_field_from_server, get_validation_data_from_server};
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
 use nice_common::{
     CLIENT_REQUEST_TIMEOUT_SECS, CLIENT_VERSION, DataToClient, DataToServer, FieldResults,
-    PROCESSING_CHUNK_SIZE, SearchMode, UniquesDistributionSimple, ValidationData,
+    FieldSize, PROCESSING_CHUNK_SIZE, SearchMode, UniquesDistributionSimple, ValidationData,
 };
 
 #[cfg(feature = "gpu")]
@@ -23,10 +23,10 @@ use nice_common::client_process_gpu::{
 use std::sync::Arc;
 
 extern crate serde_json;
+use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
 use log::{LevelFilter, debug, error, info};
-use nice_common::client_api::Client;
 use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
 use std::collections::HashMap;
@@ -113,20 +113,6 @@ pub struct Cli {
     log_level: Option<LogLevel>,
 }
 
-/// Break up the range into chunks, returning the start and end of each.
-fn chunked_ranges(range_start: u128, range_end: u128, chunk_size: usize) -> Vec<(u128, u128)> {
-    let mut chunks = Vec::new();
-    let mut start = range_start;
-
-    while start < range_end {
-        let end = (start + chunk_size as u128).min(range_end);
-        chunks.push((start, end));
-        start = end;
-    }
-
-    chunks
-}
-
 /// Process a field synchronously (`CPU` or `GPU`).
 /// This is wrapped in `spawn_blocking` when called from async context.
 fn process_field_sync(
@@ -142,18 +128,12 @@ fn process_field_sync(
             let gpu_ctx = gpu_ctx.expect("GPU context failed to initialize");
 
             let gpu_results = match mode {
-                SearchMode::Detailed => process_range_detailed_gpu(
-                    gpu_ctx,
-                    claim_data.range_start,
-                    claim_data.range_end,
-                    claim_data.base,
-                ),
-                SearchMode::Niceonly => process_range_niceonly_gpu(
-                    gpu_ctx,
-                    claim_data.range_start,
-                    claim_data.range_end,
-                    claim_data.base,
-                ),
+                SearchMode::Detailed => {
+                    process_range_detailed_gpu(gpu_ctx, &claim_data.into(), claim_data.base)
+                }
+                SearchMode::Niceonly => {
+                    process_range_niceonly_gpu(gpu_ctx, &claim_data.into(), claim_data.base)
+                }
             };
 
             match gpu_results {
@@ -172,7 +152,8 @@ fn process_field_sync(
     } else {
         // CPU processing path
         let chunk_size = PROCESSING_CHUNK_SIZE;
-        let chunks = chunked_ranges(claim_data.range_start, claim_data.range_end, chunk_size);
+        let range: FieldSize = claim_data.into();
+        let chunks = range.chunks(chunk_size);
 
         // Configure TQDM
         #[allow(
@@ -189,9 +170,9 @@ fn process_field_sync(
         chunks
             .par_iter()
             .tqdm_config(tqdm_config)
-            .map(|(start, end)| match mode {
-                SearchMode::Detailed => process_range_detailed(*start, *end, claim_data.base),
-                SearchMode::Niceonly => process_range_niceonly(*start, *end, claim_data.base),
+            .map(|chunk| match mode {
+                SearchMode::Detailed => process_range_detailed(chunk, claim_data.base),
+                SearchMode::Niceonly => process_range_niceonly(chunk, claim_data.base),
             })
             .collect()
     }
@@ -286,10 +267,10 @@ async fn run_single_iteration(
     cli: &Cli,
     client: &Client,
     #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
-) {
+) -> Result<()> {
     // Get the field (synchronously for validation/benchmark)
     let (claim_data, validation_data_opt) = if cli.validate {
-        let validation_data = get_validation_data_from_server(&cli.api_base, cli.api_max_retries);
+        let validation_data = get_validation_data_from_server(&cli.api_base, cli.api_max_retries)?;
         let claim_data = DataToClient {
             claim_id: 0,
             base: validation_data.base,
@@ -302,7 +283,7 @@ async fn run_single_iteration(
         (get_benchmark_field(benchmark), None)
     } else {
         (
-            get_field_from_server(&cli.mode, &cli.api_base, cli.api_max_retries),
+            get_field_from_server(&cli.mode, &cli.api_base, cli.api_max_retries)?,
             None,
         )
     };
@@ -327,7 +308,6 @@ async fn run_single_iteration(
 
     // Process the field
     let results = tokio::task::spawn_blocking({
-        let claim_data = claim_data.clone();
         let mode = cli.mode;
         let cli_clone = cli.clone();
         #[cfg(feature = "gpu")]
@@ -387,7 +367,7 @@ async fn run_single_iteration(
     } else if cli.benchmark.is_none() {
         let response =
             submit_field_to_server_async(client, &cli.api_base, submit_data, cli.api_max_retries)
-                .await;
+                .await?;
         match response.text().await {
             Ok(msg) => {
                 debug!("Server response: {msg}");
@@ -395,6 +375,7 @@ async fn run_single_iteration(
             Err(e) => error!("Server returned success but an error occured: {e}"),
         }
     }
+    Ok(())
 }
 
 /// Run in pipelined mode: overlap API calls with processing.
@@ -402,7 +383,7 @@ async fn run_pipelined_loop(
     cli: &Cli,
     client: &Client,
     #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
-) {
+) -> Result<()> {
     // State for the pipeline
     let mut pending_submit: Option<DataToServer> = None;
     let mut current_claim: Option<DataToClient> = None;
@@ -438,7 +419,6 @@ async fn run_pipelined_loop(
             let start_time = std::time::Instant::now();
 
             Some(tokio::task::spawn_blocking({
-                let claim_data = claim_data.clone();
                 let mode = cli.mode;
                 let cli_clone = cli.clone();
                 #[cfg(feature = "gpu")]
@@ -479,20 +459,21 @@ async fn run_pipelined_loop(
                         submit_data,
                         api_num_retries,
                     )
-                    .await;
+                    .await?;
                     match response.text().await {
                         Ok(msg) => {
                             debug!("Server response: {msg}");
                         }
                         Err(e) => error!("Server returned success but an error occured: {e}"),
                     }
+                    Ok::<(), anyhow::Error>(())
                 }
             })
         });
 
         // Wait for all concurrent operations to complete
         if let Some(fetch_task) = fetch_next {
-            next_claim = Some(fetch_task.await.expect("Fetch task panicked"));
+            next_claim = Some(fetch_task.await.expect("Fetch task panicked")?);
         }
 
         if let Some(process_task) = process_current {
@@ -524,7 +505,7 @@ async fn run_pipelined_loop(
         }
 
         if let Some(submit_task) = submit_previous {
-            submit_task.await.expect("Submit task panicked");
+            submit_task.await.expect("Submit task panicked")?;
         }
 
         // Move the pipeline forward
@@ -540,7 +521,7 @@ async fn run_pipelined_loop(
     if let Some(submit_data) = pending_submit {
         let response =
             submit_field_to_server_async(client, &cli.api_base, submit_data, cli.api_max_retries)
-                .await;
+                .await?;
         match response.text().await {
             Ok(msg) => {
                 debug!("Server response: {msg}");
@@ -548,10 +529,11 @@ async fn run_pipelined_loop(
             Err(e) => error!("Server returned success but an error occured: {e}"),
         }
     }
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     // Parse command line arguments
     let cli = Cli::parse();
 
@@ -615,7 +597,6 @@ async fn main() {
                     "Failed to initialize GPU on device {}: {:?}",
                     cli.gpu_device, e
                 );
-                eprintln!("");
                 eprintln!("Troubleshooting:");
                 eprintln!("1. Ensure NVIDIA GPU drivers are installed");
                 eprintln!("2. Verify CUDA toolkit is installed (nvcc --version)");
@@ -648,11 +629,11 @@ async fn main() {
         loop {
             #[cfg(feature = "gpu")]
             {
-                run_single_iteration(&cli, &http_client, gpu_ctx.as_ref()).await;
+                run_single_iteration(&cli, &http_client, gpu_ctx.as_ref()).await?;
             }
             #[cfg(not(feature = "gpu"))]
             {
-                run_single_iteration(&cli, &http_client).await;
+                run_single_iteration(&cli, &http_client).await?;
             }
 
             if !cli.repeat {
@@ -664,21 +645,22 @@ async fn main() {
         if cli.repeat {
             #[cfg(feature = "gpu")]
             {
-                run_pipelined_loop(&cli, &http_client, gpu_ctx.as_ref()).await;
+                run_pipelined_loop(&cli, &http_client, gpu_ctx.as_ref()).await?;
             }
             #[cfg(not(feature = "gpu"))]
             {
-                run_pipelined_loop(&cli, &http_client).await;
+                run_pipelined_loop(&cli, &http_client).await?;
             }
         } else {
             #[cfg(feature = "gpu")]
             {
-                run_single_iteration(&cli, &http_client, gpu_ctx.as_ref()).await;
+                run_single_iteration(&cli, &http_client, gpu_ctx.as_ref()).await?;
             }
             #[cfg(not(feature = "gpu"))]
             {
-                run_single_iteration(&cli, &http_client).await;
+                run_single_iteration(&cli, &http_client).await?;
             }
         }
     }
+    Ok(())
 }

@@ -43,7 +43,7 @@ struct BasePrivateNew {
     range_size: BigDecimal,
 }
 
-fn private_to_public(p: BasePrivate) -> Result<BaseRecord, String> {
+fn private_to_public(p: BasePrivate) -> Result<BaseRecord> {
     use conversions::*;
     Ok(BaseRecord {
         base: i32_to_u32(p.id)?,
@@ -60,7 +60,7 @@ fn private_to_public(p: BasePrivate) -> Result<BaseRecord, String> {
     })
 }
 
-fn public_to_private(p: BaseRecord) -> Result<BasePrivate, String> {
+fn public_to_private(p: BaseRecord) -> Result<BasePrivate> {
     use conversions::*;
     Ok(BasePrivate {
         id: u32_to_i32(p.base)?,
@@ -77,54 +77,50 @@ fn public_to_private(p: BaseRecord) -> Result<BasePrivate, String> {
     })
 }
 
-fn build_new_row(base: u32, size: FieldSize) -> Result<BasePrivateNew, String> {
+fn build_new_row(base: u32, size: FieldSize) -> Result<BasePrivateNew> {
     use conversions::*;
     Ok(BasePrivateNew {
         id: u32_to_i32(base)?,
         range_start: u128_to_bigdec(size.range_start)?,
         range_end: u128_to_bigdec(size.range_end)?,
-        range_size: u128_to_bigdec(size.range_size)?,
+        range_size: u128_to_bigdec(size.size())?,
     })
 }
 
-pub fn insert_base(
-    conn: &mut PgConnection,
-    base_id: u32,
-    size: FieldSize,
-) -> Result<BaseRecord, String> {
+pub fn insert_base(conn: &mut PgConnection, base_id: u32, size: FieldSize) -> Result<BaseRecord> {
     use self::bases::dsl::*;
 
     let insert_row = build_new_row(base_id, size)?;
 
-    diesel::insert_into(bases)
+    let result = diesel::insert_into(bases)
         .values(&insert_row)
         .get_result(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }
 
-pub fn get_base_by_id(conn: &mut PgConnection, row_id: u32) -> Result<BaseRecord, String> {
+pub fn get_base_by_id(conn: &mut PgConnection, row_id: u32) -> Result<BaseRecord> {
     use self::bases::dsl::*;
 
     let row_id = conversions::u32_to_i32(row_id)?;
 
-    bases
+    let result = bases
         .filter(id.eq(row_id))
         .first::<BasePrivate>(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }
 
-pub fn get_all_bases(conn: &mut PgConnection) -> Result<Vec<BaseRecord>, String> {
+pub fn get_all_bases(conn: &mut PgConnection) -> Result<Vec<BaseRecord>> {
     use self::bases::dsl::*;
 
     let bases_private: Vec<BasePrivate> = bases
         .order(id.asc())
         .load(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
     let mut res = Vec::new();
     for b in bases_private {
-        res.push(private_to_public(b)?)
+        res.push(private_to_public(b)?);
     }
     Ok(res)
 }
@@ -133,15 +129,15 @@ pub fn update_base(
     conn: &mut PgConnection,
     row_id: u32,
     update_row: BaseRecord,
-) -> Result<BaseRecord, String> {
+) -> Result<BaseRecord> {
     use self::bases::dsl::*;
 
     let row_id = conversions::u32_to_i32(row_id)?;
     let update_row = public_to_private(update_row)?;
 
-    diesel::update(bases.filter(id.eq(row_id)))
+    let result = diesel::update(bases.filter(id.eq(row_id)))
         .set(&update_row)
         .get_result(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }

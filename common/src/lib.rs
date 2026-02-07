@@ -1,11 +1,14 @@
 //! A library with common utilities for dealing with square-cube pandigitals.
 
-#![allow(clippy::wildcard_imports)]
+#![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::match_same_arms)]
 
 pub mod base_range;
 pub mod benchmark;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
-pub mod client_api;
+pub mod client_api_async;
+#[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
+pub mod client_api_sync;
 pub mod client_process;
 pub mod client_process_gpu;
 pub mod consensus;
@@ -21,31 +24,17 @@ pub mod residue_filter;
 
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use itertools::Itertools;
-use malachite::base::num::arithmetic::traits::{CeilingRoot, DivAssignRem, FloorRoot, Pow};
-use malachite::base::num::conversion::traits::Digits;
-use malachite::natural::Natural;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
-use std::convert::TryFrom;
 use std::env;
 use std::fmt;
-use std::ops::Add;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const CLIENT_REQUEST_TIMEOUT_SECS: u64 = 5;
 pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 pub const DOWNSAMPLE_CUTOFF_PERCENT: f32 = 0.2;
 pub const CLAIM_DURATION_HOURS: i64 = 1;
+pub const CLIENT_REQUEST_TIMEOUT_SECS: u64 = 5;
 pub const DEFAULT_FIELD_SIZE: u128 = 1_000_000_000;
-pub const PROCESSING_CHUNK_SIZE: usize = 1_000_000;
-pub const DETAILED_MINI_CHUNK_SIZE: usize = 1_000;
-pub const SAVE_TOP_N_NUMBERS: usize = 10_000;
-
-// Recursive MSD filter subdivision parameters
-pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 11;
-pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 1000;
-pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
+pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
 
 /// Each possible search mode the server and client supports.
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -78,20 +67,93 @@ pub enum FieldClaimStrategy {
 
 /// Data on the bounds of a search range.
 /// Could be a base, chunk, field, or something else.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+///
+/// **Important**: This represents a half-open range [`range_start`, `range_end`),
+/// following Rust's standard convention. This means:
+/// - `range_start` is inclusive (the first number to check)
+/// - `range_end` is exclusive (one past the last number to check)
+///
+/// Example: `FieldSize { range_start: 100, range_end: 105, range_size: 5 }`
+/// represents the numbers [100, 101, 102, 103, 104] (5 numbers total).
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq)]
 pub struct FieldSize {
-    pub range_start: u128,
-    pub range_end: u128,
-    pub range_size: u128,
+    range_start: u128,
+    range_end: u128,
+    range_size: u128,
 }
 
 impl FieldSize {
+    /// Create a new `FieldSize` with a half-open range [`range_start`, `range_end`).
+    ///
+    /// # Panics
+    /// Panics if `range_start` is greater than or equal to `range_end`.
+    #[must_use]
     pub fn new(range_start: u128, range_end: u128) -> Self {
+        assert!(
+            range_start < range_end,
+            "Range has invalid bounds, range_start must be < range_end (half-open interval)"
+        );
         FieldSize {
             range_start,
             range_end,
             range_size: range_end - range_start,
         }
+    }
+    /// Get the first number to check in the range (`range_start`).
+    #[must_use]
+    pub fn first(&self) -> u128 {
+        self.range_start
+    }
+    /// Get the last number to check in the range (`range_end` - 1).
+    #[must_use]
+    pub fn last(&self) -> u128 {
+        self.range_end - 1
+    }
+    /// Get the inclusive end of the range (`range_start`).
+    #[must_use]
+    pub fn start(&self) -> u128 {
+        self.range_start
+    }
+    /// Get the exclusive end of the range (`range_end`).
+    #[must_use]
+    pub fn end(&self) -> u128 {
+        self.range_end
+    }
+    /// The total number of items in the range.
+    #[must_use]
+    pub fn size(&self) -> u128 {
+        self.range_size
+    }
+    /// Get an iterator over the numbers in the range [`range_start`, `range_end`).
+    #[must_use]
+    pub fn range_iter(&self) -> std::ops::Range<u128> {
+        self.range_start..self.range_end
+    }
+    /// Break up the range into chunks of size `chunk_size`.
+    /// Each chunk is half-open [`range_start`, `range_end`).
+    #[must_use]
+    pub fn chunks(&self, chunk_size: u128) -> Vec<FieldSize> {
+        let mut chunks = Vec::new();
+        let mut start = self.range_start;
+
+        while start < self.range_end {
+            let end = (start + chunk_size).min(self.range_end);
+            chunks.push(FieldSize::new(start, end));
+            start = end;
+        }
+
+        chunks
+    }
+}
+impl From<DataToClient> for FieldSize {
+    fn from(data: DataToClient) -> Self {
+        FieldSize::new(data.range_start, data.range_end)
+    }
+}
+impl From<&DataToClient> for FieldSize {
+    fn from(data: &DataToClient) -> Self {
+        FieldSize::new(data.range_start, data.range_end)
     }
 }
 
@@ -162,6 +224,9 @@ pub struct ChunkRecord {
 
 /// A field record from the database.
 /// Links to a base, a chunk, and a canon submission if any.
+///
+/// **Range semantics**: This represents a half-open range [`range_start`, `range_end`),
+/// following Rust's standard convention where `range_start` is inclusive and `range_end` is exclusive.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FieldRecord {
     pub field_id: u128,
@@ -177,7 +242,8 @@ pub struct FieldRecord {
 }
 
 /// A field sent to the client for processing. Used as input for processing.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+/// **Range semantics**: This represents a half-open range [`range_start`, `range_end`).
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq)]
 pub struct DataToClient {
     pub claim_id: u128,
     pub base: u32,
@@ -197,7 +263,8 @@ pub struct DataToServer {
 }
 
 /// Both the field info for processing and the compiled results
-/// (for the validation self-check endpoint)
+/// (for the validation self-check endpoint).
+/// **Range semantics**: This represents a half-open range [`range_start`, `range_end`).
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ValidationData {
     pub base: u32,

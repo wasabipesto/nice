@@ -1,9 +1,14 @@
 //! Expand basic distribution with some redundant stats.
 
-use super::*;
+use crate::{SubmissionRecord, UniquesDistribution, UniquesDistributionSimple};
 
-/// Converts a list of UniquesDistributionSimple to UniquesDistribution by adding
+/// Converts a list of `UniquesDistributionSimple` to `UniquesDistribution` by adding
 /// some redundant information that's helpful for other tools.
+///
+/// # Panics
+/// Panics if the distribution is empty.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
 pub fn expand_distribution(
     distributions: &[UniquesDistributionSimple],
     base: u32,
@@ -21,14 +26,16 @@ pub fn expand_distribution(
         .collect()
 }
 
-/// Take a bunch of SubmissionRecords, which each have their own UniquesDistributions,
-/// and aggregate the total count per num_uniques.
+/// Take a bunch of `SubmissionRecords`, which each have their own `UniquesDistributions`,
+/// and aggregate the total count per `um_uniques`.
+#[must_use]
 pub fn downsample_distributions(
     submissions: &[SubmissionRecord],
     base: u32,
 ) -> Vec<UniquesDistribution> {
-    // set up counter vec
-    // indexed by num_uniques
+    // Set up counter vec indexed by `num_uniques`
+    // Note: Array size is (base + 1) to allow indexing from 0..=base
+    // We use indices [1..=base] (inclusive range) since `num_uniques` ranges from 1 to base
     let mut counter = vec![
         UniquesDistributionSimple {
             num_uniques: 0,
@@ -36,6 +43,7 @@ pub fn downsample_distributions(
         };
         base as usize + 1
     ];
+    // Initialize entries for `num_uniques` in [1, base] (inclusive on both ends)
     for n in 1..=base {
         counter[n as usize] = UniquesDistributionSimple {
             num_uniques: n,
@@ -43,7 +51,7 @@ pub fn downsample_distributions(
         };
     }
 
-    // count all submissions
+    // Count all submissions
     for sub in submissions.iter().filter_map(|s| s.distribution.as_deref()) {
         for dist in sub {
             if let Some(counter_dist) = counter.get_mut(dist.num_uniques as usize) {
@@ -52,11 +60,18 @@ pub fn downsample_distributions(
         }
     }
 
-    // expand out & return
+    // Expand out & return
+    // Note: counter[1..] is a half-open range slice that includes indices [1, base],
+    // effectively skipping counter[0] which was just a placeholder
     expand_distribution(&counter[1..], base)
 }
 
-/// Convert a set of UniquesDistributions to a mean and standard deviation.
+/// Convert a set of `UniquesDistributions` to a mean and standard deviation.
+///
+/// # Panics
+/// Panics if the distribution is empty.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
 pub fn mean_stdev_from_distribution(distribution: &[UniquesDistribution]) -> (f32, f32) {
     let mut mean = 0.0;
     let mut stdev = 0.0;
@@ -74,7 +89,8 @@ pub fn mean_stdev_from_distribution(distribution: &[UniquesDistribution]) -> (f3
     (mean, stdev)
 }
 
-/// Removes some information from a list of UniquesDistribution to make UniquesDistributionSimple.
+/// Removes some information from a list of `UniquesDistribution` to make `UniquesDistributionSimple`.
+#[must_use]
 pub fn shrink_distribution(distribution: &[UniquesDistribution]) -> Vec<UniquesDistributionSimple> {
     distribution
         .iter()
@@ -88,6 +104,7 @@ pub fn shrink_distribution(distribution: &[UniquesDistribution]) -> Vec<UniquesD
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SearchMode;
     use chrono::Utc;
 
     fn create_test_distribution_simple() -> Vec<UniquesDistributionSimple> {
@@ -170,7 +187,8 @@ mod tests {
         ]
     }
 
-    #[test]
+    #[test_log::test]
+    #[allow(clippy::float_cmp)]
     fn test_expand_distribution() {
         let simple_dist = create_test_distribution_simple();
         let base = 10;
@@ -197,14 +215,14 @@ mod tests {
         assert_eq!(expanded[2].density, 25.0 / 175.0);
     }
 
-    #[test]
+    #[test_log::test]
     #[should_panic(expected = "assertion failed")]
     fn test_expand_distribution_empty() {
         let empty_dist = vec![];
-        expand_distribution(&empty_dist, 10);
+        let _ = expand_distribution(&empty_dist, 10);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_downsample_distributions() {
         let submissions = create_test_submissions();
         let base = 10;
@@ -233,7 +251,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     #[should_panic(expected = "assertion failed: total_count > 0")]
     fn test_downsample_distributions_empty_submissions() {
         let submissions = vec![];
@@ -241,7 +259,7 @@ mod tests {
         let _result = downsample_distributions(&submissions, base);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_mean_stdev_from_distribution() {
         let distribution = vec![
             UniquesDistribution {
@@ -269,14 +287,14 @@ mod tests {
         assert!((stdev - 0.05).abs() < 1e-6);
     }
 
-    #[test]
+    #[test_log::test]
     #[should_panic(expected = "assertion failed")]
     fn test_mean_stdev_from_distribution_empty() {
         let empty_dist = vec![];
-        mean_stdev_from_distribution(&empty_dist);
+        let _ = mean_stdev_from_distribution(&empty_dist);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_shrink_distribution() {
         let distribution = vec![
             UniquesDistribution {
@@ -302,7 +320,7 @@ mod tests {
         assert_eq!(shrunk[1].count, 50);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_expand_shrink_roundtrip() {
         let original = create_test_distribution_simple();
         let base = 10;

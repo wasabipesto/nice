@@ -219,6 +219,11 @@ __device__ __forceinline__ uint32_t div_u256_by_base(u256& n, uint32_t base) {
 // Kernel 1: Count unique digits (detailed mode)
 // ============================================================================
 
+// Note on range semantics: This kernel operates on array indices [0, n), not ranges.
+// The host code converts the half-open range [range_start, range_end) into arrays
+// of size n = range_end - range_start, with numbers_lo[0] = range_start,
+// numbers_lo[1] = range_start + 1, ..., numbers_lo[n-1] = range_end - 1.
+
 extern "C" __global__ void count_unique_digits_kernel(
     const uint64_t* numbers_lo,
     const uint64_t* numbers_hi,
@@ -268,6 +273,11 @@ extern "C" __global__ void count_unique_digits_kernel(
 // ============================================================================
 // Kernel 2: Check if nice (niceonly mode)
 // ============================================================================
+
+// Note on range semantics: This kernel operates on array indices [0, n), not ranges.
+// The host code may pass filtered candidates (after residue/LSD filtering),
+// so numbers_lo[i] may not be contiguous values. Each array element represents
+// a candidate number to check, with idx used to access the corresponding array position.
 
 extern "C" __global__ void check_is_nice_kernel(
     const uint64_t* numbers_lo,
@@ -343,6 +353,10 @@ extern "C" __global__ void check_is_nice_kernel(
 // ============================================================================
 // Kernel 3: Residue filter (preprocessing)
 // ============================================================================
+
+// Note on range semantics: This kernel operates on array indices [0, n), not ranges.
+// The host code converts a half-open range [range_start, range_end) into arrays,
+// where numbers_lo[idx] corresponds to the number (range_start + idx) for idx in [0, n).
 
 extern "C" __global__ void filter_by_residue_kernel(
     const uint64_t* numbers_lo,
