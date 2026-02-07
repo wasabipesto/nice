@@ -5,6 +5,9 @@
 //! of the search tree (one node per possible LSD) to check if that digit leads to immediate
 //! collision in n² and n³.
 //!
+//! The filter works across all bases because the LSD of a number completely determines the LSD
+//! of its square and cube (via modular arithmetic: if n ≡ d (mod b), then n² ≡ d² (mod b)).
+//!
 //! At low bases this filter is quite effective (filters out up to 60% of candidates) but its
 //! effectiveness is sporadic and diminishes somewhat at higher bases. I experimented with
 //! searching deeper in the tree but it didn't improve the results significantly.
@@ -299,5 +302,65 @@ mod tests {
                 idempotent
             );
         }
+    }
+
+    #[test_log::test]
+    fn test_get_valid_lsds_base12() {
+        // Test base 12 (duodecimal)
+        // Valid LSDs: 2, 3, 5, 7, 8, 11
+        // Filtered: 0, 1, 4, 6, 9, 10 (50% filtered)
+        let valid_lsds = get_valid_lsds(&12);
+        assert_eq!(valid_lsds, vec![2, 3, 5, 7, 8, 11]);
+
+        // Verify specific collision cases:
+        // LSD=0: 0²=0, 0³=0 → both 0 (collision)
+        assert!(!is_valid_lsd(0, 12));
+        // LSD=1: 1²=1, 1³=1 → both 1 (collision)
+        assert!(!is_valid_lsd(1, 12));
+        // LSD=4: 4²=16₁₀=14₁₂, 4³=64₁₀=54₁₂ → both end in 4 (collision)
+        assert!(!is_valid_lsd(4, 12));
+        // LSD=6: 6²=36₁₀=30₁₂, 6³=216₁₀=160₁₂ → both end in 0 (collision)
+        assert!(!is_valid_lsd(6, 12));
+        // LSD=9: 9²=81₁₀=69₁₂, 9³=729₁₀=509₁₂ → both end in 9 (collision)
+        assert!(!is_valid_lsd(9, 12));
+        // LSD=10: 10²=100₁₀=84₁₂, 10³=1000₁₀=6B4₁₂ → both end in 4 (collision)
+        assert!(!is_valid_lsd(10, 12));
+
+        // Verify valid cases:
+        // LSD=2: 2²=4, 2³=8 → 4 and 8 (no collision)
+        assert!(is_valid_lsd(2, 12));
+        // LSD=3: 3²=9, 3³=27₁₀=23₁₂ → 9 and 3 (no collision)
+        assert!(is_valid_lsd(3, 12));
+        // LSD=11: 11²=121₁₀=A1₁₂, 11³=1331₁₀=927₁₂ → 1 and 7 (no collision)
+        assert!(is_valid_lsd(11, 12));
+    }
+
+    #[test_log::test]
+    fn test_get_valid_lsds_base16() {
+        // Test base 16 (hexadecimal)
+        // Valid LSDs: 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15
+        // Filtered: 0, 1, 4, 8, 12 (31.25% filtered)
+        let valid_lsds = get_valid_lsds(&16);
+        assert_eq!(valid_lsds, vec![2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15]);
+
+        // Verify specific collision cases:
+        // LSD=0: both end in 0
+        assert!(!is_valid_lsd(0, 16));
+        // LSD=1: both end in 1
+        assert!(!is_valid_lsd(1, 16));
+        // LSD=4: 4²=10₁₆, 4³=40₁₆ → both end in 0 (collision)
+        assert!(!is_valid_lsd(4, 16));
+        // LSD=8: 8²=40₁₆, 8³=200₁₆ → both end in 0 (collision)
+        assert!(!is_valid_lsd(8, 16));
+        // LSD=12 (C): C²=90₁₆, C³=6C0₁₆ → both end in 0 (collision)
+        assert!(!is_valid_lsd(12, 16));
+
+        // Verify valid cases:
+        // LSD=2: 2²=4, 2³=8 → 4 and 8 (no collision)
+        assert!(is_valid_lsd(2, 16));
+        // LSD=3: 3²=9, 3³=1B₁₆ → 9 and B (no collision)
+        assert!(is_valid_lsd(3, 16));
+        // LSD=15 (F): F²=E1₁₆, F³=D2F₁₆ → 1 and F (no collision)
+        assert!(is_valid_lsd(15, 16));
     }
 }
