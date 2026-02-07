@@ -187,7 +187,7 @@ mod tests {
         ]
     }
 
-    #[test]
+    #[test_log::test]
     #[allow(clippy::float_cmp)]
     fn test_expand_distribution() {
         let simple_dist = create_test_distribution_simple();
@@ -215,14 +215,14 @@ mod tests {
         assert_eq!(expanded[2].density, 25.0 / 175.0);
     }
 
-    #[test]
+    #[test_log::test]
     #[should_panic(expected = "assertion failed")]
     fn test_expand_distribution_empty() {
         let empty_dist = vec![];
         let _ = expand_distribution(&empty_dist, 10);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_downsample_distributions() {
         let submissions = create_test_submissions();
         let base = 10;
@@ -251,7 +251,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     #[should_panic(expected = "assertion failed: total_count > 0")]
     fn test_downsample_distributions_empty_submissions() {
         let submissions = vec![];
@@ -259,7 +259,7 @@ mod tests {
         let _result = downsample_distributions(&submissions, base);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_mean_stdev_from_distribution() {
         let distribution = vec![
             UniquesDistribution {
@@ -287,14 +287,14 @@ mod tests {
         assert!((stdev - 0.05).abs() < 1e-6);
     }
 
-    #[test]
+    #[test_log::test]
     #[should_panic(expected = "assertion failed")]
     fn test_mean_stdev_from_distribution_empty() {
         let empty_dist = vec![];
         let _ = mean_stdev_from_distribution(&empty_dist);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_shrink_distribution() {
         let distribution = vec![
             UniquesDistribution {
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(shrunk[1].count, 50);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_expand_shrink_roundtrip() {
         let original = create_test_distribution_simple();
         let base = 10;

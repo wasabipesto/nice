@@ -150,7 +150,7 @@ mod tests {
         ]
     }
 
-    #[test]
+    #[test_log::test]
     #[allow(clippy::float_cmp)]
     fn test_expand_numbers() {
         let simple_numbers = create_test_numbers_simple();
@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(expanded[2].niceness, 0.7); // 7/10
     }
 
-    #[test]
+    #[test_log::test]
     #[allow(clippy::float_cmp)]
     fn test_expand_numbers_different_bases() {
         let numbers = vec![NiceNumberSimple {
@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(expanded_base_20[0].niceness, 0.25); // 5/20
     }
 
-    #[test]
+    #[test_log::test]
     fn test_expand_numbers_empty() {
         let empty_numbers = vec![];
         let base = 10;
@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(expanded.len(), 0);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_downsample_numbers() {
         let submissions = create_test_submissions();
         let result = downsample_numbers(&submissions);
@@ -223,7 +223,7 @@ mod tests {
         assert!(numbers.contains(&999));
     }
 
-    #[test]
+    #[test_log::test]
     fn test_downsample_numbers_large_set() {
         // Create submissions with more than SAVE_TOP_N_NUMBERS
         let mut large_numbers = Vec::new();
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(result[0].number, nicest_number);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_downsample_numbers_empty_submissions() {
         let empty_submissions = vec![];
         let result = downsample_numbers(&empty_submissions);
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(result.len(), 0);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_shrink_numbers() {
         let numbers = vec![
             NiceNumber {
@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(shrunk[1].num_uniques, 5);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_expand_shrink_roundtrip() {
         let original = create_test_numbers_simple();
         let base = 10;

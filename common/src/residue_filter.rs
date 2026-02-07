@@ -23,7 +23,7 @@ pub fn get_residue_filter_u128(base: &u32) -> Vec<u128> {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_log::test]
     fn test_get_residue_filter() {
         assert_eq!(get_residue_filter(&10), Vec::from([0, 3, 6, 8]));
         assert_eq!(get_residue_filter(&11), Vec::<u32>::new());
@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(get_residue_filter(&120), Vec::from([0, 34, 84, 118]));
     }
 
-    #[test]
+    #[test_log::test]
     fn test_get_residue_filter_u128() {
         assert_eq!(get_residue_filter_u128(&10), Vec::from([0, 3, 6, 8]));
         assert_eq!(get_residue_filter_u128(&11), Vec::<u128>::new());

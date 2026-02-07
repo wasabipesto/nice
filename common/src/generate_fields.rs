@@ -39,7 +39,7 @@ mod tests {
     use crate::base_range;
     use malachite::base::num::arithmetic::traits::DivMod;
 
-    #[test]
+    #[test_log::test]
     fn test_break_range_into_fields_b10() {
         let base = 10;
         let size = 1_000_000_000;
@@ -50,7 +50,7 @@ mod tests {
         assert_eq!(fields, vec![FieldSize::new(47u128, 100u128)]);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_break_range_into_fields_general() {
         for base in [10, 11, 12, 13, 14, 15, 20, 30, 40] {
             for size in [100_000_000, 1_000_000_000, 10_000_000_000] {

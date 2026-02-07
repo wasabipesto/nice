@@ -85,7 +85,7 @@ impl fmt::Display for BenchmarkMode {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_log::test]
     fn test_get_benchmark_field() {
         let _ = get_benchmark_field(BenchmarkMode::BaseTen);
         let _ = get_benchmark_field(BenchmarkMode::Default);

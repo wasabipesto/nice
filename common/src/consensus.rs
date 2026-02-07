@@ -120,7 +120,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn test_evaluate_consensus_no_submissions() {
         let field = create_test_field();
         let submissions = vec![];
@@ -131,7 +131,7 @@ mod tests {
         assert_eq!(result.1, 1); // min(field.check_level, 1)
     }
 
-    #[test]
+    #[test_log::test]
     fn test_evaluate_consensus_single_submission() {
         let field = create_test_field();
         let distribution = vec![
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(result.1, 2);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_evaluate_consensus_multiple_same_submissions() {
         let field = create_test_field();
         let distribution = vec![UniquesDistributionSimple {
@@ -182,7 +182,7 @@ mod tests {
         assert_eq!(result.1, 4); // 3 submissions + 1
     }
 
-    #[test]
+    #[test_log::test]
     fn test_evaluate_consensus_different_submissions() {
         let field = create_test_field();
 
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(result.1, 3); // 2 submissions + 1
     }
 
-    #[test]
+    #[test_log::test]
     fn test_evaluate_consensus_check_level_capping() {
         let mut field = create_test_field();
         field.check_level = 5;
@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(result.1, 1);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_evaluate_consensus_large_group() {
         let field = create_test_field();
         let distribution = vec![UniquesDistributionSimple {
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(result.1, 255);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_evaluate_consensus_check_level_within_bounds() {
         let field = create_test_field();
         let distribution = vec![UniquesDistributionSimple {
@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(result.1, 255);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_evaluate_consensus_earliest_submission_selected() {
         use std::thread;
         use std::time::Duration;

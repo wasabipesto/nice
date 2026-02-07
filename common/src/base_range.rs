@@ -58,7 +58,7 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    #[test]
+    #[test_log::test]
     fn test_get_base_range_u128() {
         assert_eq!(
             get_base_range_u128(5),
@@ -97,7 +97,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[test_log::test]
     fn test_get_base_range_natural() {
         assert_eq!(
             get_base_range_natural(5),

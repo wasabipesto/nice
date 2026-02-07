@@ -66,7 +66,7 @@ mod tests {
     use super::*;
     use crate::{base_range, generate_fields};
 
-    #[test]
+    #[test_log::test]
     fn test_group_fields_into_chunks_b10() {
         let base = 10;
         let size = 1_000_000_000;
@@ -85,7 +85,7 @@ mod tests {
         assert_eq!(fields.len(), 1);
     }
 
-    #[test]
+    #[test_log::test]
     fn test_group_fields_into_chunks_general() {
         for base in [10, 11, 12, 13, 14, 15, 20, 30, 40] {
             for size in [100_000_000, 1_000_000_000, 10_000_000_000] {

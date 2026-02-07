@@ -468,7 +468,7 @@ mod tests {
             .collect()
     }
 
-    #[test]
+    #[test_log::test]
     #[ignore = "GPU not available"]
     fn test_gpu_matches_cpu_detailed_small() {
         let Some(ctx) = try_init_gpu() else {
@@ -507,7 +507,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     #[ignore = "GPU not available"]
     fn test_gpu_matches_cpu_niceonly_small() {
         let Some(ctx) = try_init_gpu() else {
@@ -541,7 +541,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     #[ignore = "GPU not available"]
     fn test_gpu_base_40_range() {
         let Some(ctx) = try_init_gpu() else {
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(cpu_nice, gpu_nice, "Results differ for base 40");
     }
 
-    #[test]
+    #[test_log::test]
     fn test_split_combine_u128() {
         let numbers = vec![0u128, 1u128, 12345u128, u128::from(u64::MAX), u128::MAX];
         let (lo, hi) = split_u128_vec(&numbers);
@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(numbers, recombined);
     }
 
-    #[test]
+    #[test_log::test]
     #[ignore = "GPU not available"]
     fn test_gpu_context_creation() {
         // Just test that we can create a context

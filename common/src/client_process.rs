@@ -285,7 +285,7 @@ mod tests {
     use super::*;
     use crate::base_range;
 
-    #[test]
+    #[test_log::test]
     fn process_detailed_b10() {
         let base = 10;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(process_range_detailed(&input.into(), input.base), result);
     }
 
-    #[test]
+    #[test_log::test]
     fn process_detailed_b40() {
         let base = 40;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
@@ -527,7 +527,7 @@ mod tests {
         assert_eq!(process_range_detailed(&input.into(), input.base), result);
     }
 
-    #[test]
+    #[test_log::test]
     fn process_detailed_b80() {
         let base = 80;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
@@ -867,7 +867,7 @@ mod tests {
         assert_eq!(process_range_detailed(&input.into(), input.base), result);
     }
 
-    #[test]
+    #[test_log::test]
     fn process_niceonly_b10() {
         let base = 10;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
@@ -888,7 +888,7 @@ mod tests {
         assert_eq!(process_range_niceonly(&input.into(), input.base), result);
     }
 
-    #[test]
+    #[test_log::test]
     fn process_niceonly_b40() {
         let base = 40;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
@@ -907,7 +907,7 @@ mod tests {
         assert_eq!(process_range_niceonly(&input.into(), input.base), result);
     }
 
-    #[test]
+    #[test_log::test]
     fn process_niceonly_b80() {
         let base = 80;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
