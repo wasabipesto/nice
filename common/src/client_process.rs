@@ -29,7 +29,7 @@ use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
 };
-use crate::{lsd_filter, msd_prefix_filter, number_stats, residue_filter};
+use crate::{msd_prefix_filter, number_stats, residue_filter};
 use itertools::Itertools;
 use log::trace;
 use malachite::base::num::arithmetic::traits::{DivAssignRem, Pow};
@@ -234,16 +234,7 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
     }
 
     // Get LSD filter to eliminate invalid least significant digits
-    let lsd_filter = lsd_filter::get_valid_lsds_u128(&base);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    {
-        trace!(
-            "Filtered candidate range by {}/{} ({:.2}%) by LSD filtering of depth 1.",
-            base - lsd_filter.len() as u32,
-            base,
-            (1.0 - (lsd_filter.len() as f64 / f64::from(base))) * 100.0
-        );
-    }
+    // let lsd_filter = lsd_filter::get_valid_lsds_u128(&base);
 
     // Get residue filters to reduce search range
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
@@ -261,7 +252,7 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
     let mut nice_list = Vec::new();
     for r in valid_ranges {
         let range_nice: Vec<NiceNumberSimple> = (r.range_start..r.range_end)
-            .filter(|num| lsd_filter.contains(&(num % base_u128)))
+            //.filter(|num| lsd_filter.contains(&(num % base_u128))) // Disable LSD filter due to poor performance
             .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
             .filter(|num| get_is_nice(*num, base))
             .map(|number| NiceNumberSimple {
