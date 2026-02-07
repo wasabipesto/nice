@@ -19,12 +19,7 @@ pub fn break_range_into_fields(min: u128, max: u128, size: u128) -> Vec<FieldSiz
         end = start.add(&size).min(max);
 
         // build and push the field
-        let field = FieldSize {
-            range_start: start,
-            range_end: end,
-            range_size: end - start,
-        };
-        fields.push(field);
+        fields.push(FieldSize::new(start, end));
 
         // bump the start
         start = end;
@@ -45,14 +40,7 @@ mod tests {
         let fields = break_range_into_fields(base_range.range_start, base_range.range_end, size);
 
         // check against known field
-        assert_eq!(
-            fields,
-            vec![FieldSize {
-                range_start: 47u128,
-                range_end: 100u128,
-                range_size: 53u128
-            }]
-        );
+        assert_eq!(fields, vec![FieldSize::new(47u128, 100u128)]);
     }
 
     #[test]

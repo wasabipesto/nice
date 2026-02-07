@@ -201,7 +201,7 @@ pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> 
     // all numbers will have duplicate/overlapping digits. It's more effective than fixed
     // chunking because it only subdivides when needed and can find natural boundaries.
     let valid_ranges = msd_prefix_filter::get_valid_ranges(range_start, range_end, base);
-    let filtered_range_size: u128 = valid_ranges.iter().map(|(s, e)| e - s).sum();
+    let filtered_range_size: u128 = valid_ranges.iter().map(|range| range.range_size).sum();
     trace!(
         "Filtered candidate range from {} to {} ({:.2}%) with MSD filtering of depth {}",
         range_size,
@@ -230,8 +230,8 @@ pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> 
 
     // Process each valid range
     let mut nice_list = Vec::new();
-    for (sub_start, sub_end) in valid_ranges {
-        let range_nice: Vec<NiceNumberSimple> = (sub_start..sub_end)
+    for r in valid_ranges {
+        let range_nice: Vec<NiceNumberSimple> = (r.range_start..r.range_end)
             .filter(|num| lsd_filter.contains(&(num % base_u128)))
             .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
             .filter(|num| get_is_nice(*num, base))

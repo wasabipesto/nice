@@ -84,6 +84,16 @@ pub struct FieldSize {
     pub range_size: u128,
 }
 
+impl FieldSize {
+    pub fn new(range_start: u128, range_end: u128) -> Self {
+        FieldSize {
+            range_start,
+            range_end,
+            range_size: range_end - range_start,
+        }
+    }
+}
+
 /// Aggregate data on the niceness of all numbers in the range.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct UniquesDistributionSimple {

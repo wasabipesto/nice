@@ -192,7 +192,7 @@ pub fn get_valid_ranges_recursive(
     max_depth: u32,
     min_range_size: u128,
     subdivision_factor: usize,
-) -> Vec<(u128, u128)> {
+) -> Vec<FieldSize> {
     // Check if range is too small or we've hit max depth
     let range_size = range_end - range_start;
     if range_size <= min_range_size || current_depth >= max_depth {
@@ -200,7 +200,7 @@ pub fn get_valid_ranges_recursive(
         trace!(
             "Depth {current_depth}: Range [{range_start}, {range_end}) too small or max depth reached, returning for processing"
         );
-        return vec![(range_start, range_end)];
+        return vec![FieldSize::new(range_start, range_end)];
     }
 
     // Check if the entire range can be skipped
@@ -215,7 +215,7 @@ pub fn get_valid_ranges_recursive(
         trace!(
             "Depth {current_depth}: Range [{range_start}, {range_end}) not worth subdividing, returning for processing"
         );
-        return vec![(range_start, range_end)];
+        return vec![FieldSize::new(range_start, range_end)];
     }
 
     // Subdivide the range and recursively check each part
@@ -255,7 +255,7 @@ pub fn get_valid_ranges_recursive(
 ///
 /// Returns a vector of (start, end) tuples representing ranges that need processing.
 /// Ranges that can be skipped based on MSD prefix are not included.
-pub fn get_valid_ranges(range_start: u128, range_end: u128, base: u32) -> Vec<(u128, u128)> {
+pub fn get_valid_ranges(range_start: u128, range_end: u128, base: u32) -> Vec<FieldSize> {
     get_valid_ranges_recursive(
         range_start,
         range_end,
