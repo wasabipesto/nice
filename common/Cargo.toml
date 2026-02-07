@@ -12,9 +12,10 @@ license-file.workspace = true
 database = ["dep:diesel", "dep:dotenvy", "dep:bigdecimal", "dep:rand"]
 openssl-tls = ["reqwest/default-tls", "dep:openssl", "dep:tokio"]
 rustls-tls = ["reqwest/rustls-tls", "dep:tokio"]
-gpu = ["dep:cudarc", "dep:anyhow"]
+gpu = ["dep:cudarc"]
 
 [dependencies]
+anyhow = { version = "1.0" }
 bigdecimal = { version = "0.4.10", optional = true }
 chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -31,7 +32,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 rand = { version = "0.9", optional = true }
 cudarc = { version = "0.19", features = ["cuda-12000"], optional = true }
-anyhow = { version = "1.0", optional = true }
 
 [build-dependencies]
 cc = { version = "1.2", optional = true }

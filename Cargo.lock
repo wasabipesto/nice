@@ -1447,6 +1447,7 @@ dependencies = [
 name = "nice_client"
 version = "3.2.11"
 dependencies = [
+ "anyhow",
  "clap",
  "cudarc",
  "env_logger",

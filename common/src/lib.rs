@@ -6,7 +6,9 @@
 pub mod base_range;
 pub mod benchmark;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
-pub mod client_api;
+pub mod client_api_async;
+#[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
+pub mod client_api_sync;
 pub mod client_process;
 pub mod client_process_gpu;
 pub mod consensus;

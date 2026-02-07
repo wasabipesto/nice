@@ -16,6 +16,7 @@ gpu = ["nice_common/gpu", "dep:cudarc"]
 
 [dependencies]
 nice_common = { workspace = true }
+anyhow = { version = "1.0" }
 clap = { version = "4.5", features = ["env", "derive"] }
 env_logger = { version = "0.11" }
 log = { version = "0.4" }
