@@ -124,7 +124,7 @@ pub fn get_all_bases(conn: &mut PgConnection) -> Result<Vec<BaseRecord>, String>
         .map_err(|err| err.to_string())?;
     let mut res = Vec::new();
     for b in bases_private {
-        res.push(private_to_public(b)?)
+        res.push(private_to_public(b)?);
     }
     Ok(res)
 }

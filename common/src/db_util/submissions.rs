@@ -86,6 +86,7 @@ fn public_to_private(p: SubmissionRecord) -> Result<SubmissionPrivate, String> {
     })
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn build_new_row(
     claim_record: &ClaimRecord,
     submit_data: &DataToServer,
@@ -199,7 +200,7 @@ pub fn get_submissions_qualified_detailed_for_field(
         .collect::<Result<Vec<SubmissionRecord>, String>>()
 }
 
-/// Struct to hold submission with chunk_id from batch query
+/// Struct to hold submission with `chunk_id` from batch query
 #[derive(Debug, QueryableByName)]
 pub struct SubmissionWithChunk {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -230,7 +231,7 @@ pub struct SubmissionWithChunk {
     pub chunk_id: Option<i32>,
 }
 
-/// Get all canon submissions for a base with their chunk_ids in a single query.
+/// Get all canon submissions for a base with their `chunk_ids` in a single query.
 /// This is much more efficient than querying each chunk individually.
 pub fn get_canon_submissions_with_chunks_by_base(
     conn: &mut PgConnection,

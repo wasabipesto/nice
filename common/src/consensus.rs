@@ -6,6 +6,9 @@ use std::collections::HashMap;
 
 /// Given a field and submissions, determine if there is a consensus.
 /// If so, update the canon submission ID and field check level.
+///
+/// # Errors
+/// Returns an error if there are no submissions or if there is an issue with the distribution.
 pub fn evaluate_consensus(
     field: &FieldRecord,
     submissions: &Vec<SubmissionRecord>,
@@ -50,10 +53,7 @@ pub fn evaluate_consensus(
         .values()
         .max_by_key(|v| v.len())
         .ok_or_else(|| {
-            format!(
-                "Could not get majority group from submission_groups: {:?}.",
-                submission_groups
-            )
+            format!("Could not get majority group from submission_groups: {submission_groups:?}.")
         })?
         .clone();
 
@@ -61,10 +61,11 @@ pub fn evaluate_consensus(
     let first_submission = majority_group
         .iter()
         .min_by_key(|sub| sub.submit_time)
-        .ok_or_else(|| format!("No submission in majority_group: {:?}.", majority_group))?;
+        .ok_or_else(|| format!("No submission in majority_group: {majority_group:?}."))?;
 
     // Determine the check level, cap to u8::MAX (255)
     let check_level_raw = majority_group.len() + 1;
+    #[allow(clippy::cast_possible_truncation)]
     let check_level = check_level_raw.min(u8::MAX as usize) as u8;
 
     Ok((Some(first_submission.clone()), check_level))
@@ -93,15 +94,15 @@ mod tests {
 
     fn create_test_submission(
         submission_id: u128,
-        distribution: Vec<UniquesDistributionSimple>,
-        numbers: Vec<NiceNumberSimple>,
+        distribution: &[UniquesDistributionSimple],
+        numbers: &[NiceNumberSimple],
     ) -> SubmissionRecord {
         let expanded_distribution = if distribution.is_empty() {
             None
         } else {
-            Some(distribution_stats::expand_distribution(&distribution, 10))
+            Some(distribution_stats::expand_distribution(distribution, 10))
         };
-        let expanded_numbers = number_stats::expand_numbers(&numbers, 10);
+        let expanded_numbers = number_stats::expand_numbers(numbers, 10);
 
         SubmissionRecord {
             submission_id,
@@ -147,7 +148,7 @@ mod tests {
             number: 123,
             num_uniques: 3,
         }];
-        let submission = create_test_submission(1, distribution, numbers);
+        let submission = create_test_submission(1, &distribution, &numbers);
         let submissions = vec![submission.clone()];
 
         let result = evaluate_consensus(&field, &submissions).unwrap();
@@ -169,10 +170,10 @@ mod tests {
         }];
 
         // Create multiple identical submissions
-        let submission1 = create_test_submission(1, distribution.clone(), numbers.clone());
-        let submission2 = create_test_submission(2, distribution.clone(), numbers.clone());
-        let submission3 = create_test_submission(3, distribution, numbers);
-        let submissions = vec![submission1.clone(), submission2, submission3];
+        let submission_1 = create_test_submission(1, &distribution, &numbers);
+        let submission_2 = create_test_submission(2, &distribution, &numbers);
+        let submission_3 = create_test_submission(3, &distribution, &numbers);
+        let submissions = vec![submission_1, submission_2, submission_3];
 
         let result = evaluate_consensus(&field, &submissions).unwrap();
 
@@ -186,29 +187,29 @@ mod tests {
         let field = create_test_field();
 
         // First group (2 submissions)
-        let distribution1 = vec![UniquesDistributionSimple {
+        let distribution_1 = vec![UniquesDistributionSimple {
             num_uniques: 1,
             count: 100,
         }];
-        let numbers1 = vec![NiceNumberSimple {
+        let numbers_1 = vec![NiceNumberSimple {
             number: 123,
             num_uniques: 3,
         }];
 
         // Second group (1 submission)
-        let distribution2 = vec![UniquesDistributionSimple {
+        let distribution_2 = vec![UniquesDistributionSimple {
             num_uniques: 2,
             count: 200,
         }];
-        let numbers2 = vec![NiceNumberSimple {
+        let numbers_2 = vec![NiceNumberSimple {
             number: 456,
             num_uniques: 5,
         }];
 
-        let submission1 = create_test_submission(1, distribution1.clone(), numbers1.clone());
-        let submission2 = create_test_submission(2, distribution1, numbers1);
-        let submission3 = create_test_submission(3, distribution2, numbers2);
-        let submissions = vec![submission1.clone(), submission2, submission3];
+        let submission_1 = create_test_submission(1, &distribution_1, &numbers_1);
+        let submission_2 = create_test_submission(2, &distribution_1, &numbers_1);
+        let submission_3 = create_test_submission(3, &distribution_2, &numbers_2);
+        let submissions = vec![submission_1, submission_2, submission_3];
 
         let result = evaluate_consensus(&field, &submissions).unwrap();
 
@@ -244,11 +245,7 @@ mod tests {
         // Create many identical submissions (more than u8::MAX)
         let mut submissions = Vec::new();
         for i in 1..=300 {
-            submissions.push(create_test_submission(
-                i,
-                distribution.clone(),
-                numbers.clone(),
-            ));
+            submissions.push(create_test_submission(i, &distribution, &numbers));
         }
 
         let result = evaluate_consensus(&field, &submissions).unwrap();
@@ -272,11 +269,7 @@ mod tests {
         // Create 254 identical submissions (to stay within u8 bounds)
         let mut submissions = Vec::new();
         for i in 1..=254 {
-            submissions.push(create_test_submission(
-                i,
-                distribution.clone(),
-                numbers.clone(),
-            ));
+            submissions.push(create_test_submission(i, &distribution, &numbers));
         }
 
         let result = evaluate_consensus(&field, &submissions).unwrap();
@@ -300,14 +293,14 @@ mod tests {
             num_uniques: 3,
         }];
 
-        let submission1 = create_test_submission(1, distribution.clone(), numbers.clone());
+        let submission_1 = create_test_submission(1, &distribution, &numbers);
         thread::sleep(Duration::from_millis(10));
-        let mut submission2 = create_test_submission(2, distribution, numbers);
+        let mut submission_2 = create_test_submission(2, &distribution, &numbers);
 
-        // Make sure submission2 has a later timestamp
-        submission2.submit_time = Utc::now();
+        // Make sure `submission_2` has a later timestamp
+        submission_2.submit_time = Utc::now();
 
-        let submissions = vec![submission2, submission1.clone()]; // Note: out of order
+        let submissions = vec![submission_2, submission_1.clone()]; // Note: out of order
 
         let result = evaluate_consensus(&field, &submissions).unwrap();
 

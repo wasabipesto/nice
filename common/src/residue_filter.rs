@@ -1,7 +1,8 @@
 //! A module for dealing with residue filters
-//! For more information: https://beautifulthorns.wixsite.com/home/post/progress-update-on-the-search-for-nice-numbers
+//! For more information: <https://beautifulthorns.wixsite.com/home/post/progress-update-on-the-search-for-nice-numbers>
 
 /// Get a list of residue filters for a base.
+#[must_use]
 pub fn get_residue_filter(base: &u32) -> Vec<u32> {
     let target_residue = base * (base - 1) / 2 % (base - 1);
     (0..(base - 1))
@@ -10,10 +11,11 @@ pub fn get_residue_filter(base: &u32) -> Vec<u32> {
 }
 
 /// Get a list of residue filters for a base, but as u128 for easier processing.
+#[must_use]
 pub fn get_residue_filter_u128(base: &u32) -> Vec<u128> {
     get_residue_filter(base)
         .iter()
-        .map(|num| *num as u128)
+        .map(|num| u128::from(*num))
         .collect()
 }
 

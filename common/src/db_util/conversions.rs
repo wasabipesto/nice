@@ -1,6 +1,14 @@
 //! Safe-ish conversions between rust and sql types.
 //! Ideally this will be ripped out and implemented as whatever custom diesel types end up being necessary.
 
+#![allow(
+    clippy::unnecessary_wraps,
+    clippy::needless_pass_by_value,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+
 use super::*;
 
 pub fn i64_to_u128(i: i64) -> Result<u128, String> {
@@ -62,14 +70,14 @@ pub fn u32_to_i32(i: u32) -> Result<i32, String> {
 }
 
 pub fn i32_to_u8(i: i32) -> Result<u8, String> {
-    if i < 0 || i > u8::MAX as i32 {
+    if i < 0 || i > i32::from(u8::MAX) {
         Err("i32 value is out of range for u8".to_string())
     } else {
         Ok(i as u8)
     }
 }
 pub fn u8_to_i32(i: u8) -> Result<i32, String> {
-    Ok(i as i32)
+    Ok(i32::from(i))
 }
 
 pub fn bigdec_to_u128(i: BigDecimal) -> Result<u128, String> {

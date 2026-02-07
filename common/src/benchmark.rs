@@ -30,8 +30,13 @@ pub enum BenchmarkMode {
 
 /// Get a benchmark field for testing and performance evaluation.
 ///
-/// **Range semantics**: Returns a DataToClient with a half-open range [range_start, range_end),
-/// where range_start is inclusive, range_end is exclusive, and range_size = range_end - range_start.
+/// **Range semantics**: Returns a `DataToClient` with a half-open range [`range_start`, `range_end`),
+/// where `range_start` is inclusive and `range_end` is exclusive.
+///
+/// # Panics
+/// Panics if the base is not supported.
+#[must_use]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
     let base = match mode {
         BenchmarkMode::BaseTen => 10,
@@ -45,8 +50,8 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
     };
     let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
     let range_start = match mode {
-        BenchmarkMode::MsdEffective => 26507984537059635,
-        BenchmarkMode::MsdIneffective => 94760515586064977,
+        BenchmarkMode::MsdEffective => 26_507_984_537_059_635,
+        BenchmarkMode::MsdIneffective => 94_760_515_586_064_977,
         _ => base_range.range_start,
     };
     let range_size = match mode {
@@ -72,7 +77,7 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
 
 impl fmt::Display for BenchmarkMode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -82,9 +87,13 @@ mod tests {
 
     #[test]
     fn test_get_benchmark_field() {
-        get_benchmark_field(BenchmarkMode::Default);
-        get_benchmark_field(BenchmarkMode::Large);
-        get_benchmark_field(BenchmarkMode::ExtraLarge);
-        get_benchmark_field(BenchmarkMode::HiBase);
+        let _ = get_benchmark_field(BenchmarkMode::BaseTen);
+        let _ = get_benchmark_field(BenchmarkMode::Default);
+        let _ = get_benchmark_field(BenchmarkMode::Large);
+        let _ = get_benchmark_field(BenchmarkMode::ExtraLarge);
+        let _ = get_benchmark_field(BenchmarkMode::Massive);
+        let _ = get_benchmark_field(BenchmarkMode::HiBase);
+        let _ = get_benchmark_field(BenchmarkMode::MsdEffective);
+        let _ = get_benchmark_field(BenchmarkMode::MsdIneffective);
     }
 }

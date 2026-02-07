@@ -1,5 +1,11 @@
 //! Interfaces between the application code and database.
 
+#![allow(
+    clippy::wildcard_imports,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+
 use super::*;
 
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
@@ -27,6 +33,7 @@ pub type PgPooledConnection = PooledConnection<ConnectionManager<PgConnection>>;
 /// Reads:
 /// - `DATABASE_URL` (required)
 /// - `DATABASE_POOL_SIZE` (optional, defaults to 10)
+#[must_use]
 pub fn get_database_pool() -> PgPool {
     dotenv().ok();
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -45,17 +52,19 @@ pub fn get_database_pool() -> PgPool {
 }
 
 /// Get a single pooled database connection.
+#[must_use]
 pub fn get_pooled_database_connection(pool: &PgPool) -> PgPooledConnection {
     pool.get()
         .expect("Error retrieving database connection from pool")
 }
 
 /// Get a single database connection (non-pooled).
+#[must_use]
 pub fn get_database_connection() -> PgConnection {
     dotenv().ok();
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     PgConnection::establish(&database_url)
-        .unwrap_or_else(|_| panic!("Error connecting to {}", database_url))
+        .unwrap_or_else(|_| panic!("Error connecting to {database_url}"))
 }
 
 /// Get a base record (base range plus cached stats).
@@ -101,7 +110,7 @@ pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<Chun
 pub fn insert_new_chunks(
     conn: &mut PgConnection,
     base: u32,
-    chunk_sizes: Vec<FieldSize>,
+    chunk_sizes: &[FieldSize],
 ) -> Result<(), String> {
     chunks::insert_chunks(conn, base, chunk_sizes)
 }
@@ -166,7 +175,7 @@ pub fn try_claim_field(
 }
 
 /// Bulk claim multiple fields at once for queue pre-filling.
-/// This is much more efficient than calling try_claim_field repeatedly.
+/// This is much more efficient than calling `try_claim_field` repeatedly.
 pub fn bulk_claim_fields(
     conn: &mut PgConnection,
     count: usize,
@@ -188,7 +197,7 @@ pub fn bulk_claim_fields(
 pub fn insert_new_fields(
     conn: &mut PgConnection,
     base: u32,
-    field_sizes: Vec<FieldSize>,
+    field_sizes: &[FieldSize],
 ) -> Result<(), String> {
     fields::insert_fields(conn, base, field_sizes)
 }
@@ -289,7 +298,7 @@ pub fn get_chunk_stats_batch(
     fields::get_chunk_stats_batch(conn, base)
 }
 
-/// Get all canon submissions for a base with their chunk_ids in a single query.
+/// Get all canon submissions for a base with their `chunk_ids` in a single query.
 /// This is much more efficient than querying each chunk individually.
 pub fn get_canon_submissions_with_chunks_by_base(
     conn: &mut PgConnection,

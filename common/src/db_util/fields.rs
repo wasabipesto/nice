@@ -58,7 +58,7 @@ fn private_to_public(p: FieldPrivate) -> Result<FieldRecord, String> {
     })
 }
 
-fn public_to_private(p: FieldRecord) -> Result<FieldPrivate, String> {
+fn public_to_private(p: &FieldRecord) -> Result<FieldPrivate, String> {
     use conversions::*;
     Ok(FieldPrivate {
         id: u128_to_i64(p.field_id)?,
@@ -87,7 +87,7 @@ fn build_new_row(base: u32, size: &FieldSize) -> Result<FieldPrivateNew, String>
 pub fn insert_fields(
     conn: &mut PgConnection,
     base: u32,
-    sizes: Vec<FieldSize>,
+    sizes: &[FieldSize],
 ) -> Result<(), String> {
     use self::fields::dsl::*;
 
@@ -201,8 +201,9 @@ pub fn get_fields_in_base_with_detailed_subs(
         .collect::<Result<Vec<FieldRecord>, String>>()
 }
 
-/// Finds the next field that matches the criteria, updates last_claim_time, and returns it.
+/// Finds the next field that matches the criteria, updates `last_claim_time`, and returns it.
 /// Returns Ok(None) if no matching fields are found.
+#[allow(clippy::too_many_lines)]
 pub fn try_claim_field(
     conn: &mut PgConnection,
     claim_strategy: FieldClaimStrategy,
@@ -370,6 +371,7 @@ pub fn try_claim_field(
             ";
 
             #[derive(QueryableByName)]
+            #[allow(clippy::items_after_statements, clippy::struct_field_names)]
             struct ChunkInfo {
                 #[diesel(sql_type = diesel::sql_types::Integer)]
                 chunk_id: i32,
@@ -379,16 +381,15 @@ pub fn try_claim_field(
                 max_field_id: Option<i64>,
             }
 
-            let chunk_info: Option<ChunkInfo> = sql_query(chunk_info_query)
+            let chunk_info_result: Option<ChunkInfo> = sql_query(chunk_info_query)
                 .bind::<Integer, _>(maximum_check_level)
                 .bind::<Numeric, _>(chunk_completion_cutoff_pct)
                 .get_result(conn)
                 .optional()
                 .map_err(|err| err.to_string())?;
 
-            let chunk_info = match chunk_info {
-                Some(info) => info,
-                None => return Ok(None), // No eligible chunk found
+            let Some(chunk_info) = chunk_info_result else {
+                return Ok(None);
             };
 
             let (min_id, max_id) = match (chunk_info.min_field_id, chunk_info.max_field_id) {
@@ -472,7 +473,7 @@ pub fn try_claim_field(
 }
 
 /// Bulk claim multiple fields at once for queue pre-filling.
-/// This is much more efficient than calling try_claim_field repeatedly.
+/// This is much more efficient than calling `try_claim_field` repeatedly.
 pub fn bulk_claim_fields(
     conn: &mut PgConnection,
     count: usize,
@@ -571,7 +572,7 @@ pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData, S
     let submission_id = field_pub
         .canon_submission_id
         .ok_or_else(|| "Field has no canonical submission".to_string())?;
-    let submission = submissions::get_submission_by_id(conn, submission_id as u128)?;
+    let submission = submissions::get_submission_by_id(conn, u128::from(submission_id))?;
 
     // Convert submission data to simple format for ValidationData
     let unique_distribution = match submission.distribution {
@@ -641,7 +642,7 @@ pub fn get_minimum_cl_by_range(
 pub fn update_field(
     conn: &mut PgConnection,
     row_id: u128,
-    update_row: FieldRecord,
+    update_row: &FieldRecord,
 ) -> Result<FieldRecord, String> {
     use self::fields::dsl::*;
 

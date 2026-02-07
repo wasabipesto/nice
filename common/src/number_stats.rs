@@ -5,13 +5,21 @@ use crate::{NEAR_MISS_CUTOFF_PERCENT, NiceNumber, NiceNumberSimple, SubmissionRe
 pub const SAVE_TOP_N_NUMBERS: usize = 10_000;
 
 /// Get the near-miss cutoff given a base.
-/// Uses the crate-level NEAR_MISS_CUTOFF_PERCENT.
+/// Uses the crate-level `NEAR_MISS_CUTOFF_PERCENT`.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 pub fn get_near_miss_cutoff(base: u32) -> u32 {
     (base as f32 * NEAR_MISS_CUTOFF_PERCENT).floor() as u32
 }
 
-/// Converts a list of NiceNumberSimple to NiceNumber by adding
+/// Converts a list of `NiceNumberSimple` to `NiceNumber` by adding
 /// some redundant information that's helpful for other tools.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
 pub fn expand_numbers(numbers: &[NiceNumberSimple], base: u32) -> Vec<NiceNumber> {
     let base_f32 = base as f32;
     numbers
@@ -25,16 +33,17 @@ pub fn expand_numbers(numbers: &[NiceNumberSimple], base: u32) -> Vec<NiceNumber
         .collect()
 }
 
-/// Take a bunch of SubmissionRecords, which each have their own NiceNumbers, and aggregate
+/// Take a bunch of `SubmissionRecords`, which each have their own `NiceNumbers`, and aggregate
 /// them all into a single list. Then filters to the top 10k for a sanity check.
+#[must_use]
 pub fn downsample_numbers(submissions: &[SubmissionRecord]) -> Vec<NiceNumber> {
-    // collate all numbers
+    // Collate all numbers
     let mut all_numbers = submissions.iter().fold(Vec::new(), |mut acc, sub| {
         acc.extend(sub.numbers.iter().cloned());
         acc
     });
 
-    // sort by number of uniques and take the top few
+    // Sort by number of uniques and take the top few
     all_numbers.sort_by(|a, b| b.num_uniques.cmp(&a.num_uniques));
     all_numbers
         .iter()
@@ -43,7 +52,8 @@ pub fn downsample_numbers(submissions: &[SubmissionRecord]) -> Vec<NiceNumber> {
         .collect()
 }
 
-/// Removes some information from a list of NiceNumbers to make NiceNumberSimple.
+/// Removes some information from a list of `NiceNumbers` to make `NiceNumberSimple`.
+#[must_use]
 pub fn shrink_numbers(numbers: &[NiceNumber]) -> Vec<NiceNumberSimple> {
     numbers
         .iter()
@@ -141,6 +151,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_expand_numbers() {
         let simple_numbers = create_test_numbers_simple();
         let base = 10;
@@ -168,6 +179,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_expand_numbers_different_bases() {
         let numbers = vec![NiceNumberSimple {
             number: 100,

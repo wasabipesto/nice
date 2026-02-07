@@ -1,19 +1,21 @@
-//! A module with client-server connection utlities.
+//! A module with client-server connection utilities.
+
+#![allow(clippy::missing_panics_doc)] // TODO: Replace these panics with Results
 
 use crate::{CLIENT_REQUEST_TIMEOUT_SECS, DataToClient, DataToServer, SearchMode, ValidationData};
 use reqwest::blocking::Response;
 use std::{thread, time::Duration};
 
-// Re-export tokio and reqwest for async functions
+// Reexport tokio and reqwest for async functions
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
 pub use reqwest::Client;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
 pub use tokio;
 
 /// Helper function to determine if an error is retry-able
-/// - is_timeout() catches typical network timeouts
-/// - is_connect() catches typical connection failures
-/// - is_request() catches DNS resolution failures and other transient request errors
+/// - `is_timeout()` catches typical network timeouts
+/// - `is_connect()` catches typical connection failures
+/// - `is_request()` catches DNS resolution failures and other transient request errors
 fn is_retryable_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
 }
@@ -64,13 +66,11 @@ where
                         );
                         thread::sleep(Duration::from_secs(sleep_secs));
                         continue;
-                    } else {
-                        panic!(
-                            "Server error after {} attempts: {}",
-                            attempts,
-                            response.status()
-                        );
                     }
+                    panic!(
+                        "Server error after {attempts} attempts: {}",
+                        response.status()
+                    );
                 }
 
                 // Process the successful response
@@ -89,14 +89,11 @@ where
                     );
                     thread::sleep(Duration::from_secs(sleep_secs));
                     continue;
-                } else {
-                    panic!(
-                        "Network error ({}) after {} attempts: {}",
-                        error_type_str(&e),
-                        attempts,
-                        e
-                    );
                 }
+                panic!(
+                    "Network error ({}) after {attempts} attempts: {e}",
+                    error_type_str(&e),
+                );
             }
         }
     }
@@ -104,6 +101,7 @@ where
 
 /// Request a field from the server and returns the deserialized data.
 /// Retries for 5xx errors or network timeouts.
+#[must_use]
 pub fn get_field_from_server(mode: &SearchMode, api_base: &str, max_retries: u32) -> DataToClient {
     let url = match mode {
         SearchMode::Detailed => format!("{api_base}/claim/detailed"),
@@ -121,7 +119,7 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str, max_retries: u32
         },
         |response| match response.json::<DataToClient>() {
             Ok(data) => data,
-            Err(e) => panic!("Error deserializing response: {}", e),
+            Err(e) => panic!("Error deserializing response: {e}"),
         },
         max_retries,
     )
@@ -129,9 +127,10 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str, max_retries: u32
 
 /// Submit field results to the server. Panic if there is an error.
 /// Retries for 5xx errors or network timeouts.
+#[must_use]
 pub fn submit_field_to_server(
     api_base: &str,
-    submit_data: DataToServer,
+    submit_data: &DataToServer,
     max_retries: u32,
 ) -> Response {
     let url = format!("{api_base}/submit");
@@ -150,11 +149,8 @@ pub fn submit_field_to_server(
             // Check for other client/server errors (4xx, etc.)
             if !response.status().is_success() {
                 match response.text() {
-                    Ok(msg) => panic!("Server returned an error: {}", msg),
-                    Err(e) => panic!(
-                        "Server returned an error, but another error occurred: {}",
-                        e
-                    ),
+                    Ok(msg) => panic!("Server returned an error: {msg}"),
+                    Err(e) => panic!("Server returned an error, but another error occurred: {e}"),
                 }
             }
             response
@@ -164,8 +160,9 @@ pub fn submit_field_to_server(
 }
 
 /// Request validation data from the server for a specific claim.
-/// Returns the deserialized ValidationData which includes the expected results.
+/// Returns the deserialized `ValidationData` which includes the expected results.
 /// Retries for 5xx errors or network timeouts.
+#[must_use]
 pub fn get_validation_data_from_server(api_base: &str, max_retries: u32) -> ValidationData {
     let url = format!("{api_base}/claim/validate");
 
@@ -180,7 +177,7 @@ pub fn get_validation_data_from_server(api_base: &str, max_retries: u32) -> Vali
         },
         |response| match response.json::<ValidationData>() {
             Ok(data) => data,
-            Err(e) => panic!("Error deserializing validation response: {}", e),
+            Err(e) => panic!("Error deserializing validation response: {e}"),
         },
         max_retries,
     )
@@ -246,13 +243,11 @@ where
                         );
                         tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
                         continue;
-                    } else {
-                        panic!(
-                            "Server error after {} attempts: {}",
-                            attempts,
-                            response.status()
-                        );
                     }
+                    panic!(
+                        "Server error after {attempts} attempts: {}",
+                        response.status()
+                    );
                 }
 
                 // Process the successful response
@@ -271,14 +266,11 @@ where
                     );
                     tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
                     continue;
-                } else {
-                    panic!(
-                        "Network error ({}) after {} attempts: {}",
-                        error_type_str_async(&e),
-                        attempts,
-                        e
-                    );
                 }
+                panic!(
+                    "Network error ({}) after {attempts} attempts: {e}",
+                    error_type_str_async(&e)
+                );
             }
         }
     }
@@ -302,7 +294,7 @@ pub async fn get_field_from_server_async(
         |response| async move {
             match response.json::<DataToClient>().await {
                 Ok(data) => data,
-                Err(e) => panic!("Error deserializing response: {}", e),
+                Err(e) => panic!("Error deserializing response: {e}"),
             }
         },
         max_retries,
@@ -326,11 +318,8 @@ pub async fn submit_field_to_server_async(
             // Check for other client/server errors (4xx, etc.)
             if !response.status().is_success() {
                 match response.text().await {
-                    Ok(msg) => panic!("Server returned an error: {}", msg),
-                    Err(e) => panic!(
-                        "Server returned an error, but another error occurred: {}",
-                        e
-                    ),
+                    Ok(msg) => panic!("Server returned an error: {msg}"),
+                    Err(e) => panic!("Server returned an error, but another error occurred: {e}"),
                 }
             }
             response
@@ -341,7 +330,7 @@ pub async fn submit_field_to_server_async(
 }
 
 /// Async version: Request validation data from the server for a specific claim.
-/// Returns the deserialized ValidationData which includes the expected results.
+/// Returns the deserialized `ValidationData` which includes the expected results.
 /// Retries for 5xx errors or network timeouts.
 pub async fn get_validation_data_from_server_async(
     client: &reqwest::Client,
@@ -355,7 +344,7 @@ pub async fn get_validation_data_from_server_async(
         |response| async move {
             match response.json::<ValidationData>().await {
                 Ok(data) => data,
-                Err(e) => panic!("Error deserializing validation response: {}", e),
+                Err(e) => panic!("Error deserializing validation response: {e}"),
             }
         },
         max_retries,

@@ -1,6 +1,7 @@
 //! A library with common utilities for dealing with square-cube pandigitals.
 
-// #![warn(clippy::all, clippy::pedantic)]
+#![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::match_same_arms)]
 
 pub mod base_range;
 pub mod benchmark;
@@ -72,6 +73,7 @@ pub enum FieldClaimStrategy {
 ///
 /// Example: `FieldSize { range_start: 100, range_end: 105, range_size: 5 }`
 /// represents the numbers [100, 101, 102, 103, 104] (5 numbers total).
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq)]
 pub struct FieldSize {
     range_start: u128,
@@ -81,7 +83,15 @@ pub struct FieldSize {
 
 impl FieldSize {
     /// Create a new `FieldSize` with a half-open range [`range_start`, `range_end`).
+    ///
+    /// # Panics
+    /// Panics if `range_start` is greater than or equal to `range_end`.
+    #[must_use]
     pub fn new(range_start: u128, range_end: u128) -> Self {
+        assert!(
+            range_start < range_end,
+            "Range has invalid bounds, range_start must be < range_end (half-open interval)"
+        );
         FieldSize {
             range_start,
             range_end,
@@ -89,31 +99,38 @@ impl FieldSize {
         }
     }
     /// Get the first number to check in the range (`range_start`).
+    #[must_use]
     pub fn first(&self) -> u128 {
         self.range_start
     }
     /// Get the last number to check in the range (`range_end` - 1).
+    #[must_use]
     pub fn last(&self) -> u128 {
         self.range_end - 1
     }
     /// Get the inclusive end of the range (`range_start`).
+    #[must_use]
     pub fn start(&self) -> u128 {
         self.range_start
     }
     /// Get the exclusive end of the range (`range_end`).
+    #[must_use]
     pub fn end(&self) -> u128 {
         self.range_end
     }
-    /// The total number of itmes in the range.
+    /// The total number of items in the range.
+    #[must_use]
     pub fn size(&self) -> u128 {
         self.range_size
     }
-    /// Get an iterator over the numbers in the range [range_start, range_end).
-    pub fn iter(&self) -> std::ops::Range<u128> {
+    /// Get an iterator over the numbers in the range [`range_start`, `range_end`).
+    #[must_use]
+    pub fn range_iter(&self) -> std::ops::Range<u128> {
         self.range_start..self.range_end
     }
-    /// Break up the range into chunks of size chunk_size.
-    /// Each chunk is half-open [range_start, range_end).
+    /// Break up the range into chunks of size `chunk_size`.
+    /// Each chunk is half-open [`range_start`, `range_end`).
+    #[must_use]
     pub fn chunks(&self, chunk_size: u128) -> Vec<FieldSize> {
         let mut chunks = Vec::new();
         let mut start = self.range_start;
@@ -206,8 +223,8 @@ pub struct ChunkRecord {
 /// A field record from the database.
 /// Links to a base, a chunk, and a canon submission if any.
 ///
-/// **Range semantics**: This represents a half-open range [range_start, range_end),
-/// following Rust's standard convention where range_start is inclusive and range_end is exclusive.
+/// **Range semantics**: This represents a half-open range [`range_start`, `range_end`),
+/// following Rust's standard convention where `range_start` is inclusive and `range_end` is exclusive.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct FieldRecord {
     pub field_id: u128,
@@ -223,12 +240,7 @@ pub struct FieldRecord {
 }
 
 /// A field sent to the client for processing. Used as input for processing.
-///
-/// **Range semantics**: This represents a half-open range [range_start, range_end),
-/// following Rust's standard convention:
-/// - `range_start` is inclusive (the first number to check)
-/// - `range_end` is exclusive (one past the last number to check)
-/// - `range_size` = range_end - range_start (the count of numbers to process)
+/// **Range semantics**: This represents a half-open range [`range_start`, `range_end`).
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq)]
 pub struct DataToClient {
     pub claim_id: u128,
@@ -249,10 +261,8 @@ pub struct DataToServer {
 }
 
 /// Both the field info for processing and the compiled results
-/// (for the validation self-check endpoint)
-///
-/// **Range semantics**: This represents a half-open range [range_start, range_end),
-/// following Rust's standard convention where range_start is inclusive and range_end is exclusive.
+/// (for the validation self-check endpoint).
+/// **Range semantics**: This represents a half-open range [`range_start`, `range_end`).
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ValidationData {
     pub base: u32,

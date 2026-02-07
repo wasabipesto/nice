@@ -21,7 +21,7 @@
 //!
 //! ## Example for Base 10
 //!
-//! The filter checks each digit and accepts those where square_lsd ≠ cube_lsd:
+//! The filter checks each digit and accepts those where `square_lsd` ≠ `cube_lsd`:
 //! - LSD=0: 0²=0, 0³=0 → collision (both 0) ✗
 //! - LSD=1: 1²=1, 1³=1 → collision (both 1) ✗
 //! - LSD=2: 2²=4, 2³=8 → LSDs are 4 and 8, no collision ✓
@@ -52,6 +52,7 @@ use malachite::natural::Natural;
 ///
 /// # Returns
 /// A vector of valid LSD values
+#[must_use]
 pub fn get_valid_lsds(base: &u32) -> Vec<u32> {
     (0..*base).filter(|&lsd| is_valid_lsd(lsd, *base)).collect()
 }
@@ -63,11 +64,9 @@ pub fn get_valid_lsds(base: &u32) -> Vec<u32> {
 ///
 /// # Returns
 /// A vector of valid LSD values as u128
+#[must_use]
 pub fn get_valid_lsds_u128(base: &u32) -> Vec<u128> {
-    get_valid_lsds(base)
-        .into_iter()
-        .map(|lsd| lsd as u128)
-        .collect()
+    get_valid_lsds(base).into_iter().map(u128::from).collect()
 }
 
 /// Check if a specific LSD can potentially produce a nice number.
@@ -137,7 +136,7 @@ mod tests {
         let base = 10u32;
         let lsd_filter = get_valid_lsds_u128(&base);
 
-        let sixty_nine_lsd = 69u128 % base as u128;
+        let sixty_nine_lsd = 69u128 % u128::from(base);
         assert_eq!(sixty_nine_lsd, 9, "69 ends in 9");
 
         // The filter correctly includes 9
@@ -156,18 +155,18 @@ mod tests {
         let lsd_filter = get_valid_lsds_u128(&base);
 
         // Numbers ending in 2, 3, 4, 7, 8, 9 should pass
-        assert!(lsd_filter.contains(&(12u128 % base as u128)));
-        assert!(lsd_filter.contains(&(23u128 % base as u128)));
-        assert!(lsd_filter.contains(&(44u128 % base as u128)));
-        assert!(lsd_filter.contains(&(47u128 % base as u128)));
-        assert!(lsd_filter.contains(&(98u128 % base as u128)));
-        assert!(lsd_filter.contains(&(99u128 % base as u128)));
+        assert!(lsd_filter.contains(&(12u128 % u128::from(base))));
+        assert!(lsd_filter.contains(&(23u128 % u128::from(base))));
+        assert!(lsd_filter.contains(&(44u128 % u128::from(base))));
+        assert!(lsd_filter.contains(&(47u128 % u128::from(base))));
+        assert!(lsd_filter.contains(&(98u128 % u128::from(base))));
+        assert!(lsd_filter.contains(&(99u128 % u128::from(base))));
 
         // Numbers ending in 0, 1, 5, 6 should be filtered
-        assert!(!lsd_filter.contains(&(10u128 % base as u128)));
-        assert!(!lsd_filter.contains(&(21u128 % base as u128)));
-        assert!(!lsd_filter.contains(&(55u128 % base as u128)));
-        assert!(!lsd_filter.contains(&(66u128 % base as u128)));
+        assert!(!lsd_filter.contains(&(10u128 % u128::from(base))));
+        assert!(!lsd_filter.contains(&(21u128 % u128::from(base))));
+        assert!(!lsd_filter.contains(&(55u128 % u128::from(base))));
+        assert!(!lsd_filter.contains(&(66u128 % u128::from(base))));
     }
 
     #[test_log::test]
@@ -205,38 +204,32 @@ mod tests {
     #[test_log::test]
     fn test_various_bases() {
         // Test that the filter works for various bases
-        for base in [10, 12, 16, 20, 40, 50].iter() {
-            let valid = get_valid_lsds(base);
+        for base in [10u32, 12, 16, 20, 40, 50] {
+            let valid = get_valid_lsds(&base);
 
             // Should return some valid LSDs
-            assert!(
-                !valid.is_empty(),
-                "Base {} should have some valid LSDs",
-                base
-            );
+            assert!(!valid.is_empty(), "Base {base} should have some valid LSDs");
 
             // Should filter out at least some LSDs (0 and 1 minimum)
             assert!(
-                valid.len() < *base as usize,
-                "Base {} should filter at least some LSDs",
-                base
+                valid.len() < base as usize,
+                "Base {base} should filter at least some LSDs"
             );
 
             // 0 and 1 should always be filtered
-            assert!(!valid.contains(&0), "Base {} should filter 0", base);
-            assert!(!valid.contains(&1), "Base {} should filter 1", base);
+            assert!(!valid.contains(&0), "Base {base} should filter 0");
+            assert!(!valid.contains(&1), "Base {base} should filter 1");
 
             // All returned LSDs should be in valid range
             assert!(
-                valid.iter().all(|&lsd| lsd < *base),
-                "Base {} has LSD out of range",
-                base
+                valid.iter().all(|&lsd| lsd < base),
+                "Base {base} has LSD out of range"
             );
 
             // Should be sorted (since we're iterating 0..base)
             let mut sorted = valid.clone();
             sorted.sort_unstable();
-            assert_eq!(valid, sorted, "Base {} LSDs not sorted", base);
+            assert_eq!(valid, sorted, "Base {base} LSDs not sorted");
         }
     }
 
@@ -244,29 +237,28 @@ mod tests {
     fn test_filter_effectiveness() {
         // Verify the filter actually reduces the search space significantly
         let base10_valid = get_valid_lsds(&10);
+
+        #[allow(clippy::cast_precision_loss)]
         let base10_filtered_pct = (10 - base10_valid.len()) as f32 / 10.0 * 100.0;
         assert!(
             base10_filtered_pct >= 30.0,
-            "Base 10 should filter at least 30% of candidates, got {:.1}%",
-            base10_filtered_pct
+            "Base 10 should filter at least 30% of candidates, got {base10_filtered_pct:.1}%"
         );
 
         // Test other bases have reasonable filtering
-        for base in [12, 20, 30, 40].iter() {
-            let valid = get_valid_lsds(base);
-            let filtered_count = *base as usize - valid.len();
+        for base in [12u32, 20, 30, 40] {
+            let valid = get_valid_lsds(&base);
+            let filtered_count = base as usize - valid.len();
             assert!(
                 filtered_count >= 2,
-                "Base {} should filter at least 2 LSDs, filtered {}",
-                base,
-                filtered_count
+                "Base {base} should filter at least 2 LSDs, filtered {filtered_count}"
             );
         }
     }
 
     #[test_log::test]
     fn test_lsd_filter_integration() {
-        // Simulate how this would be used in process_niceonly
+        // Simulate how this would be used in `process_niceonly`
         let base = 10u32;
         let lsd_filter = get_valid_lsds_u128(&base);
 
@@ -274,7 +266,7 @@ mod tests {
         let test_numbers = vec![47u128, 69u128, 100u128, 123u128, 182u128, 188u128];
         let filtered: Vec<u128> = test_numbers
             .into_iter()
-            .filter(|num| lsd_filter.contains(&(num % base as u128)))
+            .filter(|num| lsd_filter.contains(&(num % u128::from(base))))
             .collect();
 
         // 47 ends in 7 (valid), 69 ends in 9 (valid), 100 ends in 0 (filtered),
@@ -295,11 +287,10 @@ mod tests {
         // 5² = 25, 5³ = 125 (both end in 5)
         // 6² = 36, 6³ = 216 (both end in 6)
 
-        for idempotent in [0, 1, 5, 6].iter() {
+        for idempotent in [0u32, 1, 5, 6] {
             assert!(
-                !is_valid_lsd(*idempotent, base),
-                "Idempotent LSD {} correctly filtered (square_lsd == cube_lsd)",
-                idempotent
+                !is_valid_lsd(idempotent, base),
+                "Idempotent LSD {idempotent} correctly filtered (square_lsd == cube_lsd)"
             );
         }
     }

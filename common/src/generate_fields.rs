@@ -8,8 +8,9 @@ use std::ops::Add;
 /// If the base range is less than `size` it returns one field.
 ///
 /// **Range semantics**: This function takes an inclusive range [min, max] as input
-/// and produces half-open ranges [start, end) as output. Each returned FieldSize
-/// follows Rust's convention where range_start is inclusive and range_end is exclusive.
+/// and produces half-open ranges [start, end) as output. Each returned `FieldSize`
+/// follows Rust's convention where `range_start` is inclusive and `range_end` is exclusive.
+#[must_use]
 pub fn break_range_into_fields(min: u128, max: u128, size: u128) -> Vec<FieldSize> {
     // create output vec
     let mut fields = Vec::new();
@@ -41,7 +42,7 @@ mod tests {
     #[test]
     fn test_break_range_into_fields_b10() {
         let base = 10;
-        let size = 1000000000;
+        let size = 1_000_000_000;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
         let fields = break_range_into_fields(base_range.range_start, base_range.range_end, size);
 
@@ -52,7 +53,7 @@ mod tests {
     #[test]
     fn test_break_range_into_fields_general() {
         for base in [10, 11, 12, 13, 14, 15, 20, 30, 40] {
-            for size in [100000000, 1000000000, 10000000000] {
+            for size in [100_000_000, 1_000_000_000, 10_000_000_000] {
                 let base_range = base_range::get_base_range_u128(base).unwrap();
                 if let Some(range) = base_range {
                     // get the fields
@@ -86,7 +87,7 @@ mod tests {
                     let mut last_start = 0u128;
                     for field in fields {
                         assert!(field.range_start > last_start);
-                        last_start = field.range_start
+                        last_start = field.range_start;
                     }
                 }
             }

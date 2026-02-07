@@ -96,7 +96,7 @@ fn build_new_row(base: u32, size: &FieldSize) -> Result<ChunkPrivateNew, String>
 pub fn insert_chunks(
     conn: &mut PgConnection,
     base: u32,
-    sizes: Vec<FieldSize>,
+    sizes: &[FieldSize],
 ) -> Result<(), String> {
     use self::chunks::dsl::*;
 
@@ -159,6 +159,7 @@ pub fn update_chunk(
         .and_then(private_to_public)
 }
 
+#[allow(clippy::cast_possible_wrap)]
 pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(), String> {
     use diesel::sql_types::Integer;
 

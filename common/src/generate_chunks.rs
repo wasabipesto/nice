@@ -12,23 +12,32 @@ const TARGET_NUM_CHUNKS: f32 = 100.0;
 ///
 /// **Range semantics**: Input fields are half-open ranges [start, end), and output chunks
 /// are also half-open ranges. The function preserves the range boundaries correctly by
-/// using the first field's range_start and the last field's range_end for each chunk.
+/// using the first field's `range_start` and the last field's `range_end` for each chunk.
+///
+/// # Panics
+/// Panics if `fields` is empty.
+#[must_use]
 pub fn group_fields_into_chunks(fields: Vec<FieldSize>) -> Vec<FieldSize> {
-    // convert fields into ring vec in order to pop out the front
+    // Convert fields into ring vec in order to pop out the front
     let mut fields = VecDeque::from(fields);
 
-    // create output vec
+    // Create output vec
     let mut chunks = Vec::new();
 
-    // figure out how many fields per chunk
+    // Figure out how many fields per chunk
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss
+    )]
     let num_fields_per_chunk = (fields.len() as f32 / TARGET_NUM_CHUNKS).ceil() as usize;
 
-    // break out each chunk, consuming the fields we use
+    // Break out each chunk, consuming the fields we use
     while !fields.is_empty() {
-        // init vec for chunk fields
+        // Initialize vec for chunk fields
         let mut chunk_fields = VecDeque::with_capacity(num_fields_per_chunk);
 
-        // consume the first n fields
+        // Consume the first n fields
         for _ in 0..num_fields_per_chunk {
             match fields.pop_front() {
                 Some(field) => chunk_fields.push_back(field),
@@ -37,9 +46,15 @@ pub fn group_fields_into_chunks(fields: Vec<FieldSize>) -> Vec<FieldSize> {
         }
 
         // Get the start and end from the chunk (preserving half-open range semantics)
-        // range_start is inclusive (from first field), range_end is exclusive (from last field)
-        let range_start = chunk_fields.front().unwrap().range_start;
-        let range_end = chunk_fields.back().unwrap().range_end;
+        // `range_start` is inclusive (from first field), `range_end` is exclusive (from last field)
+        let range_start = chunk_fields
+            .front()
+            .expect("chunk_fields should not be empty")
+            .range_start;
+        let range_end = chunk_fields
+            .back()
+            .expect("chunk_fields should not be empty")
+            .range_end;
         chunks.push(FieldSize::new(range_start, range_end));
     }
 
@@ -54,7 +69,7 @@ mod tests {
     #[test]
     fn test_group_fields_into_chunks_b10() {
         let base = 10;
-        let size = 1000000000;
+        let size = 1_000_000_000;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
         let fields = generate_fields::break_range_into_fields(
             base_range.range_start,
@@ -73,7 +88,7 @@ mod tests {
     #[test]
     fn test_group_fields_into_chunks_general() {
         for base in [10, 11, 12, 13, 14, 15, 20, 30, 40] {
-            for size in [100000000, 1000000000, 10000000000] {
+            for size in [100_000_000, 1_000_000_000, 10_000_000_000] {
                 let base_range = base_range::get_base_range_u128(base).unwrap();
                 if let Some(range) = base_range {
                     // get the fields
@@ -92,13 +107,15 @@ mod tests {
                     assert_eq!(chunks.last().unwrap().range_end, range.range_end);
 
                     // check there are at most 100 chunks
-                    assert!(chunks.len() <= TARGET_NUM_CHUNKS as usize);
+                    #[allow(clippy::cast_precision_loss)]
+                    let num_chunks = chunks.len() as f32;
+                    assert!(num_chunks <= TARGET_NUM_CHUNKS);
 
                     // check the chunks are in ascending order
                     let mut last_start = 0u128;
                     for chunk in chunks {
                         assert!(chunk.range_start > last_start);
-                        last_start = chunk.range_start
+                        last_start = chunk.range_start;
                     }
 
                     // check the fields were not affected

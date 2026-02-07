@@ -42,6 +42,7 @@ pub const DETAILED_MINI_CHUNK_SIZE: usize = 1_000;
 /// Calculate the number of unique digits in (n^2, n^3) represented in base b.
 /// A number is nice if the result of this is equal to b (means all digits are used once).
 /// If you're just checking if the number is 100% nice, there is a faster version below.
+#[must_use]
 pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
     // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
 
@@ -72,8 +73,9 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
 /// The inner loop of detailed field processing. Also called by other crates like the WASM client.
 /// Automatically breaks the range into chunks for some performance gains.
 ///
-/// **Range semantics**: Expects a half-open range [range_start, range_end) where range_start
-/// is inclusive and range_end is exclusive, following Rust's standard convention.
+/// **Range semantics**: Expects a half-open range [`range_start`, `range_end`) where `range_start`
+/// is inclusive and `range_end` is exclusive, following Rust's standard convention.
+#[must_use]
 pub fn process_range_detailed(range: &FieldSize, base: u32) -> FieldResults {
     // Calculate the minimum num_unique_digits cutoff
     let nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
@@ -86,7 +88,7 @@ pub fn process_range_detailed(range: &FieldSize, base: u32) -> FieldResults {
 
     // Break up the range into chunks to avoid allocating too much memory
     // Note: range.iter() and all chunks are half-open ranges [range_start, range_end)
-    let chunks = range.iter().chunks(DETAILED_MINI_CHUNK_SIZE);
+    let chunks = range.range_iter().chunks(DETAILED_MINI_CHUNK_SIZE);
 
     // Process everything, saving results and aggregating after each chunk finishes
     for chunk in &chunks {
@@ -96,7 +98,7 @@ pub fn process_range_detailed(range: &FieldSize, base: u32) -> FieldResults {
             .collect();
 
         // Aggregate unique_distribution
-        for (bin_uniques, total_count) in unique_distribution_map.iter_mut() {
+        for (bin_uniques, total_count) in &mut unique_distribution_map {
             let chunk_count = chunk_results
                 .iter()
                 .filter(|(_, num_unique_digits)| num_unique_digits == bin_uniques)
@@ -130,6 +132,7 @@ pub fn process_range_detailed(range: &FieldSize, base: u32) -> FieldResults {
 }
 
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
+#[must_use]
 #[deprecated = "use process_range_detailed instead"]
 pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToServer {
     let results = process_range_detailed(&claim_data.into(), claim_data.base);
@@ -147,6 +150,10 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
 /// A number is nice if (n^2, n^3), converted to base b, have all digits of base b.
 /// Assumes we have already done residue class filtering.
 /// Immediately stops if we hit a duplicate digit.
+///
+/// # Panics
+/// Panics if the base is larger than usize.
+#[must_use]
 pub fn get_is_nice(num: u128, base: u32) -> bool {
     // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
 
@@ -161,7 +168,8 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
     let squared = (&num).pow(2);
     let mut n = squared.clone();
     while n > 0 {
-        let remainder = usize::try_from(&(n.div_assign_rem(&base_natural))).unwrap();
+        let remainder = usize::try_from(&(n.div_assign_rem(&base_natural)))
+            .expect("Failed to convert remainder to usize");
         if digits_indicator[remainder] {
             return false;
         }
@@ -171,7 +179,8 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
     // Cube the number and check those digits
     let mut n = squared * num;
     while n > 0 {
-        let remainder = usize::try_from(&(n.div_assign_rem(&base_natural))).unwrap();
+        let remainder = usize::try_from(&(n.div_assign_rem(&base_natural)))
+            .expect("Failed to convert remainder to usize");
         if digits_indicator[remainder] {
             return false;
         }
@@ -182,6 +191,7 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
 
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
+#[must_use]
 #[deprecated = "use process_range_niceonly instead"]
 pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToServer {
     let results = process_range_niceonly(&claim_data.into(), claim_data.base);
@@ -198,11 +208,12 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
 ///
-/// **Range semantics**: Expects a half-open range [range_start, range_end) where range_start
-/// is inclusive and range_end is exclusive, following Rust's standard convention.
+/// **Range semantics**: Expects a half-open range [`range_start`, `range_end`) where `range_start`
+/// is inclusive and `range_end` is exclusive, following Rust's standard convention.
+#[must_use]
 pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
     // Precompute these for faster filter checking
-    let base_u128 = base as u128;
+    let base_u128 = u128::from(base);
     let base_u128_minusone = base_u128 - 1;
 
     // Use recursive subdivision to get valid ranges that need processing.
@@ -210,32 +221,41 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
     // all numbers will have duplicate/overlapping digits. It's more effective than fixed
     // chunking because it only subdivides when needed and can find natural boundaries.
     let valid_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
-    let filtered_range_size: u128 = valid_ranges.iter().map(|range| range.size()).sum();
-    trace!(
-        "Filtered candidate range from {} to {} ({:.2}%) with MSD filtering of depth {}",
-        range.size(),
-        filtered_range_size,
-        filtered_range_size as f64 / range.size() as f64 * 100.0,
-        msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH
-    );
+    let filtered_range_size: u128 = valid_ranges.iter().map(FieldSize::size).sum();
+    #[allow(clippy::cast_precision_loss)]
+    {
+        trace!(
+            "Filtered candidate range from {} to {} ({:.2}%) with MSD filtering of depth {}",
+            range.size(),
+            filtered_range_size,
+            filtered_range_size as f64 / range.size() as f64 * 100.0,
+            msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH
+        );
+    }
 
     // Get LSD filter to eliminate invalid least significant digits
     let lsd_filter = lsd_filter::get_valid_lsds_u128(&base);
-    trace!(
-        "Filtered candidate range by {}/{} ({:.2}%) by LSD filtering of depth 1.",
-        base - lsd_filter.len() as u32,
-        base,
-        (1.0 - (lsd_filter.len() as f64 / base as f64)) * 100.0
-    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    {
+        trace!(
+            "Filtered candidate range by {}/{} ({:.2}%) by LSD filtering of depth 1.",
+            base - lsd_filter.len() as u32,
+            base,
+            (1.0 - (lsd_filter.len() as f64 / f64::from(base))) * 100.0
+        );
+    }
 
     // Get residue filters to reduce search range
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
-    trace!(
-        "Filtered candidate range by {}/{} ({:.2}%) by residue filtering.",
-        base - 1 - residue_filter.len() as u32,
-        base - 1,
-        (1.0 - (residue_filter.len() as f64 / (base - 1) as f64)) as f64 * 100.0
-    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    {
+        trace!(
+            "Filtered candidate range by {}/{} ({:.2}%) by residue filtering.",
+            base - 1 - residue_filter.len() as u32,
+            base - 1,
+            (1.0 - (residue_filter.len() as f64 / f64::from(base - 1))) as f64 * 100.0
+        );
+    }
 
     // Process each valid range (each range is half-open: [start, end))
     let mut nice_list = Vec::new();
@@ -260,18 +280,21 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
     use crate::base_range;
 
     #[test]
     fn process_detailed_b10() {
+        let base = 10;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
         let input = DataToClient {
             claim_id: 0,
-            base: 10,
-            range_start: 47,
-            range_end: 100,
-            range_size: 53,
+            base,
+            range_start: base_range.start(),
+            range_end: base_range.end(),
+            range_size: base_range.size(),
         };
         let result = FieldResults {
             distribution: Vec::from([
@@ -326,12 +349,15 @@ mod tests {
 
     #[test]
     fn process_detailed_b40() {
+        let base = 40;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let size = 10000;
         let input = DataToClient {
             claim_id: 0,
-            base: 40,
-            range_start: 916284264916,
-            range_end: 916284264916 + 10000,
-            range_size: 10000,
+            base,
+            range_start: base_range.start(),
+            range_end: base_range.start() + size,
+            range_size: size,
         };
         let result = FieldResults {
             distribution: Vec::from([
@@ -393,75 +419,75 @@ mod tests {
                 },
                 UniquesDistributionSimple {
                     num_uniques: 15,
-                    count: 0,
-                },
-                UniquesDistributionSimple {
-                    num_uniques: 16,
-                    count: 0,
-                },
-                UniquesDistributionSimple {
-                    num_uniques: 17,
-                    count: 0,
-                },
-                UniquesDistributionSimple {
-                    num_uniques: 18,
                     count: 1,
                 },
                 UniquesDistributionSimple {
+                    num_uniques: 16,
+                    count: 2,
+                },
+                UniquesDistributionSimple {
+                    num_uniques: 17,
+                    count: 15,
+                },
+                UniquesDistributionSimple {
+                    num_uniques: 18,
+                    count: 68,
+                },
+                UniquesDistributionSimple {
                     num_uniques: 19,
-                    count: 13,
+                    count: 190,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 20,
-                    count: 40,
+                    count: 423,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 21,
-                    count: 176,
+                    count: 959,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 22,
-                    count: 520,
+                    count: 1615,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 23,
-                    count: 1046,
+                    count: 1995,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 24,
-                    count: 1710,
+                    count: 1982,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 25,
-                    count: 2115,
+                    count: 1438,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 26,
-                    count: 1947,
+                    count: 825,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 27,
-                    count: 1322,
+                    count: 349,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 28,
-                    count: 728,
+                    count: 110,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 29,
-                    count: 283,
+                    count: 26,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 30,
-                    count: 83,
+                    count: 2,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 31,
-                    count: 13,
+                    count: 0,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 32,
-                    count: 3,
+                    count: 0,
                 },
                 UniquesDistributionSimple {
                     num_uniques: 33,
@@ -503,12 +529,15 @@ mod tests {
 
     #[test]
     fn process_detailed_b80() {
+        let base = 80;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let size = 10000;
         let input = DataToClient {
             claim_id: 0,
-            base: 80,
-            range_start: 653245554420798943087177909799,
-            range_end: 653245554420798943087177909799 + 10000,
-            range_size: 10000,
+            base,
+            range_start: base_range.start(),
+            range_end: base_range.start() + size,
+            range_size: size,
         };
         let result = FieldResults {
             distribution: Vec::from([
@@ -840,12 +869,14 @@ mod tests {
 
     #[test]
     fn process_niceonly_b10() {
+        let base = 10;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
         let input = DataToClient {
             claim_id: 0,
-            base: 10,
-            range_start: 47,
-            range_end: 100,
-            range_size: 53,
+            base,
+            range_start: base_range.start(),
+            range_end: base_range.end(),
+            range_size: base_range.size(),
         };
         let result = FieldResults {
             distribution: Vec::new(),
@@ -859,12 +890,15 @@ mod tests {
 
     #[test]
     fn process_niceonly_b40() {
+        let base = 40;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let size = 10000;
         let input = DataToClient {
             claim_id: 0,
-            base: 40,
-            range_start: 916284264916,
-            range_end: 916284264916 + 10000,
-            range_size: 10000,
+            base,
+            range_start: base_range.start(),
+            range_end: base_range.start() + size,
+            range_size: size,
         };
         let result = FieldResults {
             distribution: Vec::new(),
@@ -875,12 +909,15 @@ mod tests {
 
     #[test]
     fn process_niceonly_b80() {
+        let base = 80;
+        let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+        let size = 10000;
         let input = DataToClient {
             claim_id: 0,
-            base: 80,
-            range_start: 653245554420798943087177909799,
-            range_end: 653245554420798943087177909799 + 10000,
-            range_size: 10000,
+            base,
+            range_start: base_range.start(),
+            range_end: base_range.start() + size,
+            range_size: size,
         };
         let result = FieldResults {
             distribution: Vec::new(),

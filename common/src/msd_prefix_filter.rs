@@ -66,7 +66,7 @@ fn find_common_msd_prefix(digits1: &[u32], digits2: &[u32]) -> Vec<u32> {
 fn has_duplicate_digits(digits: &[u32]) -> bool {
     let mut seen = vec![false; 256];
     for &digit in digits {
-        debug_assert!(digit < 256, "Digit {} exceeds base limit", digit);
+        debug_assert!(digit < 256, "Digit {digit} exceeds base limit");
         if digit < 256 {
             if seen[digit as usize] {
                 return true;
@@ -82,13 +82,13 @@ fn has_duplicate_digits(digits: &[u32]) -> bool {
 fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
     let mut seen = vec![false; 256];
     for &digit in digits1 {
-        debug_assert!(digit < 256, "Digit {} exceeds base limit", digit);
+        debug_assert!(digit < 256, "Digit {digit} exceeds base limit");
         if digit < 256 {
             seen[digit as usize] = true;
         }
     }
     for &digit in digits2 {
-        debug_assert!(digit < 256, "Digit {} exceeds base limit", digit);
+        debug_assert!(digit < 256, "Digit {digit} exceeds base limit");
         if digit < 256 && seen[digit as usize] {
             return true;
         }
@@ -107,10 +107,14 @@ fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
 ///
 /// Note that this is half-open, meaning that the range is inclusive of the start value and
 /// exclusive of the end value. This follows the Rust convention for ranges.
+///
+/// # Panics
+/// Panics if the range is invalid or the base is greater than 256.
+#[must_use]
 pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
     // Check for edge cases
     assert!(
-        range.range_start < range.range_end,
+        range.size() > 0,
         "Range has invalid bounds, range_start must be < range_end (half-open interval)"
     );
     assert!(base <= 256, "Base must be 256 or less");
@@ -181,7 +185,7 @@ pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
 /// 2. If the range is small or max depth reached, return the range (needs processing)
 /// 3. Otherwise, subdivide into smaller ranges and recursively check each
 ///
-/// Returns a vector of FieldSize structs representing ranges that need processing.
+/// Returns a vector of `FieldSize` structs representing ranges that need processing.
 /// All ranges are half-open intervals [start, end) following Rust's standard convention.
 ///
 /// # Arguments
@@ -191,6 +195,7 @@ pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
 /// * `max_depth` - Maximum recursion depth to prevent excessive subdivision
 /// * `min_range_size` - Minimum range size before stopping subdivision
 /// * `subdivision_factor` - Number of parts to subdivide into (2-4 recommended)
+#[must_use]
 pub fn get_valid_ranges_recursive(
     range: FieldSize,
     base: u32,
@@ -268,10 +273,11 @@ pub fn get_valid_ranges_recursive(
     valid_ranges
 }
 
-/// Convenience wrapper for get_valid_ranges_recursive using default parameters from lib.rs.
+/// Convenience wrapper for `get_valid_ranges_recursive` using default parameters from lib.rs.
 ///
-/// Returns a vector of FieldSize structs representing half-open ranges [start, end) that need
+/// Returns a vector of `FieldSize` structs representing half-open ranges [start, end) that need
 /// processing. Ranges that can be skipped based on MSD prefix are not included.
+#[must_use]
 pub fn get_valid_ranges(range: FieldSize, base: u32) -> Vec<FieldSize> {
     get_valid_ranges_recursive(
         range,
@@ -367,15 +373,15 @@ mod tests {
     #[test_log::test]
     fn test_digit_order_verification() {
         // Verify that to_digits_asc returns LSD first
-        let num = Natural::from(10004569u32);
+        let num = Natural::from(10_004_569u32);
         let digits = num.to_digits_asc(&10u32);
         // 10,004,569 should be [9,6,5,4,0,0,0,1] in ascending order
         assert_eq!(digits[0], 9); // least significant digit
         assert_eq!(digits[7], 1); // most significant digit
 
         // Test our MSD prefix finder
-        let digits1 = Natural::from(10004569u32).to_digits_asc(&10u32);
-        let digits2 = Natural::from(10010896u32).to_digits_asc(&10u32);
+        let digits1 = Natural::from(10_004_569u32).to_digits_asc(&10u32);
+        let digits2 = Natural::from(10_010_896u32).to_digits_asc(&10u32);
         let msd_prefix = find_common_msd_prefix(&digits1, &digits2);
         // Both start with 1,0,0,... in normal notation
         assert_eq!(msd_prefix, vec![1, 0, 0]);
@@ -417,7 +423,7 @@ mod tests {
     }
 
     #[test_log::test]
-    #[should_panic]
+    #[should_panic = "invalid bounds"]
     fn test_invalid_bounds() {
         let range_start = 3163;
         let range_end = 3163;
