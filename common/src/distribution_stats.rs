@@ -1,6 +1,6 @@
 //! Expand basic distribution with some redundant stats.
 
-use super::*;
+use crate::{SubmissionRecord, UniquesDistribution, UniquesDistributionSimple};
 
 /// Converts a list of UniquesDistributionSimple to UniquesDistribution by adding
 /// some redundant information that's helpful for other tools.
@@ -92,6 +92,7 @@ pub fn shrink_distribution(distribution: &[UniquesDistribution]) -> Vec<UniquesD
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SearchMode;
     use chrono::Utc;
 
     fn create_test_distribution_simple() -> Vec<UniquesDistributionSimple> {

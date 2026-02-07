@@ -1,6 +1,9 @@
 //! A module to generate some basic offline benchmarking ranges.
 
-use super::*;
+use crate::DataToClient;
+use crate::base_range;
+use clap::ValueEnum;
+use std::fmt;
 
 /// Different benchmark strategies.
 #[derive(Debug, Copy, Clone, ValueEnum)]

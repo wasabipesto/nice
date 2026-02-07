@@ -1,6 +1,7 @@
 //! Generate larger search ranges ("chunks") for analytics.
 
-use super::*;
+use crate::FieldSize;
+use std::collections::VecDeque;
 
 const TARGET_NUM_CHUNKS: f32 = 100.0;
 
@@ -48,6 +49,7 @@ pub fn group_fields_into_chunks(fields: Vec<FieldSize>) -> Vec<FieldSize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{base_range, generate_fields};
 
     #[test]
     fn test_group_fields_into_chunks_b10() {

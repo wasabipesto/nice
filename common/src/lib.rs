@@ -1,6 +1,6 @@
 //! A library with common utilities for dealing with square-cube pandigitals.
 
-#![allow(clippy::wildcard_imports)]
+// #![warn(clippy::all, clippy::pedantic)]
 
 pub mod base_range;
 pub mod benchmark;
@@ -21,31 +21,17 @@ pub mod residue_filter;
 
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use itertools::Itertools;
-use malachite::base::num::arithmetic::traits::{CeilingRoot, DivAssignRem, FloorRoot, Pow};
-use malachite::base::num::conversion::traits::Digits;
-use malachite::natural::Natural;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
-use std::convert::TryFrom;
 use std::env;
 use std::fmt;
-use std::ops::Add;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const CLIENT_REQUEST_TIMEOUT_SECS: u64 = 5;
 pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 pub const DOWNSAMPLE_CUTOFF_PERCENT: f32 = 0.2;
 pub const CLAIM_DURATION_HOURS: i64 = 1;
+pub const CLIENT_REQUEST_TIMEOUT_SECS: u64 = 5;
 pub const DEFAULT_FIELD_SIZE: u128 = 1_000_000_000;
 pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
-pub const DETAILED_MINI_CHUNK_SIZE: usize = 1_000;
-pub const SAVE_TOP_N_NUMBERS: usize = 10_000;
-
-// Recursive MSD filter subdivision parameters
-pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 11;
-pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 1000;
-pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 
 /// Each possible search mode the server and client supports.
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -79,12 +65,12 @@ pub enum FieldClaimStrategy {
 /// Data on the bounds of a search range.
 /// Could be a base, chunk, field, or something else.
 ///
-/// **Important**: This represents a half-open range [range_start, range_end),
+/// **Important**: This represents a half-open range [`range_start`, `range_end`),
 /// following Rust's standard convention. This means:
 /// - `range_start` is inclusive (the first number to check)
 /// - `range_end` is exclusive (one past the last number to check)
 ///
-/// Example: FieldSize { range_start: 100, range_end: 105, range_size: 5 }
+/// Example: `FieldSize { range_start: 100, range_end: 105, range_size: 5 }`
 /// represents the numbers [100, 101, 102, 103, 104] (5 numbers total).
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq)]
 pub struct FieldSize {
@@ -94,7 +80,7 @@ pub struct FieldSize {
 }
 
 impl FieldSize {
-    /// Create a new FieldSize with a half-open range [range_start, range_end).
+    /// Create a new `FieldSize` with a half-open range [`range_start`, `range_end`).
     pub fn new(range_start: u128, range_end: u128) -> Self {
         FieldSize {
             range_start,
@@ -102,19 +88,19 @@ impl FieldSize {
             range_size: range_end - range_start,
         }
     }
-    /// Get the first number to check in the range (range_start).
+    /// Get the first number to check in the range (`range_start`).
     pub fn first(&self) -> u128 {
         self.range_start
     }
-    /// Get the last number to check in the range (range_end - 1).
+    /// Get the last number to check in the range (`range_end` - 1).
     pub fn last(&self) -> u128 {
         self.range_end - 1
     }
-    /// Get the inclusive end of the range (range_start).
+    /// Get the inclusive end of the range (`range_start`).
     pub fn start(&self) -> u128 {
         self.range_start
     }
-    /// Get the exclusive end of the range (range_end).
+    /// Get the exclusive end of the range (`range_end`).
     pub fn end(&self) -> u128 {
         self.range_end
     }

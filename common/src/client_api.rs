@@ -1,6 +1,6 @@
 //! A module with client-server connection utlities.
 
-use super::*;
+use crate::{CLIENT_REQUEST_TIMEOUT_SECS, DataToClient, DataToServer, SearchMode, ValidationData};
 use reqwest::blocking::Response;
 use std::{thread, time::Duration};
 

@@ -1,6 +1,8 @@
 //! Establish field consensus.
 
-use super::*;
+use crate::{FieldRecord, SubmissionCandidate, SubmissionRecord};
+use crate::{distribution_stats, number_stats};
+use std::collections::HashMap;
 
 /// Given a field and submissions, determine if there is a consensus.
 /// If so, update the canon submission ID and field check level.
@@ -71,6 +73,7 @@ pub fn evaluate_consensus(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NiceNumberSimple, SearchMode, UniquesDistributionSimple};
     use chrono::Utc;
 
     fn create_test_field() -> FieldRecord {

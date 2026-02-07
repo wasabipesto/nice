@@ -22,8 +22,17 @@
 //! 5. If any condition triggers, return `true` (range can be skipped).
 //! 6. Otherwise, return `false` (range must be processed normally).
 
-use super::*;
 use log::trace;
+use malachite::base::num::arithmetic::traits::Pow;
+use malachite::base::num::conversion::traits::Digits;
+use malachite::natural::Natural;
+
+use crate::FieldSize;
+
+// Recursive MSD filter subdivision parameters
+pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 11;
+pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 1000;
+pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 
 /// Find the longest common prefix of the most significant digits.
 ///
@@ -277,6 +286,7 @@ pub fn get_valid_ranges(range: FieldSize, base: u32) -> Vec<FieldSize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base_range;
     use log::debug;
 
     /// Break up the range into chunks, returning the start and end of each.

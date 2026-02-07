@@ -1,6 +1,8 @@
 //! Expand basic numbers with some redundant stats.
 
-use super::*;
+use crate::{NEAR_MISS_CUTOFF_PERCENT, NiceNumber, NiceNumberSimple, SubmissionRecord};
+
+pub const SAVE_TOP_N_NUMBERS: usize = 10_000;
 
 /// Get the near-miss cutoff given a base.
 /// Uses the crate-level NEAR_MISS_CUTOFF_PERCENT.
@@ -55,6 +57,7 @@ pub fn shrink_numbers(numbers: &[NiceNumber]) -> Vec<NiceNumberSimple> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SearchMode;
     use chrono::Utc;
 
     fn create_test_numbers_simple() -> Vec<NiceNumberSimple> {

@@ -1,6 +1,7 @@
 //! Generate the search fields for processing.
 
-use super::*;
+use crate::FieldSize;
+use std::ops::Add;
 
 /// Break a base range into smaller, searchable fields.
 /// Each field should be `size` in width, with the last one being smaller.
@@ -34,6 +35,7 @@ pub fn break_range_into_fields(min: u128, max: u128, size: u128) -> Vec<FieldSiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base_range;
     use malachite::base::num::arithmetic::traits::DivMod;
 
     #[test]

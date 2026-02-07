@@ -25,8 +25,19 @@
 //! searches, and the results are verified via consensus to ensure that
 //! everything can be trusted.
 
-use super::*;
+use crate::{
+    CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
+    UniquesDistributionSimple,
+};
+use crate::{lsd_filter, msd_prefix_filter, number_stats, residue_filter};
+use itertools::Itertools;
 use log::trace;
+use malachite::base::num::arithmetic::traits::{DivAssignRem, Pow};
+use malachite::base::num::conversion::traits::Digits;
+use malachite::natural::Natural;
+use std::collections::HashMap;
+
+pub const DETAILED_MINI_CHUNK_SIZE: usize = 1_000;
 
 /// Calculate the number of unique digits in (n^2, n^3) represented in base b.
 /// A number is nice if the result of this is equal to b (means all digits are used once).
@@ -205,7 +216,7 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
         range.size(),
         filtered_range_size,
         filtered_range_size as f64 / range.size() as f64 * 100.0,
-        MSD_RECURSIVE_MAX_DEPTH
+        msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH
     );
 
     // Get LSD filter to eliminate invalid least significant digits
@@ -251,6 +262,7 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base_range;
 
     #[test]
     fn process_detailed_b10() {

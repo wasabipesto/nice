@@ -16,10 +16,15 @@
 
 #![cfg(feature = "gpu")]
 
-use super::*;
+use crate::{
+    CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
+    UniquesDistributionSimple,
+};
+use crate::{number_stats, residue_filter};
 use anyhow::{Context as _, Result};
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Batch size for GPU kernel processing

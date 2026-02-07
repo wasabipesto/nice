@@ -1,6 +1,8 @@
 //! A module for calculating the apprpriate range for each base.
 
-use super::*;
+use crate::FieldSize;
+use malachite::base::num::arithmetic::traits::{CeilingRoot, FloorRoot, Pow};
+use malachite::natural::Natural;
 
 /// Get the range of possible values for a base.
 /// Returns None if there are no valid numbers in that base.
