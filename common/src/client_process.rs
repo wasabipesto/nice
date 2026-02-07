@@ -31,13 +31,36 @@ use crate::{
 };
 use crate::{lsd_filter, msd_prefix_filter, number_stats, residue_filter};
 use itertools::Itertools;
-use log::trace;
 use malachite::base::num::arithmetic::traits::{DivAssignRem, Pow};
 use malachite::base::num::conversion::traits::Digits;
 use malachite::natural::Natural;
 use std::collections::HashMap;
 
 pub const DETAILED_MINI_CHUNK_SIZE: usize = 1_000;
+
+/// Build optimized bit array filters for LSD and residue checks.
+/// Returns (`lsd_filter`, `residue_filter`) as boolean arrays for ultra-fast O(1) lookups.
+///
+/// # Panics
+/// Panics if base > 256.
+fn build_bit_array_filters(base: u32) -> (Vec<bool>, Vec<bool>) {
+    assert!(base <= 256, "Bit array filters only support bases <= 256");
+
+    let lsd_valid = lsd_filter::get_valid_lsds_u128(&base);
+    let residue_valid = residue_filter::get_residue_filter_u128(&base);
+
+    let mut lsd_bits = vec![false; base as usize];
+    for &lsd in &lsd_valid {
+        lsd_bits[lsd as usize] = true;
+    }
+
+    let mut residue_bits = vec![false; (base - 1) as usize];
+    for &residue in &residue_valid {
+        residue_bits[residue as usize] = true;
+    }
+
+    (lsd_bits, residue_bits)
+}
 
 /// Calculate the number of unique digits in (n^2, n^3) represented in base b.
 /// A number is nice if the result of this is equal to b (means all digits are used once).
@@ -221,56 +244,35 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
     // all numbers will have duplicate/overlapping digits. It's more effective than fixed
     // chunking because it only subdivides when needed and can find natural boundaries.
     let valid_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
-    let filtered_range_size: u128 = valid_ranges.iter().map(FieldSize::size).sum();
-    #[allow(clippy::cast_precision_loss)]
-    {
-        trace!(
-            "Filtered candidate range from {} to {} ({:.2}%) with MSD filtering of depth {}",
-            range.size(),
-            filtered_range_size,
-            filtered_range_size as f64 / range.size() as f64 * 100.0,
-            msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH
-        );
-    }
 
-    // Get LSD filter to eliminate invalid least significant digits
-    let lsd_filter = lsd_filter::get_valid_lsds_u128(&base);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    {
-        trace!(
-            "Filtered candidate range by {}/{} ({:.2}%) by LSD filtering of depth 1.",
-            base - lsd_filter.len() as u32,
-            base,
-            (1.0 - (lsd_filter.len() as f64 / f64::from(base))) * 100.0
-        );
-    }
+    // Construct bit array filters for fast lookups
+    let (lsd_bits, residue_bits) = build_bit_array_filters(base);
 
-    // Get residue filters to reduce search range
-    let residue_filter = residue_filter::get_residue_filter_u128(&base);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    {
-        trace!(
-            "Filtered candidate range by {}/{} ({:.2}%) by residue filtering.",
-            base - 1 - residue_filter.len() as u32,
-            base - 1,
-            (1.0 - (residue_filter.len() as f64 / f64::from(base - 1))) as f64 * 100.0
-        );
-    }
-
-    // Process each valid range (each range is half-open: [start, end))
     let mut nice_list = Vec::new();
     for r in valid_ranges {
-        let range_nice: Vec<NiceNumberSimple> = (r.range_start..r.range_end)
-            .filter(|num| lsd_filter.contains(&(num % base_u128)))
-            .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
-            .filter(|num| get_is_nice(*num, base))
-            .map(|number| NiceNumberSimple {
-                number,
-                num_uniques: base,
-            })
-            .collect();
+        for num in r.range_iter() {
+            // Bit array lookups for LSD filter
+            let lsd = (num % base_u128) as usize;
+            debug_assert!(lsd < lsd_bits.len());
+            if !lsd_bits[lsd] {
+                continue;
+            }
 
-        nice_list.extend(range_nice);
+            // Bit array lookups for residue filter
+            let residue = (num % base_u128_minusone) as usize;
+            debug_assert!(residue < residue_bits.len());
+            if !residue_bits[residue] {
+                continue;
+            }
+
+            // Actually check if it's 100% nice with early termination
+            if get_is_nice(num, base) {
+                nice_list.push(NiceNumberSimple {
+                    number: num,
+                    num_uniques: base,
+                });
+            }
+        }
     }
 
     FieldResults {
