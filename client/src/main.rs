@@ -11,8 +11,8 @@ use nice_common::client_api::{
 };
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
 use nice_common::{
-    CLIENT_VERSION, DataToClient, DataToServer, FieldResults, PROCESSING_CHUNK_SIZE, SearchMode,
-    UniquesDistributionSimple, ValidationData,
+    CLIENT_REQUEST_TIMEOUT_SECS, CLIENT_VERSION, DataToClient, DataToServer, FieldResults,
+    PROCESSING_CHUNK_SIZE, SearchMode, UniquesDistributionSimple, ValidationData,
 };
 
 #[cfg(feature = "gpu")]
@@ -26,9 +26,11 @@ extern crate serde_json;
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
 use log::{LevelFilter, debug, error, info};
+use nice_common::client_api::Client;
 use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LogLevel {
@@ -282,6 +284,7 @@ fn validate_results(
 /// Run a single iteration in non-pipelined mode (validation or benchmark).
 async fn run_single_iteration(
     cli: &Cli,
+    client: &Client,
     #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
 ) {
     // Get the field (synchronously for validation/benchmark)
@@ -383,7 +386,8 @@ async fn run_single_iteration(
         }
     } else if cli.benchmark.is_none() {
         let response =
-            submit_field_to_server_async(&cli.api_base, submit_data, cli.api_max_retries).await;
+            submit_field_to_server_async(client, &cli.api_base, submit_data, cli.api_max_retries)
+                .await;
         match response.text().await {
             Ok(msg) => {
                 debug!("Server response: {msg}");
@@ -394,7 +398,11 @@ async fn run_single_iteration(
 }
 
 /// Run in pipelined mode: overlap API calls with processing.
-async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>) {
+async fn run_pipelined_loop(
+    cli: &Cli,
+    client: &Client,
+    #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
+) {
     // State for the pipeline
     let mut pending_submit: Option<DataToServer> = None;
     let mut current_claim: Option<DataToClient> = None;
@@ -407,7 +415,10 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
                 let mode = cli.mode;
                 let api_base = cli.api_base.clone();
                 let api_num_retries = cli.api_max_retries;
-                async move { get_field_from_server_async(&mode, &api_base, api_num_retries).await }
+                let client = client.clone();
+                async move {
+                    get_field_from_server_async(&client, &mode, &api_base, api_num_retries).await
+                }
             }))
         } else {
             None
@@ -460,9 +471,15 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
             tokio::spawn({
                 let api_base = cli.api_base.clone();
                 let api_num_retries = cli.api_max_retries;
+                let client = client.clone();
                 async move {
-                    let response =
-                        submit_field_to_server_async(&api_base, submit_data, api_num_retries).await;
+                    let response = submit_field_to_server_async(
+                        &client,
+                        &api_base,
+                        submit_data,
+                        api_num_retries,
+                    )
+                    .await;
                     match response.text().await {
                         Ok(msg) => {
                             debug!("Server response: {msg}");
@@ -522,7 +539,8 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
     // Submit any remaining results
     if let Some(submit_data) = pending_submit {
         let response =
-            submit_field_to_server_async(&cli.api_base, submit_data, cli.api_max_retries).await;
+            submit_field_to_server_async(client, &cli.api_base, submit_data, cli.api_max_retries)
+                .await;
         match response.text().await {
             Ok(msg) => {
                 debug!("Server response: {msg}");
@@ -618,17 +636,23 @@ async fn main() {
             .unwrap();
     }
 
+    // Create a shared HTTP client with proper timeout for connection reuse
+    let http_client = Client::builder()
+        .timeout(Duration::from_secs(CLIENT_REQUEST_TIMEOUT_SECS))
+        .build()
+        .expect("Failed to create HTTP client");
+
     // Choose execution mode based on flags
     if cli.validate || cli.benchmark.is_some() {
         // Validation and benchmark modes don't support pipelining
         loop {
             #[cfg(feature = "gpu")]
             {
-                run_single_iteration(&cli, gpu_ctx.as_ref()).await;
+                run_single_iteration(&cli, &http_client, gpu_ctx.as_ref()).await;
             }
             #[cfg(not(feature = "gpu"))]
             {
-                run_single_iteration(&cli).await;
+                run_single_iteration(&cli, &http_client).await;
             }
 
             if !cli.repeat {
@@ -640,20 +664,20 @@ async fn main() {
         if cli.repeat {
             #[cfg(feature = "gpu")]
             {
-                run_pipelined_loop(&cli, gpu_ctx.as_ref()).await;
+                run_pipelined_loop(&cli, &http_client, gpu_ctx.as_ref()).await;
             }
             #[cfg(not(feature = "gpu"))]
             {
-                run_pipelined_loop(&cli).await;
+                run_pipelined_loop(&cli, &http_client).await;
             }
         } else {
             #[cfg(feature = "gpu")]
             {
-                run_single_iteration(&cli, gpu_ctx.as_ref()).await;
+                run_single_iteration(&cli, &http_client, gpu_ctx.as_ref()).await;
             }
             #[cfg(not(feature = "gpu"))]
             {
-                run_single_iteration(&cli).await;
+                run_single_iteration(&cli, &http_client).await;
             }
         }
     }

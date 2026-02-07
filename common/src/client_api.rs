@@ -4,9 +4,9 @@ use super::*;
 use reqwest::blocking::Response;
 use std::{thread, time::Duration};
 
-const REQUEST_TIMEOUT_SECS: u64 = 5;
-
-// Re-export tokio for async functions
+// Re-export tokio and reqwest for async functions
+#[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
+pub use reqwest::Client;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
 pub use tokio;
 
@@ -113,7 +113,7 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str, max_retries: u32
     retry_request(
         || {
             reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .timeout(Duration::from_secs(CLIENT_REQUEST_TIMEOUT_SECS))
                 .build()
                 .unwrap()
                 .get(&url)
@@ -139,7 +139,7 @@ pub fn submit_field_to_server(
     retry_request(
         || {
             reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .timeout(Duration::from_secs(CLIENT_REQUEST_TIMEOUT_SECS))
                 .build()
                 .unwrap()
                 .post(&url)
@@ -172,7 +172,7 @@ pub fn get_validation_data_from_server(api_base: &str, max_retries: u32) -> Vali
     retry_request(
         || {
             reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .timeout(Duration::from_secs(CLIENT_REQUEST_TIMEOUT_SECS))
                 .build()
                 .unwrap()
                 .get(&url)
@@ -287,6 +287,7 @@ where
 /// Async version: Request a field from the server and returns the deserialized data.
 /// Retries for 5xx errors or network timeouts.
 pub async fn get_field_from_server_async(
+    client: &reqwest::Client,
     mode: &SearchMode,
     api_base: &str,
     max_retries: u32,
@@ -297,15 +298,7 @@ pub async fn get_field_from_server_async(
     };
 
     retry_request_async(
-        || async {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-                .build()
-                .unwrap()
-                .get(&url)
-                .send()
-                .await
-        },
+        || async { client.get(&url).send().await },
         |response| async move {
             match response.json::<DataToClient>().await {
                 Ok(data) => data,
@@ -320,6 +313,7 @@ pub async fn get_field_from_server_async(
 /// Async version: Submit field results to the server. Panic if there is an error.
 /// Retries for 5xx errors or network timeouts.
 pub async fn submit_field_to_server_async(
+    client: &reqwest::Client,
     api_base: &str,
     submit_data: DataToServer,
     max_retries: u32,
@@ -327,16 +321,7 @@ pub async fn submit_field_to_server_async(
     let url = format!("{api_base}/submit");
 
     retry_request_async(
-        || async {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-                .build()
-                .unwrap()
-                .post(&url)
-                .json(&submit_data)
-                .send()
-                .await
-        },
+        || async { client.post(&url).json(&submit_data).send().await },
         |response| async move {
             // Check for other client/server errors (4xx, etc.)
             if !response.status().is_success() {
@@ -359,21 +344,14 @@ pub async fn submit_field_to_server_async(
 /// Returns the deserialized ValidationData which includes the expected results.
 /// Retries for 5xx errors or network timeouts.
 pub async fn get_validation_data_from_server_async(
+    client: &reqwest::Client,
     api_base: &str,
     max_retries: u32,
 ) -> ValidationData {
     let url = format!("{api_base}/claim/validate");
 
     retry_request_async(
-        || async {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-                .build()
-                .unwrap()
-                .get(&url)
-                .send()
-                .await
-        },
+        || async { client.get(&url).send().await },
         |response| async move {
             match response.json::<ValidationData>().await {
                 Ok(data) => data,
