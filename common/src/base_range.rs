@@ -1,6 +1,7 @@
 //! A module for calculating the apprpriate range for each base.
 
 use crate::FieldSize;
+use anyhow::{Result, anyhow};
 use malachite::base::num::arithmetic::traits::{CeilingRoot, FloorRoot, Pow};
 use malachite::natural::Natural;
 
@@ -39,13 +40,13 @@ pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
 ///
 /// # Errors
 /// Returns an error if the results are too large for u128.
-pub fn get_base_range_u128(base: u32) -> Result<Option<FieldSize>, String> {
+pub fn get_base_range_u128(base: u32) -> Result<Option<FieldSize>> {
     // get the natural results
     let (range_start, range_end) = match get_base_range_natural(base) {
         Some((min, max)) => (
             // convert to u128
-            u128::try_from(&min).map_err(|_| format!("Failed to convert {min} to u128."))?,
-            u128::try_from(&max).map_err(|_| format!("Failed to convert {max} to u128."))?,
+            u128::try_from(&min).map_err(|_| anyhow!("Failed to convert {min} to u128."))?,
+            u128::try_from(&max).map_err(|_| anyhow!("Failed to convert {max} to u128."))?,
         ),
         None => return Ok(None),
     };
@@ -61,39 +62,36 @@ mod tests {
     #[test_log::test]
     fn test_get_base_range_u128() {
         assert_eq!(
-            get_base_range_u128(5),
-            Ok(Some(FieldSize::new(3u128, 5u128)))
+            get_base_range_u128(5).unwrap(),
+            Some(FieldSize::new(3u128, 5u128))
         );
-        assert_eq!(get_base_range_u128(6), Ok(None));
+        assert_eq!(get_base_range_u128(6).unwrap(), None);
         assert_eq!(
-            get_base_range_u128(7),
-            Ok(Some(FieldSize::new(7u128, 13u128)))
-        );
-        assert_eq!(
-            get_base_range_u128(8),
-            Ok(Some(FieldSize::new(16u128, 22u128)))
+            get_base_range_u128(7).unwrap(),
+            Some(FieldSize::new(7u128, 13u128))
         );
         assert_eq!(
-            get_base_range_u128(9),
-            Ok(Some(FieldSize::new(27u128, 38u128)))
+            get_base_range_u128(8).unwrap(),
+            Some(FieldSize::new(16u128, 22u128))
         );
         assert_eq!(
-            get_base_range_u128(10),
-            Ok(Some(FieldSize::new(47u128, 100u128)))
+            get_base_range_u128(9).unwrap(),
+            Some(FieldSize::new(27u128, 38u128))
         );
         assert_eq!(
-            get_base_range_u128(40),
-            Ok(Some(FieldSize::new(
-                1_916_284_264_916u128,
-                6_553_600_000_000u128
-            )))
+            get_base_range_u128(10).unwrap(),
+            Some(FieldSize::new(47u128, 100u128))
         );
         assert_eq!(
-            get_base_range_u128(80),
-            Ok(Some(FieldSize::new(
+            get_base_range_u128(40).unwrap(),
+            Some(FieldSize::new(1_916_284_264_916u128, 6_553_600_000_000u128))
+        );
+        assert_eq!(
+            get_base_range_u128(80).unwrap(),
+            Some(FieldSize::new(
                 653_245_554_420_798_943_087_177_909_799u128,
                 2_814_749_767_106_560_000_000_000_000_000u128
-            )))
+            ))
         );
     }
 

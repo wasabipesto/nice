@@ -50,7 +50,7 @@ struct SubmissionPrivateNew {
     numbers: Value,
 }
 
-fn private_to_public(p: SubmissionPrivate) -> Result<SubmissionRecord, String> {
+fn private_to_public(p: SubmissionPrivate) -> Result<SubmissionRecord> {
     use conversions::*;
     Ok(SubmissionRecord {
         submission_id: i64_to_u128(p.id)?,
@@ -68,7 +68,7 @@ fn private_to_public(p: SubmissionPrivate) -> Result<SubmissionRecord, String> {
     })
 }
 
-fn public_to_private(p: SubmissionRecord) -> Result<SubmissionPrivate, String> {
+fn public_to_private(p: SubmissionRecord) -> Result<SubmissionPrivate> {
     use conversions::*;
     Ok(SubmissionPrivate {
         id: u128_to_i64(p.submission_id)?,
@@ -93,7 +93,7 @@ fn build_new_row(
     user_ip: String,
     distribution: Option<Vec<UniquesDistribution>>,
     numbers: Vec<NiceNumber>,
-) -> Result<SubmissionPrivateNew, String> {
+) -> Result<SubmissionPrivateNew> {
     use conversions::*;
     Ok(SubmissionPrivateNew {
         claim_id: u128_to_i32(claim_record.claim_id)?,
@@ -115,7 +115,7 @@ pub fn insert_submission(
     input_user_ip: String,
     input_distribution: Option<Vec<UniquesDistribution>>,
     input_numbers: Vec<NiceNumber>,
-) -> Result<SubmissionRecord, String> {
+) -> Result<SubmissionRecord> {
     use self::submissions::dsl::*;
 
     let insert_row = build_new_row(
@@ -126,33 +126,30 @@ pub fn insert_submission(
         input_numbers,
     )?;
 
-    diesel::insert_into(submissions)
+    let result = diesel::insert_into(submissions)
         .values(&insert_row)
         .get_result(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }
 
-pub fn get_submission_by_id(
-    conn: &mut PgConnection,
-    row_id: u128,
-) -> Result<SubmissionRecord, String> {
+pub fn get_submission_by_id(conn: &mut PgConnection, row_id: u128) -> Result<SubmissionRecord> {
     use self::submissions::dsl::*;
 
     let row_id = conversions::u128_to_i64(row_id)?;
 
-    submissions
+    let result = submissions
         .filter(id.eq(row_id))
         .first::<SubmissionPrivate>(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }
 
 pub fn get_canon_submissions_by_range(
     conn: &mut PgConnection,
     start: u128,
     end: u128,
-) -> Result<Vec<SubmissionRecord>, String> {
+) -> Result<Vec<SubmissionRecord>> {
     use diesel::sql_query;
     use diesel::sql_types::Numeric;
 
@@ -169,18 +166,18 @@ pub fn get_canon_submissions_by_range(
         .bind::<Numeric, _>(start)
         .bind::<Numeric, _>(end)
         .load(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     items_private
         .into_iter()
         .map(private_to_public)
-        .collect::<Result<Vec<SubmissionRecord>, String>>()
+        .collect::<Result<Vec<SubmissionRecord>>>()
 }
 
 pub fn get_submissions_qualified_detailed_for_field(
     conn: &mut PgConnection,
     input_field_id: u128,
-) -> Result<Vec<SubmissionRecord>, String> {
+) -> Result<Vec<SubmissionRecord>> {
     use self::submissions::dsl::*;
 
     let input_field_id = conversions::u128_to_i32(input_field_id)?;
@@ -192,12 +189,12 @@ pub fn get_submissions_qualified_detailed_for_field(
         .filter(search_mode.eq(input_search_mode))
         .filter(disqualified.eq(input_disqualified))
         .load(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     items_private
         .into_iter()
         .map(private_to_public)
-        .collect::<Result<Vec<SubmissionRecord>, String>>()
+        .collect::<Result<Vec<SubmissionRecord>>>()
 }
 
 /// Struct to hold submission with `chunk_id` from batch query
@@ -236,7 +233,7 @@ pub struct SubmissionWithChunk {
 pub fn get_canon_submissions_with_chunks_by_base(
     conn: &mut PgConnection,
     base: u32,
-) -> Result<Vec<(SubmissionRecord, Option<u32>)>, String> {
+) -> Result<Vec<(SubmissionRecord, Option<u32>)>> {
     use diesel::sql_query;
     use diesel::sql_types::Integer;
 
@@ -247,10 +244,7 @@ pub fn get_canon_submissions_with_chunks_by_base(
         JOIN submissions s ON f.canon_submission_id = s.id
         WHERE f.base_id = $1;";
 
-    let items: Vec<SubmissionWithChunk> = sql_query(query)
-        .bind::<Integer, _>(base)
-        .load(conn)
-        .map_err(|err| err.to_string())?;
+    let items: Vec<SubmissionWithChunk> = sql_query(query).bind::<Integer, _>(base).load(conn)?;
 
     items
         .into_iter()
@@ -272,5 +266,5 @@ pub fn get_canon_submissions_with_chunks_by_base(
             let chunk_id = conversions::opti32_to_optu32(item.chunk_id)?;
             Ok((submission, chunk_id))
         })
-        .collect::<Result<Vec<_>, String>>()
+        .collect::<Result<Vec<_>>>()
 }

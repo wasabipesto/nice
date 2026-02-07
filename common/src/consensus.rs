@@ -2,6 +2,7 @@
 
 use crate::{FieldRecord, SubmissionCandidate, SubmissionRecord};
 use crate::{distribution_stats, number_stats};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
 /// Given a field and submissions, determine if there is a consensus.
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 pub fn evaluate_consensus(
     field: &FieldRecord,
     submissions: &Vec<SubmissionRecord>,
-) -> Result<(Option<SubmissionRecord>, u8), String> {
+) -> Result<(Option<SubmissionRecord>, u8)> {
     // If there are no submissions, reset the canon submission and cap the check level
     if submissions.is_empty() {
         return Ok((None, field.check_level.min(1)));
@@ -28,7 +29,7 @@ pub fn evaluate_consensus(
     let mut submission_groups: HashMap<SubmissionCandidate, Vec<SubmissionRecord>> = HashMap::new();
     for sub in submissions {
         let sub_distribution = sub.distribution.clone().ok_or_else(|| {
-            format!(
+            anyhow!(
                 "No distribution found in detailed submission #{}",
                 sub.submission_id
             )
@@ -53,7 +54,7 @@ pub fn evaluate_consensus(
         .values()
         .max_by_key(|v| v.len())
         .ok_or_else(|| {
-            format!("Could not get majority group from submission_groups: {submission_groups:?}.")
+            anyhow!("Could not get majority group from submission_groups: {submission_groups:?}.")
         })?
         .clone();
 
@@ -61,7 +62,7 @@ pub fn evaluate_consensus(
     let first_submission = majority_group
         .iter()
         .min_by_key(|sub| sub.submit_time)
-        .ok_or_else(|| format!("No submission in majority_group: {majority_group:?}."))?;
+        .ok_or_else(|| anyhow!("No submission in majority_group: {majority_group:?}."))?;
 
     // Determine the check level, cap to u8::MAX (255)
     let check_level_raw = majority_group.len() + 1;

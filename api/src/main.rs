@@ -9,9 +9,9 @@ extern crate rocket;
 use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
-    PgPool, get_claim_by_id, get_database_pool, get_field_by_id, get_pooled_database_connection,
-    get_validation_field, insert_claim, insert_submission, try_claim_field,
-    update_field_canon_and_cl,
+    PgPool, claims::get_claim_by_id, claims::insert_claim, fields::get_field_by_id,
+    fields::get_validation_field, fields::try_claim_field, fields::update_field_canon_and_cl,
+    get_database_pool, get_pooled_database_connection, submissions::insert_submission,
 };
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
@@ -159,7 +159,7 @@ fn claim_helper(
     };
 
     // Save the claim and get the record
-    let claim_record = insert_claim(&mut conn, &search_field, search_mode, user_ip)
+    let claim_record = insert_claim(&mut conn, search_field.field_id, search_mode, user_ip)
         .map_err(|e| internal_error(format!("Database error while inserting claim: {e}")))?;
 
     // Build the struct to send to the client

@@ -47,7 +47,7 @@ struct ChunkPrivateNew {
     range_size: BigDecimal,
 }
 
-fn private_to_public(p: ChunkPrivate) -> Result<ChunkRecord, String> {
+fn private_to_public(p: ChunkPrivate) -> Result<ChunkRecord> {
     use conversions::*;
     Ok(ChunkRecord {
         chunk_id: i32_to_u32(p.id)?,
@@ -65,7 +65,7 @@ fn private_to_public(p: ChunkPrivate) -> Result<ChunkRecord, String> {
     })
 }
 
-fn public_to_private(p: ChunkRecord) -> Result<ChunkPrivate, String> {
+fn public_to_private(p: ChunkRecord) -> Result<ChunkPrivate> {
     use conversions::*;
     Ok(ChunkPrivate {
         id: u32_to_i32(p.chunk_id)?,
@@ -83,7 +83,7 @@ fn public_to_private(p: ChunkRecord) -> Result<ChunkPrivate, String> {
     })
 }
 
-fn build_new_row(base: u32, size: &FieldSize) -> Result<ChunkPrivateNew, String> {
+fn build_new_row(base: u32, size: &FieldSize) -> Result<ChunkPrivateNew> {
     use conversions::*;
     Ok(ChunkPrivateNew {
         base_id: u32_to_i32(base)?,
@@ -93,11 +93,7 @@ fn build_new_row(base: u32, size: &FieldSize) -> Result<ChunkPrivateNew, String>
     })
 }
 
-pub fn insert_chunks(
-    conn: &mut PgConnection,
-    base: u32,
-    sizes: &[FieldSize],
-) -> Result<(), String> {
+pub fn insert_chunks(conn: &mut PgConnection, base: u32, sizes: &[FieldSize]) -> Result<()> {
     use self::chunks::dsl::*;
 
     let insert_rows: Vec<ChunkPrivateNew> = sizes
@@ -107,26 +103,25 @@ pub fn insert_chunks(
 
     diesel::insert_into(chunks)
         .values(&insert_rows)
-        .get_result(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)?;
+        .execute(conn)
+        .map_err(|e| anyhow!("{e}"))?;
 
     Ok(())
 }
 
-pub fn get_chunk_by_id(conn: &mut PgConnection, row_id: u32) -> Result<ChunkRecord, String> {
+pub fn get_chunk_by_id(conn: &mut PgConnection, row_id: u32) -> Result<ChunkRecord> {
     use self::chunks::dsl::*;
 
     let row_id = conversions::u32_to_i32(row_id)?;
 
-    chunks
+    let result = chunks
         .filter(id.eq(row_id))
         .first::<ChunkPrivate>(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }
 
-pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<ChunkRecord>, String> {
+pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<ChunkRecord>> {
     use self::chunks::dsl::*;
 
     let base = u32_to_i32(base)?;
@@ -134,33 +129,33 @@ pub fn get_chunks_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<Chun
         .filter(base_id.eq(base))
         .order(id.asc())
         .load(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     items_private
         .into_iter()
         .map(private_to_public)
-        .collect::<Result<Vec<ChunkRecord>, String>>()
+        .collect::<Result<Vec<ChunkRecord>>>()
 }
 
 pub fn update_chunk(
     conn: &mut PgConnection,
     row_id: u32,
     update_row: ChunkRecord,
-) -> Result<ChunkRecord, String> {
+) -> Result<ChunkRecord> {
     use self::chunks::dsl::*;
 
     let row_id = conversions::u32_to_i32(row_id)?;
     let update_row = public_to_private(update_row)?;
 
-    diesel::update(chunks.filter(id.eq(row_id)))
+    let result = diesel::update(chunks.filter(id.eq(row_id)))
         .set(&update_row)
         .get_result(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }
 
 #[allow(clippy::cast_possible_wrap)]
-pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(), String> {
+pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<()> {
     use diesel::sql_types::Integer;
 
     let query = "
@@ -175,7 +170,7 @@ pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(
     diesel::sql_query(query)
         .bind::<Integer, _>(base as i32)
         .execute(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     Ok(())
 }

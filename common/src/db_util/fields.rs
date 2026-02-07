@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::*;
+use anyhow::anyhow;
 use rand::Rng;
 
 table! {
@@ -42,7 +43,7 @@ struct FieldPrivateNew {
     range_size: BigDecimal,
 }
 
-fn private_to_public(p: FieldPrivate) -> Result<FieldRecord, String> {
+fn private_to_public(p: FieldPrivate) -> Result<FieldRecord> {
     use conversions::*;
     Ok(FieldRecord {
         field_id: i64_to_u128(p.id)?,
@@ -58,7 +59,7 @@ fn private_to_public(p: FieldPrivate) -> Result<FieldRecord, String> {
     })
 }
 
-fn public_to_private(p: &FieldRecord) -> Result<FieldPrivate, String> {
+fn public_to_private(p: &FieldRecord) -> Result<FieldPrivate> {
     use conversions::*;
     Ok(FieldPrivate {
         id: u128_to_i64(p.field_id)?,
@@ -74,7 +75,7 @@ fn public_to_private(p: &FieldRecord) -> Result<FieldPrivate, String> {
     })
 }
 
-fn build_new_row(base: u32, size: &FieldSize) -> Result<FieldPrivateNew, String> {
+fn build_new_row(base: u32, size: &FieldSize) -> Result<FieldPrivateNew> {
     use conversions::*;
     Ok(FieldPrivateNew {
         base_id: u32_to_i32(base)?,
@@ -84,11 +85,7 @@ fn build_new_row(base: u32, size: &FieldSize) -> Result<FieldPrivateNew, String>
     })
 }
 
-pub fn insert_fields(
-    conn: &mut PgConnection,
-    base: u32,
-    sizes: &[FieldSize],
-) -> Result<(), String> {
+pub fn insert_fields(conn: &mut PgConnection, base: u32, sizes: &[FieldSize]) -> Result<()> {
     use self::fields::dsl::*;
 
     let insert_rows: Vec<FieldPrivateNew> = sizes
@@ -101,14 +98,14 @@ pub fn insert_fields(
         diesel::insert_into(fields)
             .values(chunk)
             .execute(conn)
-            .map_err(|err| err.to_string())?;
+            .map_err(|e| anyhow!("{e}"))?;
     }
 
     Ok(())
 }
 
 /// Returns the maximum `fields.id` (as u128). Assumes ids are contiguous and monotonically increasing.
-pub fn get_max_field_id(conn: &mut PgConnection) -> Result<u128, String> {
+pub fn get_max_field_id(conn: &mut PgConnection) -> Result<u128> {
     use diesel::sql_query;
     use diesel::sql_types::BigInt;
 
@@ -120,24 +117,24 @@ pub fn get_max_field_id(conn: &mut PgConnection) -> Result<u128, String> {
 
     let row: MaxIdRow = sql_query("SELECT MAX(id) AS max_id FROM fields;")
         .get_result(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     conversions::i64_to_u128(row.max_id)
 }
 
-pub fn get_field_by_id(conn: &mut PgConnection, row_id: u128) -> Result<FieldRecord, String> {
+pub fn get_field_by_id(conn: &mut PgConnection, row_id: u128) -> Result<FieldRecord> {
     use self::fields::dsl::*;
 
     let row_id = conversions::u128_to_i64(row_id)?;
 
-    fields
+    let result = fields
         .filter(id.eq(row_id))
         .first::<FieldPrivate>(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }
 
-pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<FieldRecord>, String> {
+pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<FieldRecord>> {
     use self::fields::dsl::*;
 
     let base = conversions::u32_to_i32(base)?;
@@ -145,19 +142,19 @@ pub fn get_fields_in_base(conn: &mut PgConnection, base: u32) -> Result<Vec<Fiel
         .filter(base_id.eq(base))
         .order(id.asc())
         .load(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     items_private
         .into_iter()
         .map(private_to_public)
-        .collect::<Result<Vec<FieldRecord>, String>>()
+        .collect::<Result<Vec<FieldRecord>>>()
 }
 
 pub fn get_fields_in_range(
     conn: &mut PgConnection,
     field_start: u128,
     field_end: u128,
-) -> Result<Vec<FieldRecord>, String> {
+) -> Result<Vec<FieldRecord>> {
     use self::fields::dsl::*;
 
     let field_start = conversions::u128_to_bigdec(field_start)?;
@@ -168,18 +165,18 @@ pub fn get_fields_in_range(
         .filter(range_end.le(field_end))
         .order(id.asc())
         .load(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     items_private
         .into_iter()
         .map(private_to_public)
-        .collect::<Result<Vec<FieldRecord>, String>>()
+        .collect::<Result<Vec<FieldRecord>>>()
 }
 
 pub fn get_fields_in_base_with_detailed_subs(
     conn: &mut PgConnection,
     base: u32,
-) -> Result<Vec<FieldRecord>, String> {
+) -> Result<Vec<FieldRecord>> {
     use diesel::sql_query;
     use diesel::sql_types::Integer;
 
@@ -193,12 +190,12 @@ pub fn get_fields_in_base_with_detailed_subs(
     let items_private: Vec<FieldPrivate> = sql_query(query)
         .bind::<Integer, _>(base)
         .load(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     items_private
         .into_iter()
         .map(private_to_public)
-        .collect::<Result<Vec<FieldRecord>, String>>()
+        .collect::<Result<Vec<FieldRecord>>>()
 }
 
 /// Finds the next field that matches the criteria, updates `last_claim_time`, and returns it.
@@ -210,7 +207,7 @@ pub fn try_claim_field(
     maximum_timestamp: DateTime<Utc>,
     maximum_check_level: u8,
     maximum_size: u128,
-) -> Result<Option<FieldRecord>, String> {
+) -> Result<Option<FieldRecord>> {
     use diesel::sql_query;
     use diesel::sql_types::{BigInt, Integer, Numeric, Timestamptz};
 
@@ -252,14 +249,18 @@ pub fn try_claim_field(
                 RETURNING f.*;"
             );
 
-            sql_query(query)
+            let result = sql_query(query)
                 .bind::<Timestamptz, _>(maximum_timestamp)
                 .bind::<Integer, _>(maximum_check_level)
                 .bind::<Numeric, _>(maximum_size)
                 .get_result::<FieldPrivate>(conn)
                 .optional()
-                .map_err(|err| err.to_string())
-                .and_then(|opt| opt.map_or(Ok(None), |rec| private_to_public(rec).map(Some)))
+                .map_err(|e| anyhow!("{e}"))?;
+
+            match result {
+                Some(rec) => private_to_public(rec).map(Some),
+                None => Ok(None),
+            }
         }
         FieldClaimStrategy::Random => {
             // Pseudorandom strategy: choose a random pivot id and take the next eligible row.
@@ -309,7 +310,7 @@ pub fn try_claim_field(
 
             // Compute a pivot in [1, max_id]. Caller guarantees no id gaps.
             // If max_id is 0 (empty table), use 0 so the pivot branch yields no rows and we wrap.
-            let max_id = get_max_field_id(conn).unwrap_or(0);
+            let max_id = get_max_field_id(conn)?;
             let pivot: i64 = if max_id == 0 {
                 0
             } else {
@@ -318,27 +319,32 @@ pub fn try_claim_field(
             };
 
             // First attempt: claim from pivot
-            if let Some(rec) = sql_query(query_from_pivot)
+            let result = sql_query(query_from_pivot)
                 .bind::<Timestamptz, _>(maximum_timestamp)
                 .bind::<Integer, _>(maximum_check_level)
                 .bind::<Numeric, _>(maximum_size)
                 .bind::<BigInt, _>(pivot)
                 .get_result::<FieldPrivate>(conn)
                 .optional()
-                .map_err(|err| err.to_string())?
-            {
+                .map_err(|e| anyhow!("{e}"))?;
+
+            if let Some(rec) = result {
                 return private_to_public(rec).map(Some);
             }
 
             // Second attempt: wraparound (claim from the beginning)
-            sql_query(query_wraparound)
+            let result = sql_query(query_wraparound)
                 .bind::<Timestamptz, _>(maximum_timestamp)
                 .bind::<Integer, _>(maximum_check_level)
                 .bind::<Numeric, _>(maximum_size_clone)
                 .get_result::<FieldPrivate>(conn)
                 .optional()
-                .map_err(|err| err.to_string())
-                .and_then(|opt| opt.map_or(Ok(None), |rec| private_to_public(rec).map(Some)))
+                .map_err(|e| anyhow!("{e}"))?;
+
+            match result {
+                Some(rec) => private_to_public(rec).map(Some),
+                None => Ok(None),
+            }
         }
         FieldClaimStrategy::Thin => {
             // First, finds the first chunk with less than X% of the chunk checked:
@@ -386,7 +392,7 @@ pub fn try_claim_field(
                 .bind::<Numeric, _>(chunk_completion_cutoff_pct)
                 .get_result(conn)
                 .optional()
-                .map_err(|err| err.to_string())?;
+                .map_err(|e| anyhow!("{e}"))?;
 
             let Some(chunk_info) = chunk_info_result else {
                 return Ok(None);
@@ -426,7 +432,7 @@ pub fn try_claim_field(
                 RETURNING f.*;"
             );
 
-            if let Some(rec) = sql_query(query_from_pivot)
+            let result = sql_query(query_from_pivot)
                 .bind::<Timestamptz, _>(maximum_timestamp)
                 .bind::<Integer, _>(maximum_check_level)
                 .bind::<Numeric, _>(maximum_size)
@@ -434,8 +440,9 @@ pub fn try_claim_field(
                 .bind::<BigInt, _>(pivot)
                 .get_result::<FieldPrivate>(conn)
                 .optional()
-                .map_err(|err| err.to_string())?
-            {
+                .map_err(|e| anyhow!("{e}"))?;
+
+            if let Some(rec) = result {
                 return private_to_public(rec).map(Some);
             }
 
@@ -459,15 +466,19 @@ pub fn try_claim_field(
                 RETURNING f.*;"
             );
 
-            sql_query(query_wraparound)
+            let result = sql_query(query_wraparound)
                 .bind::<Timestamptz, _>(maximum_timestamp)
                 .bind::<Integer, _>(maximum_check_level)
                 .bind::<Numeric, _>(maximum_size_clone)
                 .bind::<Integer, _>(chunk_info.chunk_id)
                 .get_result::<FieldPrivate>(conn)
                 .optional()
-                .map_err(|err| err.to_string())
-                .and_then(|opt| opt.map_or(Ok(None), |rec| private_to_public(rec).map(Some)))
+                .map_err(|e| anyhow!("{e}"))?;
+
+            match result {
+                Some(rec) => private_to_public(rec).map(Some),
+                None => Ok(None),
+            }
         }
     }
 }
@@ -480,13 +491,13 @@ pub fn bulk_claim_fields(
     maximum_timestamp: DateTime<Utc>,
     maximum_check_level: u8,
     maximum_size: u128,
-) -> Result<Vec<FieldRecord>, String> {
+) -> Result<Vec<FieldRecord>> {
     use diesel::sql_query;
     use diesel::sql_types::{BigInt, Integer, Numeric, Timestamptz};
 
     let maximum_check_level = conversions::u8_to_i32(maximum_check_level)?;
     let maximum_size = conversions::u128_to_bigdec(maximum_size)?;
-    let count_i64 = i64::try_from(count).map_err(|e| e.to_string())?;
+    let count_i64 = i64::try_from(count).map_err(|e| anyhow!("{e}"))?;
 
     // Use the same optimization for check_level = 0 to match the partial index
     let check_level_predicate = if maximum_check_level == 0 {
@@ -519,12 +530,12 @@ pub fn bulk_claim_fields(
         .bind::<Numeric, _>(maximum_size)
         .bind::<BigInt, _>(count_i64)
         .load::<FieldPrivate>(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     results.into_iter().map(private_to_public).collect()
 }
 
-pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData, String> {
+pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData> {
     use diesel::sql_query;
     use diesel::sql_types::{BigInt, Integer};
 
@@ -548,7 +559,7 @@ pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData, S
         .bind::<Integer, _>(min_check_level)
         .get_result::<FieldPrivate>(conn)
         .optional()
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     // If no field found from pivot, wrap around to the beginning
     let field = if let Some(f) = field_result {
@@ -563,7 +574,7 @@ pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData, S
         sql_query(query_wraparound)
             .bind::<Integer, _>(min_check_level)
             .get_result::<FieldPrivate>(conn)
-            .map_err(|err| err.to_string())?
+            .map_err(|e| anyhow!("{e}"))?
     };
 
     let field_pub = private_to_public(field)?;
@@ -571,13 +582,15 @@ pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData, S
     // Get the canonical submission
     let submission_id = field_pub
         .canon_submission_id
-        .ok_or_else(|| "Field has no canonical submission".to_string())?;
+        .ok_or_else(|| anyhow!("Field has no canonical submission"))?;
     let submission = submissions::get_submission_by_id(conn, u128::from(submission_id))?;
 
     // Convert submission data to simple format for ValidationData
     let unique_distribution = match submission.distribution {
         Some(dist) => distribution_stats::shrink_distribution(&dist),
-        None => return Err("Canonical submission has no distribution data".to_string()),
+        None => {
+            return Err(anyhow!("Canonical submission has no distribution data"));
+        }
     };
     let nice_numbers = number_stats::shrink_numbers(&submission.numbers);
 
@@ -597,7 +610,7 @@ pub fn get_count_checked_by_range(
     in_check_level: u8,
     start: u128,
     end: u128,
-) -> Result<u128, String> {
+) -> Result<u128> {
     use self::fields::dsl::*;
     use diesel::dsl::sum;
 
@@ -611,17 +624,13 @@ pub fn get_count_checked_by_range(
         .filter(range_start.ge(in_range_start))
         .filter(range_end.le(in_range_end))
         .first::<Option<BigDecimal>>(conn)
-        .map_err(|err| err.to_string())?
+        .map_err(|e| anyhow!("{e}"))?
         .unwrap_or(BigDecimal::from(0u32));
 
     conversions::bigdec_to_u128(result)
 }
 
-pub fn get_minimum_cl_by_range(
-    conn: &mut PgConnection,
-    start: u128,
-    end: u128,
-) -> Result<u8, String> {
+pub fn get_minimum_cl_by_range(conn: &mut PgConnection, start: u128, end: u128) -> Result<u8> {
     use self::fields::dsl::*;
     use diesel::dsl::min;
 
@@ -633,7 +642,7 @@ pub fn get_minimum_cl_by_range(
         .filter(range_start.ge(in_range_start))
         .filter(range_end.le(in_range_end))
         .first::<Option<i32>>(conn)
-        .map_err(|err| err.to_string())?
+        .map_err(|e| anyhow!("{e}"))?
         .unwrap_or_default();
 
     conversions::i32_to_u8(result)
@@ -643,17 +652,17 @@ pub fn update_field(
     conn: &mut PgConnection,
     row_id: u128,
     update_row: &FieldRecord,
-) -> Result<FieldRecord, String> {
+) -> Result<FieldRecord> {
     use self::fields::dsl::*;
 
     let row_id = conversions::u128_to_i64(row_id)?;
     let update_row = public_to_private(update_row)?;
 
-    diesel::update(fields.filter(id.eq(row_id)))
+    let result = diesel::update(fields.filter(id.eq(row_id)))
         .set(&update_row)
         .get_result(conn)
-        .map_err(|err| err.to_string())
-        .and_then(private_to_public)
+        .map_err(|e| anyhow!("{e}"))?;
+    private_to_public(result)
 }
 
 pub fn update_field_canon_and_cl(
@@ -661,7 +670,7 @@ pub fn update_field_canon_and_cl(
     field_id: u128,
     submission_id: Option<u32>,
     in_check_level: u8,
-) -> Result<(), String> {
+) -> Result<()> {
     use self::fields::dsl::*;
 
     let field_id = conversions::u128_to_i64(field_id)?;
@@ -675,7 +684,7 @@ pub fn update_field_canon_and_cl(
             check_level.eq(in_check_level),
         ))
         .execute(conn)
-        .map_err(|err| err.to_string())?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     Ok(())
 }
@@ -695,10 +704,7 @@ pub struct ChunkStats {
 
 /// Get statistics for all chunks in a base in a single query.
 /// This is much more efficient than querying each chunk individually.
-pub fn get_chunk_stats_batch(
-    conn: &mut PgConnection,
-    base: u32,
-) -> Result<Vec<ChunkStats>, String> {
+pub fn get_chunk_stats_batch(conn: &mut PgConnection, base: u32) -> Result<Vec<ChunkStats>> {
     use diesel::sql_query;
     use diesel::sql_types::Integer;
 
@@ -719,5 +725,5 @@ pub fn get_chunk_stats_batch(
     sql_query(query)
         .bind::<Integer, _>(base)
         .load(conn)
-        .map_err(|err| err.to_string())
+        .map_err(|e| anyhow!("{e}"))
 }

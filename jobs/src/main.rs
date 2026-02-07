@@ -18,7 +18,7 @@ fn main() {
     println!("Database connection established. Scheduled jobs started.");
 
     // get all bases
-    let bases = db_util::get_all_bases(&mut conn).unwrap();
+    let bases = db_util::bases::get_all_bases(&mut conn).unwrap();
     for base_record in bases {
         let base = base_record.base;
 
@@ -27,13 +27,15 @@ fn main() {
         // get all fields
         // TODO: get fields to check and their submissions in one operation
         let fields_to_check: Vec<FieldRecord> =
-            db_util::get_fields_in_base_with_detailed_subs(&mut conn, base).unwrap();
+            db_util::fields::get_fields_in_base_with_detailed_subs(&mut conn, base).unwrap();
 
         for field in fields_to_check {
             // Get all qualified and detailed submissions for the field
-            let submissions =
-                db_util::get_submissions_qualified_detailed_for_field(&mut conn, field.field_id)
-                    .unwrap();
+            let submissions = db_util::submissions::get_submissions_qualified_detailed_for_field(
+                &mut conn,
+                field.field_id,
+            )
+            .unwrap();
 
             // Establish the consensus
             let (canon_submission, check_level) =
@@ -49,7 +51,7 @@ fn main() {
                             field.check_level,
                             check_level
                         );
-                        db_util::update_field_canon_and_cl(
+                        db_util::fields::update_field_canon_and_cl(
                             &mut conn,
                             field.field_id,
                             None,
@@ -68,7 +70,7 @@ fn main() {
                     if field.canon_submission_id != Some(sub.submission_id as u32)
                         || field.check_level != check_level
                     {
-                        db_util::update_field_canon_and_cl(
+                        db_util::fields::update_field_canon_and_cl(
                             &mut conn,
                             field.field_id,
                             Some(sub.submission_id as u32),
@@ -87,7 +89,7 @@ fn main() {
         println!("=== BASE {base} DOWNSAMPLING ===");
 
         // OPTIMIZATION: Get all chunk statistics in a single batch query
-        let chunk_stats_batch = db_util::get_chunk_stats_batch(&mut conn, base).unwrap();
+        let chunk_stats_batch = db_util::fields::get_chunk_stats_batch(&mut conn, base).unwrap();
         let mut chunk_stats_map: HashMap<u32, _> = HashMap::new();
         for stats in chunk_stats_batch {
             #[allow(clippy::cast_sign_loss)]
@@ -97,7 +99,8 @@ fn main() {
 
         // OPTIMIZATION: Get all submissions for the base with chunk_ids in a single query
         let submissions_with_chunks =
-            db_util::get_canon_submissions_with_chunks_by_base(&mut conn, base).unwrap();
+            db_util::submissions::get_canon_submissions_with_chunks_by_base(&mut conn, base)
+                .unwrap();
 
         // Group submissions by chunk_id for efficient lookup
         let mut submissions_by_chunk: HashMap<u32, Vec<SubmissionRecord>> = HashMap::new();
@@ -115,7 +118,7 @@ fn main() {
         let mut base_minimum_cl: u8 = 255;
 
         // Get all chunks for the base
-        let chunks = db_util::get_chunks_in_base(&mut conn, base).unwrap();
+        let chunks = db_util::chunks::get_chunks_in_base(&mut conn, base).unwrap();
 
         for chunk in chunks {
             let chunk_size = chunk.range_size;
@@ -188,7 +191,8 @@ fn main() {
             if chunk == updated_chunk {
                 println!("No change.");
             } else {
-                db_util::update_chunk_stats(&mut conn, updated_chunk).unwrap();
+                db_util::chunks::update_chunk(&mut conn, updated_chunk.chunk_id, updated_chunk)
+                    .unwrap();
                 println!("Updated!");
             }
 
@@ -238,7 +242,7 @@ fn main() {
         if base_record == updated_base {
             println!("No change.");
         } else {
-            db_util::update_base_stats(&mut conn, updated_base).unwrap();
+            db_util::bases::update_base(&mut conn, updated_base.base, updated_base).unwrap();
             println!("Updated!");
         }
         println!();
