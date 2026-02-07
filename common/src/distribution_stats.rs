@@ -27,8 +27,9 @@ pub fn downsample_distributions(
     submissions: &[SubmissionRecord],
     base: u32,
 ) -> Vec<UniquesDistribution> {
-    // set up counter vec
-    // indexed by num_uniques
+    // Set up counter vec indexed by num_uniques
+    // Note: Array size is (base + 1) to allow indexing from 0..=base
+    // We use indices [1..=base] (inclusive range) since num_uniques ranges from 1 to base
     let mut counter = vec![
         UniquesDistributionSimple {
             num_uniques: 0,
@@ -36,6 +37,7 @@ pub fn downsample_distributions(
         };
         base as usize + 1
     ];
+    // Initialize entries for num_uniques in [1, base] (inclusive on both ends)
     for n in 1..=base {
         counter[n as usize] = UniquesDistributionSimple {
             num_uniques: n,
@@ -43,7 +45,7 @@ pub fn downsample_distributions(
         };
     }
 
-    // count all submissions
+    // Count all submissions
     for sub in submissions.iter().filter_map(|s| s.distribution.as_deref()) {
         for dist in sub {
             if let Some(counter_dist) = counter.get_mut(dist.num_uniques as usize) {
@@ -52,7 +54,9 @@ pub fn downsample_distributions(
         }
     }
 
-    // expand out & return
+    // Expand out & return
+    // Note: counter[1..] is a half-open range slice that includes indices [1, base],
+    // effectively skipping counter[0] which was just a placeholder
     expand_distribution(&counter[1..], base)
 }
 

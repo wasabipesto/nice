@@ -98,24 +98,23 @@ fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
 ///
 /// Note that this is half-open, meaning that the range is inclusive of the start value and
 /// exclusive of the end value. This follows the Rust convention for ranges.
-pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u32) -> bool {
+pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
     // Check for edge cases
     assert!(
-        range_start < arg_range_end,
+        range.range_start < range.range_end,
         "Range has invalid bounds, range_start must be < range_end (half-open interval)"
     );
     assert!(base <= 256, "Base must be 256 or less");
 
     // Can't check for duplicate values when there is only one element
-    let true_range_end = arg_range_end - 1;
-    if range_start == true_range_end {
+    if range.range_size == 1 {
         trace!("Range has only a single value, cannot use prefix optimization.");
         return false;
     }
 
     // Convert range boundaries to digit representations and find common prefixes of most significant digits
-    let range_start_square = Natural::from(range_start).pow(2).to_digits_asc(&base);
-    let range_end_square = Natural::from(true_range_end).pow(2).to_digits_asc(&base);
+    let range_start_square = Natural::from(range.first()).pow(2).to_digits_asc(&base);
+    let range_end_square = Natural::from(range.last()).pow(2).to_digits_asc(&base);
 
     // If the number of digits changes, it's harder to evaluate the prefix
     // For now we reject these to avoid false positives
@@ -134,8 +133,8 @@ pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u3
     }
 
     // Check the same thing for the cubes
-    let range_start_cube = Natural::from(range_start).pow(3).to_digits_asc(&base);
-    let range_end_cube = Natural::from(true_range_end).pow(3).to_digits_asc(&base);
+    let range_start_cube = Natural::from(range.first()).pow(3).to_digits_asc(&base);
+    let range_end_cube = Natural::from(range.last()).pow(3).to_digits_asc(&base);
 
     // If the number of digits changes, it's harder to evaluate the prefix
     // For now we reject these to avoid false positives
@@ -173,20 +172,18 @@ pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u3
 /// 2. If the range is small or max depth reached, return the range (needs processing)
 /// 3. Otherwise, subdivide into smaller ranges and recursively check each
 ///
-/// Returns a vector of (start, end) tuples representing ranges that need processing.
-/// All ranges are half-open intervals [start, end).
+/// Returns a vector of FieldSize structs representing ranges that need processing.
+/// All ranges are half-open intervals [start, end) following Rust's standard convention.
 ///
 /// # Arguments
-/// * `range_start` - Start of the range (inclusive)
-/// * `range_end` - End of the range (exclusive)
+/// * `range` - The range (exclusive, following half-open convention)
 /// * `base` - The base to check
 /// * `current_depth` - Current recursion depth (should start at 0)
 /// * `max_depth` - Maximum recursion depth to prevent excessive subdivision
 /// * `min_range_size` - Minimum range size before stopping subdivision
 /// * `subdivision_factor` - Number of parts to subdivide into (2-4 recommended)
 pub fn get_valid_ranges_recursive(
-    range_start: u128,
-    range_end: u128,
+    range: FieldSize,
     base: u32,
     current_depth: u32,
     max_depth: u32,
@@ -194,50 +191,61 @@ pub fn get_valid_ranges_recursive(
     subdivision_factor: usize,
 ) -> Vec<FieldSize> {
     // Check if range is too small or we've hit max depth
-    let range_size = range_end - range_start;
-    if range_size <= min_range_size || current_depth >= max_depth {
-        // Return this range for processing
+    if current_depth >= max_depth {
         trace!(
-            "Depth {current_depth}: Range [{range_start}, {range_end}) too small or max depth reached, returning for processing"
+            "Depth {current_depth}: Range [{}, {}) max depth reached, returning for processing",
+            range.range_start, range.range_end
         );
-        return vec![FieldSize::new(range_start, range_end)];
+        return vec![range];
+    }
+    if range.range_size <= min_range_size {
+        trace!(
+            "Depth {current_depth}: Range [{}, {}) too small, returning for processing",
+            range.range_start, range.range_end
+        );
+        return vec![range];
     }
 
     // Check if the entire range can be skipped
-    if has_duplicate_msd_prefix(range_start, range_end, base) {
-        trace!("Depth {current_depth}: Range [{range_start}, {range_end}) can be skipped entirely");
+    if has_duplicate_msd_prefix(range, base) {
+        trace!(
+            "Depth {current_depth}: Range [{}, {}) can be skipped entirely",
+            range.range_start, range.range_end
+        );
         return vec![]; // Skip this entire range
     }
 
     // Check if subdivision would be worthwhile
     // If the range is not much larger than min_range_size, don't bother subdividing
-    if range_size < min_range_size * (subdivision_factor as u128) {
+    if range.range_size < min_range_size * (subdivision_factor as u128) {
         trace!(
-            "Depth {current_depth}: Range [{range_start}, {range_end}) not worth subdividing, returning for processing"
+            "Depth {current_depth}: Range [{}, {}) not worth subdividing, returning for processing",
+            range.range_start, range.range_end
         );
-        return vec![FieldSize::new(range_start, range_end)];
+        return vec![range];
     }
 
     // Subdivide the range and recursively check each part
     trace!(
-        "Depth {current_depth}: Subdividing range [{range_start}, {range_end}) into {subdivision_factor} parts"
+        "Depth {current_depth}: Subdividing range [{}, {}) into {subdivision_factor} parts",
+        range.range_start, range.range_end
     );
 
-    let chunk_size = range_size / (subdivision_factor as u128);
+    let chunk_size = range.range_size / (subdivision_factor as u128);
     let mut valid_ranges = Vec::new();
 
     for i in 0..subdivision_factor {
-        let sub_start = range_start + (i as u128) * chunk_size;
+        let sub_start = range.range_start + (i as u128) * chunk_size;
         let sub_end = if i == subdivision_factor - 1 {
-            range_end // Last chunk gets any remainder
+            range.range_end // Last chunk gets any remainder
         } else {
             sub_start + chunk_size
         };
+        let sub_range = FieldSize::new(sub_start, sub_end);
 
         if sub_start < sub_end {
             let sub_ranges = get_valid_ranges_recursive(
-                sub_start,
-                sub_end,
+                sub_range,
                 base,
                 current_depth + 1,
                 max_depth,
@@ -253,12 +261,11 @@ pub fn get_valid_ranges_recursive(
 
 /// Convenience wrapper for get_valid_ranges_recursive using default parameters from lib.rs.
 ///
-/// Returns a vector of (start, end) tuples representing ranges that need processing.
-/// Ranges that can be skipped based on MSD prefix are not included.
-pub fn get_valid_ranges(range_start: u128, range_end: u128, base: u32) -> Vec<FieldSize> {
+/// Returns a vector of FieldSize structs representing half-open ranges [start, end) that need
+/// processing. Ranges that can be skipped based on MSD prefix are not included.
+pub fn get_valid_ranges(range: FieldSize, base: u32) -> Vec<FieldSize> {
     get_valid_ranges_recursive(
-        range_start,
-        range_end,
+        range,
         base,
         0,
         MSD_RECURSIVE_MAX_DEPTH,
@@ -376,8 +383,9 @@ mod tests {
 
         let range_start = 3163; // 3163² = 10,004,569
         let range_end = 3165; // So range is [3163, 3165), last number is 3164: 3164² = 10,010,896
+        let range = FieldSize::new(range_start, range_end);
         let base = 10;
-        let can_skip = has_duplicate_msd_prefix(range_start, range_end, base);
+        let can_skip = has_duplicate_msd_prefix(range, base);
 
         // Should return true because squares share MSD prefix [1,0,0] with duplicate 0s
         assert!(can_skip);
@@ -391,9 +399,10 @@ mod tests {
 
         let range_start = 3163;
         let range_end = 3164; // Range is [3163, 3164), which contains only 3163
+        let range = FieldSize::new(range_start, range_end);
         let base = 10;
 
-        let can_skip = has_duplicate_msd_prefix(range_start, range_end, base);
+        let can_skip = has_duplicate_msd_prefix(range, base);
         assert!(!can_skip);
     }
 
@@ -402,16 +411,17 @@ mod tests {
     fn test_invalid_bounds() {
         let range_start = 3163;
         let range_end = 3163;
+        let range = FieldSize::new(range_start, range_end);
         let base = 10;
 
-        let _can_skip = has_duplicate_msd_prefix(range_start, range_end, base);
+        let _can_skip = has_duplicate_msd_prefix(range, base);
     }
 
     #[test_log::test]
     fn test_early_exit_b10() {
         let base = 10;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
-        let can_skip = has_duplicate_msd_prefix(base_range.range_start, base_range.range_end, base);
+        let can_skip = has_duplicate_msd_prefix(base_range, base);
         assert!(!can_skip);
     }
 
@@ -419,7 +429,7 @@ mod tests {
     fn test_early_exit_b40_whole() {
         let base = 40;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
-        let can_skip = has_duplicate_msd_prefix(base_range.range_start, base_range.range_end, base);
+        let can_skip = has_duplicate_msd_prefix(base_range, base);
         assert!(!can_skip);
     }
 
@@ -427,7 +437,7 @@ mod tests {
     fn test_early_exit_b50_whole() {
         let base = 50;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
-        let can_skip = has_duplicate_msd_prefix(base_range.range_start, base_range.range_end, base);
+        let can_skip = has_duplicate_msd_prefix(base_range, base);
         assert!(!can_skip);
     }
 
@@ -452,8 +462,9 @@ mod tests {
         ];
         for (segment_num, expected_result) in expected_results {
             let segment = segments[segment_num];
+            let range = FieldSize::new(segment.0, segment.1);
             debug!("Testing base {base} segment #{segment_num}: ({segment:?})");
-            let can_skip = has_duplicate_msd_prefix(segment.0, segment.1, base);
+            let can_skip = has_duplicate_msd_prefix(range, base);
             assert_eq!(can_skip, expected_result);
         }
     }
@@ -479,8 +490,9 @@ mod tests {
         ];
         for (segment_num, expected_result) in expected_results {
             let segment = segments[segment_num];
+            let range = FieldSize::new(segment.0, segment.1);
             debug!("Testing base {base} segment #{segment_num}: ({segment:?})");
-            let can_skip = has_duplicate_msd_prefix(segment.0, segment.1, base);
+            let can_skip = has_duplicate_msd_prefix(range, base);
             assert_eq!(can_skip, expected_result);
         }
     }

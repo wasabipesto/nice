@@ -4,6 +4,9 @@ use super::*;
 
 /// Get the range of possible values for a base.
 /// Returns None if there are no valid numbers in that base.
+///
+/// **Range semantics**: This represents a half-open range [range_start, range_end),
+/// following Rust's standard convention where range_start is inclusive and range_end is exclusive.
 pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
     let b = Natural::from(base);
     let k = (base / 5) as u64;
@@ -27,6 +30,9 @@ pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
 /// Get the range of possible values for a base, but return u128.
 /// Returns None if there are no valid numbers in that base.
 /// Returns Err if the numbers are too large for u128.
+///
+/// **Range semantics**: This represents a half-open range [range_start, range_end),
+/// following Rust's standard convention where range_start is inclusive and range_end is exclusive.
 pub fn get_base_range_u128(base: u32) -> Result<Option<FieldSize>, String> {
     // get the natural results
     let (range_start, range_end) = match get_base_range_natural(base) {

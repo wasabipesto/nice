@@ -25,6 +25,10 @@ pub enum BenchmarkMode {
     MsdIneffective,
 }
 
+/// Get a benchmark field for testing and performance evaluation.
+///
+/// **Range semantics**: Returns a DataToClient with a half-open range [range_start, range_end),
+/// where range_start is inclusive, range_end is exclusive, and range_size = range_end - range_start.
 pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
     let base = match mode {
         BenchmarkMode::BaseTen => 10,
@@ -53,6 +57,7 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
         BenchmarkMode::MsdIneffective => 1e7 as u128,
     };
 
+    // Create a half-open range [range_start, range_end) with range_size elements
     DataToClient {
         claim_id: 0,
         base,

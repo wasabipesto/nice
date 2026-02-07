@@ -12,7 +12,7 @@ use nice_common::client_api::{
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
 use nice_common::{
     CLIENT_REQUEST_TIMEOUT_SECS, CLIENT_VERSION, DataToClient, DataToServer, FieldResults,
-    PROCESSING_CHUNK_SIZE, SearchMode, UniquesDistributionSimple, ValidationData,
+    FieldSize, PROCESSING_CHUNK_SIZE, SearchMode, UniquesDistributionSimple, ValidationData,
 };
 
 #[cfg(feature = "gpu")]
@@ -113,20 +113,6 @@ pub struct Cli {
     log_level: Option<LogLevel>,
 }
 
-/// Break up the range into chunks, returning the start and end of each.
-fn chunked_ranges(range_start: u128, range_end: u128, chunk_size: usize) -> Vec<(u128, u128)> {
-    let mut chunks = Vec::new();
-    let mut start = range_start;
-
-    while start < range_end {
-        let end = (start + chunk_size as u128).min(range_end);
-        chunks.push((start, end));
-        start = end;
-    }
-
-    chunks
-}
-
 /// Process a field synchronously (`CPU` or `GPU`).
 /// This is wrapped in `spawn_blocking` when called from async context.
 fn process_field_sync(
@@ -142,18 +128,12 @@ fn process_field_sync(
             let gpu_ctx = gpu_ctx.expect("GPU context failed to initialize");
 
             let gpu_results = match mode {
-                SearchMode::Detailed => process_range_detailed_gpu(
-                    gpu_ctx,
-                    claim_data.range_start,
-                    claim_data.range_end,
-                    claim_data.base,
-                ),
-                SearchMode::Niceonly => process_range_niceonly_gpu(
-                    gpu_ctx,
-                    claim_data.range_start,
-                    claim_data.range_end,
-                    claim_data.base,
-                ),
+                SearchMode::Detailed => {
+                    process_range_detailed_gpu(gpu_ctx, &claim_data.into(), claim_data.base)
+                }
+                SearchMode::Niceonly => {
+                    process_range_niceonly_gpu(gpu_ctx, &claim_data.into(), claim_data.base)
+                }
             };
 
             match gpu_results {
@@ -172,7 +152,8 @@ fn process_field_sync(
     } else {
         // CPU processing path
         let chunk_size = PROCESSING_CHUNK_SIZE;
-        let chunks = chunked_ranges(claim_data.range_start, claim_data.range_end, chunk_size);
+        let range: FieldSize = claim_data.into();
+        let chunks = range.chunks(chunk_size);
 
         // Configure TQDM
         #[allow(
@@ -189,9 +170,9 @@ fn process_field_sync(
         chunks
             .par_iter()
             .tqdm_config(tqdm_config)
-            .map(|(start, end)| match mode {
-                SearchMode::Detailed => process_range_detailed(*start, *end, claim_data.base),
-                SearchMode::Niceonly => process_range_niceonly(*start, *end, claim_data.base),
+            .map(|chunk| match mode {
+                SearchMode::Detailed => process_range_detailed(chunk, claim_data.base),
+                SearchMode::Niceonly => process_range_niceonly(chunk, claim_data.base),
             })
             .collect()
     }
@@ -327,7 +308,6 @@ async fn run_single_iteration(
 
     // Process the field
     let results = tokio::task::spawn_blocking({
-        let claim_data = claim_data.clone();
         let mode = cli.mode;
         let cli_clone = cli.clone();
         #[cfg(feature = "gpu")]
@@ -438,7 +418,6 @@ async fn run_pipelined_loop(
             let start_time = std::time::Instant::now();
 
             Some(tokio::task::spawn_blocking({
-                let claim_data = claim_data.clone();
                 let mode = cli.mode;
                 let cli_clone = cli.clone();
                 #[cfg(feature = "gpu")]
@@ -615,7 +594,6 @@ async fn main() {
                     "Failed to initialize GPU on device {}: {:?}",
                     cli.gpu_device, e
                 );
-                eprintln!("");
                 eprintln!("Troubleshooting:");
                 eprintln!("1. Ensure NVIDIA GPU drivers are installed");
                 eprintln!("2. Verify CUDA toolkit is installed (nvcc --version)");

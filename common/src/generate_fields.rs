@@ -5,6 +5,10 @@ use super::*;
 /// Break a base range into smaller, searchable fields.
 /// Each field should be `size` in width, with the last one being smaller.
 /// If the base range is less than `size` it returns one field.
+///
+/// **Range semantics**: This function takes an inclusive range [min, max] as input
+/// and produces half-open ranges [start, end) as output. Each returned FieldSize
+/// follows Rust's convention where range_start is inclusive and range_end is exclusive.
 pub fn break_range_into_fields(min: u128, max: u128, size: u128) -> Vec<FieldSize> {
     // create output vec
     let mut fields = Vec::new();
@@ -13,15 +17,15 @@ pub fn break_range_into_fields(min: u128, max: u128, size: u128) -> Vec<FieldSiz
     let mut start = min;
     let mut end = min;
 
-    // walk through base range
+    // Walk through base range (half-open ranges: start is inclusive, end is exclusive)
     while end < max {
-        // calculate the end and size
+        // Calculate the end (exclusive) and size for this field
         end = start.add(&size).min(max);
 
-        // build and push the field
+        // Build and push the field (half-open range [start, end))
         fields.push(FieldSize::new(start, end));
 
-        // bump the start
+        // Bump the start to the previous end (no gap, no overlap in half-open ranges)
         start = end;
     }
     fields

@@ -8,6 +8,10 @@ const TARGET_NUM_CHUNKS: f32 = 100.0;
 /// Has a hardcoded target number of chunks, will produce at most that many chunks.
 /// If there is less than that many fields, each field gets its own chunk.
 /// Destroys the vec passed to it.
+///
+/// **Range semantics**: Input fields are half-open ranges [start, end), and output chunks
+/// are also half-open ranges. The function preserves the range boundaries correctly by
+/// using the first field's range_start and the last field's range_end for each chunk.
 pub fn group_fields_into_chunks(fields: Vec<FieldSize>) -> Vec<FieldSize> {
     // convert fields into ring vec in order to pop out the front
     let mut fields = VecDeque::from(fields);
@@ -31,7 +35,8 @@ pub fn group_fields_into_chunks(fields: Vec<FieldSize>) -> Vec<FieldSize> {
             }
         }
 
-        // get the start, end, and size from the chunk
+        // Get the start and end from the chunk (preserving half-open range semantics)
+        // range_start is inclusive (from first field), range_end is exclusive (from last field)
         let range_start = chunk_fields.front().unwrap().range_start;
         let range_end = chunk_fields.back().unwrap().range_end;
         chunks.push(FieldSize::new(range_start, range_end));

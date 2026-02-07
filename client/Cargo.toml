@@ -9,7 +9,7 @@ readme.workspace = true
 license-file.workspace = true
 
 [features]
-default = ["rustls-tls"]
+default = ["rustls-tls", "gpu"]
 openssl-tls = ["nice_common/openssl-tls"]
 rustls-tls = ["nice_common/rustls-tls"]
 gpu = ["nice_common/gpu", "dep:cudarc"]

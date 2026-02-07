@@ -60,7 +60,10 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
 
 /// The inner loop of detailed field processing. Also called by other crates like the WASM client.
 /// Automatically breaks the range into chunks for some performance gains.
-pub fn process_range_detailed(range_start: u128, range_end: u128, base: u32) -> FieldResults {
+///
+/// **Range semantics**: Expects a half-open range [range_start, range_end) where range_start
+/// is inclusive and range_end is exclusive, following Rust's standard convention.
+pub fn process_range_detailed(range: &FieldSize, base: u32) -> FieldResults {
     // Calculate the minimum num_unique_digits cutoff
     let nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
 
@@ -71,7 +74,8 @@ pub fn process_range_detailed(range_start: u128, range_end: u128, base: u32) -> 
     let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
 
     // Break up the range into chunks to avoid allocating too much memory
-    let chunks = (range_start..range_end).chunks(DETAILED_MINI_CHUNK_SIZE);
+    // Note: (range_start..range_end) is a half-open range [range_start, range_end)
+    let chunks = range.iter().chunks(DETAILED_MINI_CHUNK_SIZE);
 
     // Process everything, saving results and aggregating after each chunk finishes
     for chunk in &chunks {
@@ -117,11 +121,7 @@ pub fn process_range_detailed(range_start: u128, range_end: u128, base: u32) -> 
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
 #[deprecated = "use process_range_detailed instead"]
 pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToServer {
-    let results = process_range_detailed(
-        claim_data.range_start,
-        claim_data.range_end,
-        claim_data.base,
-    );
+    let results = process_range_detailed(&claim_data.into(), claim_data.base);
 
     DataToServer {
         claim_id: claim_data.claim_id,
@@ -173,11 +173,7 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
 /// Implements several optimizations over the detailed search.
 #[deprecated = "use process_range_niceonly instead"]
 pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToServer {
-    let results = process_range_niceonly(
-        claim_data.range_start,
-        claim_data.range_end,
-        claim_data.base,
-    );
+    let results = process_range_niceonly(&claim_data.into(), claim_data.base);
 
     DataToServer {
         claim_id: claim_data.claim_id,
@@ -190,23 +186,25 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
 
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
-pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> FieldResults {
+///
+/// **Range semantics**: Expects a half-open range [range_start, range_end) where range_start
+/// is inclusive and range_end is exclusive, following Rust's standard convention.
+pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
     // Precompute these for faster filter checking
     let base_u128 = base as u128;
     let base_u128_minusone = base_u128 - 1;
-    let range_size = range_end - range_start;
 
     // Use recursive subdivision to get valid ranges that need processing.
     // This adaptively subdivides the range to skip portions where the MSD prefix indicates
     // all numbers will have duplicate/overlapping digits. It's more effective than fixed
     // chunking because it only subdivides when needed and can find natural boundaries.
-    let valid_ranges = msd_prefix_filter::get_valid_ranges(range_start, range_end, base);
+    let valid_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
     let filtered_range_size: u128 = valid_ranges.iter().map(|range| range.range_size).sum();
     trace!(
         "Filtered candidate range from {} to {} ({:.2}%) with MSD filtering of depth {}",
-        range_size,
+        range.range_size,
         filtered_range_size,
-        filtered_range_size as f64 / range_size as f64 * 100.0,
+        filtered_range_size as f64 / range.range_size as f64 * 100.0,
         MSD_RECURSIVE_MAX_DEPTH
     );
 
@@ -228,7 +226,7 @@ pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> 
         (1.0 - (residue_filter.len() as f64 / (base - 1) as f64)) as f64 * 100.0
     );
 
-    // Process each valid range
+    // Process each valid range (each range is half-open: [start, end))
     let mut nice_list = Vec::new();
     for r in valid_ranges {
         let range_nice: Vec<NiceNumberSimple> = (r.range_start..r.range_end)
@@ -311,10 +309,7 @@ mod tests {
                 num_uniques: 10,
             }]),
         };
-        assert_eq!(
-            process_range_detailed(input.range_start, input.range_end, input.base),
-            result
-        );
+        assert_eq!(process_range_detailed(&input.into(), input.base), result);
     }
 
     #[test]
@@ -491,10 +486,7 @@ mod tests {
             ]),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(
-            process_range_detailed(input.range_start, input.range_end, input.base),
-            result
-        );
+        assert_eq!(process_range_detailed(&input.into(), input.base), result);
     }
 
     #[test]
@@ -831,10 +823,7 @@ mod tests {
             ]),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(
-            process_range_detailed(input.range_start, input.range_end, input.base),
-            result
-        );
+        assert_eq!(process_range_detailed(&input.into(), input.base), result);
     }
 
     #[test]
@@ -853,10 +842,7 @@ mod tests {
                 num_uniques: 10,
             }]),
         };
-        assert_eq!(
-            process_range_niceonly(input.range_start, input.range_end, input.base),
-            result
-        );
+        assert_eq!(process_range_niceonly(&input.into(), input.base), result);
     }
 
     #[test]
@@ -872,10 +858,7 @@ mod tests {
             distribution: Vec::new(),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(
-            process_range_niceonly(input.range_start, input.range_end, input.base),
-            result
-        );
+        assert_eq!(process_range_niceonly(&input.into(), input.base), result);
     }
 
     #[test]
@@ -891,10 +874,7 @@ mod tests {
             distribution: Vec::new(),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(
-            process_range_niceonly(input.range_start, input.range_end, input.base),
-            result
-        );
+        assert_eq!(process_range_niceonly(&input.into(), input.base), result);
     }
 
     #[test_log::test]
@@ -908,9 +888,10 @@ mod tests {
         let chunk_size = base_range.range_size / 10_000;
         let segment_start = base_range.range_start + (30 * chunk_size);
         let segment_end = segment_start + (5 * chunk_size);
+        let range = FieldSize::new(segment_start, segment_end);
 
         // Process with chunked filtering
-        let results = process_range_niceonly(segment_start, segment_end, base);
+        let results = process_range_niceonly(&range, base);
 
         // The test passes if it completes without panic
         // The chunked filtering should skip some sub-chunks within this segment
@@ -924,9 +905,10 @@ mod tests {
         let base = 10;
         let range_start = 47;
         let range_end = 147; // Larger range to test multiple chunks
+        let range = FieldSize::new(range_start, range_end);
 
         // Process the range
-        let results = process_range_niceonly(range_start, range_end, base);
+        let results = process_range_niceonly(&range, base);
 
         // Should find the nice number 69
         assert!(results.nice_numbers.iter().any(|n| n.number == 69));
