@@ -62,6 +62,12 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
     }
 }
 
+impl fmt::Display for BenchmarkMode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
