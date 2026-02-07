@@ -83,7 +83,7 @@ fn build_new_row(base: u32, size: FieldSize) -> Result<BasePrivateNew, String> {
         id: u32_to_i32(base)?,
         range_start: u128_to_bigdec(size.range_start)?,
         range_end: u128_to_bigdec(size.range_end)?,
-        range_size: u128_to_bigdec(size.range_size)?,
+        range_size: u128_to_bigdec(size.size())?,
     })
 }
 

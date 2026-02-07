@@ -55,68 +55,39 @@ mod tests {
     fn test_get_base_range_u128() {
         assert_eq!(
             get_base_range_u128(4),
-            Ok(Some(FieldSize {
-                range_start: 2u128,
-                range_end: 2u128,
-                range_size: 0u128
-            }))
+            Ok(Some(FieldSize::new(2u128, 2u128)))
         );
         assert_eq!(
             get_base_range_u128(5),
-            Ok(Some(FieldSize {
-                range_start: 3u128,
-                range_end: 5u128,
-                range_size: 2u128
-            }))
+            Ok(Some(FieldSize::new(3u128, 5u128)))
         );
         assert_eq!(get_base_range_u128(6), Ok(None));
         assert_eq!(
             get_base_range_u128(7),
-            Ok(Some(FieldSize {
-                range_start: 7u128,
-                range_end: 13u128,
-                range_size: 6u128
-            }))
+            Ok(Some(FieldSize::new(7u128, 13u128)))
         );
         assert_eq!(
             get_base_range_u128(8),
-            Ok(Some(FieldSize {
-                range_start: 16u128,
-                range_end: 22u128,
-                range_size: 6u128
-            }))
+            Ok(Some(FieldSize::new(16u128, 22u128)))
         );
         assert_eq!(
             get_base_range_u128(9),
-            Ok(Some(FieldSize {
-                range_start: 27u128,
-                range_end: 38u128,
-                range_size: 11u128
-            }))
+            Ok(Some(FieldSize::new(27u128, 38u128)))
         );
         assert_eq!(
             get_base_range_u128(10),
-            Ok(Some(FieldSize {
-                range_start: 47u128,
-                range_end: 100u128,
-                range_size: 53u128
-            }))
+            Ok(Some(FieldSize::new(47u128, 100u128)))
         );
         assert_eq!(
             get_base_range_u128(40),
-            Ok(Some(FieldSize {
-                range_start: 1916284264916u128,
-                range_end: 6553600000000u128,
-                range_size: 4637315735084u128
-            }))
+            Ok(Some(FieldSize::new(1916284264916u128, 6553600000000u128)))
         );
         assert_eq!(
             get_base_range_u128(80),
-            Ok(Some(FieldSize {
-                range_start: 653245554420798943087177909799u128,
-                range_end: 2814749767106560000000000000000u128,
-                range_size: 2161504212685761056912822090201u128
-            }))
+            Ok(Some(FieldSize::new(
+                653245554420798943087177909799u128,
+                2814749767106560000000000000000u128
+            )))
         );
     }
 

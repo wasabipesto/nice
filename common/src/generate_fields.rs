@@ -62,7 +62,7 @@ mod tests {
 
                     // check the sizes are within range
                     for field in &fields {
-                        assert!(field.range_size <= size);
+                        assert!(field.size() <= size);
                     }
 
                     // check there are the right number of fields
@@ -71,13 +71,13 @@ mod tests {
                     assert_eq!(fields.len(), num_fields_mo as usize + 1);
 
                     // check the last field is the correct size
-                    assert_eq!(fields.last().unwrap().range_size, last_field_size);
+                    assert_eq!(fields.last().unwrap().size(), last_field_size);
 
                     // check the first field is the correct size
                     if fields.len() > 1 {
-                        assert_eq!(fields.first().unwrap().range_size, size);
+                        assert_eq!(fields.first().unwrap().size(), size);
                     } else {
-                        assert_eq!(fields.first().unwrap().range_size, range.range_size);
+                        assert_eq!(fields.first().unwrap().size(), range.size());
                     }
 
                     // check the fields are in ascending order

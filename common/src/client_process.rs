@@ -74,7 +74,7 @@ pub fn process_range_detailed(range: &FieldSize, base: u32) -> FieldResults {
     let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
 
     // Break up the range into chunks to avoid allocating too much memory
-    // Note: (range_start..range_end) is a half-open range [range_start, range_end)
+    // Note: range.iter() and all chunks are half-open ranges [range_start, range_end)
     let chunks = range.iter().chunks(DETAILED_MINI_CHUNK_SIZE);
 
     // Process everything, saving results and aggregating after each chunk finishes
@@ -199,12 +199,12 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
     // all numbers will have duplicate/overlapping digits. It's more effective than fixed
     // chunking because it only subdivides when needed and can find natural boundaries.
     let valid_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
-    let filtered_range_size: u128 = valid_ranges.iter().map(|range| range.range_size).sum();
+    let filtered_range_size: u128 = valid_ranges.iter().map(|range| range.size()).sum();
     trace!(
         "Filtered candidate range from {} to {} ({:.2}%) with MSD filtering of depth {}",
-        range.range_size,
+        range.size(),
         filtered_range_size,
-        filtered_range_size as f64 / range.range_size as f64 * 100.0,
+        filtered_range_size as f64 / range.size() as f64 * 100.0,
         MSD_RECURSIVE_MAX_DEPTH
     );
 
@@ -885,7 +885,7 @@ mod tests {
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
 
         // Use a segment that should have some skippable chunks
-        let chunk_size = base_range.range_size / 10_000;
+        let chunk_size = base_range.size() / 10_000;
         let segment_start = base_range.range_start + (30 * chunk_size);
         let segment_end = segment_start + (5 * chunk_size);
         let range = FieldSize::new(segment_start, segment_end);

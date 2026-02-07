@@ -88,9 +88,9 @@ pub enum FieldClaimStrategy {
 /// represents the numbers [100, 101, 102, 103, 104] (5 numbers total).
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq)]
 pub struct FieldSize {
-    pub range_start: u128,
-    pub range_end: u128,
-    pub range_size: u128,
+    range_start: u128,
+    range_end: u128,
+    range_size: u128,
 }
 
 impl FieldSize {
@@ -110,9 +110,17 @@ impl FieldSize {
     pub fn last(&self) -> u128 {
         self.range_end - 1
     }
+    /// Get the inclusive end of the range (range_start).
+    pub fn start(&self) -> u128 {
+        self.range_start
+    }
+    /// Get the exclusive end of the range (range_end).
+    pub fn end(&self) -> u128 {
+        self.range_end
+    }
     /// The total number of itmes in the range.
     pub fn size(&self) -> u128 {
-        self.range_end - self.range_start
+        self.range_size
     }
     /// Get an iterator over the numbers in the range [range_start, range_end).
     pub fn iter(&self) -> std::ops::Range<u128> {

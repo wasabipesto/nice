@@ -107,7 +107,7 @@ pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
     assert!(base <= 256, "Base must be 256 or less");
 
     // Can't check for duplicate values when there is only one element
-    if range.range_size == 1 {
+    if range.size() == 1 {
         trace!("Range has only a single value, cannot use prefix optimization.");
         return false;
     }
@@ -198,7 +198,7 @@ pub fn get_valid_ranges_recursive(
         );
         return vec![range];
     }
-    if range.range_size <= min_range_size {
+    if range.size() <= min_range_size {
         trace!(
             "Depth {current_depth}: Range [{}, {}) too small, returning for processing",
             range.range_start, range.range_end
@@ -217,7 +217,7 @@ pub fn get_valid_ranges_recursive(
 
     // Check if subdivision would be worthwhile
     // If the range is not much larger than min_range_size, don't bother subdividing
-    if range.range_size < min_range_size * (subdivision_factor as u128) {
+    if range.size() < min_range_size * (subdivision_factor as u128) {
         trace!(
             "Depth {current_depth}: Range [{}, {}) not worth subdividing, returning for processing",
             range.range_start, range.range_end
@@ -231,7 +231,7 @@ pub fn get_valid_ranges_recursive(
         range.range_start, range.range_end
     );
 
-    let chunk_size = range.range_size / (subdivision_factor as u128);
+    let chunk_size = range.size() / (subdivision_factor as u128);
     let mut valid_ranges = Vec::new();
 
     for i in 0..subdivision_factor {
@@ -445,7 +445,7 @@ mod tests {
     fn test_early_exit_b50_segments_large() {
         let base = 50;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
-        let chunk_size = base_range.range_size / 100;
+        let chunk_size = base_range.size() / 100;
         let segments = chunked_ranges(base_range.range_start, base_range.range_end, chunk_size);
 
         let expected_results = vec![
@@ -473,7 +473,7 @@ mod tests {
     fn test_early_exit_b50_segments_small() {
         let base = 50;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
-        let chunk_size = base_range.range_size / 10_000;
+        let chunk_size = base_range.size() / 10_000;
         let segments = chunked_ranges(base_range.range_start, base_range.range_end, chunk_size);
 
         let expected_results = vec![

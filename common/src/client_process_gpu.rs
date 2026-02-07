@@ -136,7 +136,7 @@ pub fn process_range_detailed_gpu(
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
-    let range_size = range.range_size as usize;
+    let range_size = range.size() as usize;
 
     // For small ranges, process in one batch to minimize overhead
     // For large ranges, use batched processing with overlap to maximize throughput
@@ -188,7 +188,7 @@ fn process_range_detailed_gpu_single_batch(
     base: u32,
 ) -> Result<FieldResults> {
     let nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
-    let range_size = range.range_size as usize;
+    let range_size = range.size() as usize;
 
     // Split u128 range into lo/hi u64 arrays for GPU (CUDA lacks native u128 support)
     // Note: (range_start..range_end) is a half-open range [range_start, range_end)
@@ -279,7 +279,7 @@ pub fn process_range_niceonly_gpu(
 ) -> Result<FieldResults> {
     let base_u128_minusone = base as u128 - 1;
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
-    let range_size = range.range_size as usize;
+    let range_size = range.size() as usize;
 
     // For very small ranges or after filtering, batch processing may not help
     // Use adaptive batching based on range size

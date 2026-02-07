@@ -47,7 +47,7 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
         _ => base_range.range_start,
     };
     let range_size = match mode {
-        BenchmarkMode::BaseTen => base_range.range_size,
+        BenchmarkMode::BaseTen => base_range.size(),
         BenchmarkMode::Default => 1_000_000,
         BenchmarkMode::Large => 100_000_000,
         BenchmarkMode::ExtraLarge => 1_000_000_000,
