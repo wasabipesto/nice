@@ -23,14 +23,37 @@ use nice_common::client_process_gpu::{
 use std::sync::Arc;
 
 extern crate serde_json;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use env_logger::Env;
-use log::{debug, error, info};
+use log::{LevelFilter, debug, error, info};
 use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
 use std::collections::HashMap;
 
-#[derive(Parser, Debug)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<LogLevel> for LevelFilter {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Off => LevelFilter::Off,
+            LogLevel::Error => LevelFilter::Error,
+            LogLevel::Warn => LevelFilter::Warn,
+            LogLevel::Info => LevelFilter::Info,
+            LogLevel::Debug => LevelFilter::Debug,
+            LogLevel::Trace => LevelFilter::Trace,
+        }
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 #[allow(clippy::struct_excessive_bools)]
@@ -78,6 +101,10 @@ pub struct Cli {
     /// CUDA device to use for GPU processing (0 for first GPU, 1 for second, etc.)
     #[arg(long, default_value_t = 0, env = "NICE_GPU_DEVICE")]
     gpu_device: usize,
+
+    /// Set the log level (overrides `RUST_LOG` environment variable)
+    #[arg(short, long, value_enum, env = "NICE_LOG_LEVEL")]
+    log_level: Option<LogLevel>,
 }
 
 /// Break up the range into chunks, returning the start and end of each.
@@ -283,7 +310,7 @@ async fn run_single_iteration(
     }
     debug!(
         "Claim Data: {}",
-        serde_json::to_string_pretty(&claim_data).unwrap()
+        serde_json::to_string(&claim_data).unwrap()
     );
 
     let start_time = std::time::Instant::now();
@@ -292,18 +319,7 @@ async fn run_single_iteration(
     let results = tokio::task::spawn_blocking({
         let claim_data = claim_data.clone();
         let mode = cli.mode;
-        let cli_clone = Cli {
-            mode: cli.mode,
-            api_base: cli.api_base.clone(),
-            username: cli.username.clone(),
-            repeat: cli.repeat,
-            no_progress: cli.no_progress,
-            threads: cli.threads,
-            benchmark: cli.benchmark,
-            validate: cli.validate,
-            gpu: cli.gpu,
-            gpu_device: cli.gpu_device,
-        };
+        let cli_clone = cli.clone();
         #[cfg(feature = "gpu")]
         let gpu_ctx_clone = gpu_ctx.cloned();
         move || {
@@ -340,7 +356,7 @@ async fn run_single_iteration(
 
     debug!(
         "Submit Data: {}",
-        serde_json::to_string_pretty(&submit_data).unwrap()
+        serde_json::to_string(&submit_data).unwrap()
     );
 
     // Handle validation or submission
@@ -396,7 +412,7 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
             );
             debug!(
                 "Claim Data: {}",
-                serde_json::to_string_pretty(&claim_data).unwrap()
+                serde_json::to_string(&claim_data).unwrap()
             );
 
             let start_time = std::time::Instant::now();
@@ -404,18 +420,7 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
             Some(tokio::task::spawn_blocking({
                 let claim_data = claim_data.clone();
                 let mode = cli.mode;
-                let cli_clone = Cli {
-                    mode: cli.mode,
-                    api_base: cli.api_base.clone(),
-                    username: cli.username.clone(),
-                    repeat: cli.repeat,
-                    no_progress: cli.no_progress,
-                    threads: cli.threads,
-                    benchmark: cli.benchmark,
-                    validate: cli.validate,
-                    gpu: cli.gpu,
-                    gpu_device: cli.gpu_device,
-                };
+                let cli_clone = cli.clone();
                 #[cfg(feature = "gpu")]
                 let gpu_ctx_clone = gpu_ctx.cloned();
                 move || {
@@ -484,7 +489,7 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
 
             debug!(
                 "Submit Data: {}",
-                serde_json::to_string_pretty(&submit_data).unwrap()
+                serde_json::to_string(&submit_data).unwrap()
             );
 
             pending_submit = Some(submit_data);
@@ -521,7 +526,11 @@ async fn main() {
     let cli = Cli::parse();
 
     // Set up logger
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    let mut builder = env_logger::Builder::from_env(Env::default().default_filter_or("info"));
+    if let Some(level) = cli.log_level {
+        builder.filter_level(level.into());
+    }
+    builder.init();
 
     // Check for GPU support
     if cli.gpu && !cfg!(feature = "gpu") {
