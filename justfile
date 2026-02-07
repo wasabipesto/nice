@@ -72,7 +72,7 @@ test:
     # just wasm-build
     RUST_LOG="debug" cargo test -p "*" --no-fail-fast
     just benchmark default
-    just client
+    just client --validate
 
 # List all available major dependency upgrades
 cargo-upgrades:
