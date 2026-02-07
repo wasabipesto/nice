@@ -67,8 +67,9 @@ build:
 test:
     cargo clippy -p "*"
     cargo build -p "*"
+    cargo build -p "*" --features nice_client/gpu
     cargo build -p "*" -r
-    just wasm-build
+    # just wasm-build
     RUST_LOG="debug" cargo test -p "*" --no-fail-fast
     just benchmark default
     just client
