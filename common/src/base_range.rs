@@ -37,11 +37,7 @@ pub fn get_base_range_u128(base: u32) -> Result<Option<FieldSize>, String> {
         ),
         None => return Ok(None),
     };
-    Ok(Some(FieldSize {
-        range_start,
-        range_end,
-        range_size: range_end - range_start,
-    }))
+    Ok(Some(FieldSize::new(range_start, range_end)))
 }
 
 #[cfg(test)]

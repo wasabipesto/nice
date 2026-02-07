@@ -23,7 +23,7 @@
 //! 6. Otherwise, return `false` (range must be processed normally).
 
 use super::*;
-use log::debug;
+use log::trace;
 
 /// Find the longest common prefix of the most significant digits.
 ///
@@ -109,7 +109,7 @@ pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u3
     // Can't check for duplicate values when there is only one element
     let true_range_end = arg_range_end - 1;
     if range_start == true_range_end {
-        debug!("Range has only a single value, cannot use prefix optimization.");
+        trace!("Range has only a single value, cannot use prefix optimization.");
         return false;
     }
 
@@ -120,7 +120,7 @@ pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u3
     // If the number of digits changes, it's harder to evaluate the prefix
     // For now we reject these to avoid false positives
     if range_start_square.len() != range_end_square.len() {
-        debug!(
+        trace!(
             "Range start and end squares have a different number of digits, erring on the side of caution."
         );
         return false;
@@ -129,7 +129,7 @@ pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u3
     // If the common prefix has duplicate digits, all numbers in range are invalid
     let square_prefix = find_common_msd_prefix(&range_start_square, &range_end_square);
     if has_duplicate_digits(&square_prefix) {
-        debug!("Square prefix has duplicate digits: {square_prefix:?}");
+        trace!("Square prefix has duplicate digits: {square_prefix:?}");
         return true;
     }
 
@@ -140,7 +140,7 @@ pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u3
     // If the number of digits changes, it's harder to evaluate the prefix
     // For now we reject these to avoid false positives
     if range_start_cube.len() != range_end_cube.len() {
-        debug!(
+        trace!(
             "Range start and end cubes have a different number of digits, erring on the side of caution."
         );
         return false;
@@ -149,20 +149,20 @@ pub fn has_duplicate_msd_prefix(range_start: u128, arg_range_end: u128, base: u3
     // If the common prefix has duplicate digits, all numbers in range are invalid
     let cube_prefix = find_common_msd_prefix(&range_start_cube, &range_end_cube);
     if has_duplicate_digits(&cube_prefix) {
-        debug!("Cube prefix has duplicate digits: {cube_prefix:?}");
+        trace!("Cube prefix has duplicate digits: {cube_prefix:?}");
         return true;
     }
 
     // If the square and cube prefixes overlap, all numbers in range are invalid
     if has_overlapping_digits(&square_prefix, &cube_prefix) {
-        debug!(
+        trace!(
             "Square and cube prefixes have overlapping digits: {square_prefix:?}, {cube_prefix:?}"
         );
         return true;
     }
 
     // No early exit possible
-    debug!("No early exit possible. Prefixes: {square_prefix:?}, {cube_prefix:?}");
+    trace!("No early exit possible. Prefixes: {square_prefix:?}, {cube_prefix:?}");
     false
 }
 
@@ -192,34 +192,34 @@ pub fn get_valid_ranges_recursive(
     max_depth: u32,
     min_range_size: u128,
     subdivision_factor: usize,
-) -> Vec<(u128, u128)> {
+) -> Vec<FieldSize> {
     // Check if range is too small or we've hit max depth
     let range_size = range_end - range_start;
     if range_size <= min_range_size || current_depth >= max_depth {
         // Return this range for processing
-        debug!(
+        trace!(
             "Depth {current_depth}: Range [{range_start}, {range_end}) too small or max depth reached, returning for processing"
         );
-        return vec![(range_start, range_end)];
+        return vec![FieldSize::new(range_start, range_end)];
     }
 
     // Check if the entire range can be skipped
     if has_duplicate_msd_prefix(range_start, range_end, base) {
-        debug!("Depth {current_depth}: Range [{range_start}, {range_end}) can be skipped entirely");
+        trace!("Depth {current_depth}: Range [{range_start}, {range_end}) can be skipped entirely");
         return vec![]; // Skip this entire range
     }
 
     // Check if subdivision would be worthwhile
     // If the range is not much larger than min_range_size, don't bother subdividing
     if range_size < min_range_size * (subdivision_factor as u128) {
-        debug!(
+        trace!(
             "Depth {current_depth}: Range [{range_start}, {range_end}) not worth subdividing, returning for processing"
         );
-        return vec![(range_start, range_end)];
+        return vec![FieldSize::new(range_start, range_end)];
     }
 
     // Subdivide the range and recursively check each part
-    debug!(
+    trace!(
         "Depth {current_depth}: Subdividing range [{range_start}, {range_end}) into {subdivision_factor} parts"
     );
 
@@ -255,7 +255,7 @@ pub fn get_valid_ranges_recursive(
 ///
 /// Returns a vector of (start, end) tuples representing ranges that need processing.
 /// Ranges that can be skipped based on MSD prefix are not included.
-pub fn get_valid_ranges(range_start: u128, range_end: u128, base: u32) -> Vec<(u128, u128)> {
+pub fn get_valid_ranges(range_start: u128, range_end: u128, base: u32) -> Vec<FieldSize> {
     get_valid_ranges_recursive(
         range_start,
         range_end,
@@ -270,6 +270,7 @@ pub fn get_valid_ranges(range_start: u128, range_end: u128, base: u32) -> Vec<(u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::debug;
 
     /// Break up the range into chunks, returning the start and end of each.
     fn chunked_ranges(range_start: u128, range_end: u128, chunk_size: u128) -> Vec<(u128, u128)> {

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Asynchronously submit the previous search field and get the next one while processing to reduce network overhead
+- Fix a bug in the experimental LSD filter that gave false negatives, added tests and enabled it for nice-only processing
+- Configure additional trace logging in the library
+- Replace `--verbose` and `--quiet` with `--log-level`/`-l` and `--no-progress`/`-n`
+- Add support for customizing the number of API retries with `--api-max-retries`
+
 ## Nice v3.2.11
 
 - Implement some coarse but massive optimizations to nice-only processing based on patterns in the most and least significant digits of each range. The exact amount varies by search range but in the current area of interest it is about 2.5x as fast.

@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::env;
-use std::fmt::Display;
+use std::fmt;
 use std::ops::Add;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -55,8 +55,8 @@ pub enum SearchMode {
     /// Does not keep statistics and cannot be quickly verified.
     Niceonly,
 }
-impl Display for SearchMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SearchMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SearchMode::Detailed => write!(f, "Detailed"),
             SearchMode::Niceonly => write!(f, "Nice-only"),
@@ -82,6 +82,16 @@ pub struct FieldSize {
     pub range_start: u128,
     pub range_end: u128,
     pub range_size: u128,
+}
+
+impl FieldSize {
+    pub fn new(range_start: u128, range_end: u128) -> Self {
+        FieldSize {
+            range_start,
+            range_end,
+            range_size: range_end - range_start,
+        }
+    }
 }
 
 /// Aggregate data on the niceness of all numbers in the range.

@@ -26,6 +26,7 @@
 //! everything can be trusted.
 
 use super::*;
+use log::trace;
 
 /// Calculate the number of unique digits in (n^2, n^3) represented in base b.
 /// A number is nice if the result of this is equal to b (means all digits are used once).
@@ -69,7 +70,7 @@ pub fn process_range_detailed(range_start: u128, range_end: u128, base: u32) -> 
     // Initialize a map indexed by num_unique_digits with the count of each
     let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
 
-    // Break up the range into chunks
+    // Break up the range into chunks to avoid allocating too much memory
     let chunks = (range_start..range_end).chunks(DETAILED_MINI_CHUNK_SIZE);
 
     // Process everything, saving results and aggregating after each chunk finishes
@@ -114,6 +115,7 @@ pub fn process_range_detailed(range_start: u128, range_end: u128, base: u32) -> 
 }
 
 /// Process a field by aggregating statistics on the niceness of numbers in a range.
+#[deprecated = "use process_range_detailed instead"]
 pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToServer {
     let results = process_range_detailed(
         claim_data.range_start,
@@ -169,68 +171,68 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
 
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
+#[deprecated = "use process_range_niceonly instead"]
 pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToServer {
-    let base = claim_data.base;
-    let base_u128 = base as u128;
-    let base_u128_minusone = base_u128 - 1;
-    let range_start = claim_data.range_start;
-    let range_end = claim_data.range_end;
-
-    // Use recursive subdivision to get valid ranges that need processing.
-    // This adaptively subdivides the range to skip portions where the MSD
-    // prefix indicates all numbers will have duplicate/overlapping digits.
-    let valid_ranges = msd_prefix_filter::get_valid_ranges(range_start, range_end, base);
-
-    // Get LSD filter to eliminate invalid least significant digits
-    let lsd_filter = lsd_filter::get_valid_lsds_u128(&base);
-
-    // Get residue filters to reduce search range
-    let residue_filter = residue_filter::get_residue_filter_u128(&base);
-
-    // Process each valid range
-    let mut nice_list = Vec::new();
-    for (sub_start, sub_end) in valid_ranges {
-        let range_nice: Vec<NiceNumberSimple> = (sub_start..sub_end)
-            .filter(|num| lsd_filter.contains(&(num % base_u128)))
-            .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
-            .filter(|num| get_is_nice(*num, base))
-            .map(|number| NiceNumberSimple {
-                number,
-                num_uniques: base,
-            })
-            .collect();
-
-        nice_list.extend(range_nice);
-    }
+    let results = process_range_niceonly(
+        claim_data.range_start,
+        claim_data.range_end,
+        claim_data.base,
+    );
 
     DataToServer {
         claim_id: claim_data.claim_id,
         username: username.to_owned(),
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution: None,
-        nice_numbers: nice_list,
+        nice_numbers: results.nice_numbers,
     }
 }
 
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
 pub fn process_range_niceonly(range_start: u128, range_end: u128, base: u32) -> FieldResults {
+    // Precompute these for faster filter checking
+    let base_u128 = base as u128;
+    let base_u128_minusone = base_u128 - 1;
+    let range_size = range_end - range_start;
+
     // Use recursive subdivision to get valid ranges that need processing.
     // This adaptively subdivides the range to skip portions where the MSD prefix indicates
     // all numbers will have duplicate/overlapping digits. It's more effective than fixed
     // chunking because it only subdivides when needed and can find natural boundaries.
     let valid_ranges = msd_prefix_filter::get_valid_ranges(range_start, range_end, base);
+    let filtered_range_size: u128 = valid_ranges.iter().map(|range| range.range_size).sum();
+    trace!(
+        "Filtered candidate range from {} to {} ({:.2}%) with MSD filtering of depth {}",
+        range_size,
+        filtered_range_size,
+        filtered_range_size as f64 / range_size as f64 * 100.0,
+        MSD_RECURSIVE_MAX_DEPTH
+    );
 
-    // Precompute this for residue filter checking
-    let base_u128_minusone = base as u128 - 1;
+    // Get LSD filter to eliminate invalid least significant digits
+    let lsd_filter = lsd_filter::get_valid_lsds_u128(&base);
+    trace!(
+        "Filtered candidate range by {}/{} ({:.2}%) by LSD filtering of depth 1.",
+        base - lsd_filter.len() as u32,
+        base,
+        (1.0 - (lsd_filter.len() as f64 / base as f64)) * 100.0
+    );
 
     // Get residue filters to reduce search range
     let residue_filter = residue_filter::get_residue_filter_u128(&base);
+    trace!(
+        "Filtered candidate range by {}/{} ({:.2}%) by residue filtering.",
+        base - 1 - residue_filter.len() as u32,
+        base - 1,
+        (1.0 - (residue_filter.len() as f64 / (base - 1) as f64)) as f64 * 100.0
+    );
 
     // Process each valid range
     let mut nice_list = Vec::new();
-    for (sub_start, sub_end) in valid_ranges {
-        let range_nice: Vec<NiceNumberSimple> = (sub_start..sub_end)
+    for r in valid_ranges {
+        let range_nice: Vec<NiceNumberSimple> = (r.range_start..r.range_end)
+            .filter(|num| lsd_filter.contains(&(num % base_u128)))
             .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
             .filter(|num| get_is_nice(*num, base))
             .map(|number| NiceNumberSimple {

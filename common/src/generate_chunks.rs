@@ -34,12 +34,7 @@ pub fn group_fields_into_chunks(fields: Vec<FieldSize>) -> Vec<FieldSize> {
         // get the start, end, and size from the chunk
         let range_start = chunk_fields.front().unwrap().range_start;
         let range_end = chunk_fields.back().unwrap().range_end;
-        let range_size = range_end - range_start;
-        chunks.push(FieldSize {
-            range_start,
-            range_end,
-            range_size,
-        });
+        chunks.push(FieldSize::new(range_start, range_end));
     }
 
     chunks
@@ -62,14 +57,7 @@ mod tests {
         let chunks = group_fields_into_chunks(fields.clone());
 
         // check against known field
-        assert_eq!(
-            chunks,
-            vec![FieldSize {
-                range_start: 47u128,
-                range_end: 100u128,
-                range_size: 53u128
-            }]
-        );
+        assert_eq!(chunks, vec![FieldSize::new(47u128, 100u128)]);
 
         // check the fields were not affected
         assert_eq!(fields.len(), 1);
