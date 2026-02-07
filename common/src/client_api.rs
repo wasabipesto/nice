@@ -4,7 +4,6 @@ use super::*;
 use reqwest::blocking::Response;
 use std::{thread, time::Duration};
 
-const MAX_CONNECTION_ATTEMPTS: u32 = 10;
 const REQUEST_TIMEOUT_SECS: u64 = 5;
 
 // Re-export tokio for async functions
@@ -39,7 +38,7 @@ fn error_type_str(e: &reqwest::Error) -> &'static str {
 /// Generic retry logic for HTTP requests with exponential backoff.
 /// Handles both network errors and 5xx server errors.
 /// Takes a closure to process the successful response.
-fn retry_request<F, P, T>(request_fn: F, process_response: P) -> T
+fn retry_request<F, P, T>(request_fn: F, process_response: P, max_retries: u32) -> T
 where
     F: Fn() -> Result<Response, reqwest::Error>,
     P: Fn(Response) -> T,
@@ -53,7 +52,7 @@ where
             Ok(response) => {
                 // Check if it's a 5xx server error
                 if response.status().is_server_error() {
-                    if attempts < MAX_CONNECTION_ATTEMPTS {
+                    if attempts < max_retries {
                         let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                         eprintln!(
                             "Server error ({} {}), retrying in {} seconds... (attempt {}/{})",
@@ -61,7 +60,7 @@ where
                             response.text().unwrap_or_default(),
                             sleep_secs,
                             attempts,
-                            MAX_CONNECTION_ATTEMPTS
+                            max_retries
                         );
                         thread::sleep(Duration::from_secs(sleep_secs));
                         continue;
@@ -78,14 +77,14 @@ where
                 return process_response(response);
             }
             Err(e) => {
-                if is_retryable_error(&e) && attempts < MAX_CONNECTION_ATTEMPTS {
+                if is_retryable_error(&e) && attempts < max_retries {
                     let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                     eprintln!(
                         "Network error ({}), retrying in {} seconds... (attempt {}/{}): {}",
                         error_type_str(&e),
                         sleep_secs,
                         attempts,
-                        MAX_CONNECTION_ATTEMPTS,
+                        max_retries,
                         e
                     );
                     thread::sleep(Duration::from_secs(sleep_secs));
@@ -105,7 +104,7 @@ where
 
 /// Request a field from the server and returns the deserialized data.
 /// Retries for 5xx errors or network timeouts.
-pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient {
+pub fn get_field_from_server(mode: &SearchMode, api_base: &str, max_retries: u32) -> DataToClient {
     let url = match mode {
         SearchMode::Detailed => format!("{api_base}/claim/detailed"),
         SearchMode::Niceonly => format!("{api_base}/claim/niceonly"),
@@ -124,12 +123,17 @@ pub fn get_field_from_server(mode: &SearchMode, api_base: &str) -> DataToClient 
             Ok(data) => data,
             Err(e) => panic!("Error deserializing response: {}", e),
         },
+        max_retries,
     )
 }
 
 /// Submit field results to the server. Panic if there is an error.
 /// Retries for 5xx errors or network timeouts.
-pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Response {
+pub fn submit_field_to_server(
+    api_base: &str,
+    submit_data: DataToServer,
+    max_retries: u32,
+) -> Response {
     let url = format!("{api_base}/submit");
 
     retry_request(
@@ -155,13 +159,14 @@ pub fn submit_field_to_server(api_base: &str, submit_data: DataToServer) -> Resp
             }
             response
         },
+        max_retries,
     )
 }
 
 /// Request validation data from the server for a specific claim.
 /// Returns the deserialized ValidationData which includes the expected results.
 /// Retries for 5xx errors or network timeouts.
-pub fn get_validation_data_from_server(api_base: &str) -> ValidationData {
+pub fn get_validation_data_from_server(api_base: &str, max_retries: u32) -> ValidationData {
     let url = format!("{api_base}/claim/validate");
 
     retry_request(
@@ -177,6 +182,7 @@ pub fn get_validation_data_from_server(api_base: &str) -> ValidationData {
             Ok(data) => data,
             Err(e) => panic!("Error deserializing validation response: {}", e),
         },
+        max_retries,
     )
 }
 
@@ -208,7 +214,11 @@ fn error_type_str_async(e: &reqwest::Error) -> &'static str {
 
 /// Generic retry logic for async HTTP requests with exponential backoff.
 /// Handles both network errors and 5xx server errors.
-async fn retry_request_async<F, Fut, P, FutP, T>(request_fn: F, process_response: P) -> T
+async fn retry_request_async<F, Fut, P, FutP, T>(
+    request_fn: F,
+    process_response: P,
+    max_retries: u32,
+) -> T
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
@@ -224,7 +234,7 @@ where
             Ok(response) => {
                 // Check if it's a 5xx server error
                 if response.status().is_server_error() {
-                    if attempts < MAX_CONNECTION_ATTEMPTS {
+                    if attempts < max_retries {
                         let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                         eprintln!(
                             "Server error ({} {}), retrying in {} seconds... (attempt {}/{})",
@@ -232,7 +242,7 @@ where
                             response.text().await.unwrap_or_default(),
                             sleep_secs,
                             attempts,
-                            MAX_CONNECTION_ATTEMPTS
+                            max_retries
                         );
                         tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
                         continue;
@@ -249,14 +259,14 @@ where
                 return process_response(response).await;
             }
             Err(e) => {
-                if is_retryable_error_async(&e) && attempts < MAX_CONNECTION_ATTEMPTS {
+                if is_retryable_error_async(&e) && attempts < max_retries {
                     let sleep_secs = 2_u64.pow(attempts.saturating_sub(1));
                     eprintln!(
                         "Network error ({}), retrying in {} seconds... (attempt {}/{}): {}",
                         error_type_str_async(&e),
                         sleep_secs,
                         attempts,
-                        MAX_CONNECTION_ATTEMPTS,
+                        max_retries,
                         e
                     );
                     tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
@@ -276,7 +286,11 @@ where
 
 /// Async version: Request a field from the server and returns the deserialized data.
 /// Retries for 5xx errors or network timeouts.
-pub async fn get_field_from_server_async(mode: &SearchMode, api_base: &str) -> DataToClient {
+pub async fn get_field_from_server_async(
+    mode: &SearchMode,
+    api_base: &str,
+    max_retries: u32,
+) -> DataToClient {
     let url = match mode {
         SearchMode::Detailed => format!("{api_base}/claim/detailed"),
         SearchMode::Niceonly => format!("{api_base}/claim/niceonly"),
@@ -298,6 +312,7 @@ pub async fn get_field_from_server_async(mode: &SearchMode, api_base: &str) -> D
                 Err(e) => panic!("Error deserializing response: {}", e),
             }
         },
+        max_retries,
     )
     .await
 }
@@ -307,6 +322,7 @@ pub async fn get_field_from_server_async(mode: &SearchMode, api_base: &str) -> D
 pub async fn submit_field_to_server_async(
     api_base: &str,
     submit_data: DataToServer,
+    max_retries: u32,
 ) -> reqwest::Response {
     let url = format!("{api_base}/submit");
 
@@ -334,6 +350,7 @@ pub async fn submit_field_to_server_async(
             }
             response
         },
+        max_retries,
     )
     .await
 }
@@ -341,7 +358,10 @@ pub async fn submit_field_to_server_async(
 /// Async version: Request validation data from the server for a specific claim.
 /// Returns the deserialized ValidationData which includes the expected results.
 /// Retries for 5xx errors or network timeouts.
-pub async fn get_validation_data_from_server_async(api_base: &str) -> ValidationData {
+pub async fn get_validation_data_from_server_async(
+    api_base: &str,
+    max_retries: u32,
+) -> ValidationData {
     let url = format!("{api_base}/claim/validate");
 
     retry_request_async(
@@ -360,6 +380,7 @@ pub async fn get_validation_data_from_server_async(api_base: &str) -> Validation
                 Err(e) => panic!("Error deserializing validation response: {}", e),
             }
         },
+        max_retries,
     )
     .await
 }

@@ -70,6 +70,10 @@ pub struct Cli {
     )]
     api_base: String,
 
+    /// If an API call encounters a retryable error, retry with exponential backoff this many times
+    #[arg(long, default_value_t = 10, env = "NICE_API_MAX_RETRIES")]
+    api_max_retries: u32,
+
     /// The username to send alongside your contribution
     #[arg(short, long, default_value = "anonymous", env = "NICE_USERNAME")]
     username: String,
@@ -282,7 +286,7 @@ async fn run_single_iteration(
 ) {
     // Get the field (synchronously for validation/benchmark)
     let (claim_data, validation_data_opt) = if cli.validate {
-        let validation_data = get_validation_data_from_server(&cli.api_base);
+        let validation_data = get_validation_data_from_server(&cli.api_base, cli.api_max_retries);
         let claim_data = DataToClient {
             claim_id: 0,
             base: validation_data.base,
@@ -294,7 +298,10 @@ async fn run_single_iteration(
     } else if let Some(benchmark) = cli.benchmark {
         (get_benchmark_field(benchmark), None)
     } else {
-        (get_field_from_server(&cli.mode, &cli.api_base), None)
+        (
+            get_field_from_server(&cli.mode, &cli.api_base, cli.api_max_retries),
+            None,
+        )
     };
 
     // Show claim details
@@ -375,7 +382,8 @@ async fn run_single_iteration(
             std::process::exit(1);
         }
     } else if cli.benchmark.is_none() {
-        let response = submit_field_to_server_async(&cli.api_base, submit_data).await;
+        let response =
+            submit_field_to_server_async(&cli.api_base, submit_data, cli.api_max_retries).await;
         match response.text().await {
             Ok(msg) => {
                 debug!("Server response: {msg}");
@@ -398,7 +406,8 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
             Some(tokio::spawn({
                 let mode = cli.mode;
                 let api_base = cli.api_base.clone();
-                async move { get_field_from_server_async(&mode, &api_base).await }
+                let api_num_retries = cli.api_max_retries;
+                async move { get_field_from_server_async(&mode, &api_base, api_num_retries).await }
             }))
         } else {
             None
@@ -450,8 +459,10 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
         let submit_previous = pending_submit.take().map(|submit_data| {
             tokio::spawn({
                 let api_base = cli.api_base.clone();
+                let api_num_retries = cli.api_max_retries;
                 async move {
-                    let response = submit_field_to_server_async(&api_base, submit_data).await;
+                    let response =
+                        submit_field_to_server_async(&api_base, submit_data, api_num_retries).await;
                     match response.text().await {
                         Ok(msg) => {
                             debug!("Server response: {msg}");
@@ -510,7 +521,8 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
 
     // Submit any remaining results
     if let Some(submit_data) = pending_submit {
-        let response = submit_field_to_server_async(&cli.api_base, submit_data).await;
+        let response =
+            submit_field_to_server_async(&cli.api_base, submit_data, cli.api_max_retries).await;
         match response.text().await {
             Ok(msg) => {
                 debug!("Server response: {msg}");
