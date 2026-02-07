@@ -1450,6 +1450,7 @@ dependencies = [
  "clap",
  "cudarc",
  "env_logger",
+ "log",
  "nice_common",
  "rayon",
  "serde_json",

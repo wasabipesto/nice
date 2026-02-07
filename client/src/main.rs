@@ -24,6 +24,8 @@ use std::sync::Arc;
 
 extern crate serde_json;
 use clap::Parser;
+use env_logger::Env;
+use log::{debug, error, info};
 use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
 use std::collections::HashMap;
@@ -53,13 +55,9 @@ pub struct Cli {
     #[arg(short, long, env = "NICE_REPEAT")]
     repeat: bool,
 
-    /// Suppress all output
-    #[arg(short, long, env = "NICE_QUIET")]
-    quiet: bool,
-
-    /// Show additional output
-    #[arg(short, long, env = "NICE_VERBOSE")]
-    verbose: bool,
+    /// Hide the progress bar
+    #[arg(short, long, env = "NICE_NO_PROGRESS")]
+    no_progress: bool,
 
     /// Run parallel with this many threads
     #[arg(short, long, default_value_t = 4, env = "NICE_THREADS")]
@@ -128,14 +126,14 @@ fn process_field_sync(
             match gpu_results {
                 Ok(result) => vec![result],
                 Err(e) => {
-                    eprintln!("GPU processing error: {e:?}");
+                    error!("GPU processing error: {e:?}");
                     std::process::exit(1);
                 }
             }
         }
         #[cfg(not(feature = "gpu"))]
         {
-            eprintln!("GPU support not compiled in");
+            error!("GPU support not compiled in");
             std::process::exit(1);
         }
     } else {
@@ -152,7 +150,7 @@ fn process_field_sync(
         let chunk_scale = (chunk_size as f32).log10() as u32;
         let tqdm_config = simple_tqdm::Config::new()
             .with_unit(format!("e{chunk_scale}"))
-            .with_disable(cli.quiet);
+            .with_disable(cli.no_progress);
 
         // Process each chunk and gather the results
         chunks
@@ -228,7 +226,7 @@ fn validate_results(
     server_numbers.sort_by_key(|n| n.number);
 
     if our_numbers != server_numbers {
-        println!("VALIDATION FAILED: Semi-nice numbers don't match!");
+        error!("VALIDATION FAILED: Semi-nice numbers don't match!");
         validation_passed = false;
     }
 
@@ -242,7 +240,7 @@ fn validate_results(
         server_dist_sorted.sort_by_key(|d| d.num_uniques);
 
         if our_dist_sorted != server_dist_sorted {
-            println!("VALIDATION FAILED: Distribution doesn't match!");
+            error!("VALIDATION FAILED: Distribution doesn't match!");
             validation_passed = false;
         }
     }
@@ -272,22 +270,21 @@ async fn run_single_iteration(
         (get_field_from_server(&cli.mode, &cli.api_base), None)
     };
 
-    // Print debug info
+    // Show claim details
     if let Some(ref validation_data) = validation_data_opt {
-        println!("Beginning validation: {:?}", validation_data.field_id);
-    } else if cli.benchmark.is_some() {
-        println!("Beginning benchmark:  {:?}", cli.benchmark.unwrap());
-    } else if cli.verbose {
-        println!(
-            "Claim Data: {}",
-            serde_json::to_string_pretty(&claim_data).unwrap()
-        );
-    } else if !cli.quiet {
-        println!(
+        info!("Beginning validation: {}", validation_data.field_id);
+    } else if let Some(benchmark) = cli.benchmark {
+        info!("Beginning benchmark:  {benchmark}");
+    } else {
+        info!(
             "Acquired claim:  {}, Base {}",
             claim_data.claim_id, claim_data.base
         );
     }
+    debug!(
+        "Claim Data: {}",
+        serde_json::to_string_pretty(&claim_data).unwrap()
+    );
 
     let start_time = std::time::Instant::now();
 
@@ -300,8 +297,7 @@ async fn run_single_iteration(
             api_base: cli.api_base.clone(),
             username: cli.username.clone(),
             repeat: cli.repeat,
-            quiet: cli.quiet,
-            verbose: cli.verbose,
+            no_progress: cli.no_progress,
             threads: cli.threads,
             benchmark: cli.benchmark,
             validate: cli.validate,
@@ -326,12 +322,12 @@ async fn run_single_iteration(
 
     let elapsed = start_time.elapsed();
 
-    // Print performance stats for GPU
+    // Print performance stats if progress bar is disabled
     #[allow(clippy::cast_precision_loss)]
-    if cli.gpu && !cli.quiet {
-        let range_size = claim_data.range_end - claim_data.range_start;
+    if cli.no_progress || cli.gpu {
+        let range_size = claim_data.range_size;
         let numbers_per_sec = range_size as f64 / elapsed.as_secs_f64();
-        println!(
+        info!(
             "✓ Processed {:.2e} numbers in {:.2}s ({:.2e} numbers/sec)",
             range_size as f64,
             elapsed.as_secs_f64(),
@@ -342,12 +338,10 @@ async fn run_single_iteration(
     // Compile results
     let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
 
-    if cli.verbose {
-        println!(
-            "Submit Data: {}",
-            serde_json::to_string_pretty(&submit_data).unwrap()
-        );
-    }
+    debug!(
+        "Submit Data: {}",
+        serde_json::to_string_pretty(&submit_data).unwrap()
+    );
 
     // Handle validation or submission
     if cli.validate {
@@ -355,8 +349,10 @@ async fn run_single_iteration(
         let validation_passed = validate_results(&submit_data, validation_data.clone(), cli.mode);
 
         if validation_passed {
+            println!();
             println!("Validation passed! Results match the canoncical submission.");
         } else {
+            println!();
             println!("Validation failed! Results do not match the canoncical submission.");
             println!("  Our submission data: {submit_data:?}");
             println!("  Canoncical submission: {validation_data:?}");
@@ -366,11 +362,9 @@ async fn run_single_iteration(
         let response = submit_field_to_server_async(&cli.api_base, submit_data).await;
         match response.text().await {
             Ok(msg) => {
-                if !cli.quiet {
-                    println!("Server response: {msg}");
-                }
+                debug!("Server response: {msg}");
             }
-            Err(e) => println!("Server returned success but an error occured: {e}"),
+            Err(e) => error!("Server returned success but an error occured: {e}"),
         }
     }
 }
@@ -396,17 +390,14 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
 
         // Stage 2: If we have a current claim, process it
         let process_current = if let Some(claim_data) = current_claim.take() {
-            if cli.verbose {
-                println!(
-                    "Claim Data: {}",
-                    serde_json::to_string_pretty(&claim_data).unwrap()
-                );
-            } else if !cli.quiet {
-                println!(
-                    "Acquired claim:  {}, Base {}",
-                    claim_data.claim_id, claim_data.base
-                );
-            }
+            info!(
+                "Acquired claim:  {}, Base {}",
+                claim_data.claim_id, claim_data.base
+            );
+            debug!(
+                "Claim Data: {}",
+                serde_json::to_string_pretty(&claim_data).unwrap()
+            );
 
             let start_time = std::time::Instant::now();
 
@@ -418,8 +409,7 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
                     api_base: cli.api_base.clone(),
                     username: cli.username.clone(),
                     repeat: cli.repeat,
-                    quiet: cli.quiet,
-                    verbose: cli.verbose,
+                    no_progress: cli.no_progress,
                     threads: cli.threads,
                     benchmark: cli.benchmark,
                     validate: cli.validate,
@@ -455,16 +445,13 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
         let submit_previous = pending_submit.take().map(|submit_data| {
             tokio::spawn({
                 let api_base = cli.api_base.clone();
-                let verbose = cli.verbose;
                 async move {
                     let response = submit_field_to_server_async(&api_base, submit_data).await;
                     match response.text().await {
                         Ok(msg) => {
-                            if verbose {
-                                println!("Server response: {msg}");
-                            }
+                            debug!("Server response: {msg}");
                         }
-                        Err(e) => println!("Server returned success but an error occured: {e}"),
+                        Err(e) => error!("Server returned success but an error occured: {e}"),
                     }
                 }
             })
@@ -479,12 +466,12 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
             let (claim_data, results, elapsed) =
                 process_task.await.expect("Processing task panicked");
 
-            // Print performance stats for GPU
+            // Print performance stats if progress bar is disabled
             #[allow(clippy::cast_precision_loss)]
-            if cli.gpu && !cli.quiet {
+            if cli.no_progress || cli.gpu {
                 let range_size = claim_data.range_end - claim_data.range_start;
                 let numbers_per_sec = range_size as f64 / elapsed.as_secs_f64();
-                println!(
+                info!(
                     "✓ Processed {:.2e} numbers in {:.2}s ({:.2e} numbers/sec)",
                     range_size as f64,
                     elapsed.as_secs_f64(),
@@ -495,12 +482,10 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
             // Compile results for submission
             let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
 
-            if cli.verbose {
-                println!(
-                    "Submit Data: {}",
-                    serde_json::to_string_pretty(&submit_data).unwrap()
-                );
-            }
+            debug!(
+                "Submit Data: {}",
+                serde_json::to_string_pretty(&submit_data).unwrap()
+            );
 
             pending_submit = Some(submit_data);
         }
@@ -523,11 +508,9 @@ async fn run_pipelined_loop(cli: &Cli, #[cfg(feature = "gpu")] gpu_ctx: Option<&
         let response = submit_field_to_server_async(&cli.api_base, submit_data).await;
         match response.text().await {
             Ok(msg) => {
-                if cli.verbose {
-                    println!("Server response: {msg}");
-                }
+                debug!("Server response: {msg}");
             }
-            Err(e) => println!("Server returned success but an error occured: {e}"),
+            Err(e) => error!("Server returned success but an error occured: {e}"),
         }
     }
 }
@@ -538,68 +521,63 @@ async fn main() {
     let cli = Cli::parse();
 
     // Set up logger
-    env_logger::init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     // Check for GPU support
     if cli.gpu && !cfg!(feature = "gpu") {
-        eprintln!("Error: GPU support not enabled. Rebuild with --features gpu");
+        error!("Error: GPU support not enabled. Rebuild with --features gpu");
         std::process::exit(1);
     }
 
     if cli.validate && cli.mode == SearchMode::Niceonly {
-        eprintln!("Configuration not supported: Validation && Niceonly");
+        error!("Configuration not supported: Validation && Niceonly");
         std::process::exit(1);
     }
 
-    if !cli.quiet {
-        #[allow(unused_mut)]
-        let mut cpu_or_gpu = format!("CPU with {} threads", cli.threads);
+    #[allow(unused_mut)]
+    let mut cpu_or_gpu = format!("CPU with {} threads", cli.threads);
 
-        #[cfg(feature = "gpu")]
-        if cli.gpu {
-            cpu_or_gpu = format!(
-                "GPU device {} and batch size {}",
-                cli.gpu_device, GPU_BATCH_SIZE
-            );
-        };
-
-        println!(
-            "Nice Client v{} started in {} mode, using {}.",
-            CLIENT_VERSION, cli.mode, cpu_or_gpu
+    #[cfg(feature = "gpu")]
+    if cli.gpu {
+        cpu_or_gpu = format!(
+            "GPU device {} and batch size {}",
+            cli.gpu_device, GPU_BATCH_SIZE
         );
-        if cli.validate {
-            println!("Validating correctness by checking against accepted field.");
-        }
-        if cli.repeat && !cli.validate && cli.benchmark.is_none() {
-            println!("Pipeline mode enabled: overlapping API calls with processing.");
-        }
+    };
+
+    info!(
+        "Nice Client v{} started in {} mode, using {}.",
+        CLIENT_VERSION, cli.mode, cpu_or_gpu
+    );
+    if cli.validate {
+        debug!("Validating correctness by checking against accepted field.");
     }
-    if cli.verbose {
-        println!("CLI Inputs: {cli:?}");
+    if cli.repeat && !cli.validate && cli.benchmark.is_none() {
+        debug!("Pipeline mode enabled: overlapping API calls with processing.");
     }
+    debug!("CLI Inputs: {cli:?}");
 
     // Initialize GPU context if requested
     #[cfg(feature = "gpu")]
     let gpu_ctx = if cli.gpu {
         match GpuContext::new(cli.gpu_device) {
             Ok(ctx) => {
-                if !cli.quiet {
-                    println!("GPU initialized successfully on device {}", cli.gpu_device);
-                    // Try to get GPU name if possible
-                    if let Ok(device) = cudarc::driver::CudaContext::new(cli.gpu_device)
-                        && let Ok(name) = device.name()
-                    {
-                        println!("  GPU: {name}");
-                    }
+                info!("GPU initialized successfully on device {}", cli.gpu_device);
+                // Try to get GPU name if possible
+                if let Ok(device) = cudarc::driver::CudaContext::new(cli.gpu_device)
+                    && let Ok(name) = device.name()
+                {
+                    info!("  GPU: {name}");
                 }
                 Some(Arc::new(ctx))
             }
             Err(e) => {
-                eprintln!(
+                error!(
                     "Failed to initialize GPU on device {}: {:?}",
                     cli.gpu_device, e
                 );
-                eprintln!("\nTroubleshooting:");
+                eprintln!("");
+                eprintln!("Troubleshooting:");
                 eprintln!("1. Ensure NVIDIA GPU drivers are installed");
                 eprintln!("2. Verify CUDA toolkit is installed (nvcc --version)");
                 eprintln!("3. Check that GPU {} exists (nvidia-smi)", cli.gpu_device);
