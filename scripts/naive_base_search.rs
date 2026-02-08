@@ -16,7 +16,9 @@ use simple_tqdm::ParTqdm;
 
 use nice_common::base_range::get_base_range_u128;
 use nice_common::client_process::process_range_niceonly;
-use nice_common::{FieldResults, PROCESSING_CHUNK_SIZE};
+use nice_common::stride_filter;
+use nice_common::{FieldResults, FieldSize, PROCESSING_CHUNK_SIZE};
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -28,14 +30,14 @@ pub struct Cli {
     base: u32,
 }
 
-/// Break up the range into chunks, returning the start and end of each.
-fn chunked_ranges(range_start: u128, range_end: u128, chunk_size: usize) -> Vec<(u128, u128)> {
+/// Break up the range into chunks, returning FieldSize for each.
+fn chunked_ranges(range_start: u128, range_end: u128, chunk_size: usize) -> Vec<FieldSize> {
     let mut chunks = Vec::new();
     let mut start = range_start;
 
     while start < range_end {
         let end = (start + chunk_size as u128).min(range_end);
-        chunks.push((start, end));
+        chunks.push(FieldSize::new(start, end));
         start = end;
     }
 
@@ -70,6 +72,10 @@ fn main() {
     let chunk_size = 100 * PROCESSING_CHUNK_SIZE;
     let chunks = chunked_ranges(base_range.range_start, base_range.range_end, chunk_size);
 
+    // Precompute stride table once and share across all chunks
+    let k = 1; // Number of digits for multi-digit LSD filter
+    let stride_table = Arc::new(stride_filter::StrideTable::new(base, k));
+
     // Configure TQDM
     let chunk_scale = (chunk_size as f32).log10() as u32;
     let tqdm_config = simple_tqdm::Config::new().with_unit(format!("e{chunk_scale}"));
@@ -78,7 +84,7 @@ fn main() {
     let results: Vec<FieldResults> = chunks
         .par_iter()
         .tqdm_config(tqdm_config)
-        .map(|(start, end)| process_range_niceonly(*start, *end, base))
+        .map(|chunk| process_range_niceonly(chunk, base, &stride_table))
         .collect();
 
     // Compile results from all chunks
