@@ -36,10 +36,21 @@
 //! Result: Valid LSDs for base 10 are {2, 3, 4, 7, 8, 9}, filtering out 40% of candidates.
 //!
 //! This eliminates a significant portion of the search space with minimal computation.
+//!
+//! ## Multi-Digit LSD Filter
+//!
+//! The multi-digit LSD filter extends the single-digit approach to check the last k digits
+//! (mod b^k) instead of just the last digit. This is more effective because it catches
+//! collisions that occur in the second, third, etc. positions from the right.
+//!
+//! For example, in base 10 with k=2, instead of just checking if the last digit of n² and n³
+//! collide, we check if ANY digit in the last 2 digits of n² collides with ANY digit in the
+//! last 2 digits of n³.
 
 use log::trace;
 use malachite::base::num::arithmetic::traits::Pow;
 use malachite::natural::Natural;
+use std::collections::HashSet;
 
 /// Get a list of valid least significant digits for a base.
 ///
@@ -107,6 +118,123 @@ fn is_valid_lsd(lsd: u32, base: u32) -> bool {
     // This would create a guaranteed duplicate in the combined digits of n² and n³.
     // Returns `true` if this LSD could produce a nice number, `false` if it definitely cannot
     square_lsd != cube_lsd
+}
+
+/// Extract all digits from a number in the given base.
+///
+/// # Arguments
+/// - `value`: The number to extract digits from
+/// - `base`: The numeric base
+/// - `num_digits`: Maximum number of digits to extract (from least significant)
+///
+/// # Returns
+/// A `HashSet` containing all unique digits that appear in the number
+fn extract_digits(value: u128, base: u32, num_digits: u32) -> HashSet<u32> {
+    let mut digits = HashSet::new();
+    let mut remaining = value;
+    let base_u128 = u128::from(base);
+
+    for _ in 0..num_digits {
+        #[allow(clippy::cast_possible_truncation)]
+        let digit = (remaining % base_u128) as u32;
+        digits.insert(digit);
+        remaining /= base_u128;
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    digits
+}
+
+/// Get a bitmap of valid k-digit suffixes for multi-digit LSD filtering.
+///
+/// This is Filter A from the Novel Filters document. Instead of checking only the last
+/// digit, it checks the last k digits (mod b^k) and validates that no digit collision
+/// occurs between the k-digit suffixes of n² and n³.
+///
+/// # Arguments
+/// - `base`: The numeric base
+/// - `k`: Number of digits to check (typically 2 or 3)
+///
+/// # Returns
+/// A `Vec<bool>` where `bitmap[i]` is true if suffix i is valid. This allows fast O(1)
+/// lookups using direct array indexing.
+///
+/// # Example
+/// For base 10, k=2:
+/// - Check all suffixes 00-99
+/// - For suffix=12: compute 12²=144 (last 2 digits: 44) and 12³=1728 (last 2 digits: 28)
+/// - Extract digits from "44": {4} and from "28": {2, 8}
+/// - Since {4} and {2, 8} are disjoint (no shared digits), suffix 12 is valid
+///
+/// # Panics
+/// Panics if base^k would overflow u32
+#[must_use]
+pub fn get_valid_multi_lsd_bitmap(base: u32, k: u32) -> Vec<bool> {
+    // Calculate modulus = base^k
+    let modulus = base.checked_pow(k).expect("base^k must fit in u32");
+    let modulus_u128 = u128::from(modulus);
+
+    trace!(
+        "Computing multi-digit LSD filter for base {base} with k={k} digits (modulus={modulus})"
+    );
+
+    // Build a bitmap for fast O(1) lookup via direct indexing
+    let mut bitmap = vec![false; modulus as usize];
+    let mut valid_count = 0;
+
+    for suffix in 0..modulus {
+        let suffix_u128 = u128::from(suffix);
+
+        // Compute n² mod b^k and n³ mod b^k
+        let sq = suffix_u128.pow(2) % modulus_u128;
+        let cb = suffix_u128.pow(3) % modulus_u128;
+
+        // Extract all digits from the k-digit representations
+        let sq_digits = extract_digits(sq, base, k);
+        let cb_digits = extract_digits(cb, base, k);
+
+        // Valid if no digit appears in both square and cube
+        let is_valid = sq_digits.is_disjoint(&cb_digits);
+
+        if is_valid {
+            bitmap[suffix as usize] = true;
+            valid_count += 1;
+        } else {
+            trace!(
+                "  Suffix {:0width$} rejected: sq={:0width$} (digits {:?}), cb={:0width$} (digits {:?})",
+                suffix,
+                sq,
+                sq_digits,
+                cb,
+                cb_digits,
+                width = k as usize
+            );
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let filter_rate = 100.0 * (1.0 - f64::from(valid_count) / f64::from(modulus));
+    trace!(
+        "Multi-digit LSD filter: {valid_count}/{modulus} suffixes valid ({filter_rate:.1}% filtered)"
+    );
+
+    bitmap
+}
+
+/// Get the recommended k value for multi-digit LSD filtering based on base.
+///
+/// # Arguments
+/// - `base`: The numeric base
+///
+/// # Returns
+/// Recommended number of digits to check
+#[must_use]
+pub fn get_recommended_k(_base: u32) -> u32 {
+    // if base >= 30 { 2 } else { 3 };
+    // Higher k-values reduced performance instead of increasing it, locking k to 1.
+    1
 }
 
 #[cfg(test)]
@@ -353,5 +481,152 @@ mod tests {
         assert!(is_valid_lsd(3, 16));
         // LSD=15 (F): F²=E1₁₆, F³=D2F₁₆ → 1 and F (no collision)
         assert!(is_valid_lsd(15, 16));
+    }
+
+    #[test_log::test]
+    fn test_extract_digits_base10() {
+        // Test extracting digits from various numbers in base 10
+        assert_eq!(extract_digits(0, 10, 2), HashSet::from([0]));
+        assert_eq!(extract_digits(5, 10, 2), HashSet::from([5]));
+        assert_eq!(extract_digits(12, 10, 2), HashSet::from([1, 2]));
+        assert_eq!(extract_digits(44, 10, 2), HashSet::from([4]));
+        assert_eq!(extract_digits(28, 10, 2), HashSet::from([2, 8]));
+        assert_eq!(extract_digits(123, 10, 3), HashSet::from([1, 2, 3]));
+        assert_eq!(extract_digits(111, 10, 3), HashSet::from([1]));
+    }
+
+    #[test_log::test]
+    fn test_extract_digits_base16() {
+        // Test extracting digits from various numbers in base 16
+        assert_eq!(extract_digits(0x0, 16, 2), HashSet::from([0]));
+        assert_eq!(extract_digits(0xF, 16, 2), HashSet::from([15]));
+        assert_eq!(extract_digits(0x1A, 16, 2), HashSet::from([1, 10]));
+        assert_eq!(extract_digits(0xFF, 16, 2), HashSet::from([15]));
+        assert_eq!(extract_digits(0xAB, 16, 2), HashSet::from([10, 11]));
+    }
+
+    #[test_log::test]
+    fn test_get_valid_multi_lsd_bitmap_base10_k1() {
+        // With k=1, should match single-digit LSD filter
+        let multi_lsd_bitmap = get_valid_multi_lsd_bitmap(10, 1);
+        let single_lsd = get_valid_lsds_u128(&10);
+
+        // Check that all single-digit valid LSDs are marked as valid in the bitmap
+        for &valid_lsd in &single_lsd {
+            assert!(
+                multi_lsd_bitmap[valid_lsd as usize],
+                "Single-LSD valid digit {valid_lsd} should be valid in multi-digit bitmap"
+            );
+        }
+
+        // Check that invalid single-digit LSDs are not in the bitmap
+        for lsd in 0..10u128 {
+            if single_lsd.contains(&lsd) {
+                assert!(multi_lsd_bitmap[lsd as usize]);
+            } else {
+                assert!(!multi_lsd_bitmap[lsd as usize]);
+            }
+        }
+    }
+
+    #[test_log::test]
+    fn test_get_valid_multi_lsd_bitmap_base10_k2() {
+        // Test multi-digit LSD filter with k=2 for base 10
+        let bitmap = get_valid_multi_lsd_bitmap(10, 2);
+
+        // Should have 100 entries (0-99)
+        assert_eq!(
+            bitmap.len(),
+            100,
+            "Bitmap should have 100 entries for base 10, k=2"
+        );
+
+        let valid_count = bitmap.iter().filter(|&&v| v).count();
+        assert!(valid_count < 100, "k=2 should filter some candidates");
+        assert!(valid_count > 0, "k=2 should have some valid suffixes");
+
+        // Check specific cases:
+        // 00: 00²=00, 00³=00 → both have digit 0 (collision)
+        assert!(!bitmap[0]);
+
+        // 01: 01²=01, 01³=01 → both have digits 0,1 (collision)
+        assert!(!bitmap[1]);
+
+        // 12: 12²=144 (last 2: 44={4}), 12³=1728 (last 2: 28={2,8}) → disjoint
+        assert!(
+            bitmap[12],
+            "12 should be valid: sq digits {{4}} ∩ cb digits {{2,8}} = ∅"
+        );
+
+        // 69: 69²=4761 (last 2: 61={6,1}), 69³=328509 (last 2: 09={0,9}) → disjoint
+        assert!(bitmap[69], "69 should be valid (known nice number)");
+    }
+
+    #[test_log::test]
+    fn test_get_valid_multi_lsd_bitmap_base10_k3() {
+        // Test multi-digit LSD filter with k=3 for base 10
+        let bitmap = get_valid_multi_lsd_bitmap(10, 3);
+
+        // Should have 1000 entries (0-999)
+        assert_eq!(
+            bitmap.len(),
+            1000,
+            "Bitmap should have 1000 entries for base 10, k=3"
+        );
+
+        let valid_count = bitmap.iter().filter(|&&v| v).count();
+        assert!(valid_count < 1000, "k=3 should filter some candidates");
+        assert!(valid_count > 0, "k=3 should have some valid suffixes");
+
+        // 069: 69²=4761 (last 3: 761={7,6,1}), 69³=328509 (last 3: 509={5,0,9}) → disjoint
+        assert!(bitmap[69], "069 should be valid (known nice number)");
+    }
+
+    #[test_log::test]
+    fn test_multi_lsd_filter_more_effective() {
+        // Verify that multi-digit filter is more effective than single-digit
+        let base = 10;
+
+        let k1_bitmap = get_valid_multi_lsd_bitmap(base, 1);
+        let k2_bitmap = get_valid_multi_lsd_bitmap(base, 2);
+
+        let k1_valid_count = k1_bitmap.iter().filter(|&&v| v).count();
+        let k2_valid_count = k2_bitmap.iter().filter(|&&v| v).count();
+
+        #[allow(clippy::cast_precision_loss)]
+        let k1_rate = k1_valid_count as f64 / f64::from(base);
+        #[allow(clippy::cast_precision_loss)]
+        let k2_rate = k2_valid_count as f64 / f64::from(base.pow(2));
+
+        // k=2 should have a lower pass rate (more filtering)
+        assert!(
+            k2_rate < k1_rate,
+            "Multi-digit filter (k=2) should be more effective: k1={k1_rate:.3}, k2={k2_rate:.3}"
+        );
+    }
+
+    #[test_log::test]
+    fn test_multi_lsd_includes_single_lsd_valid_numbers() {
+        // Numbers that pass single-digit LSD should be considered by multi-digit
+        // (though multi-digit may filter more aggressively)
+        let base = 10;
+        let k = 2;
+
+        let single_lsd_valid = get_valid_lsds_u128(&base);
+        let multi_lsd_bitmap = get_valid_multi_lsd_bitmap(base, k);
+
+        // For any number ending in a valid single-digit LSD, at least some
+        // k-digit suffixes ending in that digit should be valid in multi-digit filter
+        for &valid_lsd in &single_lsd_valid {
+            let has_valid_suffix = (0..base.pow(k - 1)).any(|prefix| {
+                let suffix = (u128::from(prefix) * u128::from(base) + valid_lsd) as usize;
+                multi_lsd_bitmap[suffix]
+            });
+
+            assert!(
+                has_valid_suffix,
+                "Multi-digit filter should have at least one suffix ending in single-LSD-valid digit {valid_lsd}"
+            );
+        }
     }
 }
