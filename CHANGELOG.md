@@ -3,8 +3,9 @@
 ## Unreleased
 
 - Asynchronously submit the previous search field and get the next one while processing to reduce network overhead
-- Reuse server connection client between claim/submit requests
-- Fix a bug in the experimental LSD filter that gave false negatives, added tests and enabled it for nice-only processing
+- Reuse server connection between claim/submit requests to reduce network overhead
+- Implement higher k-values for the experimental LSD filter, fix a bug and add tests
+- Implement a CRT stride filter that allows the process to jump between valid candidates instead of iterating over all of them
 - Configure additional trace logging in the library
 - Replace `--verbose` and `--quiet` with `--log-level`/`-l` and `--no-progress`/`-n`
 - Add support for customizing the number of API retries with `--api-max-retries`
