@@ -36,7 +36,7 @@ pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 
 // Cross MSD×LSD collision check parameters
 // Number of least significant digits to check for collisions with MSD
-pub const MSD_LSD_OVERLAP_K_VALUE: u32 = 1;
+pub const MSD_LSD_OVERLAP_K_VALUE: u32 = 2;
 
 /// Find the longest common prefix of the most significant digits.
 ///
@@ -669,15 +669,15 @@ mod tests {
         let spans_single = range1.first() / b_k == range1.last() / b_k;
         assert!(
             spans_single,
-            "Range [100, 200) should span single LSD class"
+            "Range [100, 200) should span single LSD class (both in class 1)"
         );
 
-        // Range [100, 201] spans from class 1 to class 2 (100/100 = 1, 200/100 = 2)
+        // Range [100, 200] spans from class 1 to class 2 (100/100 = 1, 200/100 = 2)
         let range2 = FieldSize::new(100, 201);
         let spans_multiple = range2.first() / b_k != range2.last() / b_k;
         assert!(
             spans_multiple,
-            "Range [100, 201) should span multiple LSD classes"
+            "Range [100, 201) should span multiple LSD classes (1 and 2)"
         );
     }
 
@@ -688,8 +688,9 @@ mod tests {
         let base = 40u32;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
 
-        // Create a small range within base 40's range
-        let test_range_size = 500u128; // Small enough for Filter C to apply
+        // Create a small range within base 40's range that's small enough for Filter C
+        // With k=2, b^k = 1600, so we need ranges < 1600 to stay in single LSD class
+        let test_range_size = 800u128; // Small enough for Filter C to apply
         let test_range = FieldSize::new(
             base_range.start() + 1_000_000,
             base_range.start() + 1_000_000 + test_range_size,
@@ -748,16 +749,18 @@ mod tests {
         let base = 40u32;
         let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
 
-        // Test 100 small ranges
+        // Test 100 small ranges that are sized appropriately for Filter C
+        // With k=2, b^k = 1600, so ranges of size < 1600 will span single LSD class
         let mut filter_c_applicable = 0;
         let mut ranges_skipped = 0;
+        let range_size = 800u128; // Small enough to span single LSD class
 
         for i in 0..100 {
-            let start = base_range.start() + i * 500;
-            let end = start + 500;
+            let start = base_range.start() + i * 2000; // Space them out to cross LSD boundaries
+            let end = start + range_size;
             let range = FieldSize::new(start, end);
 
-            // Check if Filter C would apply (range < b^k)
+            // Check if Filter C would apply (range spans single LSD class)
             let k = MSD_LSD_OVERLAP_K_VALUE;
             let b_k = u128::from(base).pow(k);
             if range.first() / b_k == range.last() / b_k {
@@ -774,10 +777,11 @@ mod tests {
             100
         );
 
-        // Filter C should apply to at least some ranges
+        // Filter C should apply to many of these ranges
+        // Note: Not all will apply since we space them 2000 apart to cross LSD class boundaries
         assert!(
             filter_c_applicable > 0,
-            "Filter C should be applicable to some small ranges"
+            "Filter C should be applicable to some small ranges (got {filter_c_applicable}/100)"
         );
     }
 }
