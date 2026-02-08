@@ -211,6 +211,8 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
 /// is inclusive and `range_end` is exclusive, following Rust's standard convention.
 #[must_use]
 pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
+    return crate::stride_filter::process_range_with_stride(range, base, 1);
+
     // Precompute these for faster filter checking
     let base_u128 = u128::from(base);
     let base_u128_minusone = base_u128 - 1;
