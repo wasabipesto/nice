@@ -29,9 +29,8 @@ use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
 };
-use crate::{msd_prefix_filter, number_stats, residue_filter};
+use crate::{msd_prefix_filter, number_stats, stride_filter};
 use itertools::Itertools;
-use log::trace;
 use malachite::base::num::arithmetic::traits::{DivAssignRem, Pow};
 use malachite::base::num::conversion::traits::Digits;
 use malachite::natural::Natural;
@@ -194,7 +193,9 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
 #[must_use]
 #[deprecated = "use process_range_niceonly instead"]
 pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToServer {
-    let results = process_range_niceonly(&claim_data.into(), claim_data.base);
+    let k = 1; // Number of digits for multi-digit LSD filter
+    let stride_table = stride_filter::StrideTable::new(claim_data.base, k);
+    let results = process_range_niceonly(&claim_data.into(), claim_data.base, &stride_table);
 
     DataToServer {
         claim_id: claim_data.claim_id,
@@ -211,57 +212,26 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
 /// **Range semantics**: Expects a half-open range [`range_start`, `range_end`) where `range_start`
 /// is inclusive and `range_end` is exclusive, following Rust's standard convention.
 #[must_use]
-pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
-    // Precompute these for faster filter checking
-    let base_u128 = u128::from(base);
-    let base_u128_minusone = base_u128 - 1;
-
+pub fn process_range_niceonly(
+    range: &FieldSize,
+    base: u32,
+    stride_table: &stride_filter::StrideTable,
+) -> FieldResults {
     // Use recursive subdivision to get valid ranges that need processing.
     // This adaptively subdivides the range to skip portions where the MSD prefix indicates
     // all numbers will have duplicate/overlapping digits. It's more effective than fixed
     // chunking because it only subdivides when needed and can find natural boundaries.
-    let valid_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
-    let filtered_range_size: u128 = valid_ranges.iter().map(FieldSize::size).sum();
-    #[allow(clippy::cast_precision_loss)]
-    {
-        trace!(
-            "Filtered candidate range from {} to {} ({:.2}%) with MSD filtering of depth {}",
-            range.size(),
-            filtered_range_size,
-            filtered_range_size as f64 / range.size() as f64 * 100.0,
-            msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH
-        );
-    }
+    let valid_msd_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
 
-    // Get LSD filter to eliminate invalid least significant digits
-    // let lsd_filter = lsd_filter::get_valid_lsds_u128(&base);
+    // The stride table integrates the residue filter (mod b-1) and the multi-digit
+    // LSD filter (mod b^k). It allows us to jump between valid candidates instead of
+    // iterating over each one.
+    // The table is precomputed once per field and passed in to avoid redundant computation.
 
-    // Get residue filters to reduce search range
-    let residue_filter = residue_filter::get_residue_filter_u128(&base);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    {
-        trace!(
-            "Filtered candidate range by {}/{} ({:.2}%) by residue filtering.",
-            base - 1 - residue_filter.len() as u32,
-            base - 1,
-            (1.0 - (residue_filter.len() as f64 / f64::from(base - 1))) as f64 * 100.0
-        );
-    }
-
-    // Process each valid range (each range is half-open: [start, end))
     let mut nice_list = Vec::new();
-    for r in valid_ranges {
-        let range_nice: Vec<NiceNumberSimple> = (r.range_start..r.range_end)
-            //.filter(|num| lsd_filter.contains(&(num % base_u128))) // Disable LSD filter due to poor performance
-            .filter(|num| residue_filter.contains(&(num % base_u128_minusone)))
-            .filter(|num| get_is_nice(*num, base))
-            .map(|number| NiceNumberSimple {
-                number,
-                num_uniques: base,
-            })
-            .collect();
-
-        nice_list.extend(range_nice);
+    for sub_range in valid_msd_ranges {
+        let sub_results = stride_table.iterate_range(&sub_range, base);
+        nice_list.extend(sub_results);
     }
 
     FieldResults {
@@ -876,7 +846,12 @@ mod tests {
                 num_uniques: 10,
             }]),
         };
-        assert_eq!(process_range_niceonly(&input.into(), input.base), result);
+        let k = 1;
+        let stride_table = stride_filter::StrideTable::new(input.base, k);
+        assert_eq!(
+            process_range_niceonly(&input.into(), input.base, &stride_table),
+            result
+        );
     }
 
     #[test_log::test]
@@ -895,7 +870,12 @@ mod tests {
             distribution: Vec::new(),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(process_range_niceonly(&input.into(), input.base), result);
+        let k = 1;
+        let stride_table = stride_filter::StrideTable::new(input.base, k);
+        assert_eq!(
+            process_range_niceonly(&input.into(), input.base, &stride_table),
+            result
+        );
     }
 
     #[test_log::test]
@@ -914,7 +894,12 @@ mod tests {
             distribution: Vec::new(),
             nice_numbers: Vec::new(),
         };
-        assert_eq!(process_range_niceonly(&input.into(), input.base), result);
+        let k = 1;
+        let stride_table = stride_filter::StrideTable::new(input.base, k);
+        assert_eq!(
+            process_range_niceonly(&input.into(), input.base, &stride_table),
+            result
+        );
     }
 
     #[test_log::test]
@@ -931,7 +916,9 @@ mod tests {
         let range = FieldSize::new(segment_start, segment_end);
 
         // Process with chunked filtering
-        let results = process_range_niceonly(&range, base);
+        let k = 1;
+        let stride_table = stride_filter::StrideTable::new(base, k);
+        let results = process_range_niceonly(&range, base, &stride_table);
 
         // The test passes if it completes without panic
         // The chunked filtering should skip some sub-chunks within this segment
@@ -948,7 +935,9 @@ mod tests {
         let range = FieldSize::new(range_start, range_end);
 
         // Process the range
-        let results = process_range_niceonly(&range, base);
+        let k = 1;
+        let stride_table = stride_filter::StrideTable::new(base, k);
+        let results = process_range_niceonly(&range, base, &stride_table);
 
         // Should find the nice number 69
         assert!(results.nice_numbers.iter().any(|n| n.number == 69));

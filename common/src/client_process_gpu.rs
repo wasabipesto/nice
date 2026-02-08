@@ -520,7 +520,9 @@ mod tests {
         let range = FieldSize::new(range_start, range_end);
         let base = 10u32;
 
-        let cpu_result = process_range_niceonly(&range, base);
+        let k = 1;
+        let stride_table = stride_filter::StrideTable::new(base, k);
+        let cpu_result = process_range_niceonly(&range, base, &stride_table);
         let gpu_result =
             process_range_niceonly_gpu(&ctx, &range, base).expect("GPU processing failed");
 
@@ -555,7 +557,9 @@ mod tests {
         let range = FieldSize::new(range_start, range_end);
         let base = 40u32;
 
-        let cpu_result = process_range_niceonly(&range, base);
+        let k = 1;
+        let stride_table = stride_filter::StrideTable::new(base, k);
+        let cpu_result = process_range_niceonly(&range, base, &stride_table);
         let gpu_result =
             process_range_niceonly_gpu(&ctx, &range, base).expect("GPU processing failed");
 

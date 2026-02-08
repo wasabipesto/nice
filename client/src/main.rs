@@ -10,17 +10,18 @@ use nice_common::client_api_async::{
 };
 use nice_common::client_api_sync::{get_field_from_server, get_validation_data_from_server};
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
+use nice_common::stride_filter;
 use nice_common::{
     CLIENT_REQUEST_TIMEOUT_SECS, CLIENT_VERSION, DataToClient, DataToServer, FieldResults,
     FieldSize, PROCESSING_CHUNK_SIZE, SearchMode, UniquesDistributionSimple, ValidationData,
 };
 
+const DEFAULT_LSD_K_VALUE: u32 = 2;
+
 #[cfg(feature = "gpu")]
 use nice_common::client_process_gpu::{
     GPU_BATCH_SIZE, GpuContext, process_range_detailed_gpu, process_range_niceonly_gpu,
 };
-#[cfg(feature = "gpu")]
-use std::sync::Arc;
 
 extern crate serde_json;
 use anyhow::Result;
@@ -30,6 +31,7 @@ use log::{LevelFilter, debug, error, info};
 use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -155,6 +157,18 @@ fn process_field_sync(
         let range: FieldSize = claim_data.into();
         let chunks = range.chunks(chunk_size);
 
+        // Precompute stride table once for Niceonly mode to avoid redundant computation
+        // in each chunk. The table is wrapped in Arc for thread-safe sharing across
+        // parallel chunk processing.
+        let stride_table_opt = if mode == SearchMode::Niceonly {
+            Some(Arc::new(stride_filter::StrideTable::new(
+                claim_data.base,
+                DEFAULT_LSD_K_VALUE,
+            )))
+        } else {
+            None
+        };
+
         // Configure TQDM
         #[allow(
             clippy::cast_precision_loss,
@@ -172,7 +186,12 @@ fn process_field_sync(
             .tqdm_config(tqdm_config)
             .map(|chunk| match mode {
                 SearchMode::Detailed => process_range_detailed(chunk, claim_data.base),
-                SearchMode::Niceonly => process_range_niceonly(chunk, claim_data.base),
+                SearchMode::Niceonly => {
+                    let stride_table = stride_table_opt
+                        .as_ref()
+                        .expect("Stride table not initialized");
+                    process_range_niceonly(chunk, claim_data.base, stride_table)
+                }
             })
             .collect()
     }
