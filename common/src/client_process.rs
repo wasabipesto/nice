@@ -38,30 +38,6 @@ use std::collections::HashMap;
 
 pub const DETAILED_MINI_CHUNK_SIZE: usize = 1_000;
 
-/// Build optimized bit array filters for LSD and residue checks.
-/// Returns (`lsd_filter`, `residue_filter`) as boolean arrays for ultra-fast O(1) lookups.
-///
-/// # Panics
-/// Panics if base > 256.
-fn build_bit_array_filters(base: u32) -> (Vec<bool>, Vec<bool>) {
-    assert!(base <= 256, "Bit array filters only support bases <= 256");
-
-    let lsd_valid = lsd_filter::get_valid_lsds_u128(&base);
-    let residue_valid = residue_filter::get_residue_filter_u128(&base);
-
-    let mut lsd_bits = vec![false; base as usize];
-    for &lsd in &lsd_valid {
-        lsd_bits[lsd as usize] = true;
-    }
-
-    let mut residue_bits = vec![false; (base - 1) as usize];
-    for &residue in &residue_valid {
-        residue_bits[residue as usize] = true;
-    }
-
-    (lsd_bits, residue_bits)
-}
-
 /// Calculate the number of unique digits in (n^2, n^3) represented in base b.
 /// A number is nice if the result of this is equal to b (means all digits are used once).
 /// If you're just checking if the number is 100% nice, there is a faster version below.
@@ -245,8 +221,19 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
     // chunking because it only subdivides when needed and can find natural boundaries.
     let valid_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
 
-    // Construct bit array filters for fast lookups
-    let (lsd_bits, residue_bits) = build_bit_array_filters(base);
+    // Build a bit array for LSD filter
+    let lsd_valid = lsd_filter::get_valid_lsds_u128(&base);
+    let mut lsd_bits = vec![false; base as usize];
+    for &lsd in &lsd_valid {
+        lsd_bits[lsd as usize] = true;
+    }
+
+    // Build a bit array for residue filter
+    let residue_valid = residue_filter::get_residue_filter_u128(&base);
+    let mut residue_bits = vec![false; (base - 1) as usize];
+    for &residue in &residue_valid {
+        residue_bits[residue as usize] = true;
+    }
 
     let mut nice_list = Vec::new();
     for r in valid_ranges {
