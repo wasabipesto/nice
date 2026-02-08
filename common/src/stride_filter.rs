@@ -1,18 +1,15 @@
 //! Stride-based iteration using the Chinese Remainder Theorem (CRT).
 //!
-//! This module implements Filter B from `NOVEL_FILTERS.md`: instead of iterating through
-//! every integer and filtering, we use CRT to combine the residue filter (mod b-1) and
-//! the multi-digit LSD filter (mod b^k) into a single modulus M = (b-1) × b^k.
+//! Instead of iterating through every integer and filtering, we use CRT to combine
+//! the residue filter (mod b-1) and the multi-digit LSD filter (mod b^k) into a single
+//! modulus M = (b-1) × b^k.
 //!
 //! We precompute which residues mod M are valid, then iterate by jumping directly from
-//! one valid candidate to the next using a gap table. This has **zero filter overhead**
-//! per candidate—we simply never visit invalid candidates.
-//!
-//! Key advantage: This changes from filter-based iteration to generator-based iteration,
-//! eliminating all modulo operations and lookups in the hot loop.
+//! one valid candidate to the next using a gap table. This has zero filter overhead
+//! per candidate - we simply never visit invalid candidates.
 
 use crate::client_process::get_is_nice;
-use crate::{FieldResults, FieldSize, NiceNumberSimple, lsd_filter, residue_filter};
+use crate::{FieldSize, NiceNumberSimple, lsd_filter, residue_filter};
 use log::trace;
 
 /// A precomputed stride table for efficient CRT-based iteration.
@@ -158,43 +155,6 @@ impl StrideTable {
     }
 }
 
-/// Process a range using stride-based iteration (Filter B).
-///
-/// This function combines MSD prefix filtering with CRT stride-based iteration.
-/// It first uses the MSD filter to identify valid sub-ranges, then uses stride
-/// iteration within each sub-range to efficiently visit only candidates that
-/// pass both the residue filter and multi-digit LSD filter.
-///
-/// # Arguments
-/// - `range`: The range to process
-/// - `base`: The numeric base
-/// - `k`: Number of least significant digits to check (recommended: use `lsd_filter::get_recommended_k`)
-///
-/// # Returns
-/// Field results containing only the nice numbers found
-#[must_use]
-pub fn process_range_with_stride(range: &FieldSize, base: u32, k: u32) -> FieldResults {
-    use crate::msd_prefix_filter;
-
-    // Use MSD prefix filter to get valid sub-ranges
-    let valid_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
-
-    // Build the stride table (this is cached in practice)
-    let stride_table = StrideTable::new(base, k);
-
-    // Iterate through each valid sub-range using stride iteration
-    let mut nice_list = Vec::new();
-    for sub_range in valid_ranges {
-        let sub_results = stride_table.iterate_range(&sub_range, base);
-        nice_list.extend(sub_results);
-    }
-
-    FieldResults {
-        distribution: Vec::new(),
-        nice_numbers: nice_list,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,73 +221,6 @@ mod tests {
 
         // Should find 69
         assert!(results.iter().any(|r| r.number == 69));
-    }
-
-    #[test_log::test]
-    fn test_stride_vs_linear_consistency_base10() {
-        // Compare stride iteration against linear iteration for base 10
-        use crate::client_process::process_range_niceonly;
-
-        let range = FieldSize::new(0, 1000);
-        let base = 10;
-
-        // Get results using current implementation
-        let linear_results = process_range_niceonly(&range, base);
-
-        // Get results using stride iteration
-        let stride_results = process_range_with_stride(&range, base, 1);
-
-        // Should find the same numbers
-        assert_eq!(
-            linear_results.nice_numbers.len(),
-            stride_results.nice_numbers.len(),
-            "Different number of results"
-        );
-
-        for nice in &linear_results.nice_numbers {
-            assert!(
-                stride_results
-                    .nice_numbers
-                    .iter()
-                    .any(|r| r.number == nice.number),
-                "Stride iteration missed number {}",
-                nice.number
-            );
-        }
-    }
-
-    #[test_log::test]
-    fn test_stride_vs_linear_consistency_base40() {
-        // Compare stride iteration against linear iteration for base 40
-        use crate::client_process::process_range_niceonly;
-
-        let base = 40;
-        // Use a small range around the starting point for base 40
-        let range = FieldSize::new(1_999_999_999_900, 1_999_999_999_950);
-
-        // Get results using current implementation
-        let linear_results = process_range_niceonly(&range, base);
-
-        // Get results using stride iteration
-        let stride_results = process_range_with_stride(&range, base, 2);
-
-        // Should find the same numbers
-        assert_eq!(
-            linear_results.nice_numbers.len(),
-            stride_results.nice_numbers.len(),
-            "Different number of results"
-        );
-
-        for nice in &linear_results.nice_numbers {
-            assert!(
-                stride_results
-                    .nice_numbers
-                    .iter()
-                    .any(|r| r.number == nice.number),
-                "Stride iteration missed number {}",
-                nice.number
-            );
-        }
     }
 
     #[test_log::test]

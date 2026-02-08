@@ -29,7 +29,7 @@ use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
 };
-use crate::{lsd_filter, msd_prefix_filter, number_stats, residue_filter};
+use crate::{msd_prefix_filter, number_stats, stride_filter};
 use itertools::Itertools;
 use malachite::base::num::arithmetic::traits::{DivAssignRem, Pow};
 use malachite::base::num::conversion::traits::Digits;
@@ -211,62 +211,23 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
 /// is inclusive and `range_end` is exclusive, following Rust's standard convention.
 #[must_use]
 pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
-    return crate::stride_filter::process_range_with_stride(range, base, 1);
-
-    // Precompute these for faster filter checking
-    let base_u128 = u128::from(base);
-    let base_u128_minusone = base_u128 - 1;
-
     // Use recursive subdivision to get valid ranges that need processing.
     // This adaptively subdivides the range to skip portions where the MSD prefix indicates
     // all numbers will have duplicate/overlapping digits. It's more effective than fixed
     // chunking because it only subdivides when needed and can find natural boundaries.
-    let valid_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
+    let valid_msd_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
 
-    // Build multi-digit LSD filter
-    // Instead of checking just the last digit (mod b), this checks the last k digits (mod b^k).
-    // For each k-digit suffix, it verifies that no digit appears in both n² mod b^k and n³ mod b^k.
-    // This is significantly more effective than single-digit LSD filtering because it catches
-    // collisions in positions beyond just the rightmost digit.
-    //
-    // Recommended k values: k=2 for bases ≥30, k=3 for smaller bases.
-    // For base 40 with k=2, this filters out ~60% of candidates (vs ~40% for k=1).
-    let k = lsd_filter::get_recommended_k(base);
-    let multi_lsd_bitmap = lsd_filter::get_valid_multi_lsd_bitmap(base, k);
-    let multi_lsd_modulus = u128::from(base.pow(k));
-
-    // Build a bit array for residue filter
-    let residue_valid = residue_filter::get_residue_filter_u128(&base);
-    let mut residue_bits = vec![false; (base - 1) as usize];
-    for &residue in &residue_valid {
-        residue_bits[residue as usize] = true;
-    }
+    // Build the stride table, which integrates the residue filter (mod b-1) and
+    // the multi-digit LSD filter (mod b^k). This allows us to jump between valid
+    // candidates instead of iterating over each one.
+    // TODO: Precompute this and cache it outside this loop
+    let k = 1;
+    let stride_table = stride_filter::StrideTable::new(base, k);
 
     let mut nice_list = Vec::new();
-    for r in valid_ranges {
-        for num in r.range_iter() {
-            // Multi-digit LSD filter check (Filter A) - uses direct array indexing for speed
-            let multi_lsd_suffix = (num % multi_lsd_modulus) as usize;
-            debug_assert!(multi_lsd_suffix < multi_lsd_bitmap.len());
-            if !multi_lsd_bitmap[multi_lsd_suffix] {
-                continue;
-            }
-
-            // Bit array lookups for residue filter
-            let residue = (num % base_u128_minusone) as usize;
-            debug_assert!(residue < residue_bits.len());
-            if !residue_bits[residue] {
-                continue;
-            }
-
-            // Actually check if it's 100% nice with early termination
-            if get_is_nice(num, base) {
-                nice_list.push(NiceNumberSimple {
-                    number: num,
-                    num_uniques: base,
-                });
-            }
-        }
+    for sub_range in valid_msd_ranges {
+        let sub_results = stride_table.iterate_range(&sub_range, base);
+        nice_list.extend(sub_results);
     }
 
     FieldResults {
