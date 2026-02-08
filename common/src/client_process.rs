@@ -217,11 +217,15 @@ pub fn process_range_niceonly(range: &FieldSize, base: u32) -> FieldResults {
     // chunking because it only subdivides when needed and can find natural boundaries.
     let valid_msd_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
 
+    // Set `k`, which is the number of digits to consider for the multi-digit LSD filter.
+    // Values higher than this could technically be more performant but so far have
+    // actually decreased performance.
+    let k = 1;
+
     // Build the stride table, which integrates the residue filter (mod b-1) and
     // the multi-digit LSD filter (mod b^k). This allows us to jump between valid
     // candidates instead of iterating over each one.
     // TODO: Precompute this and cache it outside this loop
-    let k = 1;
     let stride_table = stride_filter::StrideTable::new(base, k);
 
     let mut nice_list = Vec::new();
