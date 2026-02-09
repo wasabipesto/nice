@@ -1,24 +1,31 @@
 //! Stride-based iteration using the Chinese Remainder Theorem (CRT).
 //!
 //! Instead of iterating through every integer and filtering, we use CRT to combine
-//! the residue filter (mod b-1) and the multi-digit LSD filter (mod b^k) into a single
-//! modulus M = (b-1) × b^k.
+//! multiple filters into a single modulus. Currently combines:
+//! - Residue filter (mod b-1)
+//! - Multi-digit LSD filter (mod b^k)
+//! - Alternating sum filter (mod b+1)
 //!
 //! We precompute which residues mod M are valid, then iterate by jumping directly from
 //! one valid candidate to the next using a gap table. This has zero filter overhead
 //! per candidate - we simply never visit invalid candidates.
 
 use crate::client_process::get_is_nice;
-use crate::{FieldSize, NiceNumberSimple, lsd_filter, residue_filter};
+use crate::{FieldSize, NiceNumberSimple, alternating_sum_filter, lsd_filter, residue_filter};
 use log::trace;
+use std::collections::HashSet;
 
 /// A precomputed stride table for efficient CRT-based iteration.
 ///
-/// This table combines the residue filter (mod b-1) and multi-digit LSD filter (mod b^k)
-/// into a single modulus using the Chinese Remainder Theorem. Instead of checking filters
-/// for each candidate, we can jump directly from one valid candidate to the next.
+/// This table combines multiple filters using the Chinese Remainder Theorem:
+/// - Residue filter (mod b-1)
+/// - Multi-digit LSD filter (mod b^k)
+/// - Alternating sum filter (mod b+1)
+///
+/// Instead of checking filters for each candidate, we can jump directly from one
+/// valid candidate to the next.
 pub struct StrideTable {
-    /// The combined modulus: M = (b-1) × b^k
+    /// The combined modulus: M = lcm((b-1) × b^k, b+1)
     pub modulus: u128,
     /// Sorted list of valid residues mod M
     pub valid_residues: Vec<u128>,
@@ -40,20 +47,37 @@ impl StrideTable {
     pub fn new(base: u32, k: u32) -> Self {
         let b_minus_1 = u128::from(base - 1);
         let b_k = u128::from(base).pow(k);
-        let modulus = b_minus_1 * b_k; // CRT: gcd(b-1, b^k) = 1
+        let b_plus_1 = u128::from(base) + 1;
+
+        // Compute the combined modulus using LCM
+        // gcd(b-1, b^k) = 1 (coprime)
+        // gcd(b+1, b-1) = gcd(2, b-1) which is 1 or 2
+        // gcd(b+1, b^k) depends on gcd(b+1, b) = gcd(1, b) = 1
+        let m1 = b_minus_1 * b_k; // (b-1) × b^k
+        let gcd_m1_bplus1 = gcd(m1, b_plus_1);
+        let modulus = m1 * b_plus_1 / gcd_m1_bplus1; // lcm(m1, b+1)
 
         // Get the residue filter valid set (mod b-1)
-        let residue_set = residue_filter::get_residue_filter_u128(&base);
+        let residue_set: HashSet<u128> = residue_filter::get_residue_filter_u128(&base)
+            .into_iter()
+            .collect();
 
         // Get the multi-digit LSD filter bitmap (mod b^k)
         let lsd_bitmap = lsd_filter::get_valid_multi_lsd_bitmap(base, k);
 
-        // Find all residues r mod M that satisfy both filters
+        // Get the alternating sum filter valid set (mod b+1)
+        let alt_sum_set: HashSet<u128> = alternating_sum_filter::get_alternating_sum_filter(&base)
+            .into_iter()
+            .collect();
+
+        // Find all residues r mod M that satisfy all three filters
         let mut valid_residues = Vec::new();
         for r in 0..modulus {
             let passes_residue = residue_set.contains(&(r % b_minus_1));
             let passes_lsd = lsd_bitmap[(r % b_k) as usize];
-            if passes_residue && passes_lsd {
+            let passes_alt_sum = alt_sum_set.contains(&(r % b_plus_1));
+
+            if passes_residue && passes_lsd && passes_alt_sum {
                 valid_residues.push(r);
             }
         }
@@ -73,7 +97,7 @@ impl StrideTable {
         #[allow(clippy::cast_precision_loss)]
         {
             trace!(
-                "Stride table for base {base} k={k}: modulus={modulus}, {} valid residues ({:.2}% pass rate)",
+                "Stride table for base {base} k={k}: modulus={modulus}, {} valid residues ({:.2}% pass rate) [residue + LSD + alt_sum filters]",
                 valid_residues.len(),
                 100.0 * valid_residues.len() as f64 / modulus as f64
             );
@@ -155,6 +179,16 @@ impl StrideTable {
     }
 }
 
+/// Compute the greatest common divisor using Euclid's algorithm.
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let temp = b;
+        b = a % b;
+        a = temp;
+    }
+    a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,8 +197,9 @@ mod tests {
     fn test_stride_table_base10_k1() {
         let table = StrideTable::new(10, 1);
 
-        // Base 10: (b-1) = 9, b^1 = 10, M = 90
-        assert_eq!(table.modulus, 90);
+        // Base 10: (b-1) = 9, b^1 = 10, b+1 = 11
+        // M = lcm(90, 11) = 990 (since gcd(90, 11) = 1)
+        assert_eq!(table.modulus, 990);
 
         // Should have valid residues combining both filters
         assert!(!table.valid_residues.is_empty());
@@ -179,8 +214,10 @@ mod tests {
     fn test_stride_table_base40_k2() {
         let table = StrideTable::new(40, 2);
 
-        // Base 40: (b-1) = 39, b^2 = 1600, M = 62400
-        assert_eq!(table.modulus, 62_400);
+        // Base 40: (b-1) = 39, b^2 = 1600, b+1 = 41
+        // M1 = 39 × 1600 = 62400
+        // M = lcm(62400, 41) = 2558400 (since gcd(62400, 41) = 1)
+        assert_eq!(table.modulus, 2_558_400);
 
         // Should filter significantly
         assert!(table.valid_residues.len() < (table.modulus as usize));
@@ -243,5 +280,51 @@ mod tests {
                 "Valid residues should be sorted"
             );
         }
+    }
+
+    #[test_log::test]
+    fn test_gcd() {
+        assert_eq!(gcd(10, 5), 5);
+        assert_eq!(gcd(90, 11), 1);
+        assert_eq!(gcd(100, 50), 50);
+        assert_eq!(gcd(17, 19), 1);
+        assert_eq!(gcd(62400, 41), 1);
+    }
+
+    #[test_log::test]
+    fn test_alternating_sum_filter_integration() {
+        // Test that alternating sum filter is properly integrated
+        let base = 10u32;
+        let table = StrideTable::new(base, 1);
+
+        // The modulus should be lcm((b-1)×b^k, b+1) = lcm(90, 11) = 990
+        assert_eq!(table.modulus, 990);
+
+        // Verify that the number of valid residues is reduced compared to
+        // just residue + LSD filters (which would have modulus 90)
+        let just_residue_lsd = {
+            let b_minus_1 = 9u128;
+            let b_k = 10u128;
+            let m = b_minus_1 * b_k;
+            let residue_set: HashSet<u128> = residue_filter::get_residue_filter_u128(&base)
+                .into_iter()
+                .collect();
+            let lsd_bitmap = lsd_filter::get_valid_multi_lsd_bitmap(base, 1);
+            let mut count = 0;
+            for r in 0..m {
+                if residue_set.contains(&(r % b_minus_1)) && lsd_bitmap[(r % b_k) as usize] {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        // With alternating sum filter, we should have fewer or equal valid residues
+        // (scaled by the modulus ratio)
+        let expected_max = just_residue_lsd * (table.modulus / 90);
+        assert!(
+            table.valid_residues.len() as u128 <= expected_max,
+            "Alternating sum filter should reduce or maintain the valid residue count"
+        );
     }
 }

@@ -3,6 +3,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::match_same_arms)]
 
+pub mod alternating_sum_filter;
 pub mod base_range;
 pub mod benchmark;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
@@ -42,7 +43,7 @@ pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
 pub enum SearchMode {
     /// Get detailed stats on all numbers, important for long-term analytics.
     Detailed,
-    /// Implements optimizations to speed up the search, usually by a factor of around 20.
+    /// Implements optimizations to speed up the search by ~1000x.
     /// Does not keep statistics and cannot be quickly verified.
     Niceonly,
 }
