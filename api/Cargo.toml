@@ -11,7 +11,7 @@ license-file.workspace = true
 [dependencies]
 nice_common = { workspace = true, features = ["database", "rustls-tls"] }
 chrono = { version = "0.4.43", features = ["serde"] }
-rand = { version = "0.9.2" }
+rand = { version = "0.10.0" }
 rocket = { version = "0.5.1", features = ["json"] }
 rocket_prometheus = { version = "0.10.1" }
 tracing = { version = "0.1" }
