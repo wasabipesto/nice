@@ -1,0 +1,20 @@
+[package]
+name = "nice_msd_experiment"
+description = "an experiment to evaluate MSD filters"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+license-file.workspace = true
+
+[dependencies]
+nice_common = { workspace = true }
+clap = { version = "4.5", features = ["env", "derive"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+rayon = "1.8"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

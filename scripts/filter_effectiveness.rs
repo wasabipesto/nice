@@ -19,30 +19,16 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-fn get_cache_hash(base: u32, max_depth: u32, min_size: u128, subdivision_factor: usize) -> String {
-    // Create a hash of the arguments
-    let mut hasher = Sha256::new();
-    hasher.update(base.to_le_bytes());
-    hasher.update(max_depth.to_le_bytes());
-    hasher.update(min_size.to_le_bytes());
-    hasher.update(subdivision_factor.to_le_bytes());
-    let hash = hasher.finalize();
-    format!("{:x}", hash)
-}
+const MSD_MAX_DEPTH: u32 = 20;
+const MSD_MIN_RANGE_SIZE: u128 = 10_000;
+const MSD_SUBDIVISION_FACTOR: usize = 2;
 
-pub fn get_valid_ranges_size_recursive(
-    range: FieldSize,
-    base: u32,
-    current_depth: u32,
-    max_depth: u32,
-    min_range_size: u128,
-    subdivision_factor: usize,
-) -> u128 {
+pub fn get_valid_ranges_size_recursive(range: FieldSize, base: u32, current_depth: u32) -> u128 {
     // Check if range is too small or we've hit max depth
-    if current_depth >= max_depth {
+    if current_depth >= MSD_MAX_DEPTH {
         return range.size();
     }
-    if range.size() <= min_range_size {
+    if range.size() <= MSD_MIN_RANGE_SIZE {
         return range.size();
     }
 
@@ -52,18 +38,18 @@ pub fn get_valid_ranges_size_recursive(
     }
 
     // Check if subdivision would be worthwhile
-    // If the range is not much larger than min_range_size, don't bother subdividing
-    if range.size() < min_range_size * (subdivision_factor as u128) {
+    // If the range is not much larger than MSD_MIN_RANGE_SIZE, don't bother subdividing
+    if range.size() < MSD_MIN_RANGE_SIZE * (MSD_SUBDIVISION_FACTOR as u128) {
         return range.size();
     }
 
     // Subdivide the range and recursively check each part
-    let chunk_size = range.size() / (subdivision_factor as u128);
+    let chunk_size = range.size() / (MSD_SUBDIVISION_FACTOR as u128);
     let mut total_size = 0u128;
 
-    for i in 0..subdivision_factor {
+    for i in 0..MSD_SUBDIVISION_FACTOR {
         let sub_start = range.start() + (i as u128) * chunk_size;
-        let sub_end = if i == subdivision_factor - 1 {
+        let sub_end = if i == MSD_SUBDIVISION_FACTOR - 1 {
             range.end() // Last chunk gets any remainder
         } else {
             sub_start + chunk_size
@@ -71,14 +57,7 @@ pub fn get_valid_ranges_size_recursive(
         let sub_range = FieldSize::new(sub_start, sub_end);
 
         if sub_start < sub_end {
-            let sub_size = get_valid_ranges_size_recursive(
-                sub_range,
-                base,
-                current_depth + 1,
-                max_depth,
-                min_range_size,
-                subdivision_factor,
-            );
+            let sub_size = get_valid_ranges_size_recursive(sub_range, base, current_depth + 1);
             total_size += sub_size;
         }
     }
@@ -86,15 +65,9 @@ pub fn get_valid_ranges_size_recursive(
     total_size
 }
 
-fn get_msd_filtered_valid_range_cached(
-    base_range: FieldSize,
-    base: u32,
-    max_depth: u32,
-    min_size: u128,
-    subdivision_factor: usize,
-) -> u128 {
+fn get_msd_filtered_valid_range_cached(base_range: FieldSize, base: u32) -> u128 {
     let cache_path = PathBuf::from("cache/msd_cache.json");
-    let cache_hash = get_cache_hash(base, max_depth, min_size, subdivision_factor);
+    let cache_hash = format!("{base}");
 
     // Load existing cache or create new one
     let mut cache: HashMap<String, u128> = if let Ok(mut file) = File::open(&cache_path) {
@@ -114,14 +87,7 @@ fn get_msd_filtered_valid_range_cached(
     }
 
     // Compute the result
-    let size = get_valid_ranges_size_recursive(
-        base_range,
-        base,
-        0,
-        max_depth,
-        min_size,
-        subdivision_factor,
-    );
+    let size = get_valid_ranges_size_recursive(base_range, base, 0);
 
     // Update cache and save
     cache.insert(cache_hash, size);
@@ -245,16 +211,7 @@ fn main() {
         remaining = residue_pass_count;
 
         // Filter 3: MSD Prefix Filter
-        let max_depth = 50;
-        let min_size = 10_000;
-        let subdivision_factor = 2;
-        let filtered_valid_range = get_msd_filtered_valid_range_cached(
-            base_range,
-            base,
-            max_depth,
-            min_size,
-            subdivision_factor,
-        );
+        let filtered_valid_range = get_msd_filtered_valid_range_cached(base_range, base);
 
         let msd_raw_eliminated = total_numbers - filtered_valid_range;
 
@@ -264,7 +221,7 @@ fn main() {
         assert!(msd_marginal_eliminated <= remaining);
         let msd_pass_count = remaining - msd_marginal_eliminated;
 
-        println!("  3. MSD Prefix Filter (Depth {max_depth}):");
+        println!("  3. MSD Prefix Filter (Depth {MSD_MAX_DEPTH}):");
         println!(
             "     Raw efficacy:      {:.3e} eliminated ({:.2}% of original)",
             msd_raw_eliminated as f64,

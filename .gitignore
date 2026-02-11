@@ -9,3 +9,6 @@ core
 profile.json.gz
 output
 cache
+*.db
+*.db-shm
+*.db-wal

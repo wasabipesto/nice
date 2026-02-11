@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["api", "client", "common", "daemon", "jobs", "wasm-client"]
+members = ["api", "client", "common", "daemon", "jobs", "wasm-client", "msd_experiment"]
 default-members = ["client", "common"]
 
 [workspace.package]
