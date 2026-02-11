@@ -10,6 +10,7 @@
 - Configure additional trace logging in the library
 - Replace `--verbose` and `--quiet` with `--log-level`/`-l` and `--no-progress`/`-n`
 - Add support for customizing the number of API retries with `--api-max-retries`
+- Update base bounds script
 
 ## Nice v3.2.11
 
