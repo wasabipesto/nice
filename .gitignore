@@ -8,3 +8,4 @@ core
 .lake
 profile.json.gz
 output
+cache
