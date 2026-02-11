@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## Nice v3.2.12
 
 - Asynchronously submit the previous search field and get the next one while processing to reduce network overhead
 - Reuse server connection between claim/submit requests to reduce network overhead
