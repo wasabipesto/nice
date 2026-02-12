@@ -34,7 +34,7 @@ def plot_filter_effectiveness(data):
     total_elim = [d['total_eliminated_pct'] for d in data]
 
     # Set up the plot
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(21, 15))
 
     x = np.arange(len(bases))
     width = 0.25

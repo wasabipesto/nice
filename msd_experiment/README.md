@@ -2,6 +2,22 @@
 
 This tool computes the effectiveness of the MSD (Most Significant Digit) filter across different bases, with SQLite caching support for resumability, progressive refinement, and parallel processing.
 
+## Process
+
+This tool is designed to be run progressively, since this filter is applied best at small ranges. Since we use a binary search here we can quickly eliminate large invalid ranges without iterating over many items. However, this gets very expensive for very large ranges like bases over 50. Here we cache the results to avoid redoing work. 
+
+You should run this tool over your search range of choice (e.g. base 40-60) and increase your `max_depth` until you have satisfactory results. Past a certain depth level you are just going to be wasting time, this is an estimate just like the actual search client.
+
+You can visualize the results by running `uv run msd_experiment/visualize.py` with your base range to see the filter efficacy over chunks of those bases.
+
+You can visualize this against other filters by running: 
+
+1. `nice_msd_experiment --export_all`
+2. `scripts/filter_effectiveness.rs`
+3. `uv run scripts/filter_effectiveness_chart.py`
+
+Below is Claude's description of the tool.
+
 ## Features
 
 - **Persistent Caching**: All computation results are cached in SQLite, enabling crash recovery
