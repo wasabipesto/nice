@@ -6,6 +6,8 @@
 mod compute;
 mod db;
 
+use compute::flush_write_buffer;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
@@ -132,7 +134,12 @@ fn main() -> Result<()> {
                 args.subdivision_factor,
                 args.verbose,
             ) {
-                Ok(_) => {}
+                Ok(_) => {
+                    // Flush any remaining buffered writes for this thread
+                    if let Err(e) = flush_write_buffer(&pool) {
+                        eprintln!("Error flushing write buffer for base {}: {}", base, e);
+                    }
+                }
                 Err(e) => eprintln!("Error processing base {}: {}", base, e),
             }
         });
@@ -147,6 +154,8 @@ fn main() -> Result<()> {
                 args.subdivision_factor,
                 args.verbose,
             )?;
+            // Flush any remaining buffered writes
+            flush_write_buffer(&pool)?;
         }
     }
 

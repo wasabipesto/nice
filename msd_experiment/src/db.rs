@@ -171,6 +171,47 @@ pub fn cache_range(
         .unwrap_or_else(|| anyhow::anyhow!("Failed to insert cached range after retries")))
 }
 
+/// Store multiple computed results in the cache using a single transaction.
+/// This is much more efficient than calling cache_range multiple times.
+pub fn cache_range_batch(pool: &DbPool, entries: &[CachedRange]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut conn = pool.get().context("Failed to get connection from pool")?;
+
+    // Use a transaction for batch insert
+    let tx = conn.transaction().context("Failed to start transaction")?;
+
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT OR REPLACE INTO msd_cache
+                 (base, range_start, range_end, max_depth, min_range_size,
+                  subdivision_factor, valid_size, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)",
+            )
+            .context("Failed to prepare batch insert statement")?;
+
+        for entry in entries {
+            stmt.execute(params![
+                entry.base,
+                entry.range_start.to_string(),
+                entry.range_end.to_string(),
+                entry.max_depth,
+                entry.min_range_size.to_string(),
+                entry.subdivision_factor,
+                entry.valid_size.to_string(),
+            ])
+            .context("Failed to execute batch insert")?;
+        }
+    }
+
+    tx.commit().context("Failed to commit batch transaction")?;
+
+    Ok(())
+}
+
 /// Get statistics for a specific base.
 #[derive(Debug)]
 pub struct BaseStats {
