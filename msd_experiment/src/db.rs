@@ -1,11 +1,31 @@
 //! Database module for caching MSD filter computation results.
 
 use anyhow::{Context, Result};
+use lru::LruCache;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::num::NonZeroUsize;
 use std::path::Path;
+
+/// Cache key for in-memory LRU cache
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct CacheKey {
+    base: u32,
+    range_start: u128,
+    range_end: u128,
+}
+
+/// In-memory LRU cache for frequently accessed ranges
+/// Capacity of 100,000 entries should cover most hot paths (shallow depths, frequently accessed ranges)
+const MEMORY_CACHE_CAPACITY: usize = 100_000;
+
+thread_local! {
+    static MEMORY_CACHE: RefCell<LruCache<CacheKey, CachedRange>> =
+        RefCell::new(LruCache::new(NonZeroUsize::new(MEMORY_CACHE_CAPACITY).unwrap()));
+}
 
 /// Represents a cached computation result for a specific range.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +94,7 @@ pub fn init_db<P: AsRef<Path>>(db_path: P) -> Result<DbPool> {
 
 /// Get a cached result for a specific range.
 /// Returns None if not found or if the cached depth is less than requested.
+/// Checks in-memory LRU cache first before hitting SQLite.
 pub fn get_cached_range(
     pool: &DbPool,
     base: u32,
@@ -81,6 +102,22 @@ pub fn get_cached_range(
     range_end: u128,
     required_depth: u32,
 ) -> Result<Option<CachedRange>> {
+    let cache_key = CacheKey {
+        base,
+        range_start,
+        range_end,
+    };
+
+    // Check in-memory cache first
+    let memory_hit = MEMORY_CACHE.with(|cache| cache.borrow_mut().get(&cache_key).cloned());
+
+    if let Some(cached) = memory_hit {
+        if cached.max_depth >= required_depth {
+            return Ok(Some(cached));
+        }
+    }
+
+    // Cache miss - query SQLite
     let conn = pool.get().context("Failed to get connection from pool")?;
 
     let mut stmt = conn
@@ -112,7 +149,13 @@ pub fn get_cached_range(
 
     // Only return if the cached depth is sufficient
     match result {
-        Some(cached) if cached.max_depth >= required_depth => Ok(Some(cached)),
+        Some(cached) if cached.max_depth >= required_depth => {
+            // Store in memory cache for future lookups
+            MEMORY_CACHE.with(|cache| {
+                cache.borrow_mut().put(cache_key, cached.clone());
+            });
+            Ok(Some(cached))
+        }
         _ => Ok(None),
     }
 }
@@ -173,6 +216,7 @@ pub fn cache_range(
 
 /// Store multiple computed results in the cache using a single transaction.
 /// This is much more efficient than calling cache_range multiple times.
+/// Also populates the in-memory cache for future reads.
 pub fn cache_range_batch(pool: &DbPool, entries: &[CachedRange]) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -208,6 +252,19 @@ pub fn cache_range_batch(pool: &DbPool, entries: &[CachedRange]) -> Result<()> {
     }
 
     tx.commit().context("Failed to commit batch transaction")?;
+
+    // Populate memory cache with written entries
+    MEMORY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        for entry in entries {
+            let cache_key = CacheKey {
+                base: entry.base,
+                range_start: entry.range_start,
+                range_end: entry.range_end,
+            };
+            cache.put(cache_key, entry.clone());
+        }
+    });
 
     Ok(())
 }
@@ -291,6 +348,7 @@ pub fn get_all_ranges_for_base(pool: &DbPool, base: u32) -> Result<Vec<CachedRan
 }
 
 /// Clear all cached data for a specific base.
+/// Also clears relevant entries from the in-memory cache.
 pub fn clear_base_cache(pool: &DbPool, base: u32) -> Result<usize> {
     let conn = pool.get().context("Failed to get connection from pool")?;
 
@@ -298,5 +356,28 @@ pub fn clear_base_cache(pool: &DbPool, base: u32) -> Result<usize> {
         .execute("DELETE FROM msd_cache WHERE base = ?1", params![base])
         .context("Failed to clear base cache")?;
 
+    // Clear entries for this base from memory cache
+    MEMORY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // Collect keys to remove (LruCache doesn't have retain method)
+        let keys_to_remove: Vec<_> = cache
+            .iter()
+            .filter(|(key, _)| key.base == base)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for key in keys_to_remove {
+            cache.pop(&key);
+        }
+    });
+
     Ok(affected)
+}
+
+/// Get statistics about the in-memory cache (for monitoring/debugging)
+pub fn get_memory_cache_stats() -> (usize, usize) {
+    MEMORY_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        (cache.len(), MEMORY_CACHE_CAPACITY)
+    })
 }

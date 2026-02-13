@@ -164,6 +164,17 @@ fn main() -> Result<()> {
     println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
     println!("Database: {}", args.db_path.display());
 
+    // Show memory cache stats if verbose
+    if args.verbose {
+        let (cache_size, cache_capacity) = db::get_memory_cache_stats();
+        println!(
+            "Memory cache: {}/{} entries ({:.1}% full)",
+            cache_size,
+            cache_capacity,
+            (cache_size as f64 / cache_capacity as f64) * 100.0
+        );
+    }
+
     Ok(())
 }
 
@@ -207,7 +218,7 @@ fn compute_and_report_base(
     let filtered_pct = (filtered_size as f64 / total_size as f64) * 100.0;
 
     println!(
-        "Base {:3}: {:.3e} → {:.3e} ({:.2}% filtered) in {:.2}s",
+        "Base {}: {:.3e} → {:.3e} ({:.2}% filtered) in {:.2}s",
         base,
         total_size as f64,
         valid_size as f64,
