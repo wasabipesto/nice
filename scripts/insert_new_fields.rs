@@ -1,26 +1,27 @@
 #!/usr/bin/env rust-script
 //! ```cargo
 //! [dependencies]
-//! nice_common = { path = "../common" }
+//! nice_common = { path = "../common", features = ["database"] }
 //! clap = "4.4"
 //! read_input = "0.8"
 //! ```
 
 use clap::Parser;
+use nice_common::{FieldSize, DEFAULT_FIELD_SIZE};
 use read_input::prelude::*;
 
-fn print_field(i: usize, field: &nice_common::FieldSize) -> () {
+fn print_field(i: usize, field: &FieldSize) -> () {
     println!("Field #{}:", i + 1);
-    println!("  Start: {}", field.range_start);
-    println!("  End:   {}", field.range_end);
-    println!("  Size:  {}", field.range_size);
+    println!("  Start: {start} ({start:.2e})", start = field.start());
+    println!("  End:   {end} ({end:.2e})", end = field.end());
+    println!("  Size:  {size} ({size:.0e})", size = field.size());
 }
 
-fn print_chunk(i: usize, field: &nice_common::FieldSize) -> () {
+fn print_chunk(i: usize, chunk: &FieldSize) -> () {
     println!("Chunk #{}:", i + 1);
-    println!("  Start: {}", field.range_start);
-    println!("  End:   {}", field.range_end);
-    println!("  Size:  {}", field.range_size);
+    println!("  Start: {start} ({start:.2e})", start = chunk.start());
+    println!("  End:   {end} ({end:.2e})", end = chunk.end());
+    println!("  Size:  {size} ({size:.0e})", size = chunk.size());
 }
 
 #[derive(Parser)]
@@ -34,22 +35,25 @@ fn main() {
     let cli = Cli::parse();
     let base = cli.base;
 
-    let field_size = 1000000000;
-    println!("Using default field size {}.", field_size);
+    let field_size = DEFAULT_FIELD_SIZE * 100;
+    println!("Using field size {:.0e}.", field_size);
     println!();
 
     let base_range = nice_common::base_range::get_base_range_u128(base)
         .unwrap()
         .expect("Base has no valid range!");
     println!("Base Range:");
-    println!("  Base:    {}", base);
-    println!("  Minimum: {}", base_range.range_start);
-    println!("  Maximum: {}", base_range.range_end);
+    println!("  Base:    {base}");
+    println!(
+        "  Minimum: {start} ({start:.2e})",
+        start = base_range.start()
+    );
+    println!("  Maximum: {start} ({start:.2e})", start = base_range.end());
     println!();
 
     let fields = nice_common::generate_fields::break_range_into_fields(
-        base_range.range_start,
-        base_range.range_end,
+        base_range.start(),
+        base_range.end(),
         field_size,
     );
 
@@ -59,7 +63,10 @@ fn main() {
         }
 
         println!();
-        println!("... {} fields omitted ...", fields.len() - 10);
+        println!(
+            "... {num} ({num:.2e}) fields omitted ...",
+            num = fields.len() - 10
+        );
         println!();
 
         for (i, field) in fields.iter().rev().take(5).rev().enumerate() {
@@ -98,17 +105,17 @@ fn main() {
         return;
     }
     let mut conn = nice_common::db_util::get_database_connection();
-    if let Ok(base_data) = nice_common::db_util::get_base_by_id(&mut conn, base) {
+    if let Ok(base_data) = nice_common::db_util::bases::get_base_by_id(&mut conn, base) {
         panic!("Base {} already exists: {:?}", base, base_data)
     }
 
     println!("Inserting base {}...", base);
-    nice_common::db_util::insert_new_base(&mut conn, base, base_range).unwrap();
+    nice_common::db_util::bases::insert_base(&mut conn, base, base_range).unwrap();
     println!("Inserting {} fields...", fields.len());
-    nice_common::db_util::insert_new_fields(&mut conn, base, fields.clone()).unwrap();
+    nice_common::db_util::fields::insert_fields(&mut conn, base, &fields).unwrap();
     println!("Inserting {} chunks...", chunks.len());
-    nice_common::db_util::insert_new_chunks(&mut conn, base, chunks.clone()).unwrap();
+    nice_common::db_util::chunks::insert_chunks(&mut conn, base, &chunks).unwrap();
     println!("Updating base {} chunk assignments...", base);
-    nice_common::db_util::reassign_fields_to_chunks(&mut conn, base).unwrap();
+    nice_common::db_util::chunks::reassign_fields_to_chunks(&mut conn, base).unwrap();
     println!("Database updated.")
 }
