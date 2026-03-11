@@ -394,6 +394,18 @@ pub fn get_valid_ranges(range: FieldSize, base: u32) -> Vec<FieldSize> {
     )
 }
 
+/// Returns the effectiveness of the filter by comparing the size of passing
+/// ranges to the total range size.
+#[allow(clippy::cast_precision_loss)]
+pub fn get_filter_effectiveness(start: u128, base: u32) -> f64 {
+    let range_size = crate::PROCESSING_CHUNK_SIZE;
+    let range = FieldSize::new(start, start + range_size);
+    let valid_ranges = get_valid_ranges(range, base);
+    let valid_range_size = valid_ranges.iter().map(FieldSize::size).sum::<u128>();
+    let total_range_size = range.size();
+    1.0 - valid_range_size as f64 / total_range_size as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
