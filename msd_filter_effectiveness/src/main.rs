@@ -215,14 +215,24 @@ fn load_or_initialize_stats(
 }
 
 fn save_stats(output_file: &str, stats: &AggregatedStats) -> Result<()> {
+    // Write to a temporary file first, then atomically rename to prevent data loss
+    // if the process is interrupted during the write
+    let temp_file = format!("{}.tmp", output_file);
+
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(output_file)?;
+        .open(&temp_file)?;
 
     let json = serde_json::to_string_pretty(stats)?;
     write!(file, "{}", json)?;
+
+    // Ensure all data is flushed to disk before renaming
+    file.sync_all()?;
+
+    // Atomically replace the old file with the new one
+    std::fs::rename(&temp_file, output_file)?;
 
     Ok(())
 }
