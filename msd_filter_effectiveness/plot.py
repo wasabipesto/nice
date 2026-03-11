@@ -104,7 +104,7 @@ def main():
 
     heatmap_array = np.array(heatmap_data)
 
-    im = ax2.imshow(heatmap_array, aspect='auto', cmap='viridis', vmin=0, vmax=1)
+    im = ax2.imshow(heatmap_array, aspect='auto', cmap='viridis', vmin=0.8, vmax=1)
 
     ax2.set_xlabel("Chunk Index (0-99)", fontsize=12)
     ax2.set_ylabel("Base", fontsize=12)
