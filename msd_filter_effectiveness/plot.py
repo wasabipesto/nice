@@ -122,6 +122,34 @@ def main():
     plt.savefig(heatmap_path, dpi=150, bbox_inches='tight')
     print(f"Heatmap saved to {heatmap_path}")
 
+    # Calculate and print summary table
+    print("\n" + "=" * 60)
+    print("Summary Table: Mean Filter Effectiveness by Base")
+    print("=" * 60)
+    print(f"{'Base':<10} {'Mean Effectiveness':<20} {'Sample Count':<15}")
+    print("-" * 60)
+
+    summary_data = []
+    for base_str, chunks in aggregated_stats.items():
+        base = int(base_str)
+        total_sum = sum(chunk["sum"] for chunk in chunks)
+        total_count = sum(chunk["count"] for chunk in chunks)
+
+        if total_count > 0:
+            mean_effectiveness = total_sum / total_count
+        else:
+            mean_effectiveness = 0.0
+
+        summary_data.append((base, mean_effectiveness, total_count))
+
+    # Sort by base
+    summary_data.sort(key=lambda x: x[0])
+
+    for base, mean_eff, count in summary_data:
+        print(f"{base:<10} {mean_eff:<20.6f} {count:<15,}")
+
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
