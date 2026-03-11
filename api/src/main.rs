@@ -16,8 +16,8 @@ use nice_common::db_util::{
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
 use nice_common::{
-    CLAIM_DURATION_HOURS, DEFAULT_FIELD_SIZE, DataToClient, DataToServer, FieldClaimStrategy,
-    NiceNumber, SearchMode, ValidationData,
+    CLAIM_DURATION_HOURS, DataToClient, DataToServer, FieldClaimStrategy, NiceNumber, SearchMode,
+    ValidationData,
 };
 use rand::Rng;
 use rocket::State;
@@ -35,6 +35,11 @@ use helpers::{
     ApiErrorBody, ApiResult, CorsFairing, RequestTimingFairing, bad_request_error, internal_error,
     not_found_error, unprocessable_entity_error,
 };
+
+/// Detailed runners will never get a field larger than this.
+/// Currently set to 1e9, which corresponds to base 50 and takes about a minute
+/// to process on modern runners.
+const DETAILED_SEARCH_MAX_FIELD_SIZE: u128 = 1_000_000_000;
 
 #[get("/claim/validate")]
 fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
@@ -76,29 +81,29 @@ fn claim_helper(
     // Get an RNG thread for random numbers later
     let mut rng = rand::rng();
 
-    let (claim_strategy, max_check_level) = match search_mode {
+    let (claim_strategy, max_check_level, max_range_size) = match search_mode {
         SearchMode::Niceonly => {
             // For Niceonly, only ever get the next unchecked field
-            (FieldClaimStrategy::Next, 0)
+            (FieldClaimStrategy::Next, 0, u128::MAX)
         }
         SearchMode::Detailed => {
             // For Detailed, only ever get the next unchecked field
             match rng.random_range(1..=100) {
                 // 60% chance: get random field in a thin chunk
-                1..=60 => (FieldClaimStrategy::Thin, 1),
+                1..=60 => (FieldClaimStrategy::Thin, 1, DETAILED_SEARCH_MAX_FIELD_SIZE),
                 // 30% chance: get next field in any chunk
-                61..=90 => (FieldClaimStrategy::Next, 1),
+                61..=90 => (FieldClaimStrategy::Next, 1, DETAILED_SEARCH_MAX_FIELD_SIZE),
                 // 5% chance: recheck a previously checked field
-                91..=96 => (FieldClaimStrategy::Next, 2),
+                91..=96 => (FieldClaimStrategy::Next, 2, DETAILED_SEARCH_MAX_FIELD_SIZE),
                 // 5% chance: get random unchecked field
-                _ => (FieldClaimStrategy::Random, 1),
+                _ => (
+                    FieldClaimStrategy::Random,
+                    1,
+                    DETAILED_SEARCH_MAX_FIELD_SIZE,
+                ),
             }
         }
     };
-
-    // This won't affect anything since all fields will be this size or smaller
-    // TODO: Implement an "online benchmarking" option for e.g. GH runners that limits this
-    let max_range_size = DEFAULT_FIELD_SIZE;
 
     // Get the field to search based on claim strategy, max check level, etc.
     //

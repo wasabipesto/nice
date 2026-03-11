@@ -34,7 +34,6 @@ pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 pub const DOWNSAMPLE_CUTOFF_PERCENT: f32 = 0.2;
 pub const CLAIM_DURATION_HOURS: i64 = 1;
 pub const CLIENT_REQUEST_TIMEOUT_SECS: u64 = 5;
-pub const DEFAULT_FIELD_SIZE: u128 = 1_000_000_000;
 pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
 
 /// Each possible search mode the server and client supports.

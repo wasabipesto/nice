@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add additional fields to the database in bases 52, 53, and 54
+- Remove dependence on the DEFAULT_FIELD_SIZE constant. The newest fields are larger than this so the server and client are now able to handle them properly. Detailed search claims will be limited to the previous max size (1e9).
+
 ## Nice v3.2.12
 
 - Asynchronously submit the previous search field and get the next one while processing to reduce network overhead
