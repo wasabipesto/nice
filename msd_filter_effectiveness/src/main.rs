@@ -36,6 +36,10 @@ struct Args {
     /// Number of chunks per base
     #[arg(long, default_value = "1000")]
     num_chunks: usize,
+
+    /// Minimum samples per chunk - ensures under-sampled chunks get at least one sample per batch
+    #[arg(long, default_value = "1")]
+    min_samples_per_chunk: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -93,14 +97,48 @@ fn main() -> Result<()> {
 
     // Loop indefinitely
     loop {
+        // First, generate samples for under-sampled chunks if needed
+        let mut forced_samples: Vec<(u32, usize, f64)> = Vec::new();
+
+        if args.min_samples_per_chunk > 0 {
+            let stats_guard = stats.lock().unwrap();
+
+            for (base, range_start, range_end) in &bases_with_ranges {
+                if let Some(chunks) = stats_guard.get(base) {
+                    let chunk_size = (*range_end - *range_start) as f64 / args.num_chunks as f64;
+
+                    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                        if chunk.count < args.min_samples_per_chunk {
+                            // Generate a sample for this under-sampled chunk
+                            let mut rng = rand::rng();
+
+                            // Pick a random number within this chunk's range
+                            let chunk_start_offset = chunk_idx as f64 * chunk_size;
+                            let offset_in_chunk: u128 = rng.random_range(0..chunk_size as u128);
+                            let offset = chunk_start_offset as u128 + offset_in_chunk;
+                            let num_start = *range_start + offset;
+
+                            // Calculate effectiveness
+                            let effectiveness = get_filter_effectiveness(num_start, *base);
+
+                            forced_samples.push((*base, chunk_idx, effectiveness));
+                        }
+                    }
+                }
+            }
+        }
+
         // Clone data for use in parallel closure
         let bases_clone = bases_with_ranges.clone();
         let weighted_clone = weighted_index.clone();
         let stats_clone = Arc::clone(&stats);
         let num_chunks = args.num_chunks;
 
-        // Process a batch of samples in parallel
-        let batch_updates: Vec<(u32, usize, f64)> = (0..args.batch_size)
+        // Calculate how many regular samples we need (batch_size minus forced samples)
+        let regular_sample_count = args.batch_size.saturating_sub(forced_samples.len());
+
+        // Process regular samples in parallel
+        let mut batch_updates: Vec<(u32, usize, f64)> = (0..regular_sample_count)
             .into_par_iter()
             .map(|_| {
                 let mut rng = rand::rng();
@@ -124,6 +162,9 @@ fn main() -> Result<()> {
                 (base, chunk_idx, effectiveness)
             })
             .collect();
+
+        // Add forced samples to batch updates
+        batch_updates.extend(forced_samples);
 
         // Update aggregated stats
         {
