@@ -10,85 +10,48 @@
 import json
 import matplotlib.pyplot as plt
 import numpy as np
-from tqdm import tqdm
 from pathlib import Path
 
 
 def main():
-    # Get base range start/end from output/base_data.json
-    base_data_path = Path("output/base_data.json")
-    with open(base_data_path) as f:
-        base_data = json.load(f)
+    # Load aggregated stats
+    stats_path = Path("output/aggregated_stats.json")
+    with open(stats_path) as f:
+        aggregated_stats = json.load(f)
 
-    # Create a dictionary for quick lookup
-    base_ranges = {item["base"]: (item["start"], item["end"]) for item in base_data}
-    print("Base data loaded.")
+    print(f"Loaded aggregated stats for {len(aggregated_stats)} bases")
 
-    # Build base range chunks by dividing base range into 100 chunks
-    num_chunks = 100
-    base_chunks = {}
+    # Convert 1000 chunks to 100 chunks for display
+    num_chunks_display = 100
+    chunks_per_display = 10  # 1000 / 100
 
-    for base, (start, end) in base_ranges.items():
-        chunk_size = (end - start) / num_chunks
-        chunks = []
-        for i in range(num_chunks):
-            chunk_start = start + i * chunk_size
-            chunk_end = start + (i + 1) * chunk_size
-            chunks.append((chunk_start, chunk_end))
-        base_chunks[base] = chunks
-    print("Chunks generated.")
-
-    # Load JSONL data file and aggregate statistics per chunk
-    jsonl_path = Path("output/msd_filter_samples.jsonl")
-
-    # Initialize aggregation structure: {base: [(sum, count), ...]}
-    chunk_stats = {}
-
-    # Count total lines for progress bar
-    print("Counting lines...")
-    with open(jsonl_path) as f:
-        total_lines = sum(1 for _ in f)
-    print(f"Processing {total_lines:,} lines...")
-
-    with open(jsonl_path) as f:
-        for line in tqdm(f, total=total_lines):
-            if line.strip():
-                try:
-                    sample = json.loads(line)
-                    base = sample["base"]
-
-                    if base not in base_chunks:
-                        continue
-
-                    # Initialize chunk stats for this base if needed
-                    if base not in chunk_stats:
-                        chunk_stats[base] = [[0.0, 0] for _ in range(num_chunks)]
-
-                    num_start = sample["num_start"]
-                    effectiveness = sample["effectiveness"]
-
-                    # Find which chunk this sample belongs to
-                    chunks = base_chunks[base]
-                    for i, (chunk_start, chunk_end) in enumerate(chunks):
-                        if chunk_start <= num_start < chunk_end:
-                            chunk_stats[base][i][0] += effectiveness
-                            chunk_stats[base][i][1] += 1
-                            break
-                except json.JSONDecodeError:
-                    # Skip malformed lines (e.g., incomplete writes)
-                    continue
-    print("Samples loaded and aggregated.")
-
-    # Calculate mean effectiveness for each chunk
     chunk_effectiveness = {}
-    for base, stats in chunk_stats.items():
+
+    for base_str, chunks in aggregated_stats.items():
+        base = int(base_str)
         means = []
-        for sum_val, count in stats:
-            if count > 0:
-                means.append(sum_val / count)
+
+        # Process in groups of 10 to average down to 100 chunks
+        for i in range(num_chunks_display):
+            start_idx = i * chunks_per_display
+            end_idx = start_idx + chunks_per_display
+
+            # Aggregate the 10 chunks into one
+            total_sum = 0.0
+            total_count = 0
+
+            for chunk in chunks[start_idx:end_idx]:
+                total_sum += chunk["sum"]
+                total_count += chunk["count"]
+
+            if total_count > 0:
+                means.append(total_sum / total_count)
             else:
                 means.append(np.nan)
+
         chunk_effectiveness[base] = means
+
+    print("Aggregated to 100 chunks for display")
 
     # Plot filter effectiveness per chunk for all bases
     fig, ax = plt.subplots(figsize=(14, 8))
@@ -101,7 +64,7 @@ def main():
 
     for idx, base in enumerate(bases):
         means = chunk_effectiveness[base]
-        x = np.arange(num_chunks)
+        x = np.arange(num_chunks_display)
 
         # Plot only non-NaN values
         valid_mask = ~np.isnan(means)
@@ -120,7 +83,7 @@ def main():
     ax.set_title("MSD Filter Effectiveness by Base and Position", fontsize=14)
     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8, ncol=2)
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(0, num_chunks - 1)
+    ax.set_xlim(0, num_chunks_display - 1)
     ax.set_ylim(0, 1)
 
     plt.tight_layout()
