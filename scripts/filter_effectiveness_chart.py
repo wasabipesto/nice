@@ -69,7 +69,7 @@ def plot_filter_effectiveness(data):
     # Add value labels on top of bars in second subplot
     for bar in bars4:
         height = bar.get_height()
-        ax2.annotate(f'{height:.1f}%',
+        ax2.annotate(f'{height:.3f}%',
                     xy=(bar.get_x() + bar.get_width() / 2, height),
                     xytext=(0, -3),
                     textcoords="offset points",

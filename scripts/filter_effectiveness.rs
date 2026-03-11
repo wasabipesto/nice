@@ -4,139 +4,45 @@
 //! nice_common = { path = "../common" }
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
-//! sha2 = "0.10"
 //! ```
 
 use nice_common::base_range::get_base_range_u128;
 use nice_common::lsd_filter::get_valid_lsds;
-use nice_common::msd_prefix_filter::has_duplicate_msd_prefix;
 use nice_common::residue_filter::get_residue_filter;
-use nice_common::FieldSize;
-use serde::Serialize;
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 
-fn get_cache_hash(base: u32, max_depth: u32, min_size: u128, subdivision_factor: usize) -> String {
-    // Create a hash of the arguments
-    let mut hasher = Sha256::new();
-    hasher.update(base.to_le_bytes());
-    hasher.update(max_depth.to_le_bytes());
-    hasher.update(min_size.to_le_bytes());
-    hasher.update(subdivision_factor.to_le_bytes());
-    let hash = hasher.finalize();
-    format!("{:x}", hash)
+#[derive(Debug, Deserialize, Clone)]
+struct ChunkStats {
+    chunk_index: usize,
+    chunk_start: f64,
+    chunk_end: f64,
+    sum: f64,
+    count: u64,
 }
 
-pub fn get_valid_ranges_size_recursive(
-    range: FieldSize,
-    base: u32,
-    current_depth: u32,
-    max_depth: u32,
-    min_range_size: u128,
-    subdivision_factor: usize,
-) -> u128 {
-    // Check if range is too small or we've hit max depth
-    if current_depth >= max_depth {
-        return range.size();
-    }
-    if range.size() <= min_range_size {
-        return range.size();
-    }
+type AggregatedStats = HashMap<u32, Vec<ChunkStats>>;
 
-    // Check if the entire range can be skipped
-    if has_duplicate_msd_prefix(range, base) {
-        return 0;
-    }
-
-    // Check if subdivision would be worthwhile
-    // If the range is not much larger than min_range_size, don't bother subdividing
-    if range.size() < min_range_size * (subdivision_factor as u128) {
-        return range.size();
-    }
-
-    // Subdivide the range and recursively check each part
-    let chunk_size = range.size() / (subdivision_factor as u128);
-    let mut total_size = 0u128;
-
-    for i in 0..subdivision_factor {
-        let sub_start = range.start() + (i as u128) * chunk_size;
-        let sub_end = if i == subdivision_factor - 1 {
-            range.end() // Last chunk gets any remainder
-        } else {
-            sub_start + chunk_size
-        };
-        let sub_range = FieldSize::new(sub_start, sub_end);
-
-        if sub_start < sub_end {
-            let sub_size = get_valid_ranges_size_recursive(
-                sub_range,
-                base,
-                current_depth + 1,
-                max_depth,
-                min_range_size,
-                subdivision_factor,
-            );
-            total_size += sub_size;
-        }
-    }
-
-    total_size
+fn load_msd_stats() -> Result<AggregatedStats, String> {
+    let path = "output/aggregated_stats.json";
+    let mut file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|e| format!("Failed to read {}: {}", path, e))?;
+    serde_json::from_str(&contents).map_err(|e| format!("Failed to parse {}: {}", path, e))
 }
 
-fn get_msd_filtered_valid_range_cached(
-    base_range: FieldSize,
-    base: u32,
-    max_depth: u32,
-    min_size: u128,
-    subdivision_factor: usize,
-) -> u128 {
-    let cache_path = PathBuf::from("cache/msd_cache.json");
-    let cache_hash = get_cache_hash(base, max_depth, min_size, subdivision_factor);
-
-    // Load existing cache or create new one
-    let mut cache: HashMap<String, u128> = if let Ok(mut file) = File::open(&cache_path) {
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_ok() {
-            serde_json::from_str(&contents).unwrap_or_default()
-        } else {
-            HashMap::new()
+fn get_msd_effectiveness(msd_stats: &AggregatedStats, base: u32) -> Option<f64> {
+    msd_stats.get(&base).map(|chunks| {
+        let total_count: u64 = chunks.iter().map(|c| c.count).sum();
+        if total_count == 0 {
+            return 0.0;
         }
-    } else {
-        HashMap::new()
-    };
-
-    // Check if we have a cached result
-    if let Some(&size) = cache.get(&cache_hash) {
-        return size;
-    }
-
-    // Compute the result
-    let size = get_valid_ranges_size_recursive(
-        base_range,
-        base,
-        0,
-        max_depth,
-        min_size,
-        subdivision_factor,
-    );
-
-    // Update cache and save
-    cache.insert(cache_hash, size);
-
-    if let Some(parent) = cache_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    if let Ok(json) = serde_json::to_string_pretty(&cache) {
-        if let Ok(mut file) = File::create(&cache_path) {
-            let _ = file.write_all(json.as_bytes());
-        }
-    }
-
-    size
+        let total_sum: f64 = chunks.iter().map(|c| c.sum).sum();
+        1.0 - total_sum / total_count as f64
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +64,24 @@ struct FilterStats {
 }
 
 fn main() {
+    // Load MSD filter effectiveness data from sampling
+    let msd_stats = match load_msd_stats() {
+        Ok(stats) => {
+            println!(
+                "Loaded MSD filter effectiveness data for {} bases",
+                stats.len()
+            );
+            stats
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            eprintln!(
+                "Please run the msd_filter_effectiveness sampler first to generate the data."
+            );
+            return;
+        }
+    };
+
     let mut all_stats = Vec::new();
 
     println!("Filter Effectiveness Analysis");
@@ -244,27 +168,29 @@ fn main() {
 
         remaining = residue_pass_count;
 
-        // Filter 3: MSD Prefix Filter
-        let max_depth = 50;
-        let min_size = 10_000;
-        let subdivision_factor = 2;
-        let filtered_valid_range = get_msd_filtered_valid_range_cached(
-            base_range,
-            base,
-            max_depth,
-            min_size,
-            subdivision_factor,
+        // Filter 3: MSD Prefix Filter (from sampled data)
+        let msd_effectiveness = match get_msd_effectiveness(&msd_stats, base) {
+            Some(eff) => eff,
+            None => {
+                println!(
+                    "  3. MSD Prefix Filter: No sampled data available for base {}",
+                    base
+                );
+                println!();
+                continue;
+            }
+        };
+
+        // msd_effectiveness is the fraction that PASS the filter
+        let msd_pass_count = (remaining as f64 * msd_effectiveness) as u128;
+        let msd_marginal_eliminated = remaining - msd_pass_count;
+        let msd_raw_eliminated = (total_numbers as f64 * (1.0 - msd_effectiveness)) as u128;
+
+        println!("  3. MSD Prefix Filter (Sampled):");
+        println!(
+            "     Pass rate:         {:.2}% (from sampling)",
+            msd_effectiveness * 100.0
         );
-
-        let msd_raw_eliminated = total_numbers - filtered_valid_range;
-
-        // Assume raw elimination is independent of other filters, estimate marginal efficacy
-        let right_hand_eff = remaining as f64 / total_numbers as f64;
-        let msd_marginal_eliminated = (right_hand_eff * msd_raw_eliminated as f64) as u128;
-        assert!(msd_marginal_eliminated <= remaining);
-        let msd_pass_count = remaining - msd_marginal_eliminated;
-
-        println!("  3. MSD Prefix Filter (Depth {max_depth}):");
         println!(
             "     Raw efficacy:      {:.3e} eliminated ({:.2}% of original)",
             msd_raw_eliminated as f64,
