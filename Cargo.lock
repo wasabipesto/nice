@@ -1383,6 +1383,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "msd_filter_effectiveness"
+version = "3.2.12"
+dependencies = [
+ "nice_common",
+]
+
+[[package]]
 name = "multer"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
