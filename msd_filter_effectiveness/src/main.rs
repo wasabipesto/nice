@@ -3,8 +3,7 @@ use clap::Parser;
 use nice_common::base_range::get_base_range_u128;
 use nice_common::msd_prefix_filter::get_filter_effectiveness;
 use rand::Rng;
-use rand::distr::Distribution;
-use rand::distr::weighted::WeightedIndex;
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -36,10 +35,6 @@ struct Args {
     /// Number of chunks per base
     #[arg(long, default_value = "1000")]
     num_chunks: usize,
-
-    /// Minimum samples per chunk - ensures under-sampled chunks get at least one sample per batch
-    #[arg(long, default_value = "1")]
-    min_samples_per_chunk: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -69,15 +64,6 @@ fn main() -> Result<()> {
         anyhow::bail!("No valid bases found in the specified range");
     }
 
-    // Calculate weights based on range sizes (convert to f64 for WeightedIndex)
-    let weights: Vec<f64> = bases_with_ranges
-        .iter()
-        .map(|(_, start, end)| (*end - *start) as f64)
-        .collect();
-
-    // Create weighted distribution for sampling bases
-    let weighted_index = WeightedIndex::new(&weights)?;
-
     // Create output directory if it doesn't exist
     if let Some(parent) = Path::new(&args.output_file).parent() {
         std::fs::create_dir_all(parent)?;
@@ -97,74 +83,39 @@ fn main() -> Result<()> {
 
     // Loop indefinitely
     loop {
-        // First, generate samples for under-sampled chunks if needed
-        let mut forced_samples: Vec<(u32, usize, f64)> = Vec::new();
-
-        if args.min_samples_per_chunk > 0 {
-            let stats_guard = stats.lock().unwrap();
-
-            for (base, range_start, range_end) in &bases_with_ranges {
-                if let Some(chunks) = stats_guard.get(base) {
-                    let chunk_size = (*range_end - *range_start) as f64 / args.num_chunks as f64;
-
-                    for (chunk_idx, chunk) in chunks.iter().enumerate() {
-                        if chunk.count < args.min_samples_per_chunk {
-                            // Generate a sample for this under-sampled chunk
-                            let mut rng = rand::rng();
-
-                            // Pick a random number within this chunk's range
-                            let chunk_start_offset = chunk_idx as f64 * chunk_size;
-                            let offset_in_chunk: u128 = rng.random_range(0..chunk_size as u128);
-                            let offset = chunk_start_offset as u128 + offset_in_chunk;
-                            let num_start = *range_start + offset;
-
-                            // Calculate effectiveness
-                            let effectiveness = get_filter_effectiveness(num_start, *base);
-
-                            forced_samples.push((*base, chunk_idx, effectiveness));
-                        }
-                    }
-                }
-            }
-        }
-
         // Clone data for use in parallel closure
         let bases_clone = bases_with_ranges.clone();
-        let weighted_clone = weighted_index.clone();
         let stats_clone = Arc::clone(&stats);
         let num_chunks = args.num_chunks;
 
-        // Calculate how many regular samples we need (batch_size minus forced samples)
-        let regular_sample_count = args.batch_size.saturating_sub(forced_samples.len());
-
-        // Process regular samples in parallel
-        let mut batch_updates: Vec<(u32, usize, f64)> = (0..regular_sample_count)
+        // Process samples in parallel
+        let batch_updates: Vec<(u32, usize, f64)> = (0..args.batch_size)
             .into_par_iter()
             .map(|_| {
                 let mut rng = rand::rng();
 
-                // Sample a base weighted by range size
-                let idx = weighted_clone.sample(&mut rng);
-                let (base, range_start, range_end) = bases_clone[idx];
+                // Sample a base uniformly at random
+                let base_idx = rng.random_range(0..bases_clone.len());
+                let (base, range_start, range_end) = bases_clone[base_idx];
 
-                // Sample a random number within the range
-                let range_size = range_end - range_start;
-                let offset: u128 = rng.random_range(0..range_size);
+                // Pick a random chunk
+                let chunk_idx = rng.random_range(0..num_chunks);
+
+                // Calculate chunk boundaries
+                let chunk_size = (range_end - range_start) as f64 / num_chunks as f64;
+                let chunk_start_offset = chunk_idx as f64 * chunk_size;
+
+                // Pick a random starting point within the chunk
+                let offset_in_chunk: u128 = rng.random_range(0..chunk_size as u128);
+                let offset = chunk_start_offset as u128 + offset_in_chunk;
                 let num_start = range_start + offset;
 
                 // Calculate effectiveness
                 let effectiveness = get_filter_effectiveness(num_start, base);
 
-                // Calculate chunk index
-                let chunk_size = (range_end - range_start) as f64 / num_chunks as f64;
-                let chunk_idx = ((offset as f64 / chunk_size).floor() as usize).min(num_chunks - 1);
-
                 (base, chunk_idx, effectiveness)
             })
             .collect();
-
-        // Add forced samples to batch updates
-        batch_updates.extend(forced_samples);
 
         // Update aggregated stats
         {
