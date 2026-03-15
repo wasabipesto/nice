@@ -3,6 +3,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::match_same_arms)]
 
+pub mod alternating_sum_filter;
 pub mod base_range;
 pub mod benchmark;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
