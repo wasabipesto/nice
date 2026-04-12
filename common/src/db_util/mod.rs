@@ -17,6 +17,7 @@ use dotenvy::dotenv;
 use serde_json::Value;
 
 pub mod bases;
+pub mod cache;
 pub mod chunks;
 pub mod claims;
 pub mod conversions;

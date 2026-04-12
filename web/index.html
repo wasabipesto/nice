@@ -135,6 +135,13 @@
                         </div>
                     </div>
                     <div class="column is-three-fifths">
+                        <div id="chart-spinner" class="has-text-centered p-5">
+                            <p class="has-text-grey-light">Loading charts…</p>
+                            <progress
+                                class="progress is-small is-primary mt-3"
+                                max="100"
+                            ></progress>
+                        </div>
                         <div class="box content">
                             <h1 class="title is-4 mb-1">
                                 Notably Nice Numbers
@@ -161,6 +168,24 @@
                             </p>
                             <div id="completion"></div>
                         </div>
+                        <div class="box content">
+                            <h1 class="title is-4 mb-1">Search Rate</h1>
+                            <p>How much progress have we made recently?</p>
+                            <h3 class="title is-5 mb-1">Detailed</h3>
+                            <div id="rate-detailed"></div>
+                            <h3 class="title is-5 mb-1">Nice Only</h3>
+                            <div id="rate-niceonly"></div>
+                        </div>
+                        <div class="box content">
+                            <h1 class="title is-4 mb-1">Leaderboard</h1>
+                            <p>
+                                Total range searched all time, by contributor.
+                            </p>
+                            <h3 class="title is-5 mb-1">Detailed</h3>
+                            <div id="leaderboard-detailed"></div>
+                            <h3 class="title is-5 mb-1">Nice Only</h3>
+                            <div id="leaderboard-niceonly"></div>
+                        </div>
                     </div>
                 </div>
                 <div class="box content has-text-centered">
@@ -175,24 +200,86 @@
         <script type="module">
             import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/+esm";
 
+            const BASE = "https://data.nicenumbers.net";
+
             async function fetchData(url) {
                 const response = await fetch(url);
                 return response.json();
             }
 
-            (async () => {
-                const bases = await fetchData(
-                    "https://data.nicenumbers.net/bases?order=id.asc",
+            // Helper: given an array of {username, total_range} objects, return a Set of the
+            // top N usernames by total_range (summed across all rows for that username).
+            function topNUsernames(rows, n = 10) {
+                const totals = new Map();
+                for (const row of rows) {
+                    const prev = totals.get(row.username) ?? 0n;
+                    totals.set(row.username, prev + BigInt(row.total_range));
+                }
+                return new Set(
+                    [...totals.entries()]
+                        .sort((a, b) =>
+                            b[1] > a[1] ? 1 : b[1] < a[1] ? -1 : 0,
+                        )
+                        .slice(0, n)
+                        .map(([u]) => u),
                 );
-                const chunks = await fetchData(
-                    "https://data.nicenumbers.net/chunks?order=id.asc",
-                );
+            }
 
-                const numbers = bases.reduce(
+            // Bucket rows: usernames not in topSet become "Other", then re-aggregate per (date, username).
+            function bucketAndAggregate(rows, topSet, groupKeys) {
+                const map = new Map();
+                for (const row of rows) {
+                    const username = topSet.has(row.username)
+                        ? row.username
+                        : "other";
+                    const key = groupKeys
+                        .map((k) => (k === "username" ? username : row[k]))
+                        .join("|");
+                    const prev = map.get(key) ?? {
+                        ...row,
+                        username,
+                        total_range: 0n,
+                    };
+                    prev.total_range =
+                        BigInt(prev.total_range) + BigInt(row.total_range);
+                    map.set(key, prev);
+                }
+                return [...map.values()].map((r) => ({
+                    ...r,
+                    total_range: Number(r.total_range),
+                }));
+            }
+
+            (async () => {
+                // Fire all five fetches in parallel.
+                const [
+                    basesData,
+                    nicenessChunks,
+                    completionChunks,
+                    rateDaily,
+                    leaderboard,
+                ] = await Promise.all([
+                    fetchData(`${BASE}/bases?select=id,numbers&order=id.asc`),
+                    fetchData(
+                        `${BASE}/chunks?select=id,base_id,range_start,range_end,niceness_mean,niceness_stdev&niceness_mean=not.is.null&order=id.asc`,
+                    ),
+                    fetchData(
+                        `${BASE}/chunks?select=id,base_id,range_start,range_end,range_size,minimum_cl&base_id=gte.35&order=id.asc`,
+                    ),
+                    fetchData(`${BASE}/cache_search_rate_daily?order=date.asc`),
+                    fetchData(
+                        `${BASE}/cache_search_leaderboard?order=total_range.desc`,
+                    ),
+                ]);
+
+                // Hide spinner now that data is in
+                document.querySelector("#chart-spinner").remove();
+
+                // ── Notable Numbers ──────────────────────────────────────────────────
+                const numbers = basesData.reduce(
                     (acc, base) => acc.concat(base.numbers),
                     [],
                 );
-
                 const number_plot = Plot.plot({
                     width: 900,
                     height: 300,
@@ -206,11 +293,7 @@
                             y: "niceness",
                             channels: { Base: "base", Uniques: "num_uniques" },
                             fill: (i) => i.base - i.num_uniques,
-                            tip: {
-                                format: {
-                                    fill: false,
-                                },
-                            },
+                            tip: { format: { fill: false } },
                         }),
                         Plot.tip(["69 is the only known nice number."], {
                             x: 69,
@@ -241,16 +324,14 @@
                         }),
                     ],
                 });
-                const number_div = document.querySelector("#numbers");
-                number_div.append(number_plot);
+                document.querySelector("#numbers").append(number_plot);
 
-                const max_range_end = chunks
-                    .filter((item) => item.niceness_mean !== null)
-                    .reduce(
-                        (max, item) =>
-                            item.range_end > max ? item.range_end : max,
-                        -Infinity,
-                    );
+                // ── Chunk Niceness ───────────────────────────────────────────────────
+                const max_range_end = nicenessChunks.reduce(
+                    (max, item) =>
+                        item.range_end > max ? item.range_end : max,
+                    -Infinity,
+                );
                 const niceness_plot = Plot.plot({
                     width: 900,
                     height: 300,
@@ -260,13 +341,10 @@
                         type: "log",
                         domain: [45, max_range_end],
                     },
-                    y: {
-                        label: "Niceness",
-                        domain: [0.35, 0.9],
-                    },
+                    y: { label: "Niceness", domain: [0.35, 0.9] },
                     color: { legend: false, scheme: "Reds" },
                     marks: [
-                        Plot.rect(chunks, {
+                        Plot.rect(nicenessChunks, {
                             x1: (i) => i.range_start,
                             x2: (i) => i.range_end,
                             y1: (i) => i.niceness_mean - i.niceness_stdev,
@@ -293,7 +371,11 @@
                             [
                                 "Base 10's average niceness is skewed high due to 69.",
                             ],
-                            { x: 69, y: 0.775, anchor: "bottom-left" },
+                            {
+                                x: 69,
+                                y: 0.775,
+                                anchor: "bottom-left",
+                            },
                         ),
                         Plot.tip(["Base 12's niceness is surprisingly low."], {
                             x: 236,
@@ -310,29 +392,29 @@
                             [
                                 "The ranges seem to be approaching a niceness of 0.632, which is what we would expect for a random distribution.",
                             ],
-                            { x: 5.5e13, y: 0.685, anchor: "bottom-right" },
+                            { x: 7e14, y: 0.685, anchor: "bottom-right" },
                         ),
                         Plot.ruleY([0.632], { stroke: "black", opacity: 0.3 }),
                     ],
                 });
-                const niceness_div = document.querySelector("#niceness");
-                niceness_div.append(niceness_plot);
+                document.querySelector("#niceness").append(niceness_plot);
 
+                // ── Chunk Completion (base 35+) ──────────────────────────────────────
                 let currentBase = null;
                 let x = -1;
-                const chunks_for_completion_plot = chunks.map((chunk) => {
-                    if (chunk.base_id !== currentBase) {
-                        currentBase = chunk.base_id;
-                        x = 0;
-                    } else {
-                        x += 1;
-                    }
-                    return { ...chunk, chunk_x: x };
-                });
-
+                const chunks_for_completion_plot = completionChunks.map(
+                    (chunk) => {
+                        if (chunk.base_id !== currentBase) {
+                            currentBase = chunk.base_id;
+                            x = 0;
+                        } else {
+                            x += 1;
+                        }
+                        return { ...chunk, chunk_x: x };
+                    },
+                );
                 const completion_plot = Plot.plot({
                     width: 900,
-                    //height: 700,
                     x: { axis: null },
                     y: { label: "Base" },
                     marks: [
@@ -341,16 +423,13 @@
                             x: "chunk_x",
                             fill: (i) =>
                                 i.minimum_cl > 2
-                                    ? "Searched (Confirmed)"
+                                    ? "Searched (Double-Checked)"
                                     : i.minimum_cl > 1
                                       ? "Searched (Detailed)"
                                       : i.minimum_cl > 0
                                         ? "Searched (Nice Only)"
                                         : "Unsearched",
-                            channels: {
-                                Size: "range_size",
-                                Status: "fill",
-                            },
+                            channels: { Size: "range_size", Status: "fill" },
                             tip: {
                                 format: {
                                     base: true,
@@ -362,8 +441,117 @@
                         }),
                     ],
                 });
-                const completion_div = document.querySelector("#completion");
-                completion_div.append(completion_plot);
+                document.querySelector("#completion").append(completion_plot);
+
+                // ── Search Rate helpers ───────────────────────────────────────────────
+                function buildRateChart(rows, mode) {
+                    const modeRows = rows.filter((r) => r.search_mode === mode);
+                    if (modeRows.length === 0) return null;
+
+                    const top = topNUsernames(modeRows, 7);
+                    const bucketed = bucketAndAggregate(modeRows, top, [
+                        "date",
+                        "username",
+                    ]);
+
+                    return Plot.plot({
+                        width: 900,
+                        height: 300,
+                        x: { label: "Date" },
+                        y: { label: "Range Searched", tickFormat: ".0s" },
+                        marks: [
+                            Plot.rectY(
+                                bucketed,
+                                Plot.binX(
+                                    { y: "sum" },
+                                    {
+                                        x: {
+                                            value: "date",
+                                            interval: "2 days",
+                                        },
+                                        y: "total_range",
+                                        fill: "username",
+                                        tip: true,
+                                    },
+                                ),
+                            ),
+                            Plot.ruleY([0]),
+                        ],
+                    });
+                }
+
+                const rate_detailed = buildRateChart(rateDaily, "detailed");
+                if (rate_detailed)
+                    document
+                        .querySelector("#rate-detailed")
+                        .append(rate_detailed);
+                else
+                    document.querySelector("#rate-detailed").textContent =
+                        "No data yet.";
+
+                const rate_niceonly = buildRateChart(rateDaily, "niceonly");
+                if (rate_niceonly)
+                    document
+                        .querySelector("#rate-niceonly")
+                        .append(rate_niceonly);
+                else
+                    document.querySelector("#rate-niceonly").textContent =
+                        "No data yet.";
+
+                // ── Leaderboard helpers ───────────────────────────────────────────────
+                function buildLeaderboardChart(rows, mode) {
+                    const modeRows = rows.filter((r) => r.search_mode === mode);
+                    if (modeRows.length === 0) return null;
+
+                    const top = topNUsernames(modeRows, 10);
+                    const bucketed = bucketAndAggregate(modeRows, top, [
+                        "username",
+                    ]);
+
+                    return Plot.plot({
+                        width: 900,
+                        height: 250,
+                        marginLeft: 100,
+                        x: { label: "Total Range Searched", tickFormat: ".0s" },
+                        y: { label: null },
+                        marks: [
+                            Plot.barX(bucketed, {
+                                y: "username",
+                                x: "total_range",
+                                fill: "username",
+                                sort: { y: "-x" },
+                                tip: true,
+                            }),
+                            Plot.ruleX([0]),
+                        ],
+                    });
+                }
+
+                const lb_detailed = buildLeaderboardChart(
+                    leaderboard,
+                    "detailed",
+                );
+                if (lb_detailed)
+                    document
+                        .querySelector("#leaderboard-detailed")
+                        .append(lb_detailed);
+                else
+                    document.querySelector(
+                        "#leaderboard-detailed",
+                    ).textContent = "No data yet.";
+
+                const lb_niceonly = buildLeaderboardChart(
+                    leaderboard,
+                    "niceonly",
+                );
+                if (lb_niceonly)
+                    document
+                        .querySelector("#leaderboard-niceonly")
+                        .append(lb_niceonly);
+                else
+                    document.querySelector(
+                        "#leaderboard-niceonly",
+                    ).textContent = "No data yet.";
             })();
         </script>
     </body>

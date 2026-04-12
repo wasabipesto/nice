@@ -1,4 +1,6 @@
 -- DROP TABLES IN REVERSE ORDER
+DROP TABLE IF EXISTS cache_search_rate_daily;
+DROP TABLE IF EXISTS cache_search_leaderboard;
 DROP TABLE IF EXISTS submissions;
 DROP TABLE IF EXISTS claims;
 DROP TABLE IF EXISTS fields;
@@ -100,3 +102,26 @@ CREATE INDEX IF NOT EXISTS idx_fields_cl0_id ON fields(id) WHERE check_level = 0
 CREATE INDEX IF NOT EXISTS idx_submissions_search_mode_field_id ON submissions(search_mode, field_id);
 CREATE INDEX IF NOT EXISTS idx_submissions_field_mode_disq ON submissions(field_id, search_mode, disqualified);
 CREATE INDEX IF NOT EXISTS idx_submissions_id_field ON submissions(id, field_id);
+
+-- CACHE: Daily search totals per user/mode
+CREATE TABLE IF NOT EXISTS cache_search_rate_daily (
+    date DATE NOT NULL,
+    search_mode VARCHAR NOT NULL,
+    username VARCHAR NOT NULL,
+    total_range DECIMAL NOT NULL,
+    PRIMARY KEY (date, search_mode, username)
+);
+
+-- CACHE: All-time leaderboard totals per user/mode
+CREATE TABLE IF NOT EXISTS cache_search_leaderboard (
+    search_mode VARCHAR NOT NULL,
+    username VARCHAR NOT NULL,
+    total_range DECIMAL NOT NULL,
+    PRIMARY KEY (search_mode, username)
+);
+
+GRANT SELECT ON cache_search_rate_daily TO web_anon;
+GRANT SELECT ON cache_search_leaderboard TO web_anon;
+
+CREATE INDEX IF NOT EXISTS idx_cache_rate_daily_mode_date ON cache_search_rate_daily(search_mode, date);
+CREATE INDEX IF NOT EXISTS idx_cache_leaderboard_mode ON cache_search_leaderboard(search_mode, total_range DESC);
