@@ -1,3 +1,5 @@
+-- Some convenience functions to run manually against the database.
+
 -- Total amount completed per day for the last 30 days
 SELECT
     DATE(s.submit_time) as date,

@@ -247,4 +247,8 @@ fn main() {
         }
         println!();
     }
+
+    println!("=== REFRESHING SEARCH CACHES ===");
+    db_util::cache::refresh_search_caches(&mut conn).unwrap();
+    println!("Search caches refreshed.");
 }
