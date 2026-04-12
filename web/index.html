@@ -169,41 +169,21 @@
                             <div id="completion"></div>
                         </div>
                         <div class="box content">
-                            <h1 class="title is-4 mb-1">
-                                Search Rate (Detailed)
-                            </h1>
-                            <p>
-                                How much range has been searched per day over
-                                the last 30 days, by contributor?
-                            </p>
+                            <h1 class="title is-4 mb-1">Search Rate</h1>
+                            <p>How much progress have we made recently?</p>
+                            <h3 class="title is-5 mb-1">Detailed</h3>
                             <div id="rate-detailed"></div>
-                        </div>
-                        <div class="box content">
-                            <h1 class="title is-4 mb-1">
-                                Search Rate (Nice Only)
-                            </h1>
-                            <p>
-                                How much range has been searched per day over
-                                the last 30 days, by contributor?
-                            </p>
+                            <h3 class="title is-5 mb-1">Nice Only</h3>
                             <div id="rate-niceonly"></div>
                         </div>
                         <div class="box content">
-                            <h1 class="title is-4 mb-1">
-                                Leaderboard (Detailed)
-                            </h1>
+                            <h1 class="title is-4 mb-1">Leaderboard</h1>
                             <p>
                                 Total range searched all time, by contributor.
                             </p>
+                            <h3 class="title is-5 mb-1">Detailed</h3>
                             <div id="leaderboard-detailed"></div>
-                        </div>
-                        <div class="box content">
-                            <h1 class="title is-4 mb-1">
-                                Leaderboard (Nice Only)
-                            </h1>
-                            <p>
-                                Total range searched all time, by contributor.
-                            </p>
+                            <h3 class="title is-5 mb-1">Nice Only</h3>
                             <div id="leaderboard-niceonly"></div>
                         </div>
                     </div>
@@ -251,7 +231,7 @@
                 for (const row of rows) {
                     const username = topSet.has(row.username)
                         ? row.username
-                        : "Other";
+                        : "other";
                     const key = groupKeys
                         .map((k) => (k === "username" ? username : row[k]))
                         .join("|");
@@ -268,29 +248,6 @@
                     ...r,
                     total_range: Number(r.total_range),
                 }));
-            }
-
-            // Color scheme: categorical with "Other" forced to a neutral grey.
-            function buildColor(topUsers) {
-                const names = [...topUsers, "Other"];
-                // Tableau10 palette
-                const palette = [
-                    "#4e79a7",
-                    "#f28e2b",
-                    "#e15759",
-                    "#76b7b2",
-                    "#59a14f",
-                    "#edc948",
-                    "#b07aa1",
-                    "#ff9da7",
-                    "#9c755f",
-                    "#bab0ac",
-                ];
-                const domain = names;
-                const range = names.map((n, i) =>
-                    n === "Other" ? "#888888" : palette[i % palette.length],
-                );
-                return { domain, range };
             }
 
             (async () => {
@@ -435,7 +392,7 @@
                             [
                                 "The ranges seem to be approaching a niceness of 0.632, which is what we would expect for a random distribution.",
                             ],
-                            { x: 5.5e13, y: 0.685, anchor: "bottom-right" },
+                            { x: 7e14, y: 0.685, anchor: "bottom-right" },
                         ),
                         Plot.ruleY([0.632], { stroke: "black", opacity: 0.3 }),
                     ],
@@ -466,7 +423,7 @@
                             x: "chunk_x",
                             fill: (i) =>
                                 i.minimum_cl > 2
-                                    ? "Searched (Confirmed)"
+                                    ? "Searched (Double-Checked)"
                                     : i.minimum_cl > 1
                                       ? "Searched (Detailed)"
                                       : i.minimum_cl > 0
@@ -491,8 +448,7 @@
                     const modeRows = rows.filter((r) => r.search_mode === mode);
                     if (modeRows.length === 0) return null;
 
-                    const top = topNUsernames(modeRows, 10);
-                    const color = buildColor(top);
+                    const top = topNUsernames(modeRows, 7);
                     const bucketed = bucketAndAggregate(modeRows, top, [
                         "date",
                         "username",
@@ -501,23 +457,23 @@
                     return Plot.plot({
                         width: 900,
                         height: 300,
-                        x: { label: "Date", type: "utc" },
-                        y: { label: "Range Searched" },
-                        color: {
-                            legend: true,
-                            domain: color.domain,
-                            range: color.range,
-                        },
+                        x: { label: "Date" },
+                        y: { label: "Range Searched", tickFormat: ".0s" },
                         marks: [
-                            Plot.barY(
+                            Plot.rectY(
                                 bucketed,
-                                Plot.stackY({
-                                    x: (d) => new Date(d.date),
-                                    y: "total_range",
-                                    fill: "username",
-                                    order: color.domain,
-                                    tip: true,
-                                }),
+                                Plot.binX(
+                                    { y: "sum" },
+                                    {
+                                        x: {
+                                            value: "date",
+                                            interval: "2 days",
+                                        },
+                                        y: "total_range",
+                                        fill: "username",
+                                        tip: true,
+                                    },
+                                ),
                             ),
                             Plot.ruleY([0]),
                         ],
@@ -548,30 +504,16 @@
                     if (modeRows.length === 0) return null;
 
                     const top = topNUsernames(modeRows, 10);
-                    const color = buildColor(top);
                     const bucketed = bucketAndAggregate(modeRows, top, [
                         "username",
                     ]);
 
-                    // Sort: top users in order, then Other at the bottom
-                    const order = [...color.domain].reverse(); // Plot.barX sorts y ascending, so reverse for descending
-                    bucketed.sort(
-                        (a, b) =>
-                            order.indexOf(a.username) -
-                            order.indexOf(b.username),
-                    );
-
                     return Plot.plot({
                         width: 900,
-                        height: Math.max(180, bucketed.length * 28 + 40),
+                        height: 250,
                         marginLeft: 100,
-                        x: { label: "Total Range Searched" },
+                        x: { label: "Total Range Searched", tickFormat: ".0s" },
                         y: { label: null },
-                        color: {
-                            legend: false,
-                            domain: color.domain,
-                            range: color.range,
-                        },
                         marks: [
                             Plot.barX(bucketed, {
                                 y: "username",
