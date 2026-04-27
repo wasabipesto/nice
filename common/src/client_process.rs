@@ -214,6 +214,7 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
     // constant sequence. This is several times faster than runtime u128
     // division.
     match base {
+        40 => get_is_nice_u128_const::<40>(num),
         42 => get_is_nice_u256_const::<42>(num),
         43 => get_is_nice_u256_const::<43>(num),
         44 => get_is_nice_u256_const::<44>(num),
@@ -234,6 +235,37 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
         _ if base <= MAX_BASE_FOR_FIXED_WIDTH_U256 => get_is_nice_u256(num, base),
         _ => get_is_nice_natural(num, base),
     }
+}
+
+/// u128 fast path with compile-time-constant base.
+#[inline]
+fn get_is_nice_u128_const<const BASE: u32>(num: u128) -> bool {
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    let base_u128 = u128::from(BASE);
+    let mut digits_indicator = [false; MAX_BASE_FOR_DIGIT_ARRAY_U128];
+
+    let squared = num * num;
+
+    let mut n = squared;
+    while n != 0 {
+        let d = (n % base_u128) as usize;
+        n /= base_u128;
+        if digits_indicator[d] {
+            return false;
+        }
+        digits_indicator[d] = true;
+    }
+
+    let mut n = squared * num;
+    while n != 0 {
+        let d = (n % base_u128) as usize;
+        n /= base_u128;
+        if digits_indicator[d] {
+            return false;
+        }
+        digits_indicator[d] = true;
+    }
+    true
 }
 
 /// U256 fast path with compile-time-constant base.
