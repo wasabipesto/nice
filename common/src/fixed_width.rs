@@ -68,8 +68,7 @@ impl U256 {
         //   p_hh → limb 2..3
         let limb0 = p_ll as u64;
 
-        let mid =
-            (p_ll >> 64) + (p_lh & 0xFFFF_FFFF_FFFF_FFFF) + (p_hl & 0xFFFF_FFFF_FFFF_FFFF);
+        let mid = (p_ll >> 64) + (p_lh & 0xFFFF_FFFF_FFFF_FFFF) + (p_hl & 0xFFFF_FFFF_FFFF_FFFF);
         let limb1 = mid as u64;
 
         let upper = (mid >> 64) + (p_lh >> 64) + (p_hl >> 64) + (p_hh & 0xFFFF_FFFF_FFFF_FFFF);
@@ -137,6 +136,34 @@ impl U256 {
         let mut rem: u128 = 0;
 
         // Find highest non-zero limb to skip work on the leading zeros.
+        let top = if self.limbs[3] != 0 {
+            3
+        } else if self.limbs[2] != 0 {
+            2
+        } else if self.limbs[1] != 0 {
+            1
+        } else {
+            0
+        };
+
+        for i in (0..=top).rev() {
+            let cur = (rem << 64) | (self.limbs[i] as u128);
+            let q = cur / d;
+            rem = cur % d;
+            self.limbs[i] = q as u64;
+        }
+        rem as u32
+    }
+
+    /// Const-divisor variant — when the base is known at compile time, LLVM
+    /// emits a multiply-by-magic-constant sequence instead of a runtime DIV.
+    /// Significantly faster than `div_assign_rem_u32` for hot paths where the
+    /// base is known up front.
+    #[inline]
+    pub fn div_assign_rem_u32_const<const D: u32>(&mut self) -> u32 {
+        let d = D as u128;
+        let mut rem: u128 = 0;
+
         let top = if self.limbs[3] != 0 {
             3
         } else if self.limbs[2] != 0 {
@@ -238,7 +265,10 @@ mod tests {
         let cases: &[(u128, u128)] = &[
             (1u128 << 100, 3u128 << 70),
             (u128::MAX, u128::MAX),
-            (123_456_789_012_345_678_901_234_567_890u128, 999_999_999_999u128),
+            (
+                123_456_789_012_345_678_901_234_567_890u128,
+                999_999_999_999u128,
+            ),
             (u64::MAX as u128, u64::MAX as u128),
             (6_553_600_000_000u128, 6_553_600_000_000u128), // base-40 max squared
         ];
@@ -257,9 +287,9 @@ mod tests {
         // Realistic n values for bases up to 68 (where n^3 fits u256).
         // Base 40 max, base 50 max, base 60 max, base 68 max-ish.
         for &n in &[
-            6_553_599_999_999u128,                // base 40 max-ish
-            26_507_984_537_059_635u128,           // base 50 start
-            2_176_782_335_999_999_999_999u128,    // base 60 max-ish
+            6_553_599_999_999u128,                 // base 40 max-ish
+            26_507_984_537_059_635u128,            // base 50 start
+            2_176_782_335_999_999_999_999u128,     // base 60 max-ish
             6_500_000_000_000_000_000_000_000u128, // base 68 max-ish
         ] {
             let n_sq_u256 = U256::mul_u128_u128(n, n);
@@ -300,7 +330,10 @@ mod tests {
                     digits_nat.push(r);
                 }
 
-                assert_eq!(digits_u256, digits_nat, "digit stream mismatch n={n} base={base}");
+                assert_eq!(
+                    digits_u256, digits_nat,
+                    "digit stream mismatch n={n} base={base}"
+                );
             }
         }
     }

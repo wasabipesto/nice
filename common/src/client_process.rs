@@ -40,36 +40,93 @@ const MAX_BASE_FOR_FIXED_WIDTH_U128: u32 = 40;
 /// A number is nice if the result of this is equal to b (means all digits are used once).
 /// If you're just checking if the number is 100% nice, there is a faster version below.
 ///
-/// Detailed mode (which calls this) extracts every digit of n² and n³ for
-/// every candidate. Empirically, `malachite::Natural`'s small-divisor division
-/// on a 2–3 limb representation **beats** both our u128 and U256 paths for
-/// this workload — the multi-limb division is amortised over fewer cycles
-/// than two `__udivmodti4` calls per digit. So we keep the malachite path here
-/// and only use fixed-width in `get_is_nice`.
+/// Const-generic dispatch lets popular bases use multiply-by-magic-constant
+/// for digit extraction, which in detailed mode (full extraction every
+/// candidate) outperforms malachite's small-divisor multi-limb division.
 #[must_use]
 pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
-    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    match base {
+        40 => get_num_unique_digits_u128_const::<40>(num_u128),
+        42 => get_num_unique_digits_u256_const::<42>(num_u128),
+        43 => get_num_unique_digits_u256_const::<43>(num_u128),
+        44 => get_num_unique_digits_u256_const::<44>(num_u128),
+        45 => get_num_unique_digits_u256_const::<45>(num_u128),
+        47 => get_num_unique_digits_u256_const::<47>(num_u128),
+        48 => get_num_unique_digits_u256_const::<48>(num_u128),
+        49 => get_num_unique_digits_u256_const::<49>(num_u128),
+        50 => get_num_unique_digits_u256_const::<50>(num_u128),
+        52 => get_num_unique_digits_u256_const::<52>(num_u128),
+        53 => get_num_unique_digits_u256_const::<53>(num_u128),
+        54 => get_num_unique_digits_u256_const::<54>(num_u128),
+        55 => get_num_unique_digits_u256_const::<55>(num_u128),
+        57 => get_num_unique_digits_u256_const::<57>(num_u128),
+        58 => get_num_unique_digits_u256_const::<58>(num_u128),
+        59 => get_num_unique_digits_u256_const::<59>(num_u128),
+        60 => get_num_unique_digits_u256_const::<60>(num_u128),
+        _ => get_num_unique_digits_natural(num_u128, base),
+    }
+}
 
-    // Create an indicator variable as a boolean array
-    // Each bit represents a number, flip them with bit ops
+/// u128 fast path with compile-time-constant base.
+#[inline]
+fn get_num_unique_digits_u128_const<const BASE: u32>(num: u128) -> u32 {
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    let base_u128 = u128::from(BASE);
     let mut digits_indicator: u128 = 0;
 
-    // Convert u128 to natural
+    let squared = num * num;
+    let cubed = squared * num;
+
+    let mut n = squared;
+    while n != 0 {
+        let d = n % base_u128;
+        n /= base_u128;
+        digits_indicator |= 1u128 << d;
+    }
+    let mut n = cubed;
+    while n != 0 {
+        let d = n % base_u128;
+        n /= base_u128;
+        digits_indicator |= 1u128 << d;
+    }
+    digits_indicator.count_ones()
+}
+
+/// U256 fast path with compile-time-constant base.
+#[inline]
+fn get_num_unique_digits_u256_const<const BASE: u32>(num: u128) -> u32 {
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    let mut digits_indicator: u128 = 0;
+
+    let squared = U256::mul_u128_u128(num, num);
+    let cubed = squared.mul_u128_truncating(num);
+
+    let mut n = squared;
+    while !n.is_zero() {
+        let d = n.div_assign_rem_u32_const::<BASE>();
+        digits_indicator |= 1u128 << d;
+    }
+    let mut n = cubed;
+    while !n.is_zero() {
+        let d = n.div_assign_rem_u32_const::<BASE>();
+        digits_indicator |= 1u128 << d;
+    }
+    digits_indicator.count_ones()
+}
+
+/// Malachite fallback for bases without a const-generic specialisation.
+fn get_num_unique_digits_natural(num_u128: u128, base: u32) -> u32 {
+    let mut digits_indicator: u128 = 0;
     let num = Natural::from(num_u128);
 
-    // Square the number, convert to base and save the digits
     let squared = (&num).pow(2);
     for digit in squared.to_digits_asc(&base) {
         digits_indicator |= 1 << digit;
     }
-
-    // Cube, convert to base and save the digits
     let cubed = squared * &num;
     for digit in cubed.to_digits_asc(&base) {
         digits_indicator |= 1 << digit;
     }
-
-    // Output the number of unique digits
     digits_indicator.count_ones()
 }
 
@@ -152,13 +209,59 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
 #[inline]
 pub fn get_is_nice(num: u128, base: u32) -> bool {
     debug_assert!((base as usize) < MAX_BASE_FOR_DIGIT_ARRAY_U128);
-    if base <= MAX_BASE_FOR_FIXED_WIDTH_U128 {
-        get_is_nice_u128(num, base)
-    } else if base <= MAX_BASE_FOR_FIXED_WIDTH_U256 {
-        get_is_nice_u256(num, base)
-    } else {
-        get_is_nice_natural(num, base)
+    // For popular bases, dispatch to a const-generic specialization so
+    // LLVM converts `n / BASE` / `n % BASE` into a multiply-by-magic-
+    // constant sequence. This is several times faster than runtime u128
+    // division.
+    match base {
+        42 => get_is_nice_u256_const::<42>(num),
+        43 => get_is_nice_u256_const::<43>(num),
+        44 => get_is_nice_u256_const::<44>(num),
+        45 => get_is_nice_u256_const::<45>(num),
+        47 => get_is_nice_u256_const::<47>(num),
+        48 => get_is_nice_u256_const::<48>(num),
+        49 => get_is_nice_u256_const::<49>(num),
+        50 => get_is_nice_u256_const::<50>(num),
+        52 => get_is_nice_u256_const::<52>(num),
+        53 => get_is_nice_u256_const::<53>(num),
+        54 => get_is_nice_u256_const::<54>(num),
+        55 => get_is_nice_u256_const::<55>(num),
+        57 => get_is_nice_u256_const::<57>(num),
+        58 => get_is_nice_u256_const::<58>(num),
+        59 => get_is_nice_u256_const::<59>(num),
+        60 => get_is_nice_u256_const::<60>(num),
+        _ if base <= MAX_BASE_FOR_FIXED_WIDTH_U128 => get_is_nice_u128(num, base),
+        _ if base <= MAX_BASE_FOR_FIXED_WIDTH_U256 => get_is_nice_u256(num, base),
+        _ => get_is_nice_natural(num, base),
     }
+}
+
+/// U256 fast path with compile-time-constant base.
+#[inline]
+fn get_is_nice_u256_const<const BASE: u32>(num: u128) -> bool {
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    let mut digits_indicator = [false; MAX_BASE_FOR_DIGIT_ARRAY_U128];
+
+    let squared = U256::mul_u128_u128(num, num);
+
+    let mut n = squared;
+    while !n.is_zero() {
+        let d = n.div_assign_rem_u32_const::<BASE>() as usize;
+        if digits_indicator[d] {
+            return false;
+        }
+        digits_indicator[d] = true;
+    }
+
+    let mut n = squared.mul_u128_truncating(num);
+    while !n.is_zero() {
+        let d = n.div_assign_rem_u32_const::<BASE>() as usize;
+        if digits_indicator[d] {
+            return false;
+        }
+        digits_indicator[d] = true;
+    }
+    true
 }
 
 /// u128 fast path. Safe for bases ≤ 40.
