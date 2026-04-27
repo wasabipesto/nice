@@ -5,6 +5,8 @@
 - Add additional fields to the database in bases 52, 53, and 54
 - Remove dependence on the DEFAULT_FIELD_SIZE constant. The newest fields are larger than this so the server and client are now able to handle them properly. Detailed search claims will be limited to the previous max size (1e9).
 - Add recent search progress and overall leaderboard charts to the site
+- Add u256 fixed-width processing for bases 42-68 in nice-only mode
+- Add compile-time generation to replace div_asign_rem in most cases
 
 ## Nice v3.2.12
 
