@@ -4,11 +4,11 @@
 //! range are guaranteed to have a square and cube ("sqube") with the correct
 //! number of digits. The ranges provided are a sequential and continuous.
 
+use crate::fixed_width::U256;
 use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
 };
-use crate::fixed_width::U256;
 use crate::{msd_prefix_filter, number_stats, stride_filter};
 use malachite::base::num::arithmetic::traits::{DivAssignRem, Pow};
 use malachite::base::num::conversion::traits::Digits;
@@ -169,7 +169,6 @@ fn get_is_nice_u128(num: u128, base: u32) -> bool {
     let mut digits_indicator = [false; MAX_BASE_FOR_DIGIT_ARRAY_U128];
 
     let squared = num * num;
-    let cubed = squared * num;
 
     let mut n = squared;
     while n != 0 {
@@ -180,7 +179,8 @@ fn get_is_nice_u128(num: u128, base: u32) -> bool {
         }
         digits_indicator[d] = true;
     }
-    let mut n = cubed;
+
+    let mut n = squared * num;
     while n != 0 {
         let d = (n % base_u128) as usize;
         n /= base_u128;
@@ -199,7 +199,6 @@ fn get_is_nice_u256(num: u128, base: u32) -> bool {
     let mut digits_indicator = [false; MAX_BASE_FOR_DIGIT_ARRAY_U128];
 
     let squared = U256::mul_u128_u128(num, num);
-    let cubed = squared.mul_u128_truncating(num);
 
     let mut n = squared;
     while !n.is_zero() {
@@ -209,7 +208,8 @@ fn get_is_nice_u256(num: u128, base: u32) -> bool {
         }
         digits_indicator[d] = true;
     }
-    let mut n = cubed;
+
+    let mut n = squared.mul_u128_truncating(num);
     while !n.is_zero() {
         let d = n.div_assign_rem_u32(base) as usize;
         if digits_indicator[d] {
@@ -230,8 +230,8 @@ fn get_is_nice_natural(num: u128, base: u32) -> bool {
     let squared = (&num).pow(2);
     let mut n = squared.clone();
     while n > 0 {
-        let remainder = usize::try_from(&(n.div_assign_rem(&base_natural)))
-            .expect("digit fits in usize");
+        let remainder =
+            usize::try_from(&(n.div_assign_rem(&base_natural))).expect("digit fits in usize");
         if digits_indicator[remainder] {
             return false;
         }
@@ -239,8 +239,8 @@ fn get_is_nice_natural(num: u128, base: u32) -> bool {
     }
     let mut n = squared * num;
     while n > 0 {
-        let remainder = usize::try_from(&(n.div_assign_rem(&base_natural)))
-            .expect("digit fits in usize");
+        let remainder =
+            usize::try_from(&(n.div_assign_rem(&base_natural))).expect("digit fits in usize");
         if digits_indicator[remainder] {
             return false;
         }
