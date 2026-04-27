@@ -15,6 +15,7 @@ pub mod consensus;
 #[cfg(feature = "database")]
 pub mod db_util;
 pub mod distribution_stats;
+pub mod fixed_width;
 pub mod generate_chunks;
 pub mod generate_fields;
 pub mod lsd_filter;

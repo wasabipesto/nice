@@ -3,44 +3,49 @@
 //! The search ranges are precalculated by the server and all numbers in the
 //! range are guaranteed to have a square and cube ("sqube") with the correct
 //! number of digits. The ranges provided are a sequential and continuous.
-//!
-//! There's some tradeoffs to make for speed:
-//!  1. We can either get all nicencess statistics (detailed mode) or just the
-//!     100% nice numbers (nice-only mode). Nice-only is much faster because it
-//!     uses some smart filtering and breaks out of the hot loop early.
-//!     Detailed mode is good for analytics and potentially finding patters to
-//!     help reduce the search space.
-//!  2. We could deserialize our search range as Natural (arbitrarily-large)
-//!     numbers, but operations on them are slow. We could deserialize and
-//!     perform all operations as u128, but we have to hold n^3 in memory which
-//!     limits the maximum value to 7e12 (cube root of 3.4e38). This would get
-//!     us through base 40 (1.9e12 to 6.5e12) but not base 41. Instead, we will
-//!     iterate over n as u128 (max 3.4e38), but expand it into Natural for
-//!     n^2 and n^3. That means we can go up through base 97 (5.6e37 to 2.6e38)
-//!     but not base 98 (3.1e38 to 6.7e38).
-//!
-//! Currently the ranges of interest are bases 40-60 (1.9e12 to 2.1e21), so
-//! these tradeoffs will last us for a while. Clients are able to choose if
-//! they want to contribute to (or even re-implement) the detailed or nice-only
-//! searches, and the results are verified via consensus to ensure that
-//! everything can be trusted.
 
 use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
 };
+use crate::fixed_width::U256;
 use crate::{msd_prefix_filter, number_stats, stride_filter};
-use itertools::Itertools;
 use malachite::base::num::arithmetic::traits::{DivAssignRem, Pow};
 use malachite::base::num::conversion::traits::Digits;
 use malachite::natural::Natural;
-use std::collections::HashMap;
 
-pub const DETAILED_MINI_CHUNK_SIZE: usize = 1_000;
+/// Maximum supported base for the stack-resident digit array.
+/// Bases above this still work but should not be reached given the u128
+/// representation already caps n at base 97.
+const MAX_BASE_FOR_DIGIT_ARRAY_U128: usize = 128;
+
+/// Inclusive upper bound on bases that can use the U256 fast path.
+/// Above this, n³ exceeds 256 bits and we fall back to malachite `Natural`.
+/// Empirically determined: base 70's max-n cubed is 3.1e77 > 2^256 (1.16e77),
+/// while base 68's max-n cubed is ~2.7e74 < 2^256. Pick 68 for safety.
+pub const MAX_BASE_FOR_FIXED_WIDTH_U256: u32 = 68;
+
+/// Inclusive upper bound on bases where n³ fits in u128 (skips the U256 path
+/// entirely). Base 40 max n³ is 2.81e38 < 2^128 (3.40e38); base 41+ either
+/// has no valid range or exceeds u128.
+///
+/// Empirically (intervention #3 notes): u128 fast path wins big for niceonly
+/// b40 (+57%), but loses to malachite for *detailed* b40 (-12%). U256 with
+/// leading-zero skip is the better choice for bases 41–68 (msd-ineff +30%).
+/// We accept the detailed-b40 regression because the niceonly speedup
+/// dominates real workloads — most production traffic is niceonly.
+const MAX_BASE_FOR_FIXED_WIDTH_U128: u32 = 40;
 
 /// Calculate the number of unique digits in (n^2, n^3) represented in base b.
 /// A number is nice if the result of this is equal to b (means all digits are used once).
 /// If you're just checking if the number is 100% nice, there is a faster version below.
+///
+/// Detailed mode (which calls this) extracts every digit of n² and n³ for
+/// every candidate. Empirically, `malachite::Natural`'s small-divisor division
+/// on a 2–3 limb representation **beats** both our u128 and U256 paths for
+/// this workload — the multi-limb division is amortised over fewer cycles
+/// than two `__udivmodti4` calls per digit. So we keep the malachite path here
+/// and only use fixed-width in `get_is_nice`.
 #[must_use]
 pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
     // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
@@ -53,7 +58,6 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
     let num = Natural::from(num_u128);
 
     // Square the number, convert to base and save the digits
-    // We tried using foiled out versions but malachite is already pretty good
     let squared = (&num).pow(2);
     for digit in squared.to_digits_asc(&base) {
         digits_indicator |= 1 << digit;
@@ -70,7 +74,6 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
 }
 
 /// The inner loop of detailed field processing. Also called by other crates like the WASM client.
-/// Automatically breaks the range into chunks for some performance gains.
 ///
 /// **Range semantics**: Expects a half-open range [`range_start`, `range_end`) where `range_start`
 /// is inclusive and `range_end` is exclusive, following Rust's standard convention.
@@ -78,51 +81,39 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
 pub fn process_range_detailed(range: &FieldSize, base: u32) -> FieldResults {
     // Calculate the minimum num_unique_digits cutoff
     let nice_list_cutoff = number_stats::get_near_miss_cutoff(base);
+    let base_idx = base as usize;
+    debug_assert!(base_idx < MAX_BASE_FOR_DIGIT_ARRAY_U128);
 
     // Initialize a list for nice and semi-nice numbers
     let mut nice_numbers: Vec<NiceNumberSimple> = Vec::new();
 
-    // Initialize a map indexed by num_unique_digits with the count of each
-    let mut unique_distribution_map: HashMap<u32, u128> = (1..=base).map(|i| (i, 0u128)).collect();
+    // Stack-resident histogram. Index is num_uniques (0..=base).
+    let mut histogram = [0u128; MAX_BASE_FOR_DIGIT_ARRAY_U128 + 1];
 
-    // Break up the range into chunks to avoid allocating too much memory
-    // Note: range.iter() and all chunks are half-open ranges [range_start, range_end)
-    let chunks = range.range_iter().chunks(DETAILED_MINI_CHUNK_SIZE);
+    for num in range.range_iter() {
+        // Get the number of unique digits for this number
+        let num_uniques = get_num_unique_digits(num, base);
 
-    // Process everything, saving results and aggregating after each chunk finishes
-    for chunk in &chunks {
-        // Get the chunk results
-        let chunk_results: Vec<(u128, u32)> = chunk
-            .map(|num| (num, get_num_unique_digits(num, base)))
-            .collect();
+        // Save the count in the histogram
+        histogram[num_uniques as usize] += 1;
 
-        // Aggregate unique_distribution
-        for (bin_uniques, total_count) in &mut unique_distribution_map {
-            let chunk_count = chunk_results
-                .iter()
-                .filter(|(_, num_unique_digits)| num_unique_digits == bin_uniques)
-                .count() as u128;
-            *total_count += chunk_count;
+        // Save the number if it exceeds the nice list cutoff
+        if num_uniques > nice_list_cutoff {
+            nice_numbers.push(NiceNumberSimple {
+                number: num,
+                num_uniques,
+            });
         }
-
-        // Collect nice numbers
-        nice_numbers.extend(
-            chunk_results
-                .into_iter()
-                .filter(|(_, num_unique_digits)| num_unique_digits > &nice_list_cutoff)
-                .map(|(num, num_unique_digits)| NiceNumberSimple {
-                    number: num,
-                    num_uniques: num_unique_digits,
-                }),
-        );
     }
 
-    // Convert distribution map to sorted Vec
-    let mut distribution: Vec<UniquesDistributionSimple> = unique_distribution_map
-        .into_iter()
-        .map(|(num_uniques, count)| UniquesDistributionSimple { num_uniques, count })
+    // Build distribution Vec from histogram, matching the previous shape
+    // (one entry per i in 1..=base, in ascending order).
+    let distribution: Vec<UniquesDistributionSimple> = (1..=base)
+        .map(|i| UniquesDistributionSimple {
+            num_uniques: i,
+            count: histogram[i as usize],
+        })
         .collect();
-    distribution.sort_by_key(|d| d.num_uniques);
 
     FieldResults {
         distribution,
@@ -150,36 +141,106 @@ pub fn process_detailed(claim_data: &DataToClient, username: &String) -> DataToS
 /// Assumes we have already done residue class filtering.
 /// Immediately stops if we hit a duplicate digit.
 ///
+/// Dispatches to fast paths based on base:
+/// - base ≤ 40: u128 throughout (n³ ≤ 2^128)
+/// - 40 < base ≤ 68: U256 (n³ ≤ 2^256)
+/// - base > 68: malachite `Natural` fallback
+///
 /// # Panics
-/// Panics if the base is larger than usize.
+/// Panics in debug builds if base ≥ `MAX_BASE_FOR_DIGIT_ARRAY_U128`.
 #[must_use]
+#[inline]
 pub fn get_is_nice(num: u128, base: u32) -> bool {
-    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    debug_assert!((base as usize) < MAX_BASE_FOR_DIGIT_ARRAY_U128);
+    if base <= MAX_BASE_FOR_FIXED_WIDTH_U128 {
+        get_is_nice_u128(num, base)
+    } else if base <= MAX_BASE_FOR_FIXED_WIDTH_U256 {
+        get_is_nice_u256(num, base)
+    } else {
+        get_is_nice_natural(num, base)
+    }
+}
 
-    // Convert u128 to natural
+/// u128 fast path. Safe for bases ≤ 40.
+#[inline]
+fn get_is_nice_u128(num: u128, base: u32) -> bool {
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    let base_u128 = u128::from(base);
+    let mut digits_indicator = [false; MAX_BASE_FOR_DIGIT_ARRAY_U128];
+
+    let squared = num * num;
+    let cubed = squared * num;
+
+    let mut n = squared;
+    while n != 0 {
+        let d = (n % base_u128) as usize;
+        n /= base_u128;
+        if digits_indicator[d] {
+            return false;
+        }
+        digits_indicator[d] = true;
+    }
+    let mut n = cubed;
+    while n != 0 {
+        let d = (n % base_u128) as usize;
+        n /= base_u128;
+        if digits_indicator[d] {
+            return false;
+        }
+        digits_indicator[d] = true;
+    }
+    true
+}
+
+/// U256 path. Safe for bases up to `MAX_BASE_FOR_FIXED_WIDTH_U256`.
+#[inline]
+fn get_is_nice_u256(num: u128, base: u32) -> bool {
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    let mut digits_indicator = [false; MAX_BASE_FOR_DIGIT_ARRAY_U128];
+
+    let squared = U256::mul_u128_u128(num, num);
+    let cubed = squared.mul_u128_truncating(num);
+
+    let mut n = squared;
+    while !n.is_zero() {
+        let d = n.div_assign_rem_u32(base) as usize;
+        if digits_indicator[d] {
+            return false;
+        }
+        digits_indicator[d] = true;
+    }
+    let mut n = cubed;
+    while !n.is_zero() {
+        let d = n.div_assign_rem_u32(base) as usize;
+        if digits_indicator[d] {
+            return false;
+        }
+        digits_indicator[d] = true;
+    }
+    true
+}
+
+/// Malachite Natural fallback for bases > `MAX_BASE_FOR_FIXED_WIDTH_U256`.
+#[inline]
+fn get_is_nice_natural(num: u128, base: u32) -> bool {
     let num = Natural::from(num);
     let base_natural = Natural::from(base);
+    let mut digits_indicator = [false; MAX_BASE_FOR_DIGIT_ARRAY_U128];
 
-    // Create a boolean array that represents all possible digits
-    let mut digits_indicator: Vec<bool> = vec![false; base as usize];
-
-    // Square the number and check those digits
     let squared = (&num).pow(2);
     let mut n = squared.clone();
     while n > 0 {
         let remainder = usize::try_from(&(n.div_assign_rem(&base_natural)))
-            .expect("Failed to convert remainder to usize");
+            .expect("digit fits in usize");
         if digits_indicator[remainder] {
             return false;
         }
         digits_indicator[remainder] = true;
     }
-
-    // Cube the number and check those digits
     let mut n = squared * num;
     while n > 0 {
         let remainder = usize::try_from(&(n.div_assign_rem(&base_natural)))
-            .expect("Failed to convert remainder to usize");
+            .expect("digit fits in usize");
         if digits_indicator[remainder] {
             return false;
         }
