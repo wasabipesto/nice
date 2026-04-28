@@ -125,63 +125,59 @@ impl U256 {
     }
 
     /// In-place division by a small u32 divisor, returns the remainder.
-    /// Standard long-division by a single-limb divisor.
     ///
-    /// Skips work on the leading-zero limbs once we've found the highest
-    /// non-zero limb. For the bases of interest (50–60) n³ uses 3 limbs, so
-    /// this saves ~25% of the per-digit division work after the first call.
+    /// Each limb iteration splits the (rem:limb) 96-bit dividend into two
+    /// u64-fitting halves so each division is a single native x86-64 DIV
+    /// (~20 cycles) instead of `__udivti3` (~150 cycles). LLVM does not
+    /// recognize that `(rem << 64) | limb` fits in u64 when typed as u128
+    /// and emits a soft-div call.
     #[inline]
     pub fn div_assign_rem_u32(&mut self, divisor: u32) -> u32 {
-        let d = divisor as u128;
-        let mut rem: u128 = 0;
-
-        // Find highest non-zero limb to skip work on the leading zeros.
-        let top = if self.limbs[3] != 0 {
-            3
-        } else if self.limbs[2] != 0 {
-            2
-        } else if self.limbs[1] != 0 {
-            1
-        } else {
-            0
-        };
-
-        for i in (0..=top).rev() {
-            let cur = (rem << 64) | (self.limbs[i] as u128);
-            let q = cur / d;
-            rem = cur % d;
-            self.limbs[i] = q as u64;
-        }
-        rem as u32
+        div_assign_rem_inner(&mut self.limbs, divisor as u64)
     }
 
-    /// Const-divisor variant — when the base is known at compile time, LLVM
-    /// emits a multiply-by-magic-constant sequence instead of a runtime DIV.
-    /// Significantly faster than `div_assign_rem_u32` for hot paths where the
-    /// base is known up front.
+    /// Const-divisor variant. Same code shape as the runtime version; the
+    /// const D allows LLVM to multiply-by-magic the per-limb DIVs.
     #[inline]
     pub fn div_assign_rem_u32_const<const D: u32>(&mut self) -> u32 {
-        let d = D as u128;
-        let mut rem: u128 = 0;
-
-        let top = if self.limbs[3] != 0 {
-            3
-        } else if self.limbs[2] != 0 {
-            2
-        } else if self.limbs[1] != 0 {
-            1
-        } else {
-            0
-        };
-
-        for i in (0..=top).rev() {
-            let cur = (rem << 64) | (self.limbs[i] as u128);
-            let q = cur / d;
-            rem = cur % d;
-            self.limbs[i] = q as u64;
-        }
-        rem as u32
+        div_assign_rem_inner(&mut self.limbs, D as u64)
     }
+}
+
+/// Shared body for both div variants. `divisor` fits in u32 (passed as u64
+/// for native arithmetic). All intermediate dividends are constructed to fit
+/// in u64 so each `/` and `%` lowers to a single x86-64 DIV instruction.
+#[inline(always)]
+fn div_assign_rem_inner(limbs: &mut [u64; 4], divisor: u64) -> u32 {
+    let mut rem: u64 = 0;
+
+    let top = if limbs[3] != 0 {
+        3
+    } else if limbs[2] != 0 {
+        2
+    } else if limbs[1] != 0 {
+        1
+    } else {
+        0
+    };
+
+    for i in (0..=top).rev() {
+        let limb = limbs[i];
+        // dividend = (rem << 64) | limb, where rem < divisor ≤ 2^32.
+        // Split into two halves that each fit in u64:
+        //   high half = (rem << 32) | (limb >> 32)            — at most 2^32 * D + 2^32 - 1 ≤ 2^64 - 1
+        //   low  half = (q1_rem << 32) | (limb & 0xFFFFFFFF)  — same bound
+        let high = (rem << 32) | (limb >> 32);
+        let q_hi = high / divisor;
+        let r_hi = high % divisor;
+
+        let low = (r_hi << 32) | (limb & 0xFFFF_FFFF);
+        let q_lo = low / divisor;
+        rem = low % divisor;
+
+        limbs[i] = (q_hi << 32) | q_lo;
+    }
+    rem as u32
 }
 
 /// Divide a u128 by a small u32 divisor.
