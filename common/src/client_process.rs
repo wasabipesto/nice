@@ -63,40 +63,50 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
         58 => get_num_unique_digits_u256_const::<58>(num_u128),
         59 => get_num_unique_digits_u256_const::<59>(num_u128),
         60 => get_num_unique_digits_u256_const::<60>(num_u128),
+        // Note: Cannot use u256 const path for bases > 63 due to bitmask size limit
         _ => get_num_unique_digits_natural(num_u128, base),
     }
 }
 
 /// u128 fast path with compile-time-constant base.
 #[inline]
+#[allow(clippy::cast_possible_truncation)]
 fn get_num_unique_digits_u128_const<const BASE: u32>(num: u128) -> u32 {
-    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    const { assert!(BASE <= 64, "u64 bitmask can't index past bit 63") };
     let base_u128 = u128::from(BASE);
-    let mut digits_indicator: u128 = 0;
+
+    // Uses a `u64` bitmask for digit tracking: BT/BTS-style register ops instead
+    // of the `[bool; 128]` stack array's load/store ping-pong.
+    let mut digits_indicator: u64 = 0;
 
     let squared = num * num;
     let cubed = squared * num;
 
     let mut n = squared;
     while n != 0 {
-        let d = n % base_u128;
+        let d = (n % base_u128) as u32;
         n /= base_u128;
-        digits_indicator |= 1u128 << d;
+        digits_indicator |= 1u64 << d;
     }
     let mut n = cubed;
     while n != 0 {
-        let d = n % base_u128;
+        let d = (n % base_u128) as u32;
         n /= base_u128;
-        digits_indicator |= 1u128 << d;
+        digits_indicator |= 1u64 << d;
     }
     digits_indicator.count_ones()
 }
 
 /// U256 fast path with compile-time-constant base.
+///
+/// `u64` bitmask: `1u64 << d` is a single SHL on x86-64 vs `1u128 << d`'s
+/// multi-instruction sequence. Const-generic dispatch only routes bases ≤ 60
+/// here, so 64 bits is enough.
 #[inline]
 fn get_num_unique_digits_u256_const<const BASE: u32>(num: u128) -> u32 {
+    const { assert!(BASE <= 64, "u64 bitmask can't index past bit 63") };
     // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
-    let mut digits_indicator: u128 = 0;
+    let mut digits_indicator: u64 = 0;
 
     let squared = U256::mul_u128_u128(num, num);
     let cubed = squared.mul_u128_truncating(num);
@@ -104,12 +114,12 @@ fn get_num_unique_digits_u256_const<const BASE: u32>(num: u128) -> u32 {
     let mut n = squared;
     while !n.is_zero() {
         let d = n.div_assign_rem_u32_const::<BASE>();
-        digits_indicator |= 1u128 << d;
+        digits_indicator |= 1u64 << d;
     }
     let mut n = cubed;
     while !n.is_zero() {
         let d = n.div_assign_rem_u32_const::<BASE>();
-        digits_indicator |= 1u128 << d;
+        digits_indicator |= 1u64 << d;
     }
     digits_indicator.count_ones()
 }
@@ -231,6 +241,7 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
         58 => get_is_nice_u256_const::<58>(num),
         59 => get_is_nice_u256_const::<59>(num),
         60 => get_is_nice_u256_const::<60>(num),
+        // Note: Cannot use u256 const path for bases > 63 due to bitmask size limit
         _ if base <= MAX_BASE_FOR_FIXED_WIDTH_U128 => get_is_nice_u128(num, base),
         _ if base <= MAX_BASE_FOR_FIXED_WIDTH_U256 => get_is_nice_u256(num, base),
         _ => get_is_nice_natural(num, base),
@@ -239,59 +250,72 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
 
 /// u128 fast path with compile-time-constant base.
 #[inline]
+#[allow(clippy::cast_possible_truncation)]
 fn get_is_nice_u128_const<const BASE: u32>(num: u128) -> bool {
-    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    const { assert!(BASE <= 64, "u64 bitmask can't index past bit 63") };
     let base_u128 = u128::from(BASE);
-    let mut digits_indicator = [false; MAX_BASE_FOR_DIGIT_ARRAY_U128];
+
+    // Uses a `u64` bitmask for digit tracking: BT/BTS-style register ops instead
+    // of the `[bool; 128]` stack array's load/store ping-pong.
+    let mut digits_indicator: u64 = 0;
 
     let squared = num * num;
 
     let mut n = squared;
     while n != 0 {
-        let d = (n % base_u128) as usize;
+        let d = (n % base_u128) as u32;
         n /= base_u128;
-        if digits_indicator[d] {
+        let bit = 1u64 << d;
+        if digits_indicator & bit != 0 {
             return false;
         }
-        digits_indicator[d] = true;
+        digits_indicator |= bit;
     }
 
     let mut n = squared * num;
     while n != 0 {
-        let d = (n % base_u128) as usize;
+        let d = (n % base_u128) as u32;
         n /= base_u128;
-        if digits_indicator[d] {
+        let bit = 1u64 << d;
+        if digits_indicator & bit != 0 {
             return false;
         }
-        digits_indicator[d] = true;
+        digits_indicator |= bit;
     }
     true
 }
 
 /// U256 fast path with compile-time-constant base.
+///
+/// Uses a `u64` bitmask for digit tracking: BT/BTS-style register ops instead
+/// of the `[bool; 128]` stack array's load/store ping-pong. Const-generic
+/// dispatch only routes bases ≤ 60 here, so 64 bits is enough.
 #[inline]
 fn get_is_nice_u256_const<const BASE: u32>(num: u128) -> bool {
+    const { assert!(BASE <= 64, "u64 bitmask can't index past bit 63") };
     // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
-    let mut digits_indicator = [false; MAX_BASE_FOR_DIGIT_ARRAY_U128];
+    let mut digits_indicator: u64 = 0;
 
     let squared = U256::mul_u128_u128(num, num);
 
     let mut n = squared;
     while !n.is_zero() {
-        let d = n.div_assign_rem_u32_const::<BASE>() as usize;
-        if digits_indicator[d] {
+        let d = n.div_assign_rem_u32_const::<BASE>();
+        let bit = 1u64 << d;
+        if digits_indicator & bit != 0 {
             return false;
         }
-        digits_indicator[d] = true;
+        digits_indicator |= bit;
     }
 
     let mut n = squared.mul_u128_truncating(num);
     while !n.is_zero() {
-        let d = n.div_assign_rem_u32_const::<BASE>() as usize;
-        if digits_indicator[d] {
+        let d = n.div_assign_rem_u32_const::<BASE>();
+        let bit = 1u64 << d;
+        if digits_indicator & bit != 0 {
             return false;
         }
-        digits_indicator[d] = true;
+        digits_indicator |= bit;
     }
     true
 }
