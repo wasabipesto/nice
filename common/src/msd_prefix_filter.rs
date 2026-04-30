@@ -22,16 +22,262 @@
 //! 5. If any condition triggers, return `true` (range can be skipped).
 //! 6. Otherwise, return `false` (range must be processed normally).
 
+#![allow(clippy::inline_always)]
+
 use log::trace;
 use malachite::base::num::arithmetic::traits::Pow;
 use malachite::base::num::conversion::traits::Digits;
 use malachite::natural::Natural;
 
 use crate::FieldSize;
+use crate::fixed_width::U256;
 
-// Recursive MSD filter subdivision parameters
-pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 11;
-pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 1000;
+// Maximum digit count for n³ in any specialized base.
+// For b40: log_40(40^24) = 24 digits.
+// For b50: log_50(50^30) = 30 digits.
+// For b60: log_60(60^36) = 36 digits.
+// 36 covers all bases ≤ 60 (the bases the u128 fast-path applies to).
+const MAX_FW_DIGITS: usize = 36;
+
+/// Stack-resident digit sequence used by the fixed-width MSD path. Stores
+/// digits in LSD-first order (matching malachite's `to_digits_asc`) so the
+/// existing `find_common_msd_prefix` / `has_duplicate_digits` helpers work
+/// unchanged on the slice `&buf[..len]`.
+#[derive(Copy, Clone)]
+struct FwDigits {
+    buf: [u32; MAX_FW_DIGITS],
+    len: usize,
+}
+
+impl FwDigits {
+    #[inline(always)]
+    fn as_slice(&self) -> &[u32] {
+        &self.buf[..self.len]
+    }
+}
+
+/// Extract base-`BASE` digits of `n` (LSD first) into a stack array.
+/// Used by the const-generic fixed-width MSD path. With `BASE` known at
+/// compile time, `% BASE` and `/ BASE` lower to multiply-by-magic.
+// `(n % base_u128) as u32` is bounded by `BASE - 1 < 2^32`. Hot path:
+// `inline(always)` matches the convention in `fixed_width.rs`.
+#[allow(clippy::cast_possible_truncation)]
+#[inline(always)]
+fn extract_digits_u128_const<const BASE: u32>(mut n: u128) -> FwDigits {
+    let base_u128 = u128::from(BASE);
+    let mut buf = [0u32; MAX_FW_DIGITS];
+    let mut len = 0;
+    if n == 0 {
+        return FwDigits { buf, len: 1 };
+    }
+    while n != 0 {
+        debug_assert!(len < MAX_FW_DIGITS);
+        buf[len] = (n % base_u128) as u32;
+        n /= base_u128;
+        len += 1;
+    }
+    FwDigits { buf, len }
+}
+
+/// Extract base-`BASE` digits of a U256 (LSD first) into a stack array.
+/// `div_assign_rem_u32_const` mutates the input limbs; we work on a copy.
+#[inline(always)]
+fn extract_digits_u256_const<const BASE: u32>(mut n: U256) -> FwDigits {
+    let mut buf = [0u32; MAX_FW_DIGITS];
+    let mut len = 0;
+    if n.is_zero() {
+        return FwDigits { buf, len: 1 };
+    }
+    while !n.is_zero() {
+        debug_assert!(len < MAX_FW_DIGITS);
+        buf[len] = n.div_assign_rem_u32_const::<BASE>();
+        len += 1;
+    }
+    FwDigits { buf, len }
+}
+
+/// Common MSD-prefix-overlap analysis given pre-extracted digit arrays.
+/// Factored out so both u128 and U256 paths share identical post-extraction
+/// logic. The early-exit pattern matches the original malachite-based
+/// implementation exactly.
+#[inline(always)]
+fn analyze_msd_prefix<const BASE: u32>(
+    start_sq_d: &FwDigits,
+    end_sq_d: &FwDigits,
+    start_cu_d: &FwDigits,
+    end_cu_d: &FwDigits,
+    first: u128,
+    last: u128,
+) -> bool {
+    if start_sq_d.len != end_sq_d.len {
+        return false;
+    }
+
+    let square_prefix_len = common_msd_prefix_len(start_sq_d.as_slice(), end_sq_d.as_slice());
+    let square_prefix = &start_sq_d.buf[start_sq_d.len - square_prefix_len..start_sq_d.len];
+    if has_duplicate_digits_small(square_prefix) {
+        return true;
+    }
+
+    if start_cu_d.len != end_cu_d.len {
+        return false;
+    }
+
+    let cube_prefix_len = common_msd_prefix_len(start_cu_d.as_slice(), end_cu_d.as_slice());
+    let cube_prefix = &start_cu_d.buf[start_cu_d.len - cube_prefix_len..start_cu_d.len];
+    if has_duplicate_digits_small(cube_prefix) {
+        return true;
+    }
+
+    if has_overlapping_digits_small(square_prefix, cube_prefix) {
+        return true;
+    }
+
+    // Cross MSD×LSD collision check (matches the original logic).
+    let k = MSD_LSD_OVERLAP_K_VALUE as usize;
+    let b_k = u128::from(BASE).saturating_pow(MSD_LSD_OVERLAP_K_VALUE);
+    let range_spans_single_lsd_class = first / b_k == last / b_k;
+
+    if range_spans_single_lsd_class {
+        let lsd_sq = &start_sq_d.buf[..k.min(start_sq_d.len)];
+        let lsd_cu = &start_cu_d.buf[..k.min(start_cu_d.len)];
+
+        if has_overlapping_digits_small(square_prefix, lsd_sq)
+            || has_overlapping_digits_small(cube_prefix, lsd_cu)
+            || has_overlapping_digits_small(square_prefix, lsd_cu)
+            || has_overlapping_digits_small(cube_prefix, lsd_sq)
+            || has_duplicate_digits_small(lsd_sq)
+            || has_duplicate_digits_small(lsd_cu)
+            || has_overlapping_digits_small(lsd_sq, lsd_cu)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Specialized const-generic MSD prefix check for bases where `n³` fits
+/// in `u128` (b40 only — see #16). Replaces 4 per-call
+/// `Natural::pow().to_digits_asc()` invocations (heap alloc + multi-limb
+/// arithmetic) with stack-resident u128 division by a const-known base.
+///
+/// SAFETY (correctness): for b40 the max valid candidate is `40^8 - 1`
+/// and `(40^8 - 1)³ < 40^24 ≈ 1.76e38 < u128::MAX = 3.40e38`, so the
+/// cube fits with 50% margin. The `FwDigits` buffer has 36 slots,
+/// enough for any base ≤ 60's cube digit count.
+#[inline]
+fn has_duplicate_msd_prefix_u128_const<const BASE: u32>(range: FieldSize) -> bool {
+    if range.size() == 1 {
+        return false;
+    }
+
+    let first = range.first();
+    let last = range.last();
+
+    let start_sq = first * first;
+    let end_sq = last * last;
+    let start_cu = start_sq * first;
+    let end_cu = end_sq * last;
+
+    let start_sq_d = extract_digits_u128_const::<BASE>(start_sq);
+    let end_sq_d = extract_digits_u128_const::<BASE>(end_sq);
+    let start_cu_d = extract_digits_u128_const::<BASE>(start_cu);
+    let end_cu_d = extract_digits_u128_const::<BASE>(end_cu);
+
+    analyze_msd_prefix::<BASE>(&start_sq_d, &end_sq_d, &start_cu_d, &end_cu_d, first, last)
+}
+
+/// Specialized const-generic MSD prefix check for bases where `n³` fits in
+/// U256 (i.e., bases > 40 with n ≤ 60-ish). Same structure as the u128 path
+/// but uses the U256 fixed-width arithmetic from `fixed_width.rs`.
+///
+/// Per #16: the original malachite path's heap allocations are the dominant
+/// cost on xlarge-niceonly-t1 for b40; the same pattern applies for b50 and
+/// other production bases (msd-ineff workload, etc.).
+#[inline]
+fn has_duplicate_msd_prefix_u256_const<const BASE: u32>(range: FieldSize) -> bool {
+    if range.size() == 1 {
+        return false;
+    }
+
+    let first = range.first();
+    let last = range.last();
+
+    // For bases ≤ 60, n² fits in u128 (verified empirically: b60 max n² < 2^144,
+    // wait — actually b60 max n ≈ 2.18e21 ≈ 2^71 → n² ≈ 2^142 doesn't fit u128).
+    // Use U256 throughout.
+    let start_sq = U256::mul_u128_u128(first, first);
+    let end_sq = U256::mul_u128_u128(last, last);
+    let start_cu = start_sq.mul_u128_truncating(first);
+    let end_cu = end_sq.mul_u128_truncating(last);
+
+    let start_sq_d = extract_digits_u256_const::<BASE>(start_sq);
+    let end_sq_d = extract_digits_u256_const::<BASE>(end_sq);
+    let start_cu_d = extract_digits_u256_const::<BASE>(start_cu);
+    let end_cu_d = extract_digits_u256_const::<BASE>(end_cu);
+
+    analyze_msd_prefix::<BASE>(&start_sq_d, &end_sq_d, &start_cu_d, &end_cu_d, first, last)
+}
+
+/// Common-MSD-prefix length on slices in LSD-first ordering. Equivalent
+/// to `find_common_msd_prefix(...).len()` but doesn't allocate.
+#[inline(always)]
+fn common_msd_prefix_len(d1: &[u32], d2: &[u32]) -> usize {
+    let len1 = d1.len();
+    let len2 = d2.len();
+    let min_len = len1.min(len2);
+    let mut common = 0;
+    for i in 0..min_len {
+        if d1[len1 - 1 - i] == d2[len2 - 1 - i] {
+            common += 1;
+        } else {
+            break;
+        }
+    }
+    common
+}
+
+/// Stack-resident replacement for `has_duplicate_digits` (which allocates
+/// a `vec![false; 256]` per call). Uses a u64 bitmask, valid because
+/// the const-generic dispatch only routes bases ≤ 64 here. (For bases
+/// > 64 the malachite path is still used.)
+#[inline(always)]
+fn has_duplicate_digits_small(digits: &[u32]) -> bool {
+    let mut seen: u64 = 0;
+    for &d in digits {
+        debug_assert!(d < 64);
+        let bit = 1u64 << d;
+        if seen & bit != 0 {
+            return true;
+        }
+        seen |= bit;
+    }
+    false
+}
+
+/// Stack-resident replacement for `has_overlapping_digits`.
+#[inline(always)]
+fn has_overlapping_digits_small(d1: &[u32], d2: &[u32]) -> bool {
+    let mut seen: u64 = 0;
+    for &d in d1 {
+        debug_assert!(d < 64);
+        seen |= 1u64 << d;
+    }
+    for &d in d2 {
+        debug_assert!(d < 64);
+        if seen & (1u64 << d) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+// Recursive MSD filter subdivision parameters (last tuned 2026-04-30).
+// Previously we limited the depth to 11, but with fixed-width
+// arithmetic it's feasible to go down to depth ~20.
+pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 19;
+pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 250;
 pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 
 // Cross MSD×LSD collision check parameters
@@ -129,6 +375,7 @@ fn extract_lsd_suffix(digits_asc: &[u32], k: usize) -> Vec<u32> {
 ///
 /// # Panics
 /// Panics if the range is invalid or the base is greater than 256.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
     // Check for edge cases
@@ -137,6 +384,34 @@ pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
         "Range has invalid bounds, range_start must be < range_end (half-open interval)"
     );
     assert!(base <= 256, "Base must be 256 or less");
+
+    // Stack-resident fixed-width MSD path: bypasses malachite's
+    // 4 per-call `Natural::pow().to_digits_asc()` invocations (each a
+    // heap alloc + multi-limb arithmetic). Profile evidence puts the
+    // malachite/heap work at ~17% of total cycles on xlarge benchmark.
+    //
+    // b40 fits in u128 (max n³ < 1.77e38 < u128::MAX = 3.40e38). All
+    // other production bases overflow u128 and need U256.
+    match base {
+        40 => return has_duplicate_msd_prefix_u128_const::<40>(range),
+        42 => return has_duplicate_msd_prefix_u256_const::<42>(range),
+        43 => return has_duplicate_msd_prefix_u256_const::<43>(range),
+        44 => return has_duplicate_msd_prefix_u256_const::<44>(range),
+        45 => return has_duplicate_msd_prefix_u256_const::<45>(range),
+        47 => return has_duplicate_msd_prefix_u256_const::<47>(range),
+        48 => return has_duplicate_msd_prefix_u256_const::<48>(range),
+        49 => return has_duplicate_msd_prefix_u256_const::<49>(range),
+        50 => return has_duplicate_msd_prefix_u256_const::<50>(range),
+        52 => return has_duplicate_msd_prefix_u256_const::<52>(range),
+        53 => return has_duplicate_msd_prefix_u256_const::<53>(range),
+        54 => return has_duplicate_msd_prefix_u256_const::<54>(range),
+        55 => return has_duplicate_msd_prefix_u256_const::<55>(range),
+        57 => return has_duplicate_msd_prefix_u256_const::<57>(range),
+        58 => return has_duplicate_msd_prefix_u256_const::<58>(range),
+        59 => return has_duplicate_msd_prefix_u256_const::<59>(range),
+        60 => return has_duplicate_msd_prefix_u256_const::<60>(range),
+        _ => {}
+    }
 
     // Can't check for duplicate values when there is only one element
     if range.size() == 1 {
@@ -412,6 +687,99 @@ mod tests {
         }
 
         chunks
+    }
+
+    /// Reference implementation that always uses the malachite path.
+    /// Used in `test_fixed_width_matches_malachite_*` to verify the
+    /// fixed-width const-generic dispatch path produces identical
+    /// results across all specialized bases.
+    fn malachite_msd_reference(range: FieldSize, base: u32) -> bool {
+        if range.size() == 1 {
+            return false;
+        }
+        let s_sq = Natural::from(range.first()).pow(2).to_digits_asc(&base);
+        let e_sq = Natural::from(range.last()).pow(2).to_digits_asc(&base);
+        if s_sq.len() != e_sq.len() {
+            return false;
+        }
+        let sq_p = find_common_msd_prefix(&s_sq, &e_sq);
+        if has_duplicate_digits(&sq_p) {
+            return true;
+        }
+        let s_cu = Natural::from(range.first()).pow(3).to_digits_asc(&base);
+        let e_cu = Natural::from(range.last()).pow(3).to_digits_asc(&base);
+        if s_cu.len() != e_cu.len() {
+            return false;
+        }
+        let cu_p = find_common_msd_prefix(&s_cu, &e_cu);
+        if has_duplicate_digits(&cu_p) {
+            return true;
+        }
+        if has_overlapping_digits(&sq_p, &cu_p) {
+            return true;
+        }
+        let k = MSD_LSD_OVERLAP_K_VALUE as usize;
+        let b_k = u128::from(base).saturating_pow(k as u32);
+        if range.first() / b_k == range.last() / b_k {
+            let lsd_sq = extract_lsd_suffix(&s_sq, k);
+            let lsd_cu = extract_lsd_suffix(&s_cu, k);
+            if has_overlapping_digits(&sq_p, &lsd_sq)
+                || has_overlapping_digits(&cu_p, &lsd_cu)
+                || has_overlapping_digits(&sq_p, &lsd_cu)
+                || has_overlapping_digits(&cu_p, &lsd_sq)
+                || has_duplicate_digits(&lsd_sq)
+                || has_duplicate_digits(&lsd_cu)
+                || has_overlapping_digits(&lsd_sq, &lsd_cu)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Cross-check: every (base, range) sample must produce the same
+    /// answer through the dispatched path (which routes to the fixed-width
+    /// const-generic variant for specialized bases) as through a fresh
+    /// malachite computation. Catches any const-power overflow,
+    /// digit-extraction off-by-one, or analyze-step deviation in the
+    /// u128/U256 paths added by #16.
+    #[test_log::test]
+    fn test_fixed_width_msd_matches_malachite_all_bases() {
+        // 50 samples per base × 17 bases = 850 cross-checks. Keep
+        // sample count modest so the test stays sub-second.
+        let bases: &[u32] = &[
+            40, 42, 43, 44, 45, 47, 48, 49, 50, 52, 53, 54, 55, 57, 58, 59, 60,
+        ];
+        let mut state: u128 = 0x1234_5678_9abc_def0_cafe_babe_dead_beef;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for &base in bases {
+            let r = base_range::get_base_range_u128(base)
+                .unwrap_or_else(|_| panic!("b{base} range error"))
+                .unwrap_or_else(|| panic!("b{base} no range"));
+            let n_low = r.start();
+            let n_high = r.end();
+            let span = n_high - n_low;
+            for _ in 0..50 {
+                let s = n_low + (rng() % (span / 2));
+                let sz = (rng() % (span / 100).max(1)) + 1;
+                let e = (s + sz).min(n_high);
+                if e <= s {
+                    continue;
+                }
+                let range = FieldSize::new(s, e);
+                let want = malachite_msd_reference(range, base);
+                let got = has_duplicate_msd_prefix(range, base);
+                assert_eq!(
+                    want, got,
+                    "b{base} disagrees on [{s}, {e}): malachite={want}, fixed_width={got}"
+                );
+            }
+        }
     }
 
     #[test_log::test]
