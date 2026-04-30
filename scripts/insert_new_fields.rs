@@ -2,7 +2,7 @@
 //! ```cargo
 //! [dependencies]
 //! nice_common = { path = "../common", features = ["database"] }
-//! clap = "4.4"
+//! clap = "4.6"
 //! read_input = "0.8"
 //! ```
 

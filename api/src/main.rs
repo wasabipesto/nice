@@ -19,7 +19,7 @@ use nice_common::{
     CLAIM_DURATION_HOURS, DataToClient, DataToServer, FieldClaimStrategy, NiceNumber, SearchMode,
     ValidationData,
 };
-use rand::Rng;
+use rand::RngExt;
 use rocket::State;
 use rocket::http::Status;
 use rocket::response::status as rocket_status;

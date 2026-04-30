@@ -2,7 +2,7 @@
 //! ```cargo
 //! [dependencies]
 //! nice_common = { path = "../common" }
-//! clap = { version = "4.5", features = ["env", "derive"] }
+//! clap = { version = "4.6", features = ["env", "derive"] }
 //! env_logger = { version = "0.11" }
 //! rayon = { version = "1.11" }
 //! log = { version = "0.4" }
