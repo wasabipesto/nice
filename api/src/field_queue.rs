@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// Configuration for queue refilling behavior
-const REFILL_THRESHOLD: usize = 10; // Refill when queue has this many or fewer
-const REFILL_AMOUNT: usize = 100; // Claim this many fields when refilling
+const REFILL_THRESHOLD: usize = 50; // Refill when queue has this many or fewer
+const REFILL_AMOUNT: usize = 200; // Claim this many fields when refilling
 
 /// Thread-safe queue for managing pre-claimed fields.
 pub struct FieldQueue {
