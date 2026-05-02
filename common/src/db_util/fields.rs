@@ -2,7 +2,7 @@
 
 use super::*;
 use anyhow::anyhow;
-use rand::Rng;
+use rand::RngExt;
 
 table! {
     fields (id) {
