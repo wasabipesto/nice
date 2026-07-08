@@ -3,14 +3,16 @@
 //! This module offloads the hot loops to the GPU while keeping the same
 //! filter cascade and result semantics as the CPU path:
 //!
-//! - **Niceonly**: the CPU runs the real MSD prefix filter
-//!   (`msd_prefix_filter::get_valid_ranges`, parallelized across cores) at
-//!   production chunking, then ships only compact *range descriptors* to the
-//!   GPU (~12 bytes per surviving range). The GPU reconstructs the stride
-//!   filter's candidates on-device from the residue table — the g-th valid
-//!   candidate at or after a range start is `B0 + (g/R)*M + residues[g%R]` —
-//!   and runs the early-exit nice check. No per-candidate data ever crosses
-//!   the bus, and the candidate set is identical to the CPU path's.
+//! - **Niceonly**: the CPU runs the real MSD prefix filter (parallelized
+//!   across cores) with a coarser recursion floor than the CPU client (see
+//!   [`GPU_MSD_MIN_RANGE_SIZE`]), then ships only compact *range descriptors*
+//!   to the GPU (~12 bytes per surviving range). The GPU reconstructs the
+//!   stride filter's candidates on-device from the residue table — the g-th
+//!   valid candidate at or after a range start is
+//!   `B0 + (g/R)*M + residues[g%R]` — and runs the early-exit nice check.
+//!   No per-candidate data ever crosses the bus. The GPU checks a superset
+//!   of the CPU path's candidates (coarser pruning is still sound), so the
+//!   nice numbers found are identical.
 //! - **Detailed**: each GPU thread derives its own `n = start + idx`, so
 //!   there is no input transfer at all. Unique-digit counts accumulate in an
 //!   on-device histogram; only the histogram and the (rare) near-miss list
@@ -71,6 +73,25 @@ const NEAR_MISS_CAPACITY: usize = 1 << 20;
 
 /// Maximum MSD-valid ranges per niceonly kernel launch.
 const RANGES_PER_LAUNCH: usize = 1 << 22;
+
+/// MSD recursion floor for the GPU path (CPU path uses 250).
+///
+/// The MSD filter's cost is dominated by its deepest recursion levels, which
+/// buy the final few percent of pruning — pruning the GPU doesn't need,
+/// because checking a candidate costs it almost nothing. Measured on a real
+/// b52 production field (per 1e12 numbers, single core):
+///
+/// | floor  | CPU time | surviving |
+/// |--------|----------|-----------|
+/// | 250    | 350s     | 2.3%      |
+/// | 4000   | 50s      | 15.2%     |
+/// | 16000  | 15s      | 19.0%     |
+/// | 64000  | 4.8s     | 22.6%     |
+///
+/// 16000 cuts the CPU MSD cost ~23x while the extra GPU load (~2e8 checks
+/// per 1e10 field) amounts to a few milliseconds of kernel time. Pruning is
+/// sound at any granularity, so the found nice numbers are unchanged.
+const GPU_MSD_MIN_RANGE_SIZE: u128 = 16_000;
 
 /// Compiled niceonly kernel plus the per-base stride data living on-device.
 struct NiceonlyPlan {
@@ -322,9 +343,9 @@ pub fn process_range_niceonly_gpu(
     // front, so the phase timings below reflect per-field work only.
     let plan = ctx.niceonly_plan(base)?;
 
-    // Phase 1: MSD prefix filter on CPU, parallel over production-size chunks.
-    // Chunking at PROCESSING_CHUNK_SIZE matters: it lets the recursion reach
-    // full pruning depth, exactly like the CPU client.
+    // Phase 1: MSD prefix filter on CPU, parallel over production-size
+    // chunks, with the GPU-tuned recursion floor (coarser pruning, GPU
+    // absorbs the extra candidates — see GPU_MSD_MIN_RANGE_SIZE).
     let msd_start = Instant::now();
     let (offsets, lens) = msd_filter_parallel(range, base)?;
     let msd_secs = msd_start.elapsed().as_secs_f64();
@@ -342,7 +363,7 @@ pub fn process_range_niceonly_gpu(
     {
         let total_secs = msd_secs + gpu_secs;
         info!(
-            "GPU niceonly b{base}: msd {msd_secs:.2}s -> {} ranges ({:.2}% of field), gpu {gpu_secs:.2}s, {:.2e} n/s overall",
+            "GPU niceonly b{base}: msd {msd_secs:.3}s -> {} ranges ({:.2}% of field), gpu {gpu_secs:.3}s, {:.2e} n/s overall",
             offsets.len(),
             100.0 * valid_numbers as f64 / range.size() as f64,
             range.size() as f64 / total_secs,
@@ -376,7 +397,15 @@ fn msd_filter_parallel(range: &FieldSize, base: u32) -> Result<(Vec<u64>, Vec<u3
                 loop {
                     let i = next_chunk.fetch_add(1, Ordering::Relaxed);
                     let Some(chunk) = chunks.get(i) else { break };
-                    for sub in msd_prefix_filter::get_valid_ranges(*chunk, base) {
+                    let subs = msd_prefix_filter::get_valid_ranges_recursive(
+                        *chunk,
+                        base,
+                        0,
+                        msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH,
+                        GPU_MSD_MIN_RANGE_SIZE,
+                        msd_prefix_filter::MSD_RECURSIVE_SUBDIVISION_FACTOR,
+                    );
+                    for sub in subs {
                         let offset = u64::try_from(sub.start() - range.start());
                         let len = u32::try_from(sub.size());
                         if let (Ok(offset), Ok(len)) = (offset, len) {
