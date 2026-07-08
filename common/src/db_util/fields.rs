@@ -571,7 +571,7 @@ pub fn bulk_claim_thin_fields(
             SELECT id
             FROM chunks
             WHERE CASE
-                WHEN $1 = 0 THEN checked_niceonly / NULLIF(range_size, 0) < $5
+                WHEN $2 = 0 THEN checked_niceonly / NULLIF(range_size, 0) < $5
                 ELSE checked_detailed / NULLIF(range_size, 0) < $5
             END
             ORDER BY id ASC
