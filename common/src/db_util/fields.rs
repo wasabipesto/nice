@@ -535,6 +535,79 @@ pub fn bulk_claim_fields(
     results.into_iter().map(private_to_public).collect()
 }
 
+/// Bulk claim multiple fields at once from the first under-explored chunk, using the
+/// `Thin` strategy. Mirrors `try_claim_field`'s `Thin` branch but claims up to `count`
+/// fields from the chosen chunk in a single statement.
+///
+/// Only `maximum_check_level >= 1` is supported here; the niceonly (cl=0) bulk path
+/// is handled by `bulk_claim_fields`.
+pub fn bulk_claim_thin_fields(
+    conn: &mut PgConnection,
+    count: usize,
+    maximum_timestamp: DateTime<Utc>,
+    maximum_check_level: u8,
+    maximum_size: u128,
+) -> Result<Vec<FieldRecord>> {
+    use diesel::sql_query;
+    use diesel::sql_types::{BigInt, Integer, Numeric, Timestamptz};
+
+    let maximum_check_level = conversions::u8_to_i32(maximum_check_level)?;
+    let maximum_size = conversions::u128_to_bigdec(maximum_size)?;
+    let count_i64 = i64::try_from(count).map_err(|e| anyhow!("{e}"))?;
+    let chunk_completion_cutoff_pct = conversions::f32_to_bigdec(DOWNSAMPLE_CUTOFF_PERCENT)?;
+
+    // Same check_level predicate logic as try_claim_field / bulk_claim_fields.
+    let check_level_predicate = if maximum_check_level == 0 {
+        "check_level = 0"
+    } else {
+        "check_level <= $2"
+    };
+
+    // Find the first eligible (under-explored) chunk, then bulk-claim up to `count`
+    // fields within it. We do this in a single statement by joining the eligible
+    // chunk back to fields and limiting the candidate set.
+    let query = format!(
+        "WITH eligible_chunk AS (
+            SELECT id
+            FROM chunks
+            WHERE CASE
+                WHEN $1 = 0 THEN checked_niceonly / NULLIF(range_size, 0) < $5
+                ELSE checked_detailed / NULLIF(range_size, 0) < $5
+            END
+            ORDER BY id ASC
+            LIMIT 1
+        ), candidates AS (
+            SELECT f.id
+            FROM fields f
+            JOIN eligible_chunk ec ON f.chunk_id = ec.id
+            WHERE COALESCE(f.last_claim_time, 'epoch'::timestamptz) <= $1
+              AND f.{check_level_predicate}
+              AND f.range_size <= $3
+            ORDER BY f.id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT $4
+        )
+        UPDATE fields f
+        SET last_claim_time = NOW()
+        FROM candidates
+        WHERE f.id = candidates.id
+        RETURNING f.*;"
+    );
+
+    // Note: bind order is $1=maximum_timestamp, $2=maximum_check_level, $3=maximum_size,
+    // $4=count, $5=chunk_completion_cutoff_pct.
+    let results = sql_query(query)
+        .bind::<Timestamptz, _>(maximum_timestamp)
+        .bind::<Integer, _>(maximum_check_level)
+        .bind::<Numeric, _>(maximum_size)
+        .bind::<BigInt, _>(count_i64)
+        .bind::<Numeric, _>(chunk_completion_cutoff_pct)
+        .load::<FieldPrivate>(conn)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    results.into_iter().map(private_to_public).collect()
+}
+
 pub fn get_validation_field(conn: &mut PgConnection) -> Result<ValidationData> {
     use diesel::sql_query;
     use diesel::sql_types::{BigInt, Integer};

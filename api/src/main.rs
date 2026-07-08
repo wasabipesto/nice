@@ -16,8 +16,8 @@ use nice_common::db_util::{
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
 use nice_common::{
-    CLAIM_DURATION_HOURS, DataToClient, DataToServer, FieldClaimStrategy, NiceNumber, SearchMode,
-    ValidationData,
+    CLAIM_DURATION_HOURS, DETAILED_SEARCH_MAX_FIELD_SIZE, DataToClient, DataToServer,
+    FieldClaimStrategy, NiceNumber, SearchMode, ValidationData,
 };
 use rand::RngExt;
 use rocket::State;
@@ -35,11 +35,6 @@ use helpers::{
     ApiErrorBody, ApiResult, CorsFairing, RequestTimingFairing, bad_request_error, internal_error,
     not_found_error, unprocessable_entity_error,
 };
-
-/// Detailed runners will never get a field larger than this.
-/// Currently set to 1e9, which corresponds to base 50 and takes about a minute
-/// to process on modern runners.
-const DETAILED_SEARCH_MAX_FIELD_SIZE: u128 = 1_000_000_000;
 
 #[get("/claim/validate")]
 fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
@@ -59,9 +54,11 @@ fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
 #[get("/status")]
 fn status(queue: &State<FieldQueue>) -> Json<Value> {
     let niceonly_queue_size = queue.niceonly_queue_size();
+    let detailed_thin_queue_size = queue.detailed_thin_queue_size();
     Json(json!({
         "status": "ok",
-        "niceonly_queue_size": niceonly_queue_size
+        "niceonly_queue_size": niceonly_queue_size,
+        "detailed_thin_queue_size": detailed_thin_queue_size
     }))
 }
 
@@ -110,6 +107,10 @@ fn claim_helper(
     // For niceonly mode, use the pre-claimed queue for much faster response times.
     // This reduces latency from ~90ms (database query + locking + update) to <1ms (memory access).
     // The queue automatically refills by bulk-claiming fields at once when it drops below a threshold.
+    //
+    // For detailed mode, the dominant (80%) `Thin` strategy also consults a pre-claimed queue;
+    // the rarer `Next`/`Random`/cl=2 strategies fall back to a direct database claim because they
+    // are inherently per-request stateful and not worth bulk-pre-claiming.
     let search_field = if search_mode == SearchMode::Niceonly {
         // Try to get from queue first
         if let Some(queued_field) = queue.claim_niceonly() {
@@ -128,8 +129,47 @@ fn claim_helper(
             .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
             .ok_or_else(|| internal_error("Could not find any niceonly field!".to_string()))?
         }
+    } else if claim_strategy == FieldClaimStrategy::Thin {
+        // Try the detailed-thin queue first; fall back to a direct claim if it's empty.
+        if let Some(queued_field) = queue.claim_detailed_thin() {
+            queued_field
+        } else {
+            tracing::warn!("Detailed-thin queue exhausted, falling back to direct database claim");
+            let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
+            if let Some(claimed_field) = try_claim_field(
+                &mut conn,
+                claim_strategy,
+                maximum_timestamp,
+                max_check_level,
+                max_range_size,
+            )
+            .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
+            {
+                claimed_field
+            } else {
+                tracing::info!(
+                    "Unable to find an unclaimed or expired field, falling back to one that may have been claimed recently."
+                );
+                let maximum_timestamp = Utc::now();
+                let claim_strategy = FieldClaimStrategy::Next;
+                try_claim_field(
+                    &mut conn,
+                    claim_strategy,
+                    maximum_timestamp,
+                    max_check_level,
+                    max_range_size,
+                )
+                .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
+                .ok_or_else(|| {
+                    internal_error(format!(
+                        "Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!"
+                    ))
+                })?
+            }
+        }
     } else {
-        // For detailed mode, use the original database claim logic
+        // For the remaining detailed strategies (Next / Random / cl=2), use the original
+        // database claim logic with the two-step fallback.
         let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
         if let Some(claimed_field) = try_claim_field(
             &mut conn,
@@ -393,6 +433,7 @@ fn rocket() -> _ {
     // Initialize field queue and pre-fill it
     let queue = FieldQueue::new(pool.clone());
     queue.prefill_niceonly();
+    queue.prefill_detailed_thin();
 
     // Initialize Prometheus metrics
     let prometheus = PrometheusMetrics::new();
