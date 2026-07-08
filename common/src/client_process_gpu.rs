@@ -74,6 +74,7 @@ const RANGES_PER_LAUNCH: usize = 1 << 22;
 
 /// Compiled niceonly kernel plus the per-base stride data living on-device.
 struct NiceonlyPlan {
+    base: u32,
     func: CudaFunction,
     residues: CudaSlice<u32>,
     modulus: u32,
@@ -171,6 +172,7 @@ impl GpuContext {
         );
 
         let plan = Arc::new(NiceonlyPlan {
+            base,
             func,
             residues,
             modulus,
@@ -316,6 +318,10 @@ pub fn process_range_niceonly_gpu(
         });
     }
 
+    // Build (or fetch cached) the compiled kernel and device residue table up
+    // front, so the phase timings below reflect per-field work only.
+    let plan = ctx.niceonly_plan(base)?;
+
     // Phase 1: MSD prefix filter on CPU, parallel over production-size chunks.
     // Chunking at PROCESSING_CHUNK_SIZE matters: it lets the recursion reach
     // full pruning depth, exactly like the CPU client.
@@ -328,7 +334,7 @@ pub fn process_range_niceonly_gpu(
     let gpu_start = Instant::now();
     let mut nice_numbers: Vec<NiceNumberSimple> = Vec::new();
     if !offsets.is_empty() {
-        nice_numbers = launch_niceonly(ctx, range, base, &offsets, &lens)?;
+        nice_numbers = launch_niceonly(ctx, &plan, range, &offsets, &lens)?;
     }
     let gpu_secs = gpu_start.elapsed().as_secs_f64();
 
@@ -402,12 +408,11 @@ fn msd_filter_parallel(range: &FieldSize, base: u32) -> Result<(Vec<u64>, Vec<u3
 /// Upload range descriptors and run the niceonly kernel over them.
 fn launch_niceonly(
     ctx: &GpuContext,
+    plan: &NiceonlyPlan,
     range: &FieldSize,
-    base: u32,
     offsets: &[u64],
     lens: &[u32],
 ) -> Result<Vec<NiceNumberSimple>> {
-    let plan = ctx.niceonly_plan(base)?;
     let (field_start_lo, field_start_hi) = split_u128(range.start());
 
     let nice_capacity = NICE_OUT_CAPACITY as u32;
@@ -459,7 +464,7 @@ fn launch_niceonly(
         for i in 0..nice_count {
             nice_numbers.push(NiceNumberSimple {
                 number: combine_u64(out[2 * i], out[2 * i + 1]),
-                num_uniques: base,
+                num_uniques: plan.base,
             });
         }
         nice_numbers.sort_by_key(|n| n.number);
