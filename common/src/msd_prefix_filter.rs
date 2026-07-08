@@ -36,8 +36,10 @@ use crate::fixed_width::U256;
 // For b40: log_40(40^24) = 24 digits.
 // For b50: log_50(50^30) = 30 digits.
 // For b60: log_60(60^36) = 36 digits.
-// 36 covers all bases ≤ 60 (the bases the u128 fast-path applies to).
-const MAX_FW_DIGITS: usize = 36;
+// For b62: k=12, b%5=2 → n³ has 3k+1 = 37 digits.
+// For b64: k=12, b%5=4 → n³ has 3k+2 = 38 digits.
+// 38 covers all specialized bases ≤ 64.
+const MAX_FW_DIGITS: usize = 38;
 
 /// Stack-resident digit sequence used by the fixed-width MSD path. Stores
 /// digits in LSD-first order (matching malachite's `to_digits_asc`) so the
@@ -164,8 +166,8 @@ fn analyze_msd_prefix<const BASE: u32>(
 ///
 /// SAFETY (correctness): for b40 the max valid candidate is `40^8 - 1`
 /// and `(40^8 - 1)³ < 40^24 ≈ 1.76e38 < u128::MAX = 3.40e38`, so the
-/// cube fits with 50% margin. The `FwDigits` buffer has 36 slots,
-/// enough for any base ≤ 60's cube digit count.
+/// cube fits with 50% margin. The `FwDigits` buffer has 38 slots,
+/// enough for any specialized base ≤ 64's cube digit count (b64 needs 38).
 #[inline]
 fn has_duplicate_msd_prefix_u128_const<const BASE: u32>(range: FieldSize) -> bool {
     if range.size() == 1 {
@@ -410,6 +412,8 @@ pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
         58 => return has_duplicate_msd_prefix_u256_const::<58>(range),
         59 => return has_duplicate_msd_prefix_u256_const::<59>(range),
         60 => return has_duplicate_msd_prefix_u256_const::<60>(range),
+        62 => return has_duplicate_msd_prefix_u256_const::<62>(range),
+        64 => return has_duplicate_msd_prefix_u256_const::<64>(range),
         _ => {}
     }
 
@@ -748,7 +752,7 @@ mod tests {
         // 50 samples per base × 17 bases = 850 cross-checks. Keep
         // sample count modest so the test stays sub-second.
         let bases: &[u32] = &[
-            40, 42, 43, 44, 45, 47, 48, 49, 50, 52, 53, 54, 55, 57, 58, 59, 60,
+            40, 42, 43, 44, 45, 47, 48, 49, 50, 52, 53, 54, 55, 57, 58, 59, 60, 62, 64,
         ];
         let mut state: u128 = 0x1234_5678_9abc_def0_cafe_babe_dead_beef;
         let mut rng = || {

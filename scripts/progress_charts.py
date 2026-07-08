@@ -6,6 +6,7 @@
 #     "psycopg2-binary",
 #     "numpy",
 #     "python-dotenv",
+#     "tqdm",
 # ]
 # ///
 
@@ -21,6 +22,7 @@ import numpy as np
 from dotenv import load_dotenv
 from urllib.parse import urlparse
 from collections import defaultdict
+from tqdm import tqdm
 
 def connect_to_database():
     """Connect to PostgreSQL database using environment variables"""
@@ -54,7 +56,7 @@ def connect_to_database():
         sys.exit(1)
 
 def fetch_submission_data(conn):
-    """Fetch submissions from database"""
+    """Fetch submissions from database using a server-side cursor for memory efficiency"""
     query = """
     SELECT
         s.id as submission_id,
@@ -73,28 +75,46 @@ def fetch_submission_data(conn):
         s.disqualified = false;
     """
 
+    count_query = """
+    SELECT COUNT(*)
+    FROM submissions s
+    LEFT JOIN fields f ON s.field_id = f.id
+    WHERE s.disqualified = false;
+    """
+
     try:
+        # Get total count for progress bar
         with conn.cursor() as cur:
+            cur.execute(count_query)
+            total_rows = cur.fetchone()[0]
+
+        # Use server-side cursor to stream results without loading all into memory
+        chunk_size = 10000
+        submission_dicts = []
+        with conn.cursor(name='submission_cursor') as cur:
             cur.execute(query)
-            results = cur.fetchall()
+            with tqdm(total=total_rows, desc="Fetching submissions", unit="row") as pbar:
+                while True:
+                    rows = cur.fetchmany(chunk_size)
+                    if not rows:
+                        break
+                    for row in rows:
+                        submission_dicts.append({
+                            'submission_id': row[0],
+                            'field_id': row[1],
+                            'base': row[2],
+                            'range_size': row[3],
+                            'search_mode': row[4],
+                            'submit_time': row[5],
+                            'elapsed_secs': row[6],
+                            'username': row[7],
+                            'client_version': row[8],
+                            'disqualified': row[9]
+                        })
+                    pbar.update(len(rows))
     except psycopg2.Error as e:
         print(f"Error executing query: {e}")
         sys.exit(1)
-
-    submission_dicts = []
-    for row in results:
-        submission_dicts.append({
-            'submission_id': row[0],
-            'field_id': row[1],
-            'base': row[2],
-            'range_size': row[3],
-            'search_mode': row[4],
-            'submit_time': row[5],
-            'elapsed_secs': row[6],
-            'username': row[7],
-            'client_version': row[8],
-            'disqualified': row[9]
-        })
 
     return submission_dicts
 

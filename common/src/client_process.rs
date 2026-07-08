@@ -63,7 +63,9 @@ pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
         58 => get_num_unique_digits_u256_const::<58>(num_u128),
         59 => get_num_unique_digits_u256_const::<59>(num_u128),
         60 => get_num_unique_digits_u256_const::<60>(num_u128),
-        // Note: Cannot use u256 const path for bases > 63 due to bitmask size limit
+        62 => get_num_unique_digits_u256_const::<62>(num_u128),
+        64 => get_num_unique_digits_u256_const::<64>(num_u128),
+        // Note: Cannot use u256 const path for bases > 64 due to bitmask size limit
         _ => get_num_unique_digits_natural(num_u128, base),
     }
 }
@@ -241,7 +243,9 @@ pub fn get_is_nice(num: u128, base: u32) -> bool {
         58 => get_is_nice_u256_const::<58>(num),
         59 => get_is_nice_u256_const::<59>(num),
         60 => get_is_nice_u256_const::<60>(num),
-        // Note: Cannot use u256 const path for bases > 63 due to bitmask size limit
+        62 => get_is_nice_u256_const::<62>(num),
+        64 => get_is_nice_u256_const::<64>(num),
+        // Note: Cannot use u256 const path for bases > 64 due to bitmask size limit
         _ if base <= MAX_BASE_FOR_FIXED_WIDTH_U128 => get_is_nice_u128(num, base),
         _ if base <= MAX_BASE_FOR_FIXED_WIDTH_U256 => get_is_nice_u256(num, base),
         _ => get_is_nice_natural(num, base),
