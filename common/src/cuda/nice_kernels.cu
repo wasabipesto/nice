@@ -78,6 +78,10 @@
 #endif
 #endif
 
+#if BASE > 128
+#error "DigitSet is two u64 words; bases above 128 are not representable"
+#endif
+
 typedef unsigned long long u64;
 typedef unsigned int u32;
 

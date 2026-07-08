@@ -25,16 +25,16 @@
 //! multiply-high sequences, for *every* base — not just a hardcoded list.
 //! Compiled modules are cached in the context.
 //!
-//! The GPU path supports bases up to `MAX_BASE_FOR_FIXED_WIDTH_U256` (68),
-//! where n³ still fits in 256 bits. Higher bases (or bases with no valid
-//! u128 range) fall back to the CPU implementation with a logged warning.
+//! The GPU path supports every base with a valid u128 search range (through
+//! ~b97): kernel buffers are sized per base at JIT time from `N_LIMBS`, so
+//! there is no 256-bit ceiling like the CPU's `U256` fast path, and bases
+//! above 64 use a two-word digit mask. Bases with no u128 range fall back to
+//! the CPU implementation with a logged warning.
 
 #![cfg(feature = "gpu")]
 #![allow(clippy::cast_possible_truncation)]
 
-use crate::client_process::{
-    MAX_BASE_FOR_FIXED_WIDTH_U256, process_range_detailed, process_range_niceonly,
-};
+use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     PROCESSING_CHUNK_SIZE, UniquesDistributionSimple,
@@ -160,34 +160,10 @@ impl GpuContext {
         }
 
         let build_start = Instant::now();
-        let table = stride_filter::StrideTable::new(base, GPU_LSD_K);
-        ensure!(
-            !table.valid_residues.is_empty(),
-            "no valid stride residues for base {base} (residue-empty base?)"
-        );
-        ensure!(
-            table.modulus <= u128::from(u32::MAX),
-            "stride modulus {} exceeds u32 for base {base}",
-            table.modulus
-        );
+        let (defines, table) = niceonly_defines(base)?;
         let modulus = table.modulus as u32;
         let residues_host: Vec<u32> = table.valid_residues.iter().map(|&r| r as u32).collect();
         let num_residues = residues_host.len() as u32;
-        let pow64_mod_m = ((1u128 << 64) % table.modulus) as u32;
-
-        let mut defines = common_defines(base)?;
-        defines.push("NICEONLY".to_string());
-        defines.push(format!("STRIDE_M={modulus}u"));
-        defines.push(format!("STRIDE_R={num_residues}u"));
-        defines.push(format!("POW64_MOD_M={pow64_mod_m}u"));
-        if let Some(pre) = prefilter_params(base) {
-            defines.push("PREFILTER".to_string());
-            defines.push(format!("PRE_DIGITS={}", pre.digits));
-            defines.push(format!("PRE_MOD={}ull", pre.modulus));
-            defines.push(format!("POW64_MOD_PRE={}ull", pre.pow64_mod));
-        } else {
-            debug!("modular prefilter disabled for base {base}");
-        }
 
         let ptx = compile_kernel_ptx(&defines)
             .with_context(|| format!("compiling niceonly kernel for base {base}"))?;
@@ -239,13 +215,20 @@ impl GpuContext {
     }
 }
 
+/// Highest base the GPU digit mask can represent (two u64 words). The
+/// kernel's u32-limb arithmetic is width-generic (buffers are sized from
+/// `N_LIMBS` at JIT time), so unlike the CPU's `U256` path there is no
+/// 256-bit ceiling; in practice the u128 candidate representation caps
+/// usable bases around 97 via `get_base_range_u128`.
+const MAX_GPU_DIGIT_MASK_BASE: u32 = 128;
+
 /// Defines shared by both kernels for a base: `BASE`, `N_LIMBS`,
 /// `CHUNK_DIGITS`, `CHUNK_DIV`. Fails for bases the GPU cannot handle
 /// (see [`gpu_supports_base`]).
 fn common_defines(base: u32) -> Result<Vec<String>> {
     ensure!(
-        base <= MAX_BASE_FOR_FIXED_WIDTH_U256,
-        "base {base} exceeds GPU max base {MAX_BASE_FOR_FIXED_WIDTH_U256} (n³ overflows 256 bits)"
+        base <= MAX_GPU_DIGIT_MASK_BASE,
+        "base {base} exceeds the GPU digit mask limit {MAX_GPU_DIGIT_MASK_BASE}"
     );
     let range = base_range::get_base_range_u128(base)
         .context("computing base range")?
@@ -270,6 +253,41 @@ fn detailed_defines(base: u32) -> Result<Vec<String>> {
         number_stats::get_near_miss_cutoff(base)
     ));
     Ok(defines)
+}
+
+/// Full define set for the niceonly kernel (common + stride + prefilter),
+/// along with the stride table whose residues the caller uploads. Requires
+/// no GPU or NVRTC, so tests can exercise kernel configuration for every
+/// base without hardware.
+fn niceonly_defines(base: u32) -> Result<(Vec<String>, stride_filter::StrideTable)> {
+    let table = stride_filter::StrideTable::new(base, GPU_LSD_K);
+    ensure!(
+        !table.valid_residues.is_empty(),
+        "no valid stride residues for base {base} (residue-empty base?)"
+    );
+    ensure!(
+        table.modulus <= u128::from(u32::MAX),
+        "stride modulus {} exceeds u32 for base {base}",
+        table.modulus
+    );
+    let modulus = table.modulus as u32;
+    let num_residues = table.valid_residues.len() as u32;
+    let pow64_mod_m = ((1u128 << 64) % table.modulus) as u32;
+
+    let mut defines = common_defines(base)?;
+    defines.push("NICEONLY".to_string());
+    defines.push(format!("STRIDE_M={modulus}u"));
+    defines.push(format!("STRIDE_R={num_residues}u"));
+    defines.push(format!("POW64_MOD_M={pow64_mod_m}u"));
+    if let Some(pre) = prefilter_params(base) {
+        defines.push("PREFILTER".to_string());
+        defines.push(format!("PRE_DIGITS={}", pre.digits));
+        defines.push(format!("PRE_MOD={}ull", pre.modulus));
+        defines.push(format!("POW64_MOD_PRE={}ull", pre.pow64_mod));
+    } else {
+        debug!("modular prefilter disabled for base {base}");
+    }
+    Ok((defines, table))
 }
 
 /// Parameters for the niceonly kernel's modular prefilter.
@@ -336,9 +354,15 @@ fn chunk_constants(base: u32) -> (u32, u32) {
 }
 
 /// Whether the GPU path can process this base natively. Bases outside this
-/// fall back to the CPU implementation.
+/// fall back to the CPU implementation. Unlike the CPU fast path (capped at
+/// `MAX_BASE_FOR_FIXED_WIDTH_U256` = 68 by its 256-bit type), the GPU's
+/// limb-generic arithmetic handles every base with a valid u128 range.
+///
+/// Bases below 10 are excluded: their search ranges are trivially small
+/// (b5's is two numbers), and `get_base_range_u128` panics outright on
+/// degenerate ones like b4 — not worth guarding for on the GPU path.
 fn gpu_supports_base(base: u32) -> bool {
-    base <= MAX_BASE_FOR_FIXED_WIDTH_U256
+    (10..=MAX_GPU_DIGIT_MASK_BASE).contains(&base)
         && matches!(base_range::get_base_range_u128(base), Ok(Some(_)))
 }
 
@@ -398,33 +422,21 @@ pub fn process_range_niceonly_gpu(
     }
 
     // Build (or fetch cached) the compiled kernel and device residue table up
-    // front, so the phase timings below reflect per-field work only.
+    // front, so the timings below reflect per-field work only.
     let plan = ctx.niceonly_plan(base)?;
 
-    // Phase 1: MSD prefix filter on CPU, parallel over production-size
-    // chunks, with the GPU-tuned recursion floor (coarser pruning, GPU
-    // absorbs the extra candidates — see GPU_MSD_MIN_RANGE_SIZE).
-    let msd_start = Instant::now();
-    let (offsets, lens) = msd_filter_parallel(range, base)?;
-    let msd_secs = msd_start.elapsed().as_secs_f64();
-    let valid_numbers: u64 = lens.iter().map(|&l| u64::from(l)).sum();
-
-    // Phase 2: check surviving ranges on the GPU.
-    let gpu_start = Instant::now();
-    let mut nice_numbers: Vec<NiceNumberSimple> = Vec::new();
-    if !offsets.is_empty() {
-        nice_numbers = launch_niceonly(ctx, &plan, range, &offsets, &lens)?;
-    }
-    let gpu_secs = gpu_start.elapsed().as_secs_f64();
+    let (nice_numbers, stats) = run_niceonly_pipeline(ctx, &plan, range, base)?;
 
     #[allow(clippy::cast_precision_loss)]
     {
-        let total_secs = msd_secs + gpu_secs;
         info!(
-            "GPU niceonly b{base}: msd {msd_secs:.3}s -> {} ranges ({:.2}% of field), gpu {gpu_secs:.3}s, {:.2e} n/s overall",
-            offsets.len(),
-            100.0 * valid_numbers as f64 / range.size() as f64,
-            range.size() as f64 / total_secs,
+            "GPU niceonly b{base}: msd {:.3}s -> {} ranges ({:.2}% of field), gpu tail {:.3}s, total {:.3}s, {:.2e} n/s overall",
+            stats.msd_secs,
+            stats.num_ranges,
+            100.0 * stats.valid_numbers as f64 / range.size() as f64,
+            (stats.total_secs - stats.msd_secs).max(0.0),
+            stats.total_secs,
+            range.size() as f64 / stats.total_secs,
         );
     }
 
@@ -434,43 +446,104 @@ pub fn process_range_niceonly_gpu(
     })
 }
 
-/// Run `get_valid_ranges` over the field's chunks on all available cores.
-/// Returns the surviving ranges as (offset from field start, length) pairs.
-fn msd_filter_parallel(range: &FieldSize, base: u32) -> Result<(Vec<u64>, Vec<u32>)> {
+/// MSD recursion floor for the GPU path, overridable per machine with the
+/// `NICE_GPU_MSD_FLOOR` environment variable. The right value balances CPU
+/// MSD throughput against GPU check throughput, which varies with the
+/// cores-per-GPU ratio; the default is tuned for ~32 modern cores per A100.
+fn gpu_msd_floor() -> u128 {
+    static FLOOR: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| match std::env::var("NICE_GPU_MSD_FLOOR") {
+        Ok(v) => match v.parse::<u128>() {
+            Ok(f) if f >= 1 => {
+                info!("GPU MSD recursion floor overridden: {f}");
+                f
+            }
+            _ => {
+                warn!("ignoring invalid NICE_GPU_MSD_FLOOR '{v}'");
+                GPU_MSD_MIN_RANGE_SIZE
+            }
+        },
+        Err(_) => GPU_MSD_MIN_RANGE_SIZE,
+    })
+}
+
+/// Per-field statistics from the overlapped niceonly pipeline.
+struct NiceonlyStats {
+    /// Wall time until the MSD workers finished (launches overlap with this).
+    msd_secs: f64,
+    total_secs: f64,
+    num_ranges: usize,
+    valid_numbers: u64,
+    launches: u32,
+}
+
+/// Ranges buffered before each kernel launch. Big enough to amortize launch
+/// and upload overhead, small enough that launches start while the MSD
+/// workers are still producing.
+const LAUNCH_BATCH_RANGES: usize = 1 << 16;
+
+/// Run the niceonly field: MSD workers stream surviving-range descriptors
+/// through a channel while the main thread batches them into asynchronous
+/// kernel launches, so the CPU filter and the GPU checks overlap instead of
+/// running as sequential phases.
+fn run_niceonly_pipeline(
+    ctx: &GpuContext,
+    plan: &NiceonlyPlan,
+    range: &FieldSize,
+    base: u32,
+) -> Result<(Vec<NiceNumberSimple>, NiceonlyStats)> {
+    let start_time = Instant::now();
     let chunks = range.chunks(PROCESSING_CHUNK_SIZE);
+    let floor = gpu_msd_floor();
     let num_threads = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(4)
         .min(chunks.len().max(1));
 
+    let mut launcher = NiceonlyLauncher::new(ctx, plan, range)?;
+
     let next_chunk = AtomicUsize::new(0);
-    let collected: Mutex<(Vec<u64>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
-    let error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let worker_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u64>, Vec<u32>)>();
+
+    let mut stats = NiceonlyStats {
+        msd_secs: 0.0,
+        total_secs: 0.0,
+        num_ranges: 0,
+        valid_numbers: 0,
+        launches: 0,
+    };
+    let mut buf_offsets: Vec<u64> = Vec::new();
+    let mut buf_lens: Vec<u32> = Vec::new();
+    let mut launch_error: Option<anyhow::Error> = None;
 
     std::thread::scope(|scope| {
+        let chunks = &chunks;
+        let next_chunk = &next_chunk;
+        let worker_error = &worker_error;
         for _ in 0..num_threads {
-            scope.spawn(|| {
-                let mut local_offsets: Vec<u64> = Vec::new();
-                let mut local_lens: Vec<u32> = Vec::new();
+            let tx = tx.clone();
+            scope.spawn(move || {
                 loop {
                     let i = next_chunk.fetch_add(1, Ordering::Relaxed);
                     let Some(chunk) = chunks.get(i) else { break };
-                    let subs = msd_prefix_filter::get_valid_ranges_recursive(
+                    let mut offsets: Vec<u64> = Vec::new();
+                    let mut lens: Vec<u32> = Vec::new();
+                    for sub in msd_prefix_filter::get_valid_ranges_recursive(
                         *chunk,
                         base,
                         0,
                         msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH,
-                        GPU_MSD_MIN_RANGE_SIZE,
+                        floor,
                         msd_prefix_filter::MSD_RECURSIVE_SUBDIVISION_FACTOR,
-                    );
-                    for sub in subs {
+                    ) {
                         let offset = u64::try_from(sub.start() - range.start());
                         let len = u32::try_from(sub.size());
                         if let (Ok(offset), Ok(len)) = (offset, len) {
-                            local_offsets.push(offset);
-                            local_lens.push(len);
+                            offsets.push(offset);
+                            lens.push(len);
                         } else {
-                            *error.lock().unwrap() = Some(anyhow::anyhow!(
+                            *worker_error.lock().unwrap() = Some(anyhow::anyhow!(
                                 "valid range doesn't fit descriptor: start {} size {}",
                                 sub.start(),
                                 sub.size()
@@ -478,92 +551,148 @@ fn msd_filter_parallel(range: &FieldSize, base: u32) -> Result<(Vec<u64>, Vec<u3
                             return;
                         }
                     }
+                    if !offsets.is_empty() {
+                        // The receiver may be gone if a launch failed; the
+                        // remaining chunks are then discarded.
+                        let _ = tx.send((offsets, lens));
+                    }
                 }
-                let mut guard = collected.lock().unwrap();
-                guard.0.extend(local_offsets);
-                guard.1.extend(local_lens);
             });
         }
+        // The consumer runs on this thread while the workers produce. The
+        // clone of `tx` held by each worker keeps the channel open; dropping
+        // ours lets `recv` disconnect once they all finish.
+        drop(tx);
+
+        while let Ok((offsets, lens)) = rx.recv() {
+            stats.num_ranges += offsets.len();
+            stats.valid_numbers += lens.iter().map(|&l| u64::from(l)).sum::<u64>();
+            buf_offsets.extend_from_slice(&offsets);
+            buf_lens.extend_from_slice(&lens);
+            if buf_offsets.len() >= LAUNCH_BATCH_RANGES {
+                if let Err(e) = launcher.launch(&buf_offsets, &buf_lens) {
+                    launch_error = Some(e);
+                    break;
+                }
+                stats.launches += 1;
+                buf_offsets.clear();
+                buf_lens.clear();
+            }
+        }
+        // Workers are done (or the launch failed); either way this marks the
+        // end of the CPU-side phase.
+        stats.msd_secs = start_time.elapsed().as_secs_f64();
     });
 
-    if let Some(e) = error.into_inner().unwrap() {
+    if let Some(e) = launch_error {
         return Err(e);
     }
-    Ok(collected.into_inner().unwrap())
-}
-
-/// Upload range descriptors and run the niceonly kernel over them.
-fn launch_niceonly(
-    ctx: &GpuContext,
-    plan: &NiceonlyPlan,
-    range: &FieldSize,
-    offsets: &[u64],
-    lens: &[u32],
-) -> Result<Vec<NiceNumberSimple>> {
-    let (field_start_lo, field_start_hi) = split_u128(range.start());
-
-    let nice_capacity = NICE_OUT_CAPACITY as u32;
-    let d_nice_out = ctx.stream.alloc_zeros::<u64>(2 * NICE_OUT_CAPACITY)?;
-    let mut d_nice_count = ctx.stream.alloc_zeros::<u32>(1)?;
-
-    for (batch_offsets, batch_lens) in offsets
-        .chunks(RANGES_PER_LAUNCH)
-        .zip(lens.chunks(RANGES_PER_LAUNCH))
-    {
-        let d_offsets = ctx.stream.clone_htod(batch_offsets)?;
-        let d_lens = ctx.stream.clone_htod(batch_lens)?;
-        let num_ranges = batch_offsets.len() as u32;
-
-        // One warp per range.
-        let total_threads = u64::from(num_ranges) * 32;
-        let grid_blocks = total_threads.div_ceil(u64::from(BLOCK_THREADS)) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (grid_blocks, 1, 1),
-            block_dim: (BLOCK_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
-        let mut launch_args = ctx.stream.launch_builder(&plan.func);
-        launch_args.arg(&field_start_lo);
-        launch_args.arg(&field_start_hi);
-        launch_args.arg(&d_offsets);
-        launch_args.arg(&d_lens);
-        launch_args.arg(&num_ranges);
-        launch_args.arg(&plan.residues);
-        launch_args.arg(&d_nice_out);
-        launch_args.arg(&mut d_nice_count);
-        launch_args.arg(&nice_capacity);
-        unsafe {
-            launch_args.launch(cfg)?;
-        }
+    if let Some(e) = worker_error.into_inner().unwrap() {
+        return Err(e);
+    }
+    if !buf_offsets.is_empty() {
+        launcher.launch(&buf_offsets, &buf_lens)?;
+        stats.launches += 1;
     }
 
-    let nice_count = ctx.stream.clone_dtoh(&d_nice_count)?[0] as usize;
-    if nice_count > NICE_OUT_CAPACITY {
-        bail!(
-            "niceonly output buffer overflow: {nice_count} > {NICE_OUT_CAPACITY} \
-             (this strongly suggests a kernel bug)"
-        );
-    }
-    let mut nice_numbers = Vec::with_capacity(nice_count);
-    if nice_count > 0 {
-        let out = ctx.stream.clone_dtoh(&d_nice_out)?;
-        for i in 0..nice_count {
-            nice_numbers.push(NiceNumberSimple {
-                number: combine_u64(out[2 * i], out[2 * i + 1]),
-                num_uniques: plan.base,
-            });
-        }
-        nice_numbers.sort_by_key(|n| n.number);
-    }
+    let nice_numbers = launcher.finish()?;
+    stats.total_secs = start_time.elapsed().as_secs_f64();
     debug!(
-        "GPU niceonly launch: {} ranges, M={}, R={}, found {}",
-        offsets.len(),
+        "GPU niceonly pipeline: {} ranges in {} launches, M={}, R={}, found {}",
+        stats.num_ranges,
+        stats.launches,
         plan.modulus,
         plan.num_residues,
-        nice_count
+        nice_numbers.len()
     );
-    Ok(nice_numbers)
+    Ok((nice_numbers, stats))
+}
+
+/// Holds the per-field output buffers and issues asynchronous niceonly
+/// kernel launches over batches of range descriptors.
+struct NiceonlyLauncher<'a> {
+    ctx: &'a GpuContext,
+    plan: &'a NiceonlyPlan,
+    field_start_lo: u64,
+    field_start_hi: u64,
+    d_nice_out: CudaSlice<u64>,
+    d_nice_count: CudaSlice<u32>,
+}
+
+impl<'a> NiceonlyLauncher<'a> {
+    fn new(ctx: &'a GpuContext, plan: &'a NiceonlyPlan, range: &FieldSize) -> Result<Self> {
+        let (field_start_lo, field_start_hi) = split_u128(range.start());
+        Ok(NiceonlyLauncher {
+            ctx,
+            plan,
+            field_start_lo,
+            field_start_hi,
+            d_nice_out: ctx.stream.alloc_zeros::<u64>(2 * NICE_OUT_CAPACITY)?,
+            d_nice_count: ctx.stream.alloc_zeros::<u32>(1)?,
+        })
+    }
+
+    /// Upload a batch of range descriptors and launch the kernel on them.
+    /// Launches are asynchronous on the stream; results accumulate in the
+    /// shared output buffers until [`Self::finish`].
+    fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()> {
+        let nice_capacity = NICE_OUT_CAPACITY as u32;
+        for (batch_offsets, batch_lens) in offsets
+            .chunks(RANGES_PER_LAUNCH)
+            .zip(lens.chunks(RANGES_PER_LAUNCH))
+        {
+            let d_offsets = self.ctx.stream.clone_htod(batch_offsets)?;
+            let d_lens = self.ctx.stream.clone_htod(batch_lens)?;
+            let num_ranges = batch_offsets.len() as u32;
+
+            // One warp per range.
+            let total_threads = u64::from(num_ranges) * 32;
+            let grid_blocks = total_threads.div_ceil(u64::from(BLOCK_THREADS)) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_blocks, 1, 1),
+                block_dim: (BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            let mut launch_args = self.ctx.stream.launch_builder(&self.plan.func);
+            launch_args.arg(&self.field_start_lo);
+            launch_args.arg(&self.field_start_hi);
+            launch_args.arg(&d_offsets);
+            launch_args.arg(&d_lens);
+            launch_args.arg(&num_ranges);
+            launch_args.arg(&self.plan.residues);
+            launch_args.arg(&self.d_nice_out);
+            launch_args.arg(&mut self.d_nice_count);
+            launch_args.arg(&nice_capacity);
+            unsafe {
+                launch_args.launch(cfg)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Synchronize and collect the found nice numbers.
+    fn finish(self) -> Result<Vec<NiceNumberSimple>> {
+        let nice_count = self.ctx.stream.clone_dtoh(&self.d_nice_count)?[0] as usize;
+        if nice_count > NICE_OUT_CAPACITY {
+            bail!(
+                "niceonly output buffer overflow: {nice_count} > {NICE_OUT_CAPACITY} \
+                 (this strongly suggests a kernel bug)"
+            );
+        }
+        let mut nice_numbers = Vec::with_capacity(nice_count);
+        if nice_count > 0 {
+            let out = self.ctx.stream.clone_dtoh(&self.d_nice_out)?;
+            for i in 0..nice_count {
+                nice_numbers.push(NiceNumberSimple {
+                    number: combine_u64(out[2 * i], out[2 * i + 1]),
+                    num_uniques: self.plan.base,
+                });
+            }
+            nice_numbers.sort_by_key(|n| n.number);
+        }
+        Ok(nice_numbers)
+    }
 }
 
 // ============================================================================
@@ -734,8 +863,8 @@ mod tests {
     use crate::stride_filter::StrideTable;
 
     /// Bases used for CPU-side mirror tests: a mix of small, u64-range,
-    /// u128-range, and two-mask (>64) regimes.
-    const MIRROR_TEST_BASES: [u32; 6] = [10, 40, 45, 57, 62, 68];
+    /// u128-range, two-mask (>64), and beyond-U256 (>68) regimes.
+    const MIRROR_TEST_BASES: [u32; 8] = [10, 40, 45, 57, 62, 68, 70, 94];
 
     fn try_init_gpu() -> Option<GpuContext> {
         GpuContext::new(0).ok()
@@ -1110,7 +1239,7 @@ mod tests {
 
     #[test_log::test]
     fn chunk_constants_are_maximal() {
-        for base in 2..=MAX_BASE_FOR_FIXED_WIDTH_U256 {
+        for base in 2..=MAX_GPU_DIGIT_MASK_BASE {
             let (e, div) = chunk_constants(base);
             assert!(e >= 1);
             assert_eq!(u64::from(div), u64::from(base).pow(e));
@@ -1151,6 +1280,45 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // NVRTC compile tests: need libnvrtc but NO GPU device, so they run
+    // on any machine with the CUDA runtime libraries installed (e.g. inside
+    // the nvidia/cuda docker image). Skipped gracefully when NVRTC is absent.
+    // ------------------------------------------------------------------
+
+    #[test_log::test]
+    fn nvrtc_compiles_kernels_for_all_supported_bases() {
+        // Probe with a trivial program first: if THIS fails, the library is
+        // missing and we skip; any later failure is a real kernel bug.
+        // cudarc panics (rather than erroring) when libnvrtc can't be
+        // loaded, so the probe runs under catch_unwind.
+        let probe = std::panic::catch_unwind(|| {
+            compile_ptx_with_opts(
+                "extern \"C\" __global__ void probe() {}",
+                CompileOptions::default(),
+            )
+        });
+        if !matches!(probe, Ok(Ok(_))) {
+            println!("NVRTC not available, skipping compile test");
+            return;
+        }
+
+        for base in 10..=MAX_GPU_DIGIT_MASK_BASE {
+            if !gpu_supports_base(base) {
+                continue;
+            }
+            let defines = detailed_defines(base).unwrap();
+            compile_kernel_ptx(&defines)
+                .unwrap_or_else(|e| panic!("detailed kernel failed to compile for b{base}: {e:?}"));
+            if !residue_filter::get_residue_filter_u128(&base).is_empty() {
+                let (defines, _table) = niceonly_defines(base).unwrap();
+                compile_kernel_ptx(&defines).unwrap_or_else(|e| {
+                    panic!("niceonly kernel failed to compile for b{base}: {e:?}")
+                });
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // GPU integration tests (run on a CUDA machine with --ignored)
     // ------------------------------------------------------------------
 
@@ -1161,7 +1329,7 @@ mod tests {
             println!("GPU not available, skipping test");
             return;
         };
-        for base in 2..=MAX_BASE_FOR_FIXED_WIDTH_U256 {
+        for base in 2..=MAX_GPU_DIGIT_MASK_BASE {
             if !gpu_supports_base(base) {
                 continue;
             }
