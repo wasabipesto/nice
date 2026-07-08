@@ -16,6 +16,11 @@
 //   STRIDE_M      - stride filter modulus M = (BASE-1) * BASE^k
 //   STRIDE_R      - number of valid residues mod M
 //   POW64_MOD_M   - 2^64 mod STRIDE_M (for u128 mod M)
+// Optionally for the niceonly kernel (define PREFILTER; host enables it only
+// when n^2 and n^3 are guaranteed at least PRE_DIGITS digits each):
+//   PRE_DIGITS    - digits checked per value in the modular prefilter
+//   PRE_MOD       - BASE^PRE_DIGITS (u64, <= 2^48)
+//   POW64_MOD_PRE - 2^64 mod PRE_MOD
 // For the detailed kernel (define DETAILED):
 //   NEAR_MISS_CUTOFF - num_uniques above which a number is reported
 //
@@ -59,6 +64,12 @@
 #endif
 #ifndef POW64_MOD_M
 #define POW64_MOD_M 30016u
+#endif
+#ifndef PREFILTER
+#define PREFILTER
+#define PRE_DIGITS 9
+#define PRE_MOD 262144000000000ull
+#define POW64_MOD_PRE 195081709551616ull
 #endif
 #endif
 #ifdef DETAILED
@@ -113,6 +124,21 @@ __device__ __forceinline__ bool digitset_add(DigitSet& s, u32 d) {
     }
     word |= bit;
     return true;
+}
+
+// Records digit d and returns 1 if it was already present, 0 otherwise.
+// Branchless, for the uniform-length prefilter.
+__device__ __forceinline__ u32 digitset_test_and_set(DigitSet& s, u32 d) {
+#if BASE > 64
+    u64& word = (d < 64) ? s.lo : s.hi;
+    u64 bit = 1ull << (d & 63);
+#else
+    u64& word = s.lo;
+    u64 bit = 1ull << d;
+#endif
+    u32 dup = (word & bit) != 0 ? 1 : 0;
+    word |= bit;
+    return dup;
 }
 
 __device__ __forceinline__ u32 digitset_count(const DigitSet& s) {
@@ -267,6 +293,74 @@ __device__ __forceinline__ u32 mod_m(u64 n_lo, u64 n_hi) {
     return (u32)(t % STRIDE_M);
 }
 
+#ifdef PREFILTER
+
+// Reduce value = hi*2^64 + lo mod PRE_MOD. The loop maintains the invariant
+// value === hi*2^64 + lo (mod PRE_MOD) and shrinks hi by ~16 bits per step
+// (PRE_MOD <= 2^48), so it terminates in at most a few iterations for any
+// input; callers here always pass hi < 2^32 (two steps).
+__device__ __forceinline__ u64 reduce_pre(u64 hi, u64 lo) {
+    while (hi != 0) {
+        u64 p_lo = hi * POW64_MOD_PRE;
+        u64 p_hi = __umul64hi(hi, POW64_MOD_PRE);
+        lo += p_lo;
+        hi = p_hi + (lo < p_lo ? 1 : 0);
+    }
+    return lo % PRE_MOD; // const divisor -> multiply-high
+}
+
+// (a * b) mod PRE_MOD for a, b < PRE_MOD.
+__device__ __forceinline__ u64 mulmod_pre(u64 a, u64 b) {
+    return reduce_pre(__umul64hi(a, b), a * b);
+}
+
+// Cheap uniform pre-check: the lowest PRE_DIGITS digits of n^2 and of n^3,
+// computed entirely in u64 modular arithmetic via
+// x^k mod b^p == (x mod b^p)^k mod b^p — no multi-limb work at all.
+// Returns false if any digit repeats (the candidate cannot be nice).
+// Fixed-length and branch-free so warps stay converged; survivors
+// (a few percent to ~25% depending on base) fall through to the full check,
+// which redoes these digits from scratch — the recompute is amortized to
+// noise by the kill rate, and it keeps check_is_nice untouched.
+//
+// Soundness requires n^2 and n^3 to really have at least PRE_DIGITS digits
+// each (otherwise the loop would extract phantom leading zeros); the host
+// only defines PREFILTER when the base's range guarantees that.
+__device__ __forceinline__ bool prefilter_low_digits(u64 n_lo, u64 n_hi) {
+    u64 nm = reduce_pre(n_hi, n_lo);
+    u64 sq = mulmod_pre(nm, nm);
+    u64 cu = mulmod_pre(sq, nm);
+
+    DigitSet set;
+    digitset_clear(set);
+    u32 dup = 0;
+#pragma unroll
+    for (int k = 0; k < PRE_DIGITS; k++) {
+        u32 d = (u32)(sq % BASE); // const divisor -> multiply-high
+        sq /= BASE;
+        dup |= digitset_test_and_set(set, d);
+    }
+#pragma unroll
+    for (int k = 0; k < PRE_DIGITS; k++) {
+        u32 d = (u32)(cu % BASE);
+        cu /= BASE;
+        dup |= digitset_test_and_set(set, d);
+    }
+    return dup == 0;
+}
+
+#endif // PREFILTER
+
+// Full candidate check, with the modular prefilter in front when enabled.
+__device__ __forceinline__ bool candidate_is_nice(u64 n_lo, u64 n_hi) {
+#ifdef PREFILTER
+    if (!prefilter_low_digits(n_lo, n_hi)) {
+        return false;
+    }
+#endif
+    return check_is_nice(n_lo, n_hi);
+}
+
 // First index in residues[0..STRIDE_R) with residues[idx] >= m, or STRIDE_R.
 __device__ __forceinline__ u32 lower_bound_residue(
     const u32* __restrict__ residues, u32 m
@@ -331,7 +425,7 @@ extern "C" __global__ void niceonly_ranges_kernel(
             if (n_hi > re_hi || (n_hi == re_hi && n_lo >= re_lo)) {
                 break;
             }
-            if (check_is_nice(n_lo, n_hi)) {
+            if (candidate_is_nice(n_lo, n_hi)) {
                 u32 pos = atomicAdd(nice_count, 1);
                 if (pos < nice_capacity) {
                     nice_out[2 * (size_t)pos] = n_lo;

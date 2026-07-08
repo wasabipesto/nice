@@ -180,6 +180,14 @@ impl GpuContext {
         defines.push(format!("STRIDE_M={modulus}u"));
         defines.push(format!("STRIDE_R={num_residues}u"));
         defines.push(format!("POW64_MOD_M={pow64_mod_m}u"));
+        if let Some(pre) = prefilter_params(base) {
+            defines.push("PREFILTER".to_string());
+            defines.push(format!("PRE_DIGITS={}", pre.digits));
+            defines.push(format!("PRE_MOD={}ull", pre.modulus));
+            defines.push(format!("POW64_MOD_PRE={}ull", pre.pow64_mod));
+        } else {
+            debug!("modular prefilter disabled for base {base}");
+        }
 
         let ptx = compile_kernel_ptx(&defines)
             .with_context(|| format!("compiling niceonly kernel for base {base}"))?;
@@ -262,6 +270,56 @@ fn detailed_defines(base: u32) -> Result<Vec<String>> {
         number_stats::get_near_miss_cutoff(base)
     ));
     Ok(defines)
+}
+
+/// Parameters for the niceonly kernel's modular prefilter.
+struct PrefilterParams {
+    /// Digits checked per value (the lowest `digits` of n² and of n³).
+    digits: u32,
+    /// `base^digits`, at most 2^48.
+    modulus: u64,
+    /// `2^64 mod modulus`.
+    pow64_mod: u64,
+}
+
+/// Compute the prefilter parameters for a base, or None when the prefilter
+/// must stay disabled.
+///
+/// The prefilter checks the lowest p digits of n² and n³ using
+/// `x mod b^p` arithmetic in u64. Constraints:
+/// - `b^p <= 2^48` keeps every intermediate product reducible with a couple
+///   of multiply-high steps;
+/// - n² and n³ must each be guaranteed at least p digits across the base's
+///   whole range, or the digit loop would extract phantom leading zeros and
+///   could falsely reject a nice number. Verified with a conservative
+///   log-based lower bound on the digit counts at the range start.
+fn prefilter_params(base: u32) -> Option<PrefilterParams> {
+    let mut digits = 0u32;
+    let mut modulus = 1u64;
+    while modulus <= (1u64 << 48) / u64::from(base) {
+        modulus *= u64::from(base);
+        digits += 1;
+    }
+
+    let range = base_range::get_base_range_u128(base).ok()??;
+    #[allow(clippy::cast_precision_loss)]
+    let ln_n_min = (range.range_start as f64).ln();
+    let ln_base = f64::from(base).ln();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let digit_lower_bound =
+        |power: f64| ((power * ln_n_min / ln_base).floor() - 1.0).max(0.0) as u32;
+    let sq_digits_min = digit_lower_bound(2.0);
+    let cu_digits_min = digit_lower_bound(3.0);
+    if digits < 4 || sq_digits_min < digits || cu_digits_min < digits {
+        return None;
+    }
+
+    let pow64_mod = ((1u128 << 64) % u128::from(modulus)) as u64;
+    Some(PrefilterParams {
+        digits,
+        modulus,
+        pow64_mod,
+    })
 }
 
 /// Largest (e, base^e) with base^e < 2^31. The kernel splits n² and n³ into
@@ -913,6 +971,141 @@ mod tests {
             &mut digits,
         );
         seen.iter().filter(|&&s| s).count() as u32
+    }
+
+    /// Rust mirror of `reduce_pre` in `nice_kernels.cu`.
+    fn mirror_reduce_pre(mut hi: u64, mut lo: u64, modulus: u64, pow64_mod: u64) -> u64 {
+        while hi != 0 {
+            let p_lo = hi.wrapping_mul(pow64_mod);
+            let p_hi = ((u128::from(hi) * u128::from(pow64_mod)) >> 64) as u64;
+            lo = lo.wrapping_add(p_lo);
+            hi = p_hi + u64::from(lo < p_lo);
+        }
+        lo % modulus
+    }
+
+    /// Rust mirror of `prefilter_low_digits` in `nice_kernels.cu`.
+    fn mirror_prefilter(n: u128, base: u32, pre: &PrefilterParams) -> bool {
+        let mulhi = |a: u64, b: u64| ((u128::from(a) * u128::from(b)) >> 64) as u64;
+        let mulmod = |a: u64, b: u64| {
+            mirror_reduce_pre(mulhi(a, b), a.wrapping_mul(b), pre.modulus, pre.pow64_mod)
+        };
+        let (n_lo, n_hi) = split_u128(n);
+        let nm = mirror_reduce_pre(n_hi, n_lo, pre.modulus, pre.pow64_mod);
+        let mut sq = mulmod(nm, nm);
+        let mut cu = mulmod(sq, nm);
+
+        let mut seen = [false; 128];
+        let mut dup = false;
+        for _ in 0..pre.digits {
+            let d = (sq % u64::from(base)) as usize;
+            sq /= u64::from(base);
+            dup |= seen[d];
+            seen[d] = true;
+        }
+        for _ in 0..pre.digits {
+            let d = (cu % u64::from(base)) as usize;
+            cu /= u64::from(base);
+            dup |= seen[d];
+            seen[d] = true;
+        }
+        !dup
+    }
+
+    #[test_log::test]
+    fn prefilter_modular_arithmetic_matches_direct() {
+        for base in MIRROR_TEST_BASES {
+            let Some(pre) = prefilter_params(base) else {
+                continue;
+            };
+            let Ok(Some(base_range)) = base_range::get_base_range_u128(base) else {
+                continue;
+            };
+            let m = u128::from(pre.modulus);
+            assert_eq!(u128::from(pre.pow64_mod), (1u128 << 64) % m);
+            assert_eq!(m, u128::from(base).pow(pre.digits));
+
+            let span = base_range.range_end - base_range.range_start;
+            let mut x: u128 = 0x0123_4567_89ab_cdef_0f1e_2d3c_4b5a_6978;
+            for i in 0..500u128 {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
+                let n = base_range.range_start + (x % span);
+                // reduce_pre(n) == n mod m
+                let (n_lo, n_hi) = split_u128(n);
+                let nm = mirror_reduce_pre(n_hi, n_lo, pre.modulus, pre.pow64_mod);
+                assert_eq!(u128::from(nm), n % m, "reduce_pre mismatch b{base} n={n}");
+                // and the mulmod chain reproduces n^2 mod m, n^3 mod m
+                let sq_direct = (n % m) * (n % m) % m;
+                let cu_direct = sq_direct * (n % m) % m;
+                let mulhi = |a: u64, b: u64| ((u128::from(a) * u128::from(b)) >> 64) as u64;
+                let sq = mirror_reduce_pre(
+                    mulhi(nm, nm),
+                    nm.wrapping_mul(nm),
+                    pre.modulus,
+                    pre.pow64_mod,
+                );
+                let cu = mirror_reduce_pre(
+                    mulhi(sq, nm),
+                    sq.wrapping_mul(nm),
+                    pre.modulus,
+                    pre.pow64_mod,
+                );
+                assert_eq!(u128::from(sq), sq_direct, "sq mismatch b{base} n={n}");
+                assert_eq!(u128::from(cu), cu_direct, "cu mismatch b{base} n={n}");
+            }
+        }
+    }
+
+    #[test_log::test]
+    fn prefilter_is_sound_and_selective() {
+        const SAMPLES: u32 = 2000;
+        for base in MIRROR_TEST_BASES {
+            let Some(pre) = prefilter_params(base) else {
+                continue;
+            };
+            let Ok(Some(base_range)) = base_range::get_base_range_u128(base) else {
+                continue;
+            };
+            let span = base_range.range_end - base_range.range_start;
+            let mut x: u128 = 0xdead_beef_cafe_f00d_0d15_ea5e_feed_face;
+            let mut rejected = 0u32;
+            for i in 0..SAMPLES {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(u128::from(i));
+                let n = base_range.range_start + (x % span);
+                if mirror_prefilter(n, base, &pre) {
+                    continue;
+                }
+                rejected += 1;
+                // Soundness: a rejected candidate must not be nice.
+                assert!(
+                    !client_process::get_is_nice(n, base),
+                    "prefilter rejected a nice number: b{base} n={n}"
+                );
+            }
+            // Selectivity sanity: expected kill rates are 76-99% for these
+            // bases; require at least half so a broken filter can't silently
+            // pass everything.
+            assert!(
+                rejected * 2 > SAMPLES,
+                "prefilter suspiciously weak at b{base}: {rejected}/{SAMPLES}"
+            );
+        }
+    }
+
+    #[test_log::test]
+    fn prefilter_guard_disables_small_bases() {
+        // b10's n^2 has ~4 digits, far below PRE_DIGITS — the digit-count
+        // guard must disable the prefilter or it would extract phantom zeros.
+        assert!(prefilter_params(10).is_none());
+        // Frontier bases must have it enabled.
+        for base in [40, 52, 62, 68] {
+            assert!(
+                prefilter_params(base).is_some(),
+                "expected prefilter at b{base}"
+            );
+        }
     }
 
     #[test_log::test]
