@@ -5,7 +5,7 @@
 //!
 //! - **Niceonly**: the CPU runs the real MSD prefix filter (parallelized
 //!   across cores) with a coarser recursion floor than the CPU client (see
-//!   [`GPU_MSD_MIN_RANGE_SIZE`]), then ships only compact *range descriptors*
+//!   [`AdaptiveFloor`]), then ships only compact *range descriptors*
 //!   to the GPU (~12 bytes per surviving range). The GPU reconstructs the
 //!   stride filter's candidates on-device from the residue table — the g-th
 //!   valid candidate at or after a range start is
@@ -74,24 +74,112 @@ const NEAR_MISS_CAPACITY: usize = 1 << 20;
 /// Maximum MSD-valid ranges per niceonly kernel launch.
 const RANGES_PER_LAUNCH: usize = 1 << 22;
 
-/// MSD recursion floor for the GPU path (CPU path uses 250).
-///
-/// The MSD filter's cost is dominated by its deepest recursion levels, which
-/// buy the final few percent of pruning — pruning the GPU doesn't need,
-/// because checking a candidate costs it almost nothing. Measured on a real
-/// b52 production field (per 1e12 numbers, single core):
+/// Minimum MSD recursion floor (matches the CPU client's default).
+/// Below this the GPU receives virtually the same candidates as the CPU would
+/// check itself, so there is no point going lower.
+const MSD_FLOOR_MIN: f64 = 250.0;
+
+/// Maximum useful MSD recursion floor. Beyond ~64 000 the survival rate
+/// saturates around 23 % (b52 measurement), so larger values buy nothing.
+/// Measured on a real b52 production field (per 1e12 numbers, single core):
 ///
 /// | floor  | CPU time | surviving |
 /// |--------|----------|-----------|
-/// | 250    | 350s     | 2.3%      |
-/// | 4000   | 50s      | 15.2%     |
-/// | 16000  | 15s      | 19.0%     |
-/// | 64000  | 4.8s     | 22.6%     |
+/// | 250    | 350 s    | 2.3 %     |
+/// | 4 000  | 50 s     | 15.2 %    |
+/// | 16 000 | 15 s     | 19.0 %    |
+/// | 64 000 | 4.8 s    | 22.6 %    |
+const MSD_FLOOR_MAX: f64 = 256_000.0;
+
+/// Adaptive MSD recursion floor for the niceonly GPU pipeline.
 ///
-/// 16000 cuts the CPU MSD cost ~23x while the extra GPU load (~2e8 checks
-/// per 1e10 field) amounts to a few milliseconds of kernel time. Pruning is
-/// sound at any granularity, so the found nice numbers are unchanged.
-const GPU_MSD_MIN_RANGE_SIZE: u128 = 16_000;
+/// Goal: keep `msd_time ≈ gpu_tail_time` so the overlapped pipeline is
+/// balanced.  The floor is seeded from the CPU count (fewer cores → coarser
+/// floor, because MSD is the bottleneck) and then nudged ≤ 1.5× per field
+/// toward that balance.  Setting `NICE_GPU_MSD_FLOOR` in the environment
+/// pins the floor and disables adaptation.
+struct AdaptiveFloor {
+    floor: f64,
+    /// Fields remaining in warmup (skip adaptation); `u32::MAX` = permanently
+    /// fixed via env-var override.
+    warmup: u32,
+}
+
+/// Fields to observe before adapting, so NVRTC and JIT one-time costs don't
+/// skew the first measurement.
+const ADAPT_WARMUP: u32 = 3;
+
+/// Maximum multiplicative step per field in either direction.
+const ADAPT_MAX_STEP: f64 = 1.5;
+
+/// Ignore a phase if it took less than this many seconds — the measurement
+/// noise would dominate the ratio.
+const ADAPT_MIN_SECS: f64 = 0.002;
+
+/// Floor value calibrated for 32 cores. Derived value for N cores:
+/// `ADAPT_BASE_CORE_PRODUCT / N`, clamped to `[MSD_FLOOR_MIN, MSD_FLOOR_MAX]`.
+const ADAPT_BASE_CORE_PRODUCT: f64 = 512_000.0;
+
+impl AdaptiveFloor {
+    fn current(&self) -> u128 {
+        self.floor as u128
+    }
+
+    fn update(&mut self, msd_secs: f64, total_secs: f64) {
+        if self.warmup == u32::MAX {
+            return;
+        }
+        if self.warmup > 0 {
+            self.warmup -= 1;
+            return;
+        }
+        let gpu_tail = (total_secs - msd_secs).max(0.0);
+        let ratio = if gpu_tail < ADAPT_MIN_SECS {
+            ADAPT_MAX_STEP
+        } else if msd_secs < ADAPT_MIN_SECS {
+            1.0 / ADAPT_MAX_STEP
+        } else {
+            msd_secs / gpu_tail
+        };
+        let factor = ratio.clamp(1.0 / ADAPT_MAX_STEP, ADAPT_MAX_STEP);
+        let new_floor = (self.floor * factor).clamp(MSD_FLOOR_MIN, MSD_FLOOR_MAX);
+        if (new_floor - self.floor).abs() > self.floor * 0.05 {
+            info!(
+                "GPU MSD floor: {:.0} → {:.0} (msd {:.3}s, gpu_tail {:.3}s)",
+                self.floor, new_floor, msd_secs, gpu_tail,
+            );
+        }
+        self.floor = new_floor;
+    }
+}
+
+static ADAPTIVE_FLOOR: std::sync::OnceLock<Mutex<AdaptiveFloor>> = std::sync::OnceLock::new();
+
+fn adaptive_floor() -> &'static Mutex<AdaptiveFloor> {
+    ADAPTIVE_FLOOR.get_or_init(|| {
+        if let Ok(v) = std::env::var("NICE_GPU_MSD_FLOOR") {
+            match v.parse::<f64>() {
+                Ok(f) if f >= 1.0 => {
+                    info!("GPU MSD floor fixed at {f:.0} via NICE_GPU_MSD_FLOOR");
+                    return Mutex::new(AdaptiveFloor {
+                        floor: f,
+                        warmup: u32::MAX,
+                    });
+                }
+                _ => warn!("ignoring invalid NICE_GPU_MSD_FLOOR '{v}'; using adaptive floor"),
+            }
+        }
+        let cpu_count = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(32) as f64;
+        let seed = (ADAPT_BASE_CORE_PRODUCT / cpu_count).clamp(MSD_FLOOR_MIN, MSD_FLOOR_MAX);
+        info!("GPU MSD floor: adaptive, seed {seed:.0} ({cpu_count:.0} logical cores)");
+        Mutex::new(AdaptiveFloor {
+            floor: seed,
+            warmup: ADAPT_WARMUP,
+        })
+    })
+}
 
 /// Compiled niceonly kernel plus the per-base stride data living on-device.
 struct NiceonlyPlan {
@@ -439,6 +527,7 @@ pub fn process_range_niceonly_gpu(
             range.size() as f64 / stats.total_secs,
         );
     }
+    update_msd_floor(stats.msd_secs, stats.total_secs);
 
     Ok(FieldResults {
         distribution: Vec::new(),
@@ -446,25 +535,15 @@ pub fn process_range_niceonly_gpu(
     })
 }
 
-/// MSD recursion floor for the GPU path, overridable per machine with the
-/// `NICE_GPU_MSD_FLOOR` environment variable. The right value balances CPU
-/// MSD throughput against GPU check throughput, which varies with the
-/// cores-per-GPU ratio; the default is tuned for ~32 modern cores per A100.
 fn gpu_msd_floor() -> u128 {
-    static FLOOR: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
-    *FLOOR.get_or_init(|| match std::env::var("NICE_GPU_MSD_FLOOR") {
-        Ok(v) => match v.parse::<u128>() {
-            Ok(f) if f >= 1 => {
-                info!("GPU MSD recursion floor overridden: {f}");
-                f
-            }
-            _ => {
-                warn!("ignoring invalid NICE_GPU_MSD_FLOOR '{v}'");
-                GPU_MSD_MIN_RANGE_SIZE
-            }
-        },
-        Err(_) => GPU_MSD_MIN_RANGE_SIZE,
-    })
+    adaptive_floor().lock().unwrap().current()
+}
+
+fn update_msd_floor(msd_secs: f64, total_secs: f64) {
+    adaptive_floor()
+        .lock()
+        .unwrap()
+        .update(msd_secs, total_secs);
 }
 
 /// Per-field statistics from the overlapped niceonly pipeline.
