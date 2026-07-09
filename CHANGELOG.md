@@ -2,7 +2,7 @@
 
 ## Nice v3.2.14
 
-- Rewrite the CUDA GPU path from scratch. Kernels are now JIT-specialized per base and can be verified with libnvrtc. For detailed search, the GPU handles all processing. Not nice-only search, the CPU handles MSD filtering and the GPU handles bulk nice checks. The handoff between the CPU and GPU needs to be tuned for each machine config with `NICE_GPU_MSD_FLOOR`.
+- Rewrite the CUDA GPU path from scratch. Kernels are now JIT-specialized per base and can be verified with libnvrtc. For detailed search, the GPU handles all processing. Not nice-only search, the CPU handles MSD filtering and the GPU handles bulk nice checks. The handoff between the CPU and GPU is adapted over time but can be overridden with `NICE_GPU_MSD_FLOOR`.
 - Add a field queue for the detailed thin strategy, which speeds up the `/detailed/claim` endpoint about 80% of the time
 
 ## Nice v3.2.13
