@@ -167,6 +167,60 @@ There are also a few scripts, to be used with [rust-script](https://rust-script.
 
 If you want to run a copy of this server yourself, a SQL schema file has been provided. You can build the bases and fields with the `insert_fields` script.
 
+### GPU development
+
+The CUDA kernels in `common/src/cuda` are compiled at runtime by NVRTC, once
+per (base, mode), with all base-dependent constants baked in as defines. Most
+of the kernel logic is covered by CPU-side mirror tests that run with the
+normal test suite, but the kernel source itself is only parsed by NVRTC — and
+NVRTC is just a shared library, so you can compile-test every base's kernel
+on a machine with no GPU at all. The `nvrtc_compiles_kernels_for_all_supported_bases`
+test activates automatically when `libnvrtc` is loadable and skips otherwise.
+
+The easiest way to get `libnvrtc` is the pip wheel, via [uv](https://docs.astral.sh/uv/):
+
+```sh
+# Fetch libnvrtc from the pip wheel and point the linker at it (no GPU needed)
+NVRTC_LIB=$(uv run --no-project --with nvidia-cuda-nvrtc-cu12 python -c \
+    "import nvidia.cuda_nvrtc; print(nvidia.cuda_nvrtc.__path__[0] + '/lib')")
+LD_LIBRARY_PATH="$NVRTC_LIB" cargo test --features gpu -p nice_common
+```
+
+Or run the tests inside a CUDA container, which ships `libnvrtc`:
+
+```sh
+docker run --rm -v "$PWD":/work -w /work nvidia/cuda:12.4.1-devel-ubuntu22.04 \
+    bash -c "apt-get update -qq && apt-get install -y -qq curl build-essential > /dev/null && \
+             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q && \
+             . ~/.cargo/env && cargo test --features gpu -p nice_common"
+```
+
+Functional GPU tests (CPU/GPU result parity) still need real hardware; they
+are `#[ignore]`d and run with `cargo test --features gpu -- --ignored`.
+
+#### Tuning `NICE_GPU_MSD_FLOOR`
+
+In niceonly mode the CPU runs the MSD prefix filter and the GPU checks the
+surviving candidates. `NICE_GPU_MSD_FLOOR` (default 16000) sets how far the
+CPU's recursive pruning descends before handing ranges to the GPU: a lower
+floor spends more CPU to prune more candidates, a higher floor ships more
+work to the GPU. The default is balanced for roughly 32 modern cores per
+A100-class GPU. Any value is *correct* — pruning is sound at every
+granularity, so this only moves work between the CPU and GPU.
+
+To tune it, watch the per-field log line (visible at `--log-level info`):
+
+```
+GPU niceonly b52: msd 0.045s -> 60835 ranges (19.01% of field), gpu tail 0.020s, total 0.065s, ...
+```
+
+- If `msd` dominates `total` and the `gpu tail` is near zero, the CPU is the
+  bottleneck: raise the floor (try 4x steps, e.g. 64000).
+- If the `gpu tail` rivals or exceeds `msd`, the GPU is saturated: you're
+  balanced, or can lower the floor if you have spare cores.
+- Gains taper above ~64000: the surviving fraction saturates around 20-25%,
+  so there's little left to trade.
+
 ## Why are you writing this from scratch for like the tenth time
 
 It's the sixth time. And no comment.
