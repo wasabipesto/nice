@@ -1,7 +1,11 @@
 # Changelog
 
-## Nice v3.2.13
+## Nice v3.2.14
 
+- Rewrite the CUDA GPU path from scratch. Kernels are now JIT-specialized per base and can be verified with libnvrtc. For detailed search, the GPU handles all processing. Not nice-only search, the CPU handles MSD filtering and the GPU handles bulk nice checks. The handoff between the CPU and GPU needs to be tuned for each machine config with `NICE_GPU_MSD_FLOOR`.
+- Add a field queue for the detailed thin strategy, which speeds up the `/detailed/claim` endpoint about 80% of the time
+
+## Nice v3.2.13
 - Add additional fields to the database in bases 52, 53, and 54
 - Remove dependence on the DEFAULT_FIELD_SIZE constant. The newest fields are larger than this so the server and client are now able to handle them properly. Detailed search claims will be limited to the previous max size (1e9).
 - Add recent search progress and overall leaderboard charts to the site
