@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "nice-wasm-client"
-version = "3.2.14"
+version = "3.2.15"
 dependencies = [
  "console_error_panic_hook",
  "nice_common",
@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "nice_api"
-version = "3.2.14"
+version = "3.2.15"
 dependencies = [
  "chrono",
  "nice_common",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "nice_client"
-version = "3.2.14"
+version = "3.2.15"
 dependencies = [
  "anyhow",
  "clap",
@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "nice_common"
-version = "3.2.14"
+version = "3.2.15"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "nice_daemon"
-version = "3.2.14"
+version = "3.2.15"
 dependencies = [
  "clap",
  "num_cpus",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "nice_jobs"
-version = "3.2.14"
+version = "3.2.15"
 dependencies = [
  "clap",
  "nice_common",

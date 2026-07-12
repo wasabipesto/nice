@@ -1,5 +1,12 @@
 # Changelog
 
+## Nice v3.2.15
+
+- Fix a bug in the nice-only GPU mode where valid nice numbers would be silently skipped in some bases between 10-25 due to an invalid prefilter configuration. This had no effect on live fields but affected some benchmarks.
+- Optimize the nice-only GPU path slightly by disabling the prefilter on bases 41 or higher where warp stats indicate it already runs the full check regardless
+- Optimize the nice-only GPU path slightly by computing the square's digits and finding conflicts before calculating the cube
+- Optimize the nice-only GPU path slightly by accumulating duplicate flags across a chunk and testing once per chunk instead of branching per digit
+
 ## Nice v3.2.14
 
 - Rewrite the CUDA GPU path from scratch. Kernels are now JIT-specialized per base and can be verified with libnvrtc. For detailed search, the GPU handles all processing. Not nice-only search, the CPU handles MSD filtering and the GPU handles bulk nice checks. The handoff between the CPU and GPU is adapted over time but can be overridden with `NICE_GPU_MSD_FLOOR`.
