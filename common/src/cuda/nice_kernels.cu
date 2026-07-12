@@ -42,6 +42,15 @@
 #if !defined(NICEONLY) && !defined(DETAILED)
 #define NICEONLY
 #define DETAILED
+// PREFILTER may only default on in standalone syntax-check builds. The host
+// omits it deliberately for bases whose n^2/n^3 are not guaranteed PRE_DIGITS
+// digits: the low-digit peel would extract phantom leading zeros and falsely
+// reject nice numbers (that bug shipped when this was an #ifndef fallback
+// below, silently force-enabling the prefilter on bases 10-25).
+#define PREFILTER
+#define PRE_DIGITS 9
+#define PRE_MOD 262144000000000ull
+#define POW64_MOD_PRE 195081709551616ull
 #endif
 #ifndef BASE
 #define BASE 40
@@ -64,12 +73,6 @@
 #endif
 #ifndef POW64_MOD_M
 #define POW64_MOD_M 30016u
-#endif
-#ifndef PREFILTER
-#define PREFILTER
-#define PRE_DIGITS 9
-#define PRE_MOD 262144000000000ull
-#define POW64_MOD_PRE 195081709551616ull
 #endif
 #endif
 #ifdef DETAILED

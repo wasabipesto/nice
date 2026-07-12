@@ -1316,6 +1316,29 @@ mod tests {
         }
     }
 
+    /// Regression for the v3.2.14 phantom-zero bug: an `#ifndef PREFILTER`
+    /// fallback in the kernel source force-enabled the prefilter (with
+    /// base-40 constants) on the bases where the host deliberately omits it,
+    /// so the GPU silently rejected every candidate on b10-25. The define
+    /// must come only from the host or the standalone syntax-check block.
+    #[test_log::test]
+    fn prefilter_has_no_ifndef_fallback() {
+        let kernel_src = include_str!("cuda/nice_kernels.cu");
+        assert!(
+            !kernel_src.contains("#ifndef PREFILTER"),
+            "PREFILTER must not have an #ifndef fallback; the host omits the \
+             define deliberately for bases with too-short n^2/n^3"
+        );
+        // And the host must keep omitting it where the guard says so.
+        for base in [10u32, 12, 25] {
+            let (defines, _) = niceonly_defines(base).unwrap();
+            assert!(
+                !defines.iter().any(|d| d.starts_with("PREFILTER")),
+                "b{base}: host emitted PREFILTER despite disabled guard"
+            );
+        }
+    }
+
     #[test_log::test]
     fn chunk_constants_are_maximal() {
         for base in 2..=MAX_GPU_DIGIT_MASK_BASE {
@@ -1456,7 +1479,10 @@ mod tests {
             return;
         };
 
-        for base in [10u32, 40, 45, 62] {
+        // 10, 12, and 25 run with the prefilter host-disabled (regression for
+        // the v3.2.14 phantom-zero bug, where the GPU missed every nice
+        // number on such bases); the rest run the full prefilter path.
+        for base in [10u32, 12, 25, 40, 45, 62] {
             let Ok(Some(base_range)) = base_range::get_base_range_u128(base) else {
                 continue;
             };
