@@ -399,7 +399,26 @@ struct PrefilterParams {
 ///   whole range, or the digit loop would extract phantom leading zeros and
 ///   could falsely reject a nice number. Verified with a conservative
 ///   log-based lower bound on the digit counts at the range start.
+/// Highest base where the niceonly kernel's fused prefilter still pays for
+/// itself. Above this the prefilter is compiled out even though it would be
+/// sound: warp divergence means the whole warp runs the full check whenever
+/// any lane survives, so the prefilter only pays while per-lane survival is
+/// very low (at 4% survival ~74% of warp iterations already hold a
+/// survivor). Measured (G1 2026-07-12 + crossover sweep,
+/// scratchpad/2026-07-gpu-compaction/g1-verdict.md): fused wins at b40
+/// (1.1% survival, 16-30% faster on 3090/4090), loses at every live base
+/// from b42 up (4%+ survival, 4-27% slower). b41 has no live range.
+const GPU_PREFILTER_MAX_BASE: u32 = 40;
+
 fn prefilter_params(base: u32) -> Option<PrefilterParams> {
+    // Profitability gate (see GPU_PREFILTER_MAX_BASE). Every consumer —
+    // define injection, the CPU diagnostics mirror, the G0/G1 harnesses —
+    // takes the on/off decision from this single function, so the kernel
+    // and its mirrors always agree.
+    if base > GPU_PREFILTER_MAX_BASE {
+        return None;
+    }
+
     let mut digits = 0u32;
     let mut modulus = 1u64;
     while modulus <= (1u64 << 48) / u64::from(base) {
@@ -1307,11 +1326,20 @@ mod tests {
         // b10's n^2 has ~4 digits, far below PRE_DIGITS — the digit-count
         // guard must disable the prefilter or it would extract phantom zeros.
         assert!(prefilter_params(10).is_none());
-        // Frontier bases must have it enabled.
-        for base in [40, 52, 62, 68] {
+        // Low bases where the prefilter pays (survival ~1%) keep it.
+        for base in [30, 40] {
             assert!(
                 prefilter_params(base).is_some(),
                 "expected prefilter at b{base}"
+            );
+        }
+        // Above the profitability threshold it is compiled out even though
+        // it would be sound: at 4%+ lane survival most warps run the full
+        // check anyway (GPU_PREFILTER_MAX_BASE, g1-verdict.md).
+        for base in [42, 52, 62, 68] {
+            assert!(
+                prefilter_params(base).is_none(),
+                "expected prefilter disabled at b{base}"
             );
         }
     }
