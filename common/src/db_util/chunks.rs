@@ -163,8 +163,9 @@ pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(
         SET chunk_id = c.id
         FROM chunks c
         WHERE f.base_id = $1
+            AND c.base_id = $1
             AND f.range_start >= c.range_start
-            AND f.range_end <= c.range_end;"
+            AND f.range_start <  c.range_end;"
         .to_string();
 
     diesel::sql_query(query)

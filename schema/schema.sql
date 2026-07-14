@@ -105,6 +105,7 @@ CREATE INDEX IF NOT EXISTS idx_submissions_id_field ON submissions(id, field_id)
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_claims_field_id ON claims (field_id);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_submissions_field_id ON submissions (field_id);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_submissions_claim_id ON submissions (claim_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_base_range ON chunks(base_id, range_start, range_end);
 
 -- CACHE: Daily search totals per user/mode
 CREATE TABLE IF NOT EXISTS cache_search_rate_daily (
