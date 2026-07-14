@@ -27,15 +27,17 @@ fn print_chunk(i: usize, chunk: &nice_common::FieldSize) -> () {
 pub struct Cli {
     #[arg(short, long)]
     base: u32,
+
+    #[arg(short, long)]
+    field_size: f32,
 }
 
 fn main() {
     // parse args from command line
     let cli = Cli::parse();
     let base = cli.base;
-
-    let field_size = 1e11 as u128;
-    println!("Using field size {:.0e}.", field_size);
+    let field_size = cli.field_size as u128;
+    println!("Preparing to insert rows for base {base} using field size {field_size:.0e} ({field_size}).");
     println!();
 
     let base_range = nice_common::base_range::get_base_range_u128(base)
@@ -97,7 +99,6 @@ fn main() {
         }
     }
     println!();
-
     print!("Add to database? [y/N] ");
     let confirm_add_to_db = input::<String>().get();
     if !["y", "Y", "ye", "yes"].contains(&confirm_add_to_db.as_str()) {
