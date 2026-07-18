@@ -29,14 +29,26 @@ pub struct Cli {
     base: u32,
 
     #[arg(short, long)]
-    field_size: f32,
+    #[arg(value_parser = parse_exp_u128)]
+    field_size: u128,
+}
+
+fn parse_exp_u128(s: &str) -> Result<u128, String> {
+    let (base, exp) = s.split_once('e').ok_or("Expected format XeY (e.g. 1e14)")?;
+    let digit: u128 = base.parse().map_err(|_| "Invalid base digit")?;
+    let exp: u32 = exp.parse().map_err(|_| "Invalid exponent")?;
+
+    let pow10 = 10u128.checked_pow(exp).ok_or("Exponent too large")?;
+    digit
+        .checked_mul(pow10)
+        .ok_or("Overflow — value exceeds u128::MAX".to_string())
 }
 
 fn main() {
     // parse args from command line
     let cli = Cli::parse();
     let base = cli.base;
-    let field_size = cli.field_size as u128;
+    let field_size = cli.field_size;
     println!("Preparing to insert rows for base {base} using field size {field_size:.0e} ({field_size}).");
     println!();
 
