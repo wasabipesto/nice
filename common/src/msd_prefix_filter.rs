@@ -275,10 +275,10 @@ fn has_overlapping_digits_small(d1: &[u32], d2: &[u32]) -> bool {
     false
 }
 
-// Recursive MSD filter subdivision parameters (last tuned 2026-04-30).
-// Previously we limited the depth to 11, but with fixed-width
-// arithmetic it's feasible to go down to depth ~20.
-pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 19;
+// Recursive MSD filter subdivision parameters for the binary search.
+// These are tuned to try and find the natural bounds of MSD shifts without wasting too much
+// time when they are naturally chaotic.
+pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 22;
 pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 250;
 pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 

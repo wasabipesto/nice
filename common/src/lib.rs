@@ -35,7 +35,6 @@ pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 pub const DOWNSAMPLE_CUTOFF_PERCENT: f32 = 0.2;
 pub const CLAIM_DURATION_HOURS: i64 = 1;
 pub const CLIENT_REQUEST_TIMEOUT_SECS: u64 = 5;
-pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
 
 /// Detailed runners will never get a field larger than this.
 /// Currently set to 1e9, which corresponds to base 50 and takes about a minute

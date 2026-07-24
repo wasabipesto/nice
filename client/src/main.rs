@@ -13,7 +13,7 @@ use nice_common::client_process::{process_range_detailed, process_range_niceonly
 use nice_common::stride_filter;
 use nice_common::{
     CLIENT_REQUEST_TIMEOUT_SECS, CLIENT_VERSION, DataToClient, DataToServer, FieldResults,
-    FieldSize, PROCESSING_CHUNK_SIZE, SearchMode, UniquesDistributionSimple, ValidationData,
+    FieldSize, SearchMode, UniquesDistributionSimple, ValidationData,
 };
 
 const DEFAULT_LSD_K_VALUE: u32 = 2;
@@ -153,8 +153,18 @@ fn process_field_sync(
         }
     } else {
         // CPU processing path
-        let chunk_size = PROCESSING_CHUNK_SIZE;
         let range: FieldSize = claim_data.into();
+
+        // Scale the processing chunk size with the field size
+        let chunk_default_size: u128 = 1_000_000;
+        let target_max_chunks: u128 = 100_000;
+
+        let chunk_multiple = range
+            .size()
+            .div_ceil(chunk_default_size * target_max_chunks)
+            .clamp(1, 1_000);
+        let chunk_size = chunk_default_size * chunk_multiple;
+
         let chunks = range.chunks(chunk_size);
 
         // Precompute stride table once for Niceonly mode to avoid redundant computation
