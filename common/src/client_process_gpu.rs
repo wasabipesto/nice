@@ -37,7 +37,7 @@
 use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
-    PROCESSING_CHUNK_SIZE, UniquesDistributionSimple,
+    UniquesDistributionSimple,
 };
 use crate::{base_range, msd_prefix_filter, number_stats, residue_filter, stride_filter};
 use anyhow::{Context as _, Result, bail, ensure};
@@ -50,6 +50,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
 
 /// Numbers processed per detailed-mode kernel launch. Larger batches amortize
 /// launch overhead; since the detailed kernel takes no input arrays, batch
