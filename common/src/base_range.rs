@@ -1,8 +1,8 @@
-//! A module for calculating the apprpriate range for each base.
+//! A module for calculating the appropriate range for each base.
 
 use crate::FieldSize;
 use anyhow::{Result, anyhow};
-use malachite::base::num::arithmetic::traits::{CeilingRoot, FloorRoot, Pow};
+use malachite::base::num::arithmetic::traits::{CeilingRoot, Pow};
 use malachite::natural::Natural;
 
 /// Get the range of possible values for a base.
@@ -18,14 +18,14 @@ pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
     match base % 5 {
         0 => Some((b.clone().pow(3 * k - 1).ceiling_root(3), b.pow(k))),
         1 => None,
-        2 => Some((b.clone().pow(k), b.pow(3 * k + 1).floor_root(3))),
+        2 => Some((b.clone().pow(k), b.pow(3 * k + 1).ceiling_root(3))),
         3 => Some((
             b.clone().pow(3 * k + 1).ceiling_root(3),
-            b.pow(2 * k + 1).floor_root(2),
+            b.pow(2 * k + 1).ceiling_root(2),
         )),
         4 => Some((
             b.clone().pow(2 * k + 1).ceiling_root(2),
-            b.pow(3 * k + 2).floor_root(3),
+            b.pow(3 * k + 2).ceiling_root(3),
         )),
         _ => None,
     }
@@ -68,15 +68,15 @@ mod tests {
         assert_eq!(get_base_range_u128(6).unwrap(), None);
         assert_eq!(
             get_base_range_u128(7).unwrap(),
-            Some(FieldSize::new(7u128, 13u128))
+            Some(FieldSize::new(7u128, 14u128))
         );
         assert_eq!(
             get_base_range_u128(8).unwrap(),
-            Some(FieldSize::new(16u128, 22u128))
+            Some(FieldSize::new(16u128, 23u128))
         );
         assert_eq!(
             get_base_range_u128(9).unwrap(),
-            Some(FieldSize::new(27u128, 38u128))
+            Some(FieldSize::new(27u128, 39u128))
         );
         assert_eq!(
             get_base_range_u128(10).unwrap(),
@@ -104,15 +104,15 @@ mod tests {
         assert_eq!(get_base_range_natural(6), None);
         assert_eq!(
             get_base_range_natural(7),
-            Some((Natural::from(7u32), Natural::from(13u32)))
+            Some((Natural::from(7u32), Natural::from(14u32)))
         );
         assert_eq!(
             get_base_range_natural(8),
-            Some((Natural::from(16u32), Natural::from(22u32)))
+            Some((Natural::from(16u32), Natural::from(23u32)))
         );
         assert_eq!(
             get_base_range_natural(9),
-            Some((Natural::from(27u32), Natural::from(38u32)))
+            Some((Natural::from(27u32), Natural::from(39u32)))
         );
         assert_eq!(
             get_base_range_natural(10),
@@ -197,21 +197,21 @@ mod tests {
             get_base_range_natural(122),
             Some((
                 Natural::from_str("118205024187370033135932935819405317049548439289856").unwrap(),
-                Natural::from_str("586258581805989694050980431834549184603056531020210").unwrap()
+                Natural::from_str("586258581805989694050980431834549184603056531020211").unwrap()
             ))
         );
         assert_eq!(
             get_base_range_natural(123),
             Some((
                 Natural::from_str("715085071699820536699499456671007010425915160419662").unwrap(),
-                Natural::from_str("1594686179043939546502781159240976178904795301633107").unwrap()
+                Natural::from_str("1594686179043939546502781159240976178904795301633108").unwrap()
             ))
         );
         assert_eq!(
             get_base_range_natural(124),
             Some((
                 Natural::from_str("1944604500263970232242123784503740458789493393829926").unwrap(),
-                Natural::from_str("4342450740818512904293955173690913927483946149220888").unwrap()
+                Natural::from_str("4342450740818512904293955173690913927483946149220889").unwrap()
             ))
         );
         assert_eq!(
