@@ -6,9 +6,9 @@
 extern crate nice_common;
 use nice_common::benchmark::{BenchmarkMode, get_benchmark_field};
 use nice_common::client_api_async::{
-    Client, get_field_from_server_async, submit_field_to_server_async,
+    Client, get_field_from_server_async, get_validation_data_from_server_async,
+    submit_field_to_server_async,
 };
-use nice_common::client_api_sync::{get_field_from_server, get_validation_data_from_server};
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
 use nice_common::stride_filter;
 use nice_common::{
@@ -36,6 +36,18 @@ const MAX_SUBMITS_IN_FLIGHT: usize = 8;
 use nice_common::client_process_gpu::{
     GPU_BATCH_SIZE, GpuContext, process_range_detailed_gpu, process_range_niceonly_gpu,
 };
+
+/// A GPU context can never exist in a build without GPU support, so the type is
+/// uninhabited there and `GpuCtx` below is provably always `None`.
+#[cfg(not(feature = "gpu"))]
+enum GpuContext {}
+
+/// The GPU context, if this build has one and the user asked for it.
+///
+/// Naming the type in both builds means everything that only passes the context
+/// along can do so without a `#[cfg]`, leaving the split to
+/// `process_field_sync` — the one place that actually looks inside it.
+type GpuCtx = Option<Arc<GpuContext>>;
 
 extern crate serde_json;
 use anyhow::{Result, anyhow};
@@ -145,17 +157,13 @@ pub struct Cli {
 
 /// Process a field synchronously (`CPU` or `GPU`).
 /// This is wrapped in `spawn_blocking` when called from async context.
-fn process_field_sync(
-    claim_data: &DataToClient,
-    mode: SearchMode,
-    cli: &Cli,
-    #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
-) -> Vec<FieldResults> {
+fn process_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Vec<FieldResults> {
+    let mode = cli.mode;
     if cli.gpu {
         // GPU processing path
         #[cfg(feature = "gpu")]
         {
-            let gpu_ctx = gpu_ctx.expect("GPU context failed to initialize");
+            let gpu_ctx = gpu.as_ref().expect("GPU context failed to initialize");
 
             let gpu_results = match mode {
                 SearchMode::Detailed => {
@@ -176,6 +184,7 @@ fn process_field_sync(
         }
         #[cfg(not(feature = "gpu"))]
         {
+            let _ = gpu; // there is no context to look at in this build
             error!("GPU support not compiled in");
             std::process::exit(1);
         }
@@ -235,34 +244,79 @@ fn process_field_sync(
     }
 }
 
+/// Process one field on the blocking pool.
+///
+/// Returns the claim back alongside its results, since the blocking task has to
+/// take ownership of it, plus how long the processing took.
+async fn process_field(
+    claim_data: DataToClient,
+    cli: &Arc<Cli>,
+    gpu: &GpuCtx,
+) -> (DataToClient, Vec<FieldResults>, Duration) {
+    let cli = Arc::clone(cli);
+    let gpu = gpu.clone();
+    let start_time = std::time::Instant::now();
+
+    tokio::task::spawn_blocking(move || {
+        let results = process_field_sync(&claim_data, &cli, &gpu);
+        (claim_data, results, start_time.elapsed())
+    })
+    .await
+    .expect("Processing task panicked")
+}
+
+/// Report the processing rate, for the runs where the progress bar isn't
+/// already showing it.
+#[allow(clippy::cast_precision_loss)]
+fn log_field_rate(claim_data: &DataToClient, elapsed: Duration, cli: &Cli) {
+    if !cli.no_progress && !cli.gpu {
+        return;
+    }
+    let range_size = claim_data.range_size as f64;
+    let seconds = elapsed.as_secs_f64();
+    info!(
+        "✓ Processed {range_size:.2e} numbers in {seconds:.2}s ({:.2e} numbers/sec)",
+        range_size / seconds
+    );
+}
+
+/// Send one field's results to the server and log whatever it says back.
+async fn submit_results(
+    client: &Client,
+    api_base: &str,
+    submit_data: DataToServer,
+    max_retries: u32,
+) -> Result<()> {
+    let response = submit_field_to_server_async(client, api_base, submit_data, max_retries).await?;
+    match response.text().await {
+        Ok(msg) => debug!("Server response: {msg}"),
+        Err(e) => error!("Server returned success but an error occurred: {e}"),
+    }
+    Ok(())
+}
+
 /// Compile results from multiple chunks into a single `DataToServer`.
-#[allow(clippy::needless_pass_by_value)]
 fn compile_results(
     results: Vec<FieldResults>,
     claim_data: &DataToClient,
     username: &str,
     mode: SearchMode,
 ) -> DataToServer {
-    let nice_numbers = results
-        .iter()
-        .flat_map(|result| result.nice_numbers.clone())
-        .collect();
+    // Take the pieces out of the results rather than cloning them back out.
+    // Niceonly runs always report an empty distribution, so summing it costs
+    // nothing there even though the total is discarded below.
+    let mut nice_numbers = Vec::new();
+    let mut dist_map: HashMap<u32, u128> = HashMap::new();
+    for result in results {
+        nice_numbers.extend(result.nice_numbers);
+        for dist in result.distribution {
+            *dist_map.entry(dist.num_uniques).or_insert(0) += dist.count;
+        }
+    }
 
     let unique_distribution = if mode == SearchMode::Niceonly {
         None
     } else {
-        // Flatten all distribution sets from the results
-        let result_distributions: Vec<UniquesDistributionSimple> = results
-            .iter()
-            .flat_map(|result| result.distribution.clone())
-            .collect();
-
-        // Collect the counts into a map
-        let mut dist_map: HashMap<u32, u128> = HashMap::new();
-        for dist in result_distributions {
-            *dist_map.entry(dist.num_uniques).or_insert(0) += dist.count;
-        }
-
         // Convert the counts back into a formatted, sorted list
         let mut distribution: Vec<UniquesDistributionSimple> = dist_map
             .into_iter()
@@ -272,20 +326,24 @@ fn compile_results(
         Some(distribution)
     };
 
-    DataToServer {
+    let submit_data = DataToServer {
         claim_id: claim_data.claim_id,
         username: username.to_string(),
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution,
         nice_numbers,
-    }
+    };
+    debug!(
+        "Submit Data: {}",
+        serde_json::to_string(&submit_data).unwrap()
+    );
+    submit_data
 }
 
 /// Validate results against expected `ValidationData`.
-#[allow(clippy::needless_pass_by_value)]
 fn validate_results(
     submit_data: &DataToServer,
-    validation_data: ValidationData,
+    validation_data: &ValidationData,
     mode: SearchMode,
 ) -> bool {
     let mut validation_passed = true;
@@ -319,15 +377,15 @@ fn validate_results(
     validation_passed
 }
 
-/// Run a single iteration in non-pipelined mode (validation or benchmark).
-async fn run_single_iteration(
-    cli: &Cli,
-    client: &Client,
-    #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
-) -> Result<()> {
-    // Get the field (synchronously for validation/benchmark)
-    let (claim_data, validation_data_opt) = if cli.validate {
-        let validation_data = get_validation_data_from_server(&cli.api_base, cli.api_max_retries)?;
+/// Check this client against a field the server has already accepted.
+///
+/// Nothing is claimed and nothing is submitted, so there is no pipeline here;
+/// each round is one field, start to finish.
+async fn run_validation(cli: &Arc<Cli>, client: &Client, gpu: &GpuCtx) -> Result<()> {
+    loop {
+        let validation_data =
+            get_validation_data_from_server_async(client, &cli.api_base, cli.api_max_retries)
+                .await?;
         let claim_data = DataToClient {
             claim_id: 0,
             base: validation_data.base,
@@ -335,104 +393,59 @@ async fn run_single_iteration(
             range_end: validation_data.range_end,
             range_size: validation_data.range_size,
         };
-        (claim_data, Some(validation_data))
-    } else if let Some(benchmark) = cli.benchmark {
-        (get_benchmark_field(benchmark), None)
-    } else {
-        (
-            get_field_from_server(&cli.mode, &cli.api_base, cli.api_max_retries)?,
-            None,
-        )
-    };
 
-    // Show claim details
-    if let Some(ref validation_data) = validation_data_opt {
         info!("Beginning validation: {}", validation_data.field_id);
-    } else if let Some(benchmark) = cli.benchmark {
-        info!("Beginning benchmark:  {benchmark}");
-    } else {
-        info!(
-            "Acquired claim:  {}, Base {}",
-            claim_data.claim_id, claim_data.base
+        debug!(
+            "Claim Data: {}",
+            serde_json::to_string(&claim_data).unwrap()
         );
-    }
-    debug!(
-        "Claim Data: {}",
-        serde_json::to_string(&claim_data).unwrap()
-    );
 
-    let start_time = std::time::Instant::now();
+        let (claim_data, results, elapsed) = process_field(claim_data, cli, gpu).await;
+        log_field_rate(&claim_data, elapsed, cli);
 
-    // Process the field
-    let results = tokio::task::spawn_blocking({
-        let mode = cli.mode;
-        let cli_clone = cli.clone();
-        #[cfg(feature = "gpu")]
-        let gpu_ctx_clone = gpu_ctx.cloned();
-        move || {
-            #[cfg(feature = "gpu")]
-            {
-                process_field_sync(&claim_data, mode, &cli_clone, gpu_ctx_clone.as_ref())
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                process_field_sync(&claim_data, mode, &cli_clone)
-            }
-        }
-    })
-    .await
-    .expect("Processing task panicked");
+        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
 
-    let elapsed = start_time.elapsed();
-
-    // Print performance stats if progress bar is disabled
-    #[allow(clippy::cast_precision_loss)]
-    if cli.no_progress || cli.gpu {
-        let range_size = claim_data.range_size;
-        let numbers_per_sec = range_size as f64 / elapsed.as_secs_f64();
-        info!(
-            "✓ Processed {:.2e} numbers in {:.2}s ({:.2e} numbers/sec)",
-            range_size as f64,
-            elapsed.as_secs_f64(),
-            numbers_per_sec
-        );
-    }
-
-    // Compile results
-    let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
-
-    debug!(
-        "Submit Data: {}",
-        serde_json::to_string(&submit_data).unwrap()
-    );
-
-    // Handle validation or submission
-    if cli.validate {
-        let validation_data = validation_data_opt.expect("Validation data not found");
-        let validation_passed = validate_results(&submit_data, validation_data.clone(), cli.mode);
-
-        if validation_passed {
+        if validate_results(&submit_data, &validation_data, cli.mode) {
             println!();
-            println!("Validation passed! Results match the canoncical submission.");
+            println!("Validation passed! Results match the canonical submission.");
         } else {
             println!();
-            println!("Validation failed! Results do not match the canoncical submission.");
+            println!("Validation failed! Results do not match the canonical submission.");
             println!("  Our submission data: {submit_data:?}");
-            println!("  Canoncical submission: {validation_data:?}");
+            println!("  Canonical submission: {validation_data:?}");
             std::process::exit(1);
         }
-    } else if cli.benchmark.is_none() {
-        let response =
-            submit_field_to_server_async(client, &cli.api_base, submit_data, cli.api_max_retries)
-                .await?;
-        match response.text().await {
-            Ok(msg) => {
-                debug!("Server response: {msg}");
-            }
-            Err(e) => error!("Server returned success but an error occured: {e}"),
+
+        if !cli.repeat {
+            break;
         }
     }
     Ok(())
+}
+
+/// Process a fixed offline field to measure this machine.
+///
+/// Never contacts the server, hence no HTTP client and no `Result`.
+async fn run_benchmark(cli: &Arc<Cli>, benchmark: BenchmarkMode, gpu: &GpuCtx) {
+    loop {
+        let claim_data = get_benchmark_field(benchmark);
+
+        info!("Beginning benchmark:  {benchmark}");
+        debug!(
+            "Claim Data: {}",
+            serde_json::to_string(&claim_data).unwrap()
+        );
+
+        let (claim_data, results, elapsed) = process_field(claim_data, cli, gpu).await;
+        log_field_rate(&claim_data, elapsed, cli);
+
+        // Compiled but never sent; the debug trace it emits is the point.
+        compile_results(results, &claim_data, &cli.username, cli.mode);
+
+        if !cli.repeat {
+            break;
+        }
+    }
 }
 
 /// How many claims to keep on hand — buffered or in flight — counting the one
@@ -511,9 +524,9 @@ fn request_claims(
 /// `JoinSet` aborts its tasks, which on the submit side would throw away results
 /// that have already been computed.
 async fn run_pipelined_fields(
-    cli: &Cli,
+    cli: &Arc<Cli>,
     client: &Client,
-    #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
+    gpu: &GpuCtx,
     buffer: &mut VecDeque<DataToClient>,
     fetches: &mut JoinSet<Result<DataToClient>>,
     submits: &mut JoinSet<Result<()>>,
@@ -523,7 +536,14 @@ async fn run_pipelined_fields(
     let mut field_process_ewma: Option<f64> = None;
 
     loop {
-        let target = prefetch_target(cli.prefetch_seconds, cli.prefetch_max, field_process_ewma);
+        // Without --repeat there is exactly one field to do, so claim exactly
+        // one: anything extra would be claimed, never processed, and left for
+        // the server to time out.
+        let target = if cli.repeat {
+            prefetch_target(cli.prefetch_seconds, cli.prefetch_max, field_process_ewma)
+        } else {
+            1
+        };
 
         // Take delivery of anything that landed while we were processing, then
         // put the requests back up to depth.
@@ -555,44 +575,10 @@ async fn run_pipelined_fields(
             fetches.len()
         );
 
-        let start_time = std::time::Instant::now();
-
         // Process the field. The claim requests already spawned keep making
         // progress on the runtime while this is awaited.
-        let (claim_data, results, elapsed) = tokio::task::spawn_blocking({
-            let mode = cli.mode;
-            let cli_clone = cli.clone();
-            #[cfg(feature = "gpu")]
-            let gpu_ctx_clone = gpu_ctx.cloned();
-            move || {
-                let results = {
-                    #[cfg(feature = "gpu")]
-                    {
-                        process_field_sync(&claim_data, mode, &cli_clone, gpu_ctx_clone.as_ref())
-                    }
-                    #[cfg(not(feature = "gpu"))]
-                    {
-                        process_field_sync(&claim_data, mode, &cli_clone)
-                    }
-                };
-                (claim_data, results, start_time.elapsed())
-            }
-        })
-        .await
-        .expect("Processing task panicked");
-
-        // Print performance stats if progress bar is disabled
-        #[allow(clippy::cast_precision_loss)]
-        if cli.no_progress || cli.gpu {
-            let range_size = claim_data.range_end - claim_data.range_start;
-            let numbers_per_sec = range_size as f64 / elapsed.as_secs_f64();
-            info!(
-                "✓ Processed {:.2e} numbers in {:.2}s ({:.2e} numbers/sec)",
-                range_size as f64,
-                elapsed.as_secs_f64(),
-                numbers_per_sec
-            );
-        }
+        let (claim_data, results, elapsed) = process_field(claim_data, cli, gpu).await;
+        log_field_rate(&claim_data, elapsed, cli);
 
         // Feed the buffer sizer.
         let elapsed_secs = elapsed.as_secs_f64();
@@ -604,11 +590,6 @@ async fn run_pipelined_fields(
         // Compile results for submission
         let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
 
-        debug!(
-            "Submit Data: {}",
-            serde_json::to_string(&submit_data).unwrap()
-        );
-
         // Submit without blocking the next field on the round trip.
         //
         // Hand this field off before inspecting any earlier submission: a
@@ -619,18 +600,7 @@ async fn run_pipelined_fields(
             let api_base = cli.api_base.clone();
             let api_num_retries = cli.api_max_retries;
             let client = client.clone();
-            async move {
-                let response =
-                    submit_field_to_server_async(&client, &api_base, submit_data, api_num_retries)
-                        .await?;
-                match response.text().await {
-                    Ok(msg) => {
-                        debug!("Server response: {msg}");
-                    }
-                    Err(e) => error!("Server returned success but an error occured: {e}"),
-                }
-                Ok::<(), anyhow::Error>(())
-            }
+            async move { submit_results(&client, &api_base, submit_data, api_num_retries).await }
         });
 
         // Reap whatever has finished, so a failure is still reported promptly.
@@ -680,33 +650,13 @@ async fn drain_submits(submits: &mut JoinSet<Result<()>>) -> Result<()> {
 /// Owns the pipeline state so that however `run_pipelined_fields` ends, the
 /// submissions still in flight are finished rather than aborted and the claims
 /// left behind are reported.
-async fn run_pipelined_loop(
-    cli: &Cli,
-    client: &Client,
-    #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
-) -> Result<()> {
+async fn run_pipelined_loop(cli: &Arc<Cli>, client: &Client, gpu: &GpuCtx) -> Result<()> {
     let mut buffer: VecDeque<DataToClient> = VecDeque::new();
     let mut fetches: JoinSet<Result<DataToClient>> = JoinSet::new();
     let mut submits: JoinSet<Result<()>> = JoinSet::new();
 
-    let outcome = {
-        #[cfg(feature = "gpu")]
-        {
-            run_pipelined_fields(
-                cli,
-                client,
-                gpu_ctx,
-                &mut buffer,
-                &mut fetches,
-                &mut submits,
-            )
-            .await
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            run_pipelined_fields(cli, client, &mut buffer, &mut fetches, &mut submits).await
-        }
-    };
+    let outcome =
+        run_pipelined_fields(cli, client, gpu, &mut buffer, &mut fetches, &mut submits).await;
 
     // Work already done outranks the error that interrupted it.
     let drained = drain_submits(&mut submits).await;
@@ -736,8 +686,9 @@ async fn run_pipelined_loop(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse command line arguments
-    let cli = Cli::parse();
+    // Parse command line arguments. Shared behind an `Arc` because every field
+    // handed to the blocking pool needs an owned copy of the settings.
+    let cli = Arc::new(Cli::parse());
 
     // Set up logger
     let mut builder = env_logger::Builder::from_env(Env::default().default_filter_or("info"));
@@ -781,8 +732,11 @@ async fn main() -> Result<()> {
     debug!("CLI Inputs: {cli:?}");
 
     // Initialize GPU context if requested
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ctx: GpuCtx = None;
+
     #[cfg(feature = "gpu")]
-    let gpu_ctx = if cli.gpu {
+    let gpu_ctx: GpuCtx = if cli.gpu {
         match GpuContext::new(cli.gpu_device) {
             Ok(ctx) => {
                 info!("GPU initialized successfully on device {}", cli.gpu_device);
@@ -825,44 +779,14 @@ async fn main() -> Result<()> {
         .build()
         .expect("Failed to create HTTP client");
 
-    // Choose execution mode based on flags
-    if cli.validate || cli.benchmark.is_some() {
-        // Validation and benchmark modes don't support pipelining
-        loop {
-            #[cfg(feature = "gpu")]
-            {
-                run_single_iteration(&cli, &http_client, gpu_ctx.as_ref()).await?;
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                run_single_iteration(&cli, &http_client).await?;
-            }
-
-            if !cli.repeat {
-                break;
-            }
-        }
+    // Choose execution mode based on flags. Each mode repeats on its own, so
+    // that the pipelined one can keep its claim buffer full across fields.
+    if cli.validate {
+        run_validation(&cli, &http_client, &gpu_ctx).await?;
+    } else if let Some(benchmark) = cli.benchmark {
+        run_benchmark(&cli, benchmark, &gpu_ctx).await;
     } else {
-        // Normal mode: use pipelining for repeat mode, simple mode otherwise
-        if cli.repeat {
-            #[cfg(feature = "gpu")]
-            {
-                run_pipelined_loop(&cli, &http_client, gpu_ctx.as_ref()).await?;
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                run_pipelined_loop(&cli, &http_client).await?;
-            }
-        } else {
-            #[cfg(feature = "gpu")]
-            {
-                run_single_iteration(&cli, &http_client, gpu_ctx.as_ref()).await?;
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                run_single_iteration(&cli, &http_client).await?;
-            }
-        }
+        run_pipelined_loop(&cli, &http_client, &gpu_ctx).await?;
     }
     Ok(())
 }
