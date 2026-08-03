@@ -41,7 +41,7 @@ extern crate serde_json;
 use anyhow::{Result, anyhow};
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
-use log::{LevelFilter, debug, error, info};
+use log::{LevelFilter, debug, error, info, warn};
 use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
 use std::collections::{HashMap, VecDeque};
@@ -501,18 +501,23 @@ fn request_claims(
     }
 }
 
-/// Run in pipelined mode: overlap API calls with processing.
+/// Drive the claim/process/submit pipeline until it stops or fails.
 ///
 /// The processor is fed from a buffer of claims that is refilled by several
 /// concurrent requests.
-async fn run_pipelined_loop(
+///
+/// The buffer and the two join sets are borrowed rather than owned so that an
+/// early return from here still leaves the caller holding them: dropping a
+/// `JoinSet` aborts its tasks, which on the submit side would throw away results
+/// that have already been computed.
+async fn run_pipelined_fields(
     cli: &Cli,
     client: &Client,
     #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
+    buffer: &mut VecDeque<DataToClient>,
+    fetches: &mut JoinSet<Result<DataToClient>>,
+    submits: &mut JoinSet<Result<()>>,
 ) -> Result<()> {
-    let mut buffer: VecDeque<DataToClient> = VecDeque::new();
-    let mut fetches: JoinSet<Result<DataToClient>> = JoinSet::new();
-    let mut submits: JoinSet<Result<()>> = JoinSet::new();
     // Exponentially weighted moving average of how long one field takes to
     // process, this is what the target buffer depth is derived from.
     let mut field_process_ewma: Option<f64> = None;
@@ -522,8 +527,8 @@ async fn run_pipelined_loop(
 
         // Take delivery of anything that landed while we were processing, then
         // put the requests back up to depth.
-        collect_ready_claims(&mut fetches, &mut buffer)?;
-        request_claims(&mut fetches, buffer.len(), target, cli, client);
+        collect_ready_claims(fetches, buffer)?;
+        request_claims(fetches, buffer.len(), target, cli, client);
 
         // With an empty buffer there is nothing to do but wait for a claim.
         while buffer.is_empty() {
@@ -531,8 +536,8 @@ async fn run_pipelined_loop(
                 return Err(anyhow!("no claims buffered and no requests in flight"));
             };
             buffer.push_back(joined.expect("Fetch task panicked")?);
-            collect_ready_claims(&mut fetches, &mut buffer)?;
-            request_claims(&mut fetches, buffer.len(), target, cli, client);
+            collect_ready_claims(fetches, buffer)?;
+            request_claims(fetches, buffer.len(), target, cli, client);
         }
 
         let claim_data = buffer.pop_front().expect("buffer was just checked");
@@ -604,18 +609,12 @@ async fn run_pipelined_loop(
             serde_json::to_string(&submit_data).unwrap()
         );
 
-        // Submit without blocking the next field on the round trip. Reap the
-        // finished ones first so a failure is still reported promptly.
-        while let Some(joined) = submits.try_join_next() {
-            joined.expect("Submit task panicked")?;
-        }
-        while submits.len() >= MAX_SUBMITS_IN_FLIGHT {
-            let joined = submits
-                .join_next()
-                .await
-                .expect("join set is not empty here");
-            joined.expect("Submit task panicked")?;
-        }
+        // Submit without blocking the next field on the round trip.
+        //
+        // Hand this field off before inspecting any earlier submission: a
+        // failure there returns from this function, and results not yet spawned
+        // would go with it. Once spawned, the caller's drain will see it
+        // through.
         submits.spawn({
             let api_base = cli.api_base.clone();
             let api_num_retries = cli.api_max_retries;
@@ -634,16 +633,105 @@ async fn run_pipelined_loop(
             }
         });
 
+        // Reap whatever has finished, so a failure is still reported promptly.
+        while let Some(joined) = submits.try_join_next() {
+            joined.expect("Submit task panicked")?;
+        }
+        // Then wait if we are running too far ahead of the server.
+        while submits.len() >= MAX_SUBMITS_IN_FLIGHT {
+            let joined = submits
+                .join_next()
+                .await
+                .expect("join set is not empty here");
+            joined.expect("Submit task panicked")?;
+        }
+
         if !cli.repeat {
             break;
         }
     }
-
-    // Let every outstanding submission finish before returning.
-    while let Some(joined) = submits.join_next().await {
-        joined.expect("Submit task panicked")?;
-    }
     Ok(())
+}
+
+/// Wait for every outstanding submission to finish, then report the first
+/// failure among them.
+///
+/// Every task is joined even after one fails: the alternative is to return
+/// early and drop the `JoinSet`, which aborts the rest and discards fields that
+/// were already processed.
+async fn drain_submits(submits: &mut JoinSet<Result<()>>) -> Result<()> {
+    let mut first_error: Option<anyhow::Error> = None;
+    while let Some(joined) = submits.join_next().await {
+        if let Err(e) = joined.expect("Submit task panicked") {
+            match first_error {
+                None => first_error = Some(e),
+                Some(_) => error!("Further submission failure: {e}"),
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Run in pipelined mode: overlap API calls with processing.
+///
+/// Owns the pipeline state so that however `run_pipelined_fields` ends, the
+/// submissions still in flight are finished rather than aborted and the claims
+/// left behind are reported.
+async fn run_pipelined_loop(
+    cli: &Cli,
+    client: &Client,
+    #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
+) -> Result<()> {
+    let mut buffer: VecDeque<DataToClient> = VecDeque::new();
+    let mut fetches: JoinSet<Result<DataToClient>> = JoinSet::new();
+    let mut submits: JoinSet<Result<()>> = JoinSet::new();
+
+    let outcome = {
+        #[cfg(feature = "gpu")]
+        {
+            run_pipelined_fields(
+                cli,
+                client,
+                gpu_ctx,
+                &mut buffer,
+                &mut fetches,
+                &mut submits,
+            )
+            .await
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            run_pipelined_fields(cli, client, &mut buffer, &mut fetches, &mut submits).await
+        }
+    };
+
+    // Work already done outranks the error that interrupted it.
+    let drained = drain_submits(&mut submits).await;
+
+    // Claims we never got to stay claimed on the server until the window
+    // expires, so account for them instead of letting them disappear quietly.
+    let abandoned = buffer.len() + fetches.len();
+    if abandoned > 0 {
+        warn!(
+            "Abandoning up to {abandoned} claimed field(s) ({} buffered, {} in flight).",
+            buffer.len(),
+            fetches.len()
+        );
+    }
+
+    match (outcome, drained) {
+        // Report what stopped the pipeline, not what the drain then ran into.
+        (Err(e), drain) => {
+            if let Err(drain_error) = drain {
+                error!("Submission also failed while draining: {drain_error}");
+            }
+            Err(e)
+        }
+        (Ok(()), drain) => drain,
+    }
 }
 
 #[tokio::main]
@@ -781,7 +869,11 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_PREFETCH_MAX, DEFAULT_PREFETCH_SECONDS, prefetch_target};
+    use super::{DEFAULT_PREFETCH_MAX, DEFAULT_PREFETCH_SECONDS, drain_submits, prefetch_target};
+    use anyhow::{Result, anyhow};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::task::JoinSet;
 
     // Deliberately not built through `Cli::parse_from`: clap reads the `env`
     // attributes from the real process environment, so a developer with
@@ -841,6 +933,48 @@ mod tests {
         // A nonsensical cap must still leave room for one prefetched field.
         assert_eq!(prefetch_target(2.0, 1, Some(0.25)), 2);
         assert_eq!(prefetch_target(2.0, 0, Some(0.25)), 2);
+    }
+
+    #[tokio::test]
+    async fn draining_finishes_every_submission_despite_a_failure() {
+        // The point of the drain: returning early on the first failure would
+        // drop the JoinSet, and dropping a JoinSet aborts the tasks still in it.
+        // Those tasks are fields that have already been processed, so losing
+        // them means the work is done again by somebody else.
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut submits: JoinSet<Result<()>> = JoinSet::new();
+
+        // The failure lands first; the successes are still in progress behind it.
+        submits.spawn(async { Err(anyhow!("server rejected the submission")) });
+        for _ in 0..4 {
+            let completed = Arc::clone(&completed);
+            submits.spawn(async move {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        }
+
+        let result = drain_submits(&mut submits).await;
+
+        assert!(result.is_err(), "the failure still has to be reported");
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            4,
+            "every queued submission must run to completion despite the failure"
+        );
+        assert_eq!(submits.len(), 0, "nothing may be left unjoined");
+    }
+
+    #[tokio::test]
+    async fn draining_a_healthy_pipeline_succeeds() {
+        let mut submits: JoinSet<Result<()>> = JoinSet::new();
+        for _ in 0..3 {
+            submits.spawn(async { Ok(()) });
+        }
+        assert!(drain_submits(&mut submits).await.is_ok());
     }
 
     #[test]
