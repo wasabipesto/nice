@@ -18,21 +18,29 @@ use nice_common::{
 
 const DEFAULT_LSD_K_VALUE: u32 = 2;
 
+/// Defaults for the prefetch buffer, named so the CLI and the tests cannot
+/// disagree about them. The tests care: the guarantee that a slow client is
+/// unaffected by any of this is a statement about these exact values.
+const DEFAULT_PREFETCH_SECONDS: f64 = 2.0;
+const DEFAULT_PREFETCH_MAX: usize = 16;
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 4;
+
 #[cfg(feature = "gpu")]
 use nice_common::client_process_gpu::{
     GPU_BATCH_SIZE, GpuContext, process_range_detailed_gpu, process_range_niceonly_gpu,
 };
 
 extern crate serde_json;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, ValueEnum};
 use env_logger::Env;
 use log::{LevelFilter, debug, error, info};
 use rayon::prelude::*;
 use simple_tqdm::ParTqdm;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LogLevel {
@@ -93,6 +101,28 @@ pub struct Cli {
     /// Run parallel with this many threads
     #[arg(short, long, default_value_t = 4, env = "NICE_THREADS")]
     threads: usize,
+
+    /// Keep roughly this many seconds of work claimed ahead of the processor.
+    ///
+    /// The buffer is sized in seconds rather than fields so that it adapts to how
+    /// fast this machine actually is: a client taking at least this long per field
+    /// prefetches a single one, while a client finishing a field in a fraction of
+    /// this buffers enough to ride out a slow claim.
+    /// Set to 0 to force the old single-field prefetch.
+    #[arg(long, default_value_t = DEFAULT_PREFETCH_SECONDS, env = "NICE_PREFETCH_SECONDS")]
+    prefetch_seconds: f64,
+
+    /// Never hold more than this many claimed fields at once.
+    ///
+    /// A claimed field is unavailable to other clients until it is submitted or
+    /// the server's claim window expires, so this bounds how much work is
+    /// stranded if the client dies.
+    #[arg(long, default_value_t = DEFAULT_PREFETCH_MAX, env = "NICE_PREFETCH_MAX")]
+    prefetch_max: usize,
+
+    /// Allow this many claim requests to be in flight at once.
+    #[arg(long, default_value_t = DEFAULT_PREFETCH_CONCURRENCY, env = "NICE_PREFETCH_CONCURRENCY")]
+    prefetch_concurrency: usize,
 
     /// Run an offline benchmark
     #[arg(short, long, env = "NICE_BENCHMARK")]
@@ -407,156 +437,219 @@ async fn run_single_iteration(
     Ok(())
 }
 
+/// Cap on result submissions in flight at once.
+///
+/// Submissions are small and were measured to cost far less than a claim, but an
+/// unbounded queue would quietly absorb a server outage instead of surfacing it.
+const MAX_SUBMITS_IN_FLIGHT: usize = 8;
+
+/// How many claims to keep on hand — buffered or in flight — counting the one
+/// about to be processed.
+///
+/// `field_process_seconds` is how long this machine takes to process one field,
+/// smoothed over recent fields; `None` before the first one completes.
+///
+/// Sized in seconds of work rather than in fields so that it adapts to the
+/// machine. Any client averaging at least `prefetch_seconds` per field gets 2,
+/// which is exactly the historical behavior of one field processing and one
+/// prefetched; only a client faster than that buffers more, and then only enough
+/// to ride out a slow claim without stalling the processor.
+fn prefetch_target(
+    prefetch_seconds: f64,
+    prefetch_max: usize,
+    field_process_seconds: Option<f64>,
+) -> usize {
+    let floor = 2;
+    let ceiling = prefetch_max.max(floor);
+    if prefetch_seconds <= 0.0 {
+        return floor;
+    }
+    match field_process_seconds {
+        // Nothing processed yet, so we have no idea how fast this box is.
+        None => floor,
+        Some(per_field) if per_field <= 0.0 => ceiling,
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some(per_field) => {
+            // `as usize` saturates rather than wrapping, so a tiny time is safe.
+            let fields = (prefetch_seconds / per_field).ceil() as usize;
+            fields.saturating_add(1).clamp(floor, ceiling)
+        }
+    }
+}
+
+/// Move every claim that has already arrived out of the join set and into the
+/// buffer. Non-blocking.
+fn collect_ready_claims(
+    fetches: &mut JoinSet<Result<DataToClient>>,
+    buffer: &mut VecDeque<DataToClient>,
+) -> Result<()> {
+    while let Some(joined) = fetches.try_join_next() {
+        buffer.push_back(joined.expect("Fetch task panicked")?);
+    }
+    Ok(())
+}
+
+/// Top the claim requests back up to the target, subject to the concurrency cap.
+fn request_claims(
+    fetches: &mut JoinSet<Result<DataToClient>>,
+    buffered: usize,
+    target: usize,
+    cli: &Cli,
+    client: &Client,
+) {
+    let concurrency = cli.prefetch_concurrency.max(1);
+    while buffered + fetches.len() < target && fetches.len() < concurrency {
+        let mode = cli.mode;
+        let api_base = cli.api_base.clone();
+        let api_num_retries = cli.api_max_retries;
+        let client = client.clone();
+        fetches.spawn(async move {
+            get_field_from_server_async(&client, &mode, &api_base, api_num_retries).await
+        });
+    }
+}
+
 /// Run in pipelined mode: overlap API calls with processing.
+///
+/// The processor is fed from a buffer of claims that is refilled by several
+/// concurrent requests.
 async fn run_pipelined_loop(
     cli: &Cli,
     client: &Client,
     #[cfg(feature = "gpu")] gpu_ctx: Option<&Arc<GpuContext>>,
 ) -> Result<()> {
-    // State for the pipeline
-    let mut pending_submit: Option<DataToServer> = None;
-    let mut current_claim: Option<DataToClient> = None;
-    let mut next_claim: Option<DataToClient> = None;
+    let mut buffer: VecDeque<DataToClient> = VecDeque::new();
+    let mut fetches: JoinSet<Result<DataToClient>> = JoinSet::new();
+    let mut submits: JoinSet<Result<()>> = JoinSet::new();
+    // Exponentially weighted moving average of how long one field takes to
+    // process, this is what the target buffer depth is derived from.
+    let mut field_process_ewma: Option<f64> = None;
 
     loop {
-        // Stage 1: Start fetching the next field if we don't have one
-        let fetch_next = if next_claim.is_none() {
-            Some(tokio::spawn({
-                let mode = cli.mode;
-                let api_base = cli.api_base.clone();
-                let api_num_retries = cli.api_max_retries;
-                let client = client.clone();
-                async move {
-                    get_field_from_server_async(&client, &mode, &api_base, api_num_retries).await
-                }
-            }))
-        } else {
-            None
-        };
+        let target = prefetch_target(cli.prefetch_seconds, cli.prefetch_max, field_process_ewma);
 
-        // Stage 2: If we have a current claim, process it
-        let process_current = if let Some(claim_data) = current_claim.take() {
-            info!(
-                "Acquired claim:  {}, Base {}",
-                claim_data.claim_id, claim_data.base
-            );
-            debug!(
-                "Claim Data: {}",
-                serde_json::to_string(&claim_data).unwrap()
-            );
+        // Take delivery of anything that landed while we were processing, then
+        // put the requests back up to depth.
+        collect_ready_claims(&mut fetches, &mut buffer)?;
+        request_claims(&mut fetches, buffer.len(), target, cli, client);
 
-            let start_time = std::time::Instant::now();
+        // With an empty buffer there is nothing to do but wait for a claim.
+        while buffer.is_empty() {
+            let Some(joined) = fetches.join_next().await else {
+                return Err(anyhow!("no claims buffered and no requests in flight"));
+            };
+            buffer.push_back(joined.expect("Fetch task panicked")?);
+            collect_ready_claims(&mut fetches, &mut buffer)?;
+            request_claims(&mut fetches, buffer.len(), target, cli, client);
+        }
 
-            Some(tokio::task::spawn_blocking({
-                let mode = cli.mode;
-                let cli_clone = cli.clone();
-                #[cfg(feature = "gpu")]
-                let gpu_ctx_clone = gpu_ctx.cloned();
-                move || {
-                    let results = {
-                        #[cfg(feature = "gpu")]
-                        {
-                            process_field_sync(
-                                &claim_data,
-                                mode,
-                                &cli_clone,
-                                gpu_ctx_clone.as_ref(),
-                            )
-                        }
-                        #[cfg(not(feature = "gpu"))]
-                        {
-                            process_field_sync(&claim_data, mode, &cli_clone)
-                        }
-                    };
-                    (claim_data, results, start_time.elapsed())
-                }
-            }))
-        } else {
-            None
-        };
+        let claim_data = buffer.pop_front().expect("buffer was just checked");
+        info!(
+            "Acquired claim:  {}, Base {}",
+            claim_data.claim_id, claim_data.base
+        );
+        debug!(
+            "Claim Data: {}",
+            serde_json::to_string(&claim_data).unwrap()
+        );
+        debug!(
+            "Prefetch: {} buffered, {} in flight, target {target}",
+            buffer.len(),
+            fetches.len()
+        );
 
-        // Stage 3: Submit previous results if we have any
-        let submit_previous = pending_submit.take().map(|submit_data| {
-            tokio::spawn({
-                let api_base = cli.api_base.clone();
-                let api_num_retries = cli.api_max_retries;
-                let client = client.clone();
-                async move {
-                    let response = submit_field_to_server_async(
-                        &client,
-                        &api_base,
-                        submit_data,
-                        api_num_retries,
-                    )
-                    .await?;
-                    match response.text().await {
-                        Ok(msg) => {
-                            debug!("Server response: {msg}");
-                        }
-                        Err(e) => error!("Server returned success but an error occured: {e}"),
+        let start_time = std::time::Instant::now();
+
+        // Process the field. The claim requests already spawned keep making
+        // progress on the runtime while this is awaited.
+        let (claim_data, results, elapsed) = tokio::task::spawn_blocking({
+            let mode = cli.mode;
+            let cli_clone = cli.clone();
+            #[cfg(feature = "gpu")]
+            let gpu_ctx_clone = gpu_ctx.cloned();
+            move || {
+                let results = {
+                    #[cfg(feature = "gpu")]
+                    {
+                        process_field_sync(&claim_data, mode, &cli_clone, gpu_ctx_clone.as_ref())
                     }
-                    Ok::<(), anyhow::Error>(())
-                }
-            })
+                    #[cfg(not(feature = "gpu"))]
+                    {
+                        process_field_sync(&claim_data, mode, &cli_clone)
+                    }
+                };
+                (claim_data, results, start_time.elapsed())
+            }
+        })
+        .await
+        .expect("Processing task panicked");
+
+        // Print performance stats if progress bar is disabled
+        #[allow(clippy::cast_precision_loss)]
+        if cli.no_progress || cli.gpu {
+            let range_size = claim_data.range_end - claim_data.range_start;
+            let numbers_per_sec = range_size as f64 / elapsed.as_secs_f64();
+            info!(
+                "✓ Processed {:.2e} numbers in {:.2}s ({:.2e} numbers/sec)",
+                range_size as f64,
+                elapsed.as_secs_f64(),
+                numbers_per_sec
+            );
+        }
+
+        // Feed the buffer sizer.
+        let elapsed_secs = elapsed.as_secs_f64();
+        field_process_ewma = Some(match field_process_ewma {
+            Some(previous) => 0.7 * previous + 0.3 * elapsed_secs,
+            None => elapsed_secs,
         });
 
-        // Wait for all concurrent operations to complete
-        if let Some(fetch_task) = fetch_next {
-            next_claim = Some(fetch_task.await.expect("Fetch task panicked")?);
+        // Compile results for submission
+        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
+
+        debug!(
+            "Submit Data: {}",
+            serde_json::to_string(&submit_data).unwrap()
+        );
+
+        // Submit without blocking the next field on the round trip. Reap the
+        // finished ones first so a failure is still reported promptly.
+        while let Some(joined) = submits.try_join_next() {
+            joined.expect("Submit task panicked")?;
         }
-
-        if let Some(process_task) = process_current {
-            let (claim_data, results, elapsed) =
-                process_task.await.expect("Processing task panicked");
-
-            // Print performance stats if progress bar is disabled
-            #[allow(clippy::cast_precision_loss)]
-            if cli.no_progress || cli.gpu {
-                let range_size = claim_data.range_end - claim_data.range_start;
-                let numbers_per_sec = range_size as f64 / elapsed.as_secs_f64();
-                info!(
-                    "✓ Processed {:.2e} numbers in {:.2}s ({:.2e} numbers/sec)",
-                    range_size as f64,
-                    elapsed.as_secs_f64(),
-                    numbers_per_sec
-                );
+        while submits.len() >= MAX_SUBMITS_IN_FLIGHT {
+            let joined = submits
+                .join_next()
+                .await
+                .expect("join set is not empty here");
+            joined.expect("Submit task panicked")?;
+        }
+        submits.spawn({
+            let api_base = cli.api_base.clone();
+            let api_num_retries = cli.api_max_retries;
+            let client = client.clone();
+            async move {
+                let response =
+                    submit_field_to_server_async(&client, &api_base, submit_data, api_num_retries)
+                        .await?;
+                match response.text().await {
+                    Ok(msg) => {
+                        debug!("Server response: {msg}");
+                    }
+                    Err(e) => error!("Server returned success but an error occured: {e}"),
+                }
+                Ok::<(), anyhow::Error>(())
             }
+        });
 
-            // Compile results for submission
-            let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
-
-            debug!(
-                "Submit Data: {}",
-                serde_json::to_string(&submit_data).unwrap()
-            );
-
-            pending_submit = Some(submit_data);
-        }
-
-        if let Some(submit_task) = submit_previous {
-            submit_task.await.expect("Submit task panicked")?;
-        }
-
-        // Move the pipeline forward
-        current_claim = next_claim.take();
-
-        // If we don't have a current claim and we're not repeating, we're done
-        if current_claim.is_none() && !cli.repeat {
+        if !cli.repeat {
             break;
         }
     }
 
-    // Submit any remaining results
-    if let Some(submit_data) = pending_submit {
-        let response =
-            submit_field_to_server_async(client, &cli.api_base, submit_data, cli.api_max_retries)
-                .await?;
-        match response.text().await {
-            Ok(msg) => {
-                debug!("Server response: {msg}");
-            }
-            Err(e) => error!("Server returned success but an error occured: {e}"),
-        }
+    // Let every outstanding submission finish before returning.
+    while let Some(joined) = submits.join_next().await {
+        joined.expect("Submit task panicked")?;
     }
     Ok(())
 }
@@ -692,4 +785,77 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_PREFETCH_MAX, DEFAULT_PREFETCH_SECONDS, prefetch_target};
+
+    // Deliberately not built through `Cli::parse_from`: clap reads the `env`
+    // attributes from the real process environment, so a developer with
+    // NICE_PREFETCH_SECONDS exported would see these fail, and a malformed value
+    // would make clap exit the test binary outright. Testing the plain function
+    // against the named defaults keeps the assertions about the shipped
+    // behavior without making them hostage to the shell they run in.
+
+    #[test]
+    fn slow_clients_keep_the_historical_depth() {
+        // Any client at or above `prefetch_seconds` per field must behave exactly
+        // as it always has: one field being processed, one prefetched. The
+        // boundary case is the interesting one, hence DEFAULT_PREFETCH_SECONDS
+        // itself in the list.
+        for per_field in [660.0, 11.0, DEFAULT_PREFETCH_SECONDS] {
+            assert_eq!(
+                prefetch_target(
+                    DEFAULT_PREFETCH_SECONDS,
+                    DEFAULT_PREFETCH_MAX,
+                    Some(per_field)
+                ),
+                2,
+                "a {per_field}s field should not deepen the buffer"
+            );
+        }
+        // And before anything has been processed we do not guess.
+        assert_eq!(
+            prefetch_target(DEFAULT_PREFETCH_SECONDS, DEFAULT_PREFETCH_MAX, None),
+            2
+        );
+    }
+
+    #[test]
+    fn fast_clients_buffer_the_configured_seconds() {
+        // A quarter-second field needs eight buffered to cover two seconds,
+        // plus the one being processed.
+        assert_eq!(prefetch_target(2.0, DEFAULT_PREFETCH_MAX, Some(0.25)), 9);
+        assert_eq!(prefetch_target(2.0, DEFAULT_PREFETCH_MAX, Some(1.0)), 3);
+        // Doubling the window doubles the fields held, cap permitting.
+        assert_eq!(prefetch_target(4.0, 64, Some(0.25)), 17);
+    }
+
+    #[test]
+    fn the_cap_and_the_opt_out_both_hold() {
+        assert_eq!(
+            prefetch_target(2.0, DEFAULT_PREFETCH_MAX, Some(0.0001)),
+            DEFAULT_PREFETCH_MAX
+        );
+        assert_eq!(
+            prefetch_target(2.0, DEFAULT_PREFETCH_MAX, Some(0.0)),
+            DEFAULT_PREFETCH_MAX
+        );
+
+        // Zero seconds is the opt-out: back to a single prefetched field.
+        assert_eq!(prefetch_target(0.0, DEFAULT_PREFETCH_MAX, Some(0.25)), 2);
+
+        // A nonsensical cap must still leave room for one prefetched field.
+        assert_eq!(prefetch_target(2.0, 1, Some(0.25)), 2);
+        assert_eq!(prefetch_target(2.0, 0, Some(0.25)), 2);
+    }
+
+    #[test]
+    fn the_shipped_defaults_are_what_the_other_tests_assume() {
+        // If these move, the "slow clients are unaffected" guarantee above is
+        // no longer a statement about what actually ships.
+        assert!((DEFAULT_PREFETCH_SECONDS - 2.0).abs() < f64::EPSILON);
+        assert_eq!(DEFAULT_PREFETCH_MAX, 16);
+    }
 }
