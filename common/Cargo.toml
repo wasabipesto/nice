@@ -26,8 +26,8 @@ log = { version = "0.4" }
 malachite = { version = "0.9.1" }
 malachite-nz = { version = "0.9", features = ["enable_serde"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
-reqwest = { version = "0.12", features = ["blocking", "json"], optional = true, default-features = false }
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros"], optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true, default-features = false }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 rand = { version = "0.10.1", optional = true }
