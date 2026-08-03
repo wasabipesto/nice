@@ -4,6 +4,7 @@
 
 - Fix an off-by-one error in get_base_range_natural which dropped one trailing candidate per base where base % 5 ∈ {2,3,4}. Thanks to [Janzert](https://github.com/Janzert) for reporting this!
 - Adapt CPU client processing chunk size from field size to reduce memory usage with larger fields and make TQDM output more readable
+- Buffer client claims and overlap the requests that refill them. Thanks to [Janzert](https://github.com/Janzert) for implementing this!
 
 ## Nice v3.2.15
 

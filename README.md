@@ -107,6 +107,24 @@ Options:
           [env: NICE_THREADS=]
           [default: 4]
 
+      --prefetch-seconds <PREFETCH_SECONDS>
+          Keep roughly this many seconds of work claimed ahead of the processor. Set to 0 to force the old single-field prefetch
+
+          [env: NICE_PREFETCH_SECONDS=]
+          [default: 2]
+
+      --prefetch-max <PREFETCH_MAX>
+          Never hold more than this many claimed fields at once
+
+          [env: NICE_PREFETCH_MAX=]
+          [default: 16]
+
+      --prefetch-concurrency <PREFETCH_CONCURRENCY>
+          Allow this many claim requests to be in flight at once
+
+          [env: NICE_PREFETCH_CONCURRENCY=]
+          [default: 4]
+
   -b, --benchmark <BENCHMARK>
           Run an offline benchmark
 
