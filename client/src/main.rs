@@ -18,12 +18,19 @@ use nice_common::{
 
 const DEFAULT_LSD_K_VALUE: u32 = 2;
 
-/// Defaults for the prefetch buffer, named so the CLI and the tests cannot
-/// disagree about them. The tests care: the guarantee that a slow client is
-/// unaffected by any of this is a statement about these exact values.
+/// Defaults for the prefetch buffer.
+/// The buffer is sized in seconds rather than fields so that it adapts to how
+/// fast this machine actually is: a client taking at least this long per field
+/// prefetches a single one, while a client finishing a field in a fraction of
+/// this buffers enough to ride out a slow claim.
 const DEFAULT_PREFETCH_SECONDS: f64 = 2.0;
 const DEFAULT_PREFETCH_MAX: usize = 16;
 const DEFAULT_PREFETCH_CONCURRENCY: usize = 4;
+
+/// Cap on result submissions in flight at once.
+/// Submissions are small and were measured to cost far less than a claim, but an
+/// unbounded queue would quietly absorb a server outage instead of surfacing it.
+const MAX_SUBMITS_IN_FLIGHT: usize = 8;
 
 #[cfg(feature = "gpu")]
 use nice_common::client_process_gpu::{
@@ -103,20 +110,11 @@ pub struct Cli {
     threads: usize,
 
     /// Keep roughly this many seconds of work claimed ahead of the processor.
-    ///
-    /// The buffer is sized in seconds rather than fields so that it adapts to how
-    /// fast this machine actually is: a client taking at least this long per field
-    /// prefetches a single one, while a client finishing a field in a fraction of
-    /// this buffers enough to ride out a slow claim.
     /// Set to 0 to force the old single-field prefetch.
     #[arg(long, default_value_t = DEFAULT_PREFETCH_SECONDS, env = "NICE_PREFETCH_SECONDS")]
     prefetch_seconds: f64,
 
     /// Never hold more than this many claimed fields at once.
-    ///
-    /// A claimed field is unavailable to other clients until it is submitted or
-    /// the server's claim window expires, so this bounds how much work is
-    /// stranded if the client dies.
     #[arg(long, default_value_t = DEFAULT_PREFETCH_MAX, env = "NICE_PREFETCH_MAX")]
     prefetch_max: usize,
 
@@ -436,12 +434,6 @@ async fn run_single_iteration(
     }
     Ok(())
 }
-
-/// Cap on result submissions in flight at once.
-///
-/// Submissions are small and were measured to cost far less than a claim, but an
-/// unbounded queue would quietly absorb a server outage instead of surfacing it.
-const MAX_SUBMITS_IN_FLIGHT: usize = 8;
 
 /// How many claims to keep on hand — buffered or in flight — counting the one
 /// about to be processed.
