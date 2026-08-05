@@ -201,6 +201,40 @@ fn compiled_backends() -> &'static str {
     }
 }
 
+/// Try to bring up CUDA, turning `cudarc`'s panics into errors.
+///
+/// `cudarc` panics rather than returning when the CUDA shared library is absent
+/// (`panic_no_lib_found`, cudarc/src/lib.rs) — which is the ordinary case on any
+/// machine with no NVIDIA driver, i.e. precisely the case `--gpu-backend auto`
+/// exists to fall through. Upstream catches the same panic for the same reason
+/// in `nvrtc_compiles_kernels_for_all_supported_bases`.
+///
+/// The panic hook is silenced for the duration so a routine fallback does not
+/// print cudarc's 20-line message. GPU init runs before any worker threads
+/// start, so swapping the global hook here is safe.
+///
+/// Note this relies on unwinding; under `panic = "abort"` the process would die
+/// as before. The workspace does not set that.
+#[cfg(feature = "gpu")]
+fn try_init_cuda(device: usize) -> Result<GpuContext> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let caught = std::panic::catch_unwind(|| GpuContext::new(device));
+    std::panic::set_hook(previous);
+
+    match caught {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("the CUDA driver library could not be loaded");
+            Err(anyhow!("{msg}"))
+        }
+    }
+}
+
 /// Bring up the GPU backend the user asked for.
 ///
 /// `Auto` tries CUDA first and falls back to Vulkan, so an NVIDIA machine
@@ -217,7 +251,7 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
 
     #[cfg(feature = "gpu")]
     if matches!(want, GpuBackend::Auto | GpuBackend::Cuda) {
-        match GpuContext::new(cli.gpu_device) {
+        match try_init_cuda(cli.gpu_device) {
             Ok(ctx) => {
                 info!(
                     "GPU initialized: CUDA device {}, batch size {}",
@@ -233,7 +267,7 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
             Err(e) => {
                 if want == GpuBackend::Cuda {
                     error!(
-                        "Failed to initialize CUDA on device {}: {e:?}",
+                        "Failed to initialize CUDA on device {}: {e:#}",
                         cli.gpu_device
                     );
                     eprintln!("Troubleshooting:");
@@ -241,9 +275,13 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                     eprintln!("2. Verify CUDA toolkit is installed (nvcc --version)");
                     eprintln!("3. Check that GPU {} exists (nvidia-smi)", cli.gpu_device);
                     eprintln!("4. Try a different device with --gpu-device <N>");
+                    if cfg!(feature = "vulkan") {
+                        eprintln!("5. Or use the Vulkan backend: --gpu-backend vulkan");
+                    }
                     std::process::exit(1);
                 }
-                debug!("CUDA unavailable ({e:#}); trying Vulkan");
+                info!("CUDA unavailable; trying Vulkan");
+                debug!("  CUDA init failed: {e:#}");
             }
         }
     }
@@ -1013,5 +1051,17 @@ mod tests {
         // no longer a statement about what actually ships.
         assert!((DEFAULT_PREFETCH_SECONDS - 2.0).abs() < f64::EPSILON);
         assert_eq!(DEFAULT_PREFETCH_MAX, 16);
+    }
+
+    /// `cudarc` panics rather than returning when the CUDA shared library is
+    /// missing, which took the whole client down before `--gpu-backend auto`
+    /// could fall through to Vulkan. Whatever this machine has installed,
+    /// initialization must *return* — Ok on a CUDA box, Err on one without —
+    /// and never unwind past here.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn cuda_init_returns_instead_of_panicking() {
+        // The result depends on the host; only the absence of a panic matters.
+        let _ = super::try_init_cuda(0);
     }
 }
