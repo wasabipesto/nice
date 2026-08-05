@@ -39,6 +39,9 @@ use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
 };
+use crate::gpu_config::{
+    MAX_GPU_DIGIT_MASK_BASE, chunk_constants, gpu_supports_base, prefilter_params,
+};
 use crate::{base_range, msd_prefix_filter, number_stats, residue_filter, stride_filter};
 use anyhow::{Context as _, Result, bail, ensure};
 use cudarc::driver::{
@@ -305,12 +308,6 @@ impl GpuContext {
     }
 }
 
-/// Highest base the GPU digit mask can represent (two u64 words). The
-/// kernel's u32-limb arithmetic is width-generic (buffers are sized from
-/// `N_LIMBS` at JIT time), so unlike the CPU's `U256` path there is no
-/// 256-bit ceiling; in practice the u128 candidate representation caps
-/// usable bases around 97 via `get_base_range_u128`.
-const MAX_GPU_DIGIT_MASK_BASE: u32 = 128;
 
 /// Defines shared by both kernels for a base: `BASE`, `N_LIMBS`,
 /// `CHUNK_DIGITS`, `CHUNK_DIV`. Fails for bases the GPU cannot handle
@@ -380,100 +377,6 @@ fn niceonly_defines(base: u32) -> Result<(Vec<String>, stride_filter::StrideTabl
     Ok((defines, table))
 }
 
-/// Parameters for the niceonly kernel's modular prefilter.
-struct PrefilterParams {
-    /// Digits checked per value (the lowest `digits` of n² and of n³).
-    digits: u32,
-    /// `base^digits`, at most 2^48.
-    modulus: u64,
-    /// `2^64 mod modulus`.
-    pow64_mod: u64,
-}
-
-/// Compute the prefilter parameters for a base, or None when the prefilter
-/// must stay disabled.
-///
-/// The prefilter checks the lowest p digits of n² and n³ using
-/// `x mod b^p` arithmetic in u64. Constraints:
-/// - `b^p <= 2^48` keeps every intermediate product reducible with a couple
-///   of multiply-high steps;
-/// - n² and n³ must each be guaranteed at least p digits across the base's
-///   whole range, or the digit loop would extract phantom leading zeros and
-///   could falsely reject a nice number. Verified with a conservative
-///   log-based lower bound on the digit counts at the range start.
-/// Highest base where the niceonly kernel's fused prefilter still pays for
-/// itself. Above this the prefilter is compiled out even though it would be
-/// sound: warp divergence means the whole warp runs the full check whenever
-/// any lane survives, so the prefilter only pays while per-lane survival is
-/// very low (at 4% survival ~74% of warp iterations already hold a
-/// survivor). Measured (G1 2026-07-12 + crossover sweep,
-/// scratchpad/2026-07-gpu-compaction/g1-verdict.md): fused wins at b40
-/// (1.1% survival, 16-30% faster on 3090/4090), loses at every live base
-/// from b42 up (4%+ survival, 4-27% slower). b41 has no live range.
-const GPU_PREFILTER_MAX_BASE: u32 = 40;
-
-fn prefilter_params(base: u32) -> Option<PrefilterParams> {
-    // Profitability gate (see GPU_PREFILTER_MAX_BASE). Every consumer —
-    // define injection, the CPU diagnostics mirror, the G0/G1 harnesses —
-    // takes the on/off decision from this single function, so the kernel
-    // and its mirrors always agree.
-    if base > GPU_PREFILTER_MAX_BASE {
-        return None;
-    }
-
-    let mut digits = 0u32;
-    let mut modulus = 1u64;
-    while modulus <= (1u64 << 48) / u64::from(base) {
-        modulus *= u64::from(base);
-        digits += 1;
-    }
-
-    let range = base_range::get_base_range_u128(base).ok()??;
-    #[allow(clippy::cast_precision_loss)]
-    let ln_n_min = (range.range_start as f64).ln();
-    let ln_base = f64::from(base).ln();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let digit_lower_bound =
-        |power: f64| ((power * ln_n_min / ln_base).floor() - 1.0).max(0.0) as u32;
-    let sq_digits_min = digit_lower_bound(2.0);
-    let cu_digits_min = digit_lower_bound(3.0);
-    if digits < 4 || sq_digits_min < digits || cu_digits_min < digits {
-        return None;
-    }
-
-    let pow64_mod = ((1u128 << 64) % u128::from(modulus)) as u64;
-    Some(PrefilterParams {
-        digits,
-        modulus,
-        pow64_mod,
-    })
-}
-
-/// Largest (e, base^e) with base^e < 2^31. The kernel splits n² and n³ into
-/// chunks of `e` digits by dividing by `base^e`, then peels single digits
-/// from each u32 chunk — all divisions by compile-time constants.
-fn chunk_constants(base: u32) -> (u32, u32) {
-    let mut e = 0u32;
-    let mut div = 1u64;
-    while div * u64::from(base) < (1 << 31) {
-        div *= u64::from(base);
-        e += 1;
-    }
-    (e, div as u32)
-}
-
-/// Whether the GPU path can process this base natively. Bases outside this
-/// fall back to the CPU implementation. Unlike the CPU fast path (capped at
-/// `MAX_BASE_FOR_FIXED_WIDTH_U256` = 68 by its 256-bit type), the GPU's
-/// limb-generic arithmetic handles every base with a valid u128 range.
-///
-/// Bases below 10 are excluded: their search ranges are trivially small
-/// (b5's is two numbers), and `get_base_range_u128` panics outright on
-/// degenerate ones like b4 — not worth guarding for on the GPU path.
-fn gpu_supports_base(base: u32) -> bool {
-    (10..=MAX_GPU_DIGIT_MASK_BASE).contains(&base)
-        && matches!(base_range::get_base_range_u128(base), Ok(Some(_)))
-}
 
 /// Compile the embedded CUDA source with the given `-D` defines via NVRTC.
 fn compile_kernel_ptx(defines: &[String]) -> Result<Ptx> {
@@ -959,6 +862,7 @@ pub fn process_niceonly_gpu(
 )]
 mod tests {
     use super::*;
+    use crate::gpu_config::PrefilterParams;
     use crate::client_process;
     use crate::stride_filter::StrideTable;
 
@@ -1369,19 +1273,6 @@ mod tests {
         }
     }
 
-    #[test_log::test]
-    fn chunk_constants_are_maximal() {
-        for base in 2..=MAX_GPU_DIGIT_MASK_BASE {
-            let (e, div) = chunk_constants(base);
-            assert!(e >= 1);
-            assert_eq!(u64::from(div), u64::from(base).pow(e));
-            assert!(u64::from(div) < (1 << 31), "base {base}: div too large");
-            assert!(
-                u64::from(div) * u64::from(base) >= (1 << 31),
-                "base {base}: e not maximal"
-            );
-        }
-    }
 
     #[test_log::test]
     fn mirror_digit_extraction_matches_cpu() {

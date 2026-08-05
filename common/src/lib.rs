@@ -9,6 +9,7 @@ pub mod benchmark;
 pub mod client_api_async;
 pub mod client_process;
 pub mod client_process_gpu;
+pub mod client_process_vulkan;
 pub mod consensus;
 #[cfg(feature = "database")]
 pub mod db_util;
@@ -16,11 +17,13 @@ pub mod distribution_stats;
 pub mod fixed_width;
 pub mod generate_chunks;
 pub mod generate_fields;
+pub mod gpu_config;
 pub mod lsd_filter;
 pub mod msd_prefix_filter;
 pub mod number_stats;
 pub mod residue_filter;
 pub mod stride_filter;
+pub mod vulkan;
 
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
