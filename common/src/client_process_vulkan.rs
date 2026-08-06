@@ -13,6 +13,7 @@
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::gpu_config::gpu_supports_base;
+use crate::residue_filter;
 use crate::stride_filter::StrideTable;
 use crate::vulkan::{DetailedRun, VulkanContext};
 use crate::{
@@ -95,6 +96,28 @@ pub fn process_range_detailed_vulkan(
     })
 }
 
+/// The answer for a residue-empty base, if this is one.
+///
+/// For `b ≡ 3 mod 4` the residue set `R_b` is empty, which means there are
+/// provably no solutions — but it also means the stride table does not return
+/// so much as panic when indexed
+/// (`stride_filter::first_valid_at_or_after` indexes `valid_residues[idx]`).
+/// So this has to be checked before any stride table is built.
+///
+/// The CUDA path has the same guard inside `process_range_niceonly_gpu`; here
+/// it sits ahead of the CPU fallback rather than after it, so it also covers
+/// bases the GPU itself cannot take.
+fn residue_empty_result(base: u32) -> Option<FieldResults> {
+    if residue_filter::get_residue_filter_u128(&base).is_empty() {
+        debug!("base {base} is residue-empty; no candidates to check");
+        return Some(FieldResults {
+            distribution: Vec::new(),
+            nice_numbers: Vec::new(),
+        });
+    }
+    None
+}
+
 /// Niceonly on the Vulkan backend — CPU for now.
 ///
 /// # Errors
@@ -105,6 +128,10 @@ pub fn process_range_niceonly_vulkan(
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
+    if let Some(empty) = residue_empty_result(base) {
+        return Ok(empty);
+    }
+
     warn!("niceonly is not implemented on the Vulkan backend; using the CPU for this field");
     let table = StrideTable::new(base, LSD_K);
     Ok(process_range_niceonly(range, base, &table))
@@ -156,6 +183,32 @@ mod tests {
     #[test]
     fn batch_size_cannot_overflow_a_u32_bin() {
         assert!(VULKAN_BATCH_SIZE < u128::from(u32::MAX));
+    }
+
+    /// Bases with `b % 4 == 3` have an empty residue set, and the stride table
+    /// panics rather than returning when indexed. Niceonly must answer "nothing
+    /// here" instead of taking the client down, and must decide that *before*
+    /// building any stride table.
+    #[test]
+    fn residue_empty_bases_short_circuit_before_the_stride_table() {
+        let mut checked = 0;
+        for base in 10..=60 {
+            let empty = residue_filter::get_residue_filter_u128(&base).is_empty();
+            assert_eq!(
+                empty,
+                base % 4 == 3,
+                "base {base}: residue-emptiness should track b mod 4 == 3"
+            );
+            match residue_empty_result(base) {
+                Some(out) => {
+                    assert!(empty, "base {base} short-circuited but has residues");
+                    assert!(out.nice_numbers.is_empty() && out.distribution.is_empty());
+                    checked += 1;
+                }
+                None => assert!(!empty, "base {base} is residue-empty but was not caught"),
+            }
+        }
+        assert!(checked >= 10, "only {checked} residue-empty bases exercised");
     }
 
     /// CPU/GPU parity on the detailed path. Requires a Vulkan device, so it is

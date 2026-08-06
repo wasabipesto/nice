@@ -151,10 +151,21 @@ Options:
           [env: NICE_GPU=]
 
       --gpu-device <GPU_DEVICE>
-          CUDA device to use for GPU processing (0 for first GPU, 1 for second, etc.)
+          GPU device to use (0 for first GPU, 1 for second, etc.)
 
           [env: NICE_GPU_DEVICE=]
           [default: 0]
+
+      --gpu-backend <GPU_BACKEND>
+          Which GPU backend to use with --gpu
+
+          Possible values:
+          - auto:   CUDA if available, otherwise Vulkan
+          - cuda:   NVIDIA only; requires the CUDA toolkit at runtime for NVRTC
+          - vulkan: Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe)
+
+          [env: NICE_GPU_BACKEND=]
+          [default: auto]
 
   -l, --log-level <LOG_LEVEL>
           Set the log level (overrides `RUST_LOG` environment variable)
@@ -178,6 +189,8 @@ There are some feature flags that enable specific dependencies:
 - `nice_common/database` is set automatically from binaries that connect directly to postgres (`api` and `jobs`). This requires the `libpq-dev` package to be installed.
 - `nice_client/rustls-tls` is enabled by default and uses rustls for TLS connections, which doesn't require any external dependencies. Disable it and enable `nice_client/openssl-tls` to use `openssl`.
 - In order to build the client with GPU acceleration, enable the `nice_client/gpu` feature. This requires no additional build-time dependencies, but it does require the CUDA toolkit to be available at runtime for kernel compilation.
+- `nice_client/vulkan` builds a second GPU backend that runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, and llvmpipe). Like the CUDA one it needs nothing at build time; at runtime it needs only a Vulkan driver, since shaders are generated per base and compiled with `naga`. Currently detailed mode only — niceonly falls back to the CPU.
+- The two features are additive: `--features gpu,vulkan` produces one binary that runs on either, selected with `--gpu-backend`. Neither library is needed to *build* it, and `auto` prefers CUDA.
 
 Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack/).
 
