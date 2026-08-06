@@ -59,12 +59,63 @@ pub const MISS_STRIDE: u32 = 5;
 /// the base.
 pub const NICE_STRIDE: u32 = 4;
 
-/// Threads cooperating on one MSD-valid range, matching the CUDA kernel's
-/// one-warp-per-range tiling. Nothing here is a hardware property — the lanes
-/// stride through the range's candidates by index and never communicate — so
-/// this is a tuning constant, not a subgroup width. 64 is the obvious thing to
-/// try on RDNA, where a wave is currently split across two ranges.
-pub const LANES_PER_RANGE: u32 = 32;
+/// Most threads that may cooperate on one MSD-valid range — CUDA's
+/// one-warp-per-range tiling, and the ceiling for [`lane_shift_for`].
+///
+/// Nothing here is a hardware property: the lanes stride through the range's
+/// candidates by index and never communicate, so this is a tiling constant, not
+/// a subgroup width. Which is exactly why it does not have to be a constant at
+/// all — the shader takes `log2(lanes)` as a push constant and the host picks it
+/// per dispatch.
+pub const MAX_LANES_PER_RANGE: u32 = 32;
+
+/// Candidates each lane should have to work on, which is what
+/// [`lane_shift_for`] sizes the tiling to deliver.
+///
+/// Every lane assigned to a range redundantly repeats that range's setup — the
+/// residue reduction and a ~12-iteration binary search over the residue table —
+/// before its first candidate. At CUDA's fixed 32 lanes and an MSD floor of 250,
+/// a base-40 range holds ~39 candidates, so the tiling buys 32 copies of that
+/// setup to share out **1.2 candidates per lane**.
+///
+/// Measured (b40, 1e12, floor 250, device time): 32 lanes 30.0 s, 16 24.6 s,
+/// 8 22.8 s, 4 21.6 s, 2 21.1 s, 1 21.1 s. Monotone, and 32 candidates per lane
+/// is what puts a ~39-candidate range on a single lane. Where ranges are long
+/// the same sweep is flat inside run-to-run variance (floor 4000: 21.1-21.6 s
+/// across every width; floor 32000: 24.9-25.9 s), so this only has to be right
+/// at the short-range end.
+const TARGET_CANDIDATES_PER_LANE: u64 = 32;
+
+/// Threads a dispatch should have before the tiling starts economizing on them.
+///
+/// The floor is for small batches — the last of a field, or a field whose whole
+/// MSD output is a few thousand ranges. 65536 is measured to saturate this
+/// device (at floor 250 a 65536-range batch at one lane apiece is the fastest
+/// setting there is), so it is a lower bound rather than a target; on a device
+/// with 30x the ALUs the [`MAX_LANES_PER_RANGE`] cap binds first anyway.
+const MIN_DISPATCH_THREADS: u64 = 1 << 16;
+
+/// `log2` of the lanes to assign per range, for a dispatch of `num_ranges`
+/// ranges averaging `mean_len` numbers, of which `stride_r / stride_m` are
+/// candidates.
+///
+/// Clamped to `[1, MAX_LANES_PER_RANGE]` lanes. Returning a shift rather than a
+/// count keeps the shader's `gid.x >> shift` / `gid.x & (lanes - 1)` split
+/// exact, so the tiling stays pure index arithmetic at any width.
+#[must_use]
+pub fn lane_shift_for(num_ranges: u64, mean_len: u64, stride_m: u32, stride_r: u32) -> u32 {
+    let candidates = mean_len * u64::from(stride_r) / u64::from(stride_m);
+    // Round down to a power of two: 63 candidates' worth of lanes is 4, not 8,
+    // because the last lane would otherwise idle through most of the range.
+    let by_work =
+        (candidates / TARGET_CANDIDATES_PER_LANE).clamp(1, u64::from(MAX_LANES_PER_RANGE));
+    // ...but never leave the device short of threads to hide latency behind.
+    let by_occupancy = MIN_DISPATCH_THREADS
+        .div_ceil(num_ranges.max(1))
+        .next_power_of_two()
+        .min(u64::from(MAX_LANES_PER_RANGE));
+    by_work.max(by_occupancy).ilog2()
+}
 
 /// Largest stride modulus the niceonly shader's residue reduction accepts.
 ///
@@ -670,10 +721,10 @@ pub(crate) fn mirror_prefilter(
 
 /// The complete niceonly compute shader for one base.
 ///
-/// Mirrors `niceonly_ranges_kernel` in `nice_kernels.cu`: one group of
-/// [`LANES_PER_RANGE`] threads per MSD-valid range, candidates reconstructed
-/// on-device from the residue table, so the host ships ~12 bytes per range and
-/// no per-candidate data at all.
+/// Mirrors `niceonly_ranges_kernel` in `nice_kernels.cu`: a host-chosen group
+/// of threads per MSD-valid range (see [`lane_shift_for`]), candidates
+/// reconstructed on-device from the residue table, so the host ships ~12 bytes
+/// per range and no per-candidate data at all.
 #[must_use]
 pub fn niceonly_wgsl(cfg: &NiceonlyConfig) -> String {
     niceonly_wgsl_impl(cfg, false)
@@ -713,8 +764,6 @@ fn niceonly_wgsl_impl(cfg: &NiceonlyConfig, probe: bool) -> String {
     let cu_limbs = kernel.cu_limbs();
     let sq_limbs = kernel.sq_limbs();
     let wg = WORKGROUP_SIZE;
-    let lanes = LANES_PER_RANGE;
-    let lane_shift = lanes.trailing_zeros();
 
     let mut s = String::with_capacity(8192);
     let _ = writeln!(
@@ -727,7 +776,7 @@ fn niceonly_wgsl_impl(cfg: &NiceonlyConfig, probe: bool) -> String {
          \x20   fs_mod_m: u32,                           // field start mod M, host-computed\n\
          \x20   num_ranges: u32,\n\
          \x20   nice_cap: u32,\n\
-         \x20   pad: u32,\n\
+         \x20   lane_shift: u32,                         // log2 of the lanes per range\n\
          }}\n\
          var<immediate> pc: Params;\n\n\
          @group(0) @binding(0) var<storage, read> residues: array<u32>;\n\
@@ -836,11 +885,12 @@ fn niceonly_wgsl_impl(cfg: &NiceonlyConfig, probe: bool) -> String {
         "@compute @workgroup_size({wg})\n\
          fn main(@builtin(global_invocation_id) gid: vec3<u32>,\n\
          \x20       @builtin(num_workgroups) nwg: vec3<u32>) {{\n\
-         \x20   let lane: u32 = gid.x & {}u;\n\
-         \x20   let nwarps: u32 = (nwg.x * {wg}u) >> {lane_shift}u;\n\
+         \x20   let lanes: u32 = 1u << pc.lane_shift;\n\
+         \x20   let lane: u32 = gid.x & (lanes - 1u);\n\
+         \x20   let nwarps: u32 = (nwg.x * {wg}u) >> pc.lane_shift;\n\
          \x20   let fs_lo: u64 = (u64(pc.fs1) << 32u) | u64(pc.fs0);\n\
          \x20   let fs_hi: u64 = (u64(pc.fs3) << 32u) | u64(pc.fs2);\n\n\
-         \x20   var r: u32 = gid.x >> {lane_shift}u;\n\
+         \x20   var r: u32 = gid.x >> pc.lane_shift;\n\
          \x20   loop {{\n\
          \x20       if (r >= pc.num_ranges) {{ break; }}\n\
          \x20       let off_lo: u32 = range_offsets[2u * r];\n\
@@ -879,12 +929,11 @@ fn niceonly_wgsl_impl(cfg: &NiceonlyConfig, probe: bool) -> String {
          \x20                   nice_out[o + 3u] = u32(n_hi >> 32u);\n\
          \x20               }}\n\
          \x20           }}\n\
-         \x20           g = g + {lanes}u;\n\
+         \x20           g = g + lanes;\n\
          \x20       }}\n\
          \x20       r = r + nwarps;\n\
          \x20   }}\n\
-         }}",
-        lanes - 1
+         }}"
     );
 
     s
@@ -1016,7 +1065,7 @@ mod tests {
     }
 
     /// Rust mirror of the niceonly kernel's candidate loop, with all
-    /// [`LANES_PER_RANGE`] lanes' indices merged (so `g` increments by 1).
+    /// lanes' indices merged (so `g` increments by 1).
     /// Takes the range the way the shader does — a field start plus a u64
     /// offset — because that split is exactly what is being checked.
     fn mirror_kernel_candidates(
@@ -1254,6 +1303,49 @@ mod tests {
         }
         assert!(with > 0, "no base emitted a prefilter");
         assert!(without > 0, "every base emitted a prefilter");
+    }
+
+    /// The lane tiling must track the range size, never leave the shader's
+    /// representable band, and never hand a range more lanes than it has
+    /// candidates — which is the whole failure it exists to fix.
+    #[test]
+    fn lane_tiling_follows_the_range_size() {
+        let table = StrideTable::new(40, crate::gpu_niceonly::GPU_LSD_K);
+        #[allow(clippy::cast_possible_truncation)]
+        let (m, r) = (table.modulus as u32, table.valid_residues.len() as u32);
+
+        // A full batch of floor-250 ranges: ~490 numbers each, i.e. ~39
+        // candidates — the configuration where a fixed 32 lanes leaves 1.2
+        // candidates apiece, and where one lane each measured fastest.
+        let batch = crate::gpu_niceonly::LAUNCH_BATCH_RANGES as u64;
+        assert_eq!(lane_shift_for(batch, 490, m, r), 0, "short ranges want 1 lane");
+        // Long ranges keep the full warp.
+        assert_eq!(
+            lane_shift_for(batch, 1 << 20, m, r),
+            MAX_LANES_PER_RANGE.ilog2()
+        );
+        // A range with no candidates at all still gets one lane, not zero.
+        assert_eq!(lane_shift_for(batch, 0, m, r), 0);
+        // A batch too small to fill the device buys threads with lanes instead,
+        // even though the work rule alone would ask for one.
+        assert!(
+            lane_shift_for(64, 490, m, r) > lane_shift_for(batch, 490, m, r),
+            "a tiny batch must widen the tiling"
+        );
+
+        let mut prev = 0;
+        for len in (0..24).map(|k| 1u64 << k) {
+            let shift = lane_shift_for(batch, len, m, r);
+            assert!(shift >= prev, "tiling must not shrink as ranges grow");
+            assert!(1 << shift <= MAX_LANES_PER_RANGE, "len {len}: too many lanes");
+            let candidates = len * u64::from(r) / u64::from(m);
+            assert!(
+                (1u64 << shift) <= candidates.max(1),
+                "len {len}: {} lanes for {candidates} candidates",
+                1u64 << shift
+            );
+            prev = shift;
+        }
     }
 
     /// The measurement knob, without touching the process environment.

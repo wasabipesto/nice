@@ -24,13 +24,13 @@ pub mod codegen;
 use anyhow::{Context as _, Result, bail};
 use ash::vk;
 use codegen::{
-    KernelConfig, LANES_PER_RANGE, MISS_STRIDE, NICE_STRIDE, NiceonlyConfig, WORKGROUP_SIZE,
-    detailed_wgsl, niceonly_wgsl,
+    KernelConfig, MAX_LANES_PER_RANGE, MISS_STRIDE, NICE_STRIDE, NiceonlyConfig, WORKGROUP_SIZE,
+    detailed_wgsl, lane_shift_for, niceonly_wgsl,
 };
 use crate::NiceNumberSimple;
 use crate::gpu_niceonly::{GPU_LSD_K, RangeSink};
 use crate::stride_filter::StrideTable;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -78,7 +78,7 @@ struct NiceonlyParams {
     fs_mod_m: u32,
     num_ranges: u32,
     nice_cap: u32,
-    pad: u32,
+    lane_shift: u32,
 }
 
 #[allow(clippy::cast_possible_truncation)] // 32 bytes; the const assert below pins it
@@ -91,6 +91,28 @@ const _: () = assert!(
     PUSH_CONSTANT_SIZE <= 128 && NICEONLY_PUSH_CONSTANT_SIZE <= 128,
     "push constant block exceeds the guaranteed minimum"
 );
+
+/// Lane tiling pinned by `NICE_VULKAN_LANES`, as a shift, or `None` to size it
+/// per dispatch.
+///
+/// `NICE_VULKAN_LANES=32` reproduces the fixed one-warp-per-range tiling the
+/// CUDA kernel uses and this backend used through Phase 2, which is how the
+/// tiling A/B is taken — the same shape of knob as `NICE_GPU_MSD_FLOOR`. Values
+/// that are not a power of two in `1..=MAX_LANES_PER_RANGE` are ignored with a
+/// warning rather than silently rounded.
+fn pinned_lane_shift() -> Option<u32> {
+    let raw = std::env::var("NICE_VULKAN_LANES").ok()?;
+    match raw.parse::<u32>() {
+        Ok(n) if n.is_power_of_two() && n <= MAX_LANES_PER_RANGE => {
+            info!("Vulkan niceonly lanes pinned at {n} via NICE_VULKAN_LANES");
+            Some(n.trailing_zeros())
+        }
+        _ => {
+            warn!("ignoring invalid NICE_VULKAN_LANES '{raw}'; sizing lanes per dispatch");
+            None
+        }
+    }
+}
 
 /// Reinterpret a push constant block as bytes for `cmd_push_constants`.
 ///
@@ -159,12 +181,35 @@ struct NiceonlyPipeline {
 unsafe impl Send for NiceonlyPipeline {}
 unsafe impl Sync for NiceonlyPipeline {}
 
-/// Command buffer + fence, serialized because queue submission needs external
-/// synchronization.
-struct Submitter {
-    pool: vk::CommandPool,
+/// Submissions the device may be working on before the host waits for one.
+///
+/// The host's job between dispatches is to fill the next batch's range
+/// descriptors, so one slot in flight while another is being filled is all the
+/// overlap there is to have; a third only adds latency to `sync`. Every slot
+/// costs a command buffer, a fence, and — for niceonly — its own descriptor
+/// buffers, which is why this is 2 and not 8.
+const SUBMISSION_SLOTS: usize = 2;
+
+/// One command buffer and its fence.
+struct Slot {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// Submitted and not yet waited for: the fence needs a wait before this
+    /// slot's command buffer or host-side buffers can be touched again.
+    in_flight: bool,
+}
+
+/// The submission ring, serialized because queue submission needs external
+/// synchronization.
+///
+/// Slots are handed out round-robin by [`VulkanContext::acquire_slot`], which
+/// waits for the fence of the slot it is about to reuse — so the host blocks
+/// only once the device is [`SUBMISSION_SLOTS`] dispatches behind, rather than
+/// after every one.
+struct Submitter {
+    pool: vk::CommandPool,
+    slots: Vec<Slot>,
+    next: usize,
 }
 
 /// Vulkan device handle plus a cache of per-base compiled pipelines.
@@ -255,17 +300,27 @@ impl VulkanContext {
             )
         }
         .context("creating the command pool")?;
-        let cmd = unsafe {
+        #[allow(clippy::cast_possible_truncation)]
+        let cmds = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
+                    .command_buffer_count(SUBMISSION_SLOTS as u32),
             )
         }
-        .context("allocating the command buffer")?[0];
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-            .context("creating the fence")?;
+        .context("allocating the command buffers")?;
+        let mut slots = Vec::with_capacity(SUBMISSION_SLOTS);
+        for cmd in cmds {
+            // Created unsignaled, matching `in_flight: false`.
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .context("creating the fence")?;
+            slots.push(Slot {
+                cmd,
+                fence,
+                in_flight: false,
+            });
+        }
 
         let ctx = Self {
             entry,
@@ -273,7 +328,11 @@ impl VulkanContext {
             device,
             queue,
             mem_props,
-            submitter: Mutex::new(Submitter { pool, cmd, fence }),
+            submitter: Mutex::new(Submitter {
+                pool,
+                slots,
+                next: 0,
+            }),
             pipelines: Mutex::new(HashMap::new()),
             niceonly_pipelines: Mutex::new(HashMap::new()),
             device_name,
@@ -577,7 +636,100 @@ impl VulkanContext {
         Ok((pool, set))
     }
 
-    /// Record and submit one dispatch, waiting for it to complete.
+    /// Reserve the next submission slot, waiting for its previous dispatch to
+    /// finish if it has one.
+    ///
+    /// The slot is the caller's until it submits: whatever host-side buffers
+    /// that slot owns are free to overwrite, because the device is done reading
+    /// them. That is the contract that lets a caller double-buffer per slot.
+    ///
+    /// The returned guard holds the submitter lock across the caller's fill,
+    /// which is what makes the reservation exclusive — otherwise a second
+    /// thread could be handed the same slot while the first was still filling
+    /// it, since nothing marks it taken until the submit. Holding it costs no
+    /// device time: the lock blocks other *hosts*, and the device is meanwhile
+    /// working through the slots already submitted.
+    fn acquire_slot(&self) -> Result<SlotGuard<'_>> {
+        let mut guard = self.submitter.lock().unwrap();
+        let idx = guard.next;
+        guard.next = (guard.next + 1) % guard.slots.len();
+        if guard.slots[idx].in_flight {
+            let fence = guard.slots[idx].fence;
+            wait_fence(&self.device, fence)?;
+            unsafe { self.device.reset_fences(&[fence]) }?;
+            guard.slots[idx].in_flight = false;
+        }
+        Ok(SlotGuard {
+            ctx: self,
+            guard,
+            idx,
+        })
+    }
+
+    /// Record and submit one dispatch on a reserved slot, without waiting.
+    fn submit_locked(
+        &self,
+        s: &mut Submitter,
+        slot: usize,
+        shader: &Shader,
+        set: vk::DescriptorSet,
+        push: &[u8],
+        groups: u32,
+    ) -> Result<()> {
+        let (cmd, fence) = (s.slots[slot].cmd, s.slots[slot].fence);
+        unsafe {
+            self.device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            self.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, shader.pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                shader.layout,
+                0,
+                &[set],
+                &[],
+            );
+            self.device
+                .cmd_push_constants(cmd, shader.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+            self.device.cmd_dispatch(cmd, groups, 1, 1);
+            self.device.end_command_buffer(cmd)?;
+
+            let cmds = [cmd];
+            self.device.queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                fence,
+            )?;
+        }
+        s.slots[slot].in_flight = true;
+        Ok(())
+    }
+
+    /// Wait for every outstanding submission.
+    ///
+    /// Callers must do this before reading any buffer a dispatch wrote — the
+    /// device's results are not there until they do.
+    fn wait_all(&self) -> Result<()> {
+        let mut s = self.submitter.lock().unwrap();
+        for i in 0..s.slots.len() {
+            if s.slots[i].in_flight {
+                let fence = s.slots[i].fence;
+                wait_fence(&self.device, fence)?;
+                unsafe { self.device.reset_fences(&[fence]) }?;
+                s.slots[i].in_flight = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Submit one dispatch and wait for it — the synchronous path, for callers
+    /// that read the device's output straight afterwards.
     fn dispatch(
         &self,
         shader: &Shader,
@@ -585,55 +737,49 @@ impl VulkanContext {
         push: &[u8],
         groups: u32,
     ) -> Result<()> {
-        let s = self.submitter.lock().unwrap();
-        unsafe {
-            self.device
-                .reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty())?;
-            self.device.begin_command_buffer(
-                s.cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-            self.device
-                .cmd_bind_pipeline(s.cmd, vk::PipelineBindPoint::COMPUTE, shader.pipeline);
-            self.device.cmd_bind_descriptor_sets(
-                s.cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                shader.layout,
-                0,
-                &[set],
-                &[],
-            );
-            self.device.cmd_push_constants(
-                s.cmd,
-                shader.layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                push,
-            );
-            self.device.cmd_dispatch(s.cmd, groups, 1, 1);
-            self.device.end_command_buffer(s.cmd)?;
+        self.acquire_slot()?.submit(shader, set, push, groups)?;
+        self.wait_all()
+    }
+}
 
-            self.device.reset_fences(&[s.fence])?;
-            let cmds = [s.cmd];
-            self.device.queue_submit(
-                self.queue,
-                &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                s.fence,
-            )?;
-            match self
-                .device
-                .wait_for_fences(&[s.fence], true, FENCE_TIMEOUT_NS)
-            {
-                Ok(()) => {}
-                Err(vk::Result::TIMEOUT) => bail!(
-                    "Vulkan dispatch timed out after {}s",
-                    FENCE_TIMEOUT_NS / 1_000_000_000
-                ),
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
+/// An exclusive reservation of one submission slot.
+///
+/// Holds the submitter lock, so the slot — and the host-side buffers the caller
+/// keeps for it — cannot be handed out again until this is submitted or
+/// dropped.
+struct SlotGuard<'a> {
+    ctx: &'a VulkanContext,
+    guard: std::sync::MutexGuard<'a, Submitter>,
+    idx: usize,
+}
+
+impl SlotGuard<'_> {
+    fn index(&self) -> usize {
+        self.idx
+    }
+
+    /// Record and submit this slot's dispatch, releasing the reservation.
+    fn submit(
+        mut self,
+        shader: &Shader,
+        set: vk::DescriptorSet,
+        push: &[u8],
+        groups: u32,
+    ) -> Result<()> {
+        let (ctx, idx) = (self.ctx, self.idx);
+        ctx.submit_locked(&mut self.guard, idx, shader, set, push, groups)
+    }
+}
+
+/// Wait on one fence, turning the timeout into an error rather than a hang.
+fn wait_fence(device: &ash::Device, fence: vk::Fence) -> Result<()> {
+    match unsafe { device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS) } {
+        Ok(()) => Ok(()),
+        Err(vk::Result::TIMEOUT) => bail!(
+            "Vulkan dispatch timed out after {}s",
+            FENCE_TIMEOUT_NS / 1_000_000_000
+        ),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -649,7 +795,9 @@ impl Drop for VulkanContext {
                 self.free_buf(&p.residues);
             }
             let s = self.submitter.lock().unwrap();
-            self.device.destroy_fence(s.fence, None);
+            for slot in &s.slots {
+                self.device.destroy_fence(slot.fence, None);
+            }
             self.device.destroy_command_pool(s.pool, None);
             drop(s);
             self.device.destroy_device(None);
@@ -771,26 +919,38 @@ impl Drop for DetailedRun<'_> {
     }
 }
 
+/// The range descriptors for one in-flight dispatch, and the descriptor set
+/// that points at them.
+///
+/// One per submission slot. The host fills slot `i`'s buffers while the device
+/// is still reading slot `i-1`'s, which is the entire point of the ring: a
+/// single shared pair of buffers would be safe only if `launch` waited, and
+/// waiting is what Phase 3 is removing.
+struct RangeSlot {
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    offsets: Buf,
+    lens: Buf,
+}
+
 /// One niceonly field in progress.
 ///
-/// The output buffers persist across every dispatch of the field; the range
-/// descriptor buffers are reused, which is safe only because
-/// [`VulkanContext::dispatch`] blocks on its fence before returning — nothing
-/// can still be reading last dispatch's descriptors when the next memcpy
-/// starts. Making dispatch asynchronous (spec Phase 3) means double-buffering
-/// these too.
+/// The output buffers persist across every dispatch of the field and are shared
+/// by all slots — the kernel appends to them through an atomic counter, so
+/// concurrent dispatches cannot collide. Only the *inputs* need one copy per
+/// slot.
 pub(crate) struct NiceonlyRun<'a> {
     ctx: &'a VulkanContext,
     pipe: Arc<NiceonlyPipeline>,
-    pool: vk::DescriptorPool,
-    set: vk::DescriptorSet,
-    range_offsets: Buf,
-    range_lens: Buf,
+    slots: Vec<RangeSlot>,
     nice_out: Buf,
     nice_count: Buf,
     /// `field_start mod M`, so the shader only reduces the 64-bit offset.
     fs_mod_m: u32,
     field_start: u128,
+    /// Lane tiling pinned by `NICE_VULKAN_LANES`, or `None` to size it per
+    /// dispatch from the batch's ranges.
+    lane_shift: Option<u32>,
 }
 
 impl<'a> NiceonlyRun<'a> {
@@ -808,43 +968,50 @@ impl<'a> NiceonlyRun<'a> {
         pipe: Arc<NiceonlyPipeline>,
         field_start: u128,
     ) -> Result<Self> {
-        let range_offsets = ctx.alloc_buf(RANGES_PER_DISPATCH * 2)?;
-        let range_lens = ctx.alloc_buf(RANGES_PER_DISPATCH)?;
         let nice_out = ctx.alloc_buf(NICE_OUT_CAPACITY * NICE_STRIDE as usize)?;
         let nice_count = ctx.alloc_buf(1)?;
-        let (pool, set) = ctx.make_descriptor_set(
-            pipe.shader.dsl,
-            &[
-                &pipe.residues,
-                &range_offsets,
-                &range_lens,
-                &nice_out,
-                &nice_count,
-            ],
-        )?;
+        let mut slots = Vec::with_capacity(SUBMISSION_SLOTS);
+        for _ in 0..SUBMISSION_SLOTS {
+            let offsets = ctx.alloc_buf(RANGES_PER_DISPATCH * 2)?;
+            let lens = ctx.alloc_buf(RANGES_PER_DISPATCH)?;
+            let (pool, set) = ctx.make_descriptor_set(
+                pipe.shader.dsl,
+                &[&pipe.residues, &offsets, &lens, &nice_out, &nice_count],
+            )?;
+            slots.push(RangeSlot {
+                pool,
+                set,
+                offsets,
+                lens,
+            });
+        }
         #[allow(clippy::cast_possible_truncation)]
         let fs_mod_m = (field_start % u128::from(pipe.cfg.stride_m)) as u32;
         Ok(Self {
             ctx,
             pipe,
-            pool,
-            set,
-            range_offsets,
-            range_lens,
+            slots,
             nice_out,
             nice_count,
             fs_mod_m,
             field_start,
+            lane_shift: pinned_lane_shift(),
         })
     }
 
     /// Collect the nice numbers found across the whole field.
+    ///
+    /// Waits for the device first. The pipeline already calls [`Self::sync`],
+    /// but a dispatch that is still in flight has simply not written its hits
+    /// yet, and the failure mode is *silently missing solutions* — so the read
+    /// path guarantees it rather than relying on the caller's ordering.
     ///
     /// # Errors
     /// Returns an error if the kernel tried to write more hits than the buffer
     /// holds — which, given how rare nice numbers are, means a kernel bug
     /// rather than a genuine flood.
     pub(crate) fn finish(&self) -> Result<Vec<NiceNumberSimple>> {
+        self.ctx.wait_all()?;
         let written = self.nice_count.as_slice()[0] as usize;
         if written > NICE_OUT_CAPACITY {
             bail!(
@@ -880,15 +1047,42 @@ impl RangeSink for NiceonlyRun<'_> {
             .chunks(RANGES_PER_DISPATCH)
             .zip(lens.chunks(RANGES_PER_DISPATCH))
         {
+            // Reserving the slot is what waits — and only once the device is
+            // `SUBMISSION_SLOTS` dispatches behind. Until it returns, nothing
+            // may touch this slot's buffers, because the device may still be
+            // reading them. `ctx` is copied out of `self` first so the
+            // reservation does not borrow the run that owns the buffers.
+            let ctx = self.ctx;
+            let reservation = ctx.acquire_slot()?;
+            let slot_idx = reservation.index();
+            let slot = &mut self.slots[slot_idx];
+
             #[allow(clippy::cast_possible_truncation)]
             {
-                let dst = self.range_offsets.as_mut_slice();
+                let dst = slot.offsets.as_mut_slice();
                 for (i, &o) in batch_offsets.iter().enumerate() {
                     dst[2 * i] = o as u32;
                     dst[2 * i + 1] = (o >> 32) as u32;
                 }
             }
-            self.range_lens.as_mut_slice()[..batch_lens.len()].copy_from_slice(batch_lens);
+            slot.lens.as_mut_slice()[..batch_lens.len()].copy_from_slice(batch_lens);
+
+            // Tile the dispatch to this batch's ranges rather than to CUDA's
+            // warp. Every lane on a range repeats that range's setup, so a
+            // batch of short ranges wants few lanes and a batch of long ones
+            // wants many; batches are homogeneous enough for the mean to be a
+            // good summary, because the MSD recursion bounds range length by
+            // the floor.
+            let mean_len = batch_lens.iter().map(|&l| u64::from(l)).sum::<u64>()
+                / batch_lens.len().max(1) as u64;
+            let lane_shift = self.lane_shift.unwrap_or_else(|| {
+                lane_shift_for(
+                    batch_lens.len() as u64,
+                    mean_len,
+                    self.pipe.cfg.stride_m,
+                    self.pipe.cfg.stride_r,
+                )
+            });
 
             #[allow(clippy::cast_possible_truncation)]
             let params = NiceonlyParams {
@@ -899,22 +1093,29 @@ impl RangeSink for NiceonlyRun<'_> {
                 fs_mod_m: self.fs_mod_m,
                 num_ranges: u32::try_from(batch_offsets.len()).unwrap_or(u32::MAX),
                 nice_cap: NICE_OUT_CAPACITY as u32,
-                pad: 0,
+                lane_shift,
             };
-            let threads = (batch_offsets.len() as u64) * u64::from(LANES_PER_RANGE);
+            let threads = (batch_offsets.len() as u64) << lane_shift;
             #[allow(clippy::cast_possible_truncation)]
             let groups = threads
                 .div_ceil(u64::from(WORKGROUP_SIZE))
                 .min(u64::from(MAX_WORKGROUPS)) as u32;
             // Safety: `NiceonlyParams` is a `#[repr(C)]` block of u32s.
-            self.ctx.dispatch(
+            reservation.submit(
                 &self.pipe.shader,
-                self.set,
+                self.slots[slot_idx].set,
                 unsafe { push_bytes(&params) },
                 groups.max(1),
             )?;
         }
         Ok(())
+    }
+
+    /// Wait for every dispatch of this field. The pipeline calls this inside
+    /// its timed region, which is what keeps `device_secs` honest now that
+    /// `launch` returns before the device is done.
+    fn sync(&mut self) -> Result<()> {
+        self.ctx.wait_all()
     }
 }
 
@@ -922,10 +1123,14 @@ impl Drop for NiceonlyRun<'_> {
     fn drop(&mut self) {
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
-            self.ctx.device.destroy_descriptor_pool(self.pool, None);
+            for slot in &self.slots {
+                self.ctx.device.destroy_descriptor_pool(slot.pool, None);
+            }
         }
-        self.ctx.free_buf(&self.range_offsets);
-        self.ctx.free_buf(&self.range_lens);
+        for slot in &self.slots {
+            self.ctx.free_buf(&slot.offsets);
+            self.ctx.free_buf(&slot.lens);
+        }
         self.ctx.free_buf(&self.nice_out);
         self.ctx.free_buf(&self.nice_count);
     }
@@ -1084,7 +1289,7 @@ mod tests {
             "fs_mod_m",
             "num_ranges",
             "nice_cap",
-            "pad",
+            "lane_shift",
         ] {
             assert!(src.contains(field), "generated Params lacks {field}");
         }
@@ -1128,11 +1333,33 @@ mod tests {
                 pipe.cfg.prefilter.is_some(),
                 "base {base}: probe built without the prefilter"
             );
-            let mut run =
-                NiceonlyRun::from_pipeline(&ctx, pipe.clone(), start).expect("probe run");
-            run.launch(&[0], &[len]).expect("dispatch");
-            let got: Vec<u128> = run.finish().expect("results").iter().map(|n| n.number).collect();
-            drop(run);
+            // Every lane width, over the identical range. The tiling is pure
+            // index arithmetic — `gid.x >> shift` picks the range and
+            // `gid.x & (lanes - 1)` the lane — so a width the host never
+            // happens to choose is exactly where an off-by-one would hide.
+            let mut per_width = Vec::new();
+            for shift in 0..=MAX_LANES_PER_RANGE.ilog2() {
+                let mut run =
+                    NiceonlyRun::from_pipeline(&ctx, pipe.clone(), start).expect("probe run");
+                run.lane_shift = Some(shift);
+                run.launch(&[0], &[len]).expect("dispatch");
+                per_width.push(
+                    run.finish()
+                        .expect("results")
+                        .iter()
+                        .map(|n| n.number)
+                        .collect::<Vec<u128>>(),
+                );
+            }
+            for (shift, got) in per_width.iter().enumerate() {
+                assert_eq!(
+                    got,
+                    &per_width[0],
+                    "base {base}: {} lanes disagree with 1 lane",
+                    1 << shift
+                );
+            }
+            let got = per_width.swap_remove(0);
             ctx.destroy_niceonly_pipeline(&pipe);
 
             // Every stride candidate in the range, filtered by the mirror.
