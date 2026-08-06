@@ -32,7 +32,9 @@
 //! zeros, the most significant chunk contributes digits only until it reaches
 //! zero.
 
-use crate::gpu_config::{chunk_constants_u16, n_limbs};
+use crate::gpu_config::{
+    VulkanPrefilterParams, chunk_constants_u16, n_limbs, vulkan_prefilter_params,
+};
 use crate::number_stats;
 use crate::stride_filter::StrideTable;
 use anyhow::{Context as _, Result, ensure};
@@ -426,6 +428,8 @@ pub struct NiceonlyConfig {
     pub stride_m: u32,
     /// Number of valid residues mod `M`.
     pub stride_r: u32,
+    /// Low-digit prefilter, when the base both allows and wants one.
+    pub prefilter: Option<VulkanPrefilterParams>,
 }
 
 impl NiceonlyConfig {
@@ -453,8 +457,25 @@ impl NiceonlyConfig {
             stride_m: table.modulus as u32,
             stride_r: u32::try_from(table.valid_residues.len())
                 .with_context(|| format!("residue count overflows u32 for base {base}"))?,
+            prefilter: prefilter_enabled().then(|| vulkan_prefilter_params(base)).flatten(),
         })
     }
+}
+
+/// Whether the generator may emit the low-digit prefilter at all.
+///
+/// `NICE_VULKAN_PREFILTER=0` compiles it out everywhere, which is how the
+/// with/against measurement is taken — the same shape of knob as
+/// `NICE_GPU_MSD_FLOOR`. Anything else (including unset) leaves the per-base
+/// decision to [`vulkan_prefilter_params`].
+fn prefilter_enabled() -> bool {
+    prefilter_enabled_for(std::env::var("NICE_VULKAN_PREFILTER").ok().as_deref())
+}
+
+/// The knob's parsing, separated from reading the environment so it can be
+/// tested without a process-wide mutation.
+fn prefilter_enabled_for(value: Option<&str>) -> bool {
+    !matches!(value, Some("0" | "off" | "false"))
 }
 
 /// Reduce a u64 range offset mod `M` on the host, the way the shader does.
@@ -470,6 +491,183 @@ pub fn offset_mod_m(offset: u64, stride_m: u32) -> u32 {
     acc
 }
 
+/// One `split16` step over the scalar limbs `{v}0..{v}{n_limbs}`: divides that
+/// value by `chunk_div` in place and leaves the remainder — one chunk of
+/// `chunk_digits` base-`b` digits — in `rem`.
+///
+/// The same arithmetic [`emit_scan`] uses, minus the `top` tracking: the
+/// prefilter peels a fixed number of chunks off a value it never has to scan to
+/// the end of, so there is nothing to skip and the fixed trip count keeps the
+/// whole filter branch-free.
+fn emit_split_step(s: &mut String, v: &str, n_limbs: u32, chunk_div: u32, indent: &str) {
+    let _ = writeln!(s, "{indent}var rem: u32 = 0u;");
+    for i in (0..n_limbs).rev() {
+        let _ = writeln!(
+            s,
+            "{indent}{{ let vi: u32 = {v}{i};\n\
+             {indent}  let c1: u32 = (rem << 16u) | (vi >> 16u);\n\
+             {indent}  let q1: u32 = c1 / {chunk_div}u;\n\
+             {indent}  let c2: u32 = ((c1 % {chunk_div}u) << 16u) | (vi & 0xffffu);\n\
+             {indent}  rem = c2 % {chunk_div}u;\n\
+             {indent}  {v}{i} = (q1 << 16u) | (c2 / {chunk_div}u); }}"
+        );
+    }
+}
+
+/// `{out}[0..limbs] = {x} * {y}` truncated to `limbs` chunks of base `div`.
+///
+/// Schoolbook, dropping every product and carry that lands at or above chunk
+/// `limbs` — which is exactly reduction mod `div^limbs`, since those only ever
+/// feed positions further up. The accumulator is a `u32` and stays one: every
+/// operand is below `div < 2^16`, so the step is at most `div² - 1 < 2^32`
+/// (pinned by `prefilter_multiply_cannot_overflow_a_u32`). That is the whole
+/// point of the chunk representation — `%` and `/` here name a 32-bit constant,
+/// which RADV strength-reduces, where the CUDA prefilter's u64 modulus would
+/// not.
+fn emit_mulmod_chunks(s: &mut String, out: &str, x: &str, y: &str, limbs: u32, div: u32) {
+    for i in 0..limbs {
+        let _ = writeln!(s, "    var {out}{i}: u32 = 0u;");
+    }
+    for i in 0..limbs {
+        let _ = writeln!(s, "    {{ var carry: u32 = 0u;");
+        for j in 0..limbs - i {
+            let _ = writeln!(
+                s,
+                "        {{ let t: u32 = {x}{i} * {y}{j} + {out}{k} + carry;\n\
+                 \x20         {out}{k} = t % {div}u; carry = t / {div}u; }}",
+                k = i + j
+            );
+        }
+        s.push_str("    }\n");
+    }
+}
+
+/// `fn prefilter(n_lo, n_hi) -> bool`: the low-digit modular prefilter.
+///
+/// Checks whether the lowest `digits` base-`b` digits of n² and of n³ are all
+/// distinct, using `x^k mod b^p == (x mod b^p)^k mod b^p` so no multi-limb
+/// value is ever formed. A repeat there means the candidate cannot be nice, and
+/// the caller skips the full check.
+///
+/// Fixed-length and branch-free, which is the point: lanes only save work when
+/// their *whole* group is killed, so a uniform-cost filter that kills ~98% of
+/// candidates beats a cheaper divergent one. Survivors pay for these digits
+/// twice, since `check_is_nice` recomputes them from scratch — amortized to
+/// noise by the kill rate, and it keeps `check_is_nice` untouched.
+///
+/// Soundness rests on n² and n³ really having `digits` digits everywhere in the
+/// base's range; `gpu_config::vulkan_prefilter_params` returns `None` when they
+/// might not, and there is deliberately no fallback that could turn the filter
+/// on behind the generator's back (the CUDA path shipped that bug once — see
+/// `prefilter_has_no_ifndef_fallback`).
+fn emit_prefilter(s: &mut String, cfg: &KernelConfig, pre: &VulkanPrefilterParams) {
+    let KernelConfig { base, n_limbs, .. } = *cfg;
+    let VulkanPrefilterParams {
+        limbs,
+        chunk_digits,
+        chunk_div,
+        ..
+    } = *pre;
+
+    s.push_str("fn prefilter(n_lo: u64, n_hi: u64) -> bool {\n");
+    for i in 0..n_limbs {
+        let word = if i < 2 { "n_lo" } else { "n_hi" };
+        let shift = (i & 1) * 32;
+        let _ = writeln!(s, "    var v{i}: u32 = u32({word} >> {shift}u);");
+    }
+    // n mod chunk_div^limbs, low chunk first — the same repeated split the
+    // digit scan does, stopped after `limbs` chunks.
+    for r in 0..limbs {
+        let _ = writeln!(s, "    var a{r}: u32 = 0u;");
+        s.push_str("    {\n");
+        emit_split_step(s, "v", n_limbs, chunk_div, "        ");
+        let _ = writeln!(s, "        a{r} = rem;\n    }}");
+    }
+    emit_mulmod_chunks(s, "sq", "a", "a", limbs, chunk_div);
+    emit_mulmod_chunks(s, "cu", "sq", "a", limbs, chunk_div);
+
+    emit_mask_clear(s, cfg);
+    s.push_str("    var dup: u64 = 0lu;\n");
+    // Each chunk holds exactly `chunk_digits` digits, leading zeros included —
+    // which is what the digit-count guarantee buys, and why they are real
+    // digits of the value rather than padding.
+    for (name, count) in [("sq", limbs), ("cu", limbs)] {
+        for i in 0..count {
+            let _ = writeln!(
+                s,
+                "    {{ var c: u32 = {name}{i};\n\
+                 \x20     for (var k: u32 = 0u; k < {chunk_digits}u; k = k + 1u) {{\n\
+                 \x20         let d: u32 = c % {base}u;\n\
+                 \x20         c = c / {base}u;"
+            );
+            emit_digit_set(s, cfg, "            ", true);
+            s.push_str("        }\n    }\n");
+        }
+    }
+    s.push_str("    return dup == 0lu;\n}\n\n");
+}
+
+/// Rust mirror of the generated `prefilter`, chunk for chunk: the same
+/// repeated `split16` over n's u32 limbs, the same truncated schoolbook
+/// multiply, the same digit peel. Returns the verdict plus the n², n³
+/// chunks so a test can check the arithmetic and not just the answer.
+///
+/// Deliberately written in `u32` rather than a wider accumulator: in a
+/// debug build that makes every step of the shader's "this cannot overflow
+/// a u32" argument a checked assertion, and the tests run in debug.
+#[cfg(test)]
+pub(crate) fn mirror_prefilter(
+    n: u128,
+    cfg: &KernelConfig,
+    pre: &VulkanPrefilterParams,
+) -> (bool, Vec<u32>, Vec<u32>) {
+    let div = pre.chunk_div;
+    let split_step = |v: &mut Vec<u32>| -> u32 {
+        let mut rem: u32 = 0;
+        for i in (0..v.len()).rev() {
+            let vi = v[i];
+            let c1 = (rem << 16) | (vi >> 16);
+            let q1 = c1 / div;
+            let c2 = ((c1 % div) << 16) | (vi & 0xffff);
+            rem = c2 % div;
+            v[i] = (q1 << 16) | (c2 / div);
+        }
+        rem
+    };
+    let mulmod = |x: &[u32], y: &[u32]| -> Vec<u32> {
+        let limbs = pre.limbs as usize;
+        let mut out = vec![0u32; limbs];
+        for i in 0..limbs {
+            let mut carry: u32 = 0;
+            for j in 0..limbs - i {
+                let acc = x[i] * y[j] + out[i + j] + carry;
+                out[i + j] = acc % div;
+                carry = acc / div;
+            }
+        }
+        out
+    };
+
+    #[allow(clippy::cast_possible_truncation)]
+    let mut v: Vec<u32> = (0..cfg.n_limbs).map(|i| (n >> (32 * i)) as u32).collect();
+    let nm: Vec<u32> = (0..pre.limbs).map(|_| split_step(&mut v)).collect();
+    let sq = mulmod(&nm, &nm);
+    let cu = mulmod(&sq, &nm);
+
+    let mut seen = [false; 128];
+    let mut dup = false;
+    for chunk in sq.iter().chain(&cu) {
+        let mut rest = *chunk;
+        for _ in 0..pre.chunk_digits {
+            let digit = (rest % cfg.base) as usize;
+            rest /= cfg.base;
+            dup |= seen[digit];
+            seen[digit] = true;
+        }
+    }
+    (!dup, sq, cu)
+}
+
 /// The complete niceonly compute shader for one base.
 ///
 /// Mirrors `niceonly_ranges_kernel` in `nice_kernels.cu`: one group of
@@ -477,12 +675,33 @@ pub fn offset_mod_m(offset: u64, stride_m: u32) -> u32 {
 /// on-device from the residue table, so the host ships ~12 bytes per range and
 /// no per-candidate data at all.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn niceonly_wgsl(cfg: &NiceonlyConfig) -> String {
+    niceonly_wgsl_impl(cfg, false)
+}
+
+/// The same shader with the full check removed, so it reports every candidate
+/// the *prefilter* passes.
+///
+/// The device tests otherwise cannot see this filter at all. Nice numbers are
+/// astronomically rare, so a prefilter that wrongly rejected every candidate
+/// would agree with the CPU on every base the parity test can afford to run —
+/// and rejecting everything is not a hypothetical, it is the bug the CUDA path
+/// shipped in v3.2.14. This turns the filter's own output into something a test
+/// can compare against [`mirror_prefilter`].
+#[cfg(test)]
+#[must_use]
+pub(crate) fn niceonly_probe_wgsl(cfg: &NiceonlyConfig) -> String {
+    niceonly_wgsl_impl(cfg, true)
+}
+
+#[must_use]
+#[allow(clippy::too_many_lines)]
+fn niceonly_wgsl_impl(cfg: &NiceonlyConfig, probe: bool) -> String {
     let NiceonlyConfig {
         kernel,
         stride_m,
         stride_r,
+        prefilter,
     } = *cfg;
     let KernelConfig {
         base,
@@ -555,6 +774,20 @@ pub fn niceonly_wgsl(cfg: &NiceonlyConfig) -> String {
         "    if (!scan_dup(top_limb({cu_limbs}))) {{ return false; }}"
     );
     let _ = writeln!(s, "    return ({}) == {base}u;\n}}\n", popcount_expr(&kernel));
+
+    // --- prefilter / candidate_is_nice --------------------------------------
+    if let Some(pre) = prefilter {
+        emit_prefilter(&mut s, &kernel, &pre);
+    }
+    s.push_str("fn candidate_is_nice(n_lo: u64, n_hi: u64) -> bool {\n");
+    if prefilter.is_some() {
+        s.push_str("    if (!prefilter(n_lo, n_hi)) { return false; }\n");
+    }
+    if probe {
+        s.push_str("    return true; // probe build: report prefilter survivors\n}\n\n");
+    } else {
+        s.push_str("    return check_is_nice(n_lo, n_hi);\n}\n\n");
+    }
 
     // --- offset_mod_m -------------------------------------------------------
     //
@@ -636,7 +869,7 @@ pub fn niceonly_wgsl(cfg: &NiceonlyConfig) -> String {
          \x20           var n_hi: u64 = b0_hi;\n\
          \x20           if (n_lo < b0_lo) {{ n_hi = n_hi + 1lu; }}\n\
          \x20           if (n_hi > re_hi || (n_hi == re_hi && n_lo >= re_lo)) {{ break; }}\n\
-         \x20           if (check_is_nice(n_lo, n_hi)) {{\n\
+         \x20           if (candidate_is_nice(n_lo, n_hi)) {{\n\
          \x20               let pos: u32 = atomicAdd(&nice_count[0], 1u);\n\
          \x20               if (pos < pc.nice_cap) {{\n\
          \x20                   let o: u32 = {NICE_STRIDE}u * pos;\n\
@@ -895,6 +1128,142 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // --- prefilter ----------------------------------------------------------
+
+    /// Bases to exercise the prefilter on: every base that enables one.
+    fn prefilter_bases() -> Vec<(u32, KernelConfig, VulkanPrefilterParams)> {
+        (10..=MAX_GPU_DIGIT_MASK_BASE)
+            .filter(|&b| gpu_supports_base(b))
+            .filter_map(|b| {
+                Some((b, KernelConfig::new(b).ok()?, vulkan_prefilter_params(b)?))
+            })
+            .collect()
+    }
+
+    /// The chunk arithmetic must reproduce `n² mod b^p` and `n³ mod b^p`
+    /// exactly, chunk by chunk.
+    ///
+    /// This is the piece with no CUDA original to transliterate — the kernel
+    /// computes those residues in a u64 and reduces with `%`, which is the one
+    /// construct RADV/ACO expands — so, like the byte-wise Horner in the stride
+    /// reduction, it needs a mirror rather than a reading.
+    #[test]
+    fn prefilter_chunks_match_direct_modular_powers() {
+        let mut checked = 0;
+        for (base, cfg, pre) in prefilter_bases() {
+            let range = crate::base_range::get_base_range_u128(base).unwrap().unwrap();
+            let span = range.range_end - range.range_start;
+            let modulus = u128::from(base).pow(pre.digits);
+            let d = u128::from(pre.chunk_div);
+
+            let mut x: u128 = 0x0123_4567_89ab_cdef_0f1e_2d3c_4b5a_6978;
+            for i in 0..500u128 {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
+                let n = range.range_start + (x % span);
+                let (_, sq, cu) = mirror_prefilter(n, &cfg, &pre);
+
+                let nm = n % modulus;
+                let sq_direct = nm * nm % modulus;
+                let cu_direct = sq_direct * nm % modulus;
+                for (chunks, direct, name) in
+                    [(&sq, sq_direct, "n²"), (&cu, cu_direct, "n³")]
+                {
+                    let rebuilt = chunks
+                        .iter()
+                        .rev()
+                        .fold(0u128, |acc, &c| acc * d + u128::from(c));
+                    assert_eq!(rebuilt, direct, "b{base} n={n}: {name} mod b^p mismatch");
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000, "only {checked} samples");
+    }
+
+    /// Soundness and selectivity, the two properties that matter.
+    ///
+    /// Soundness is the one that can lose a solution: a rejected candidate must
+    /// really not be nice, checked against the CPU's own `get_is_nice`. The
+    /// failure mode this guards is a prefilter peeling more digits than the
+    /// value has, so that phantom leading zeros collide and every candidate is
+    /// rejected — the CUDA path shipped exactly that (v3.2.14).
+    #[test]
+    fn prefilter_is_sound_and_selective() {
+        const SAMPLES: u32 = 2000;
+        for (base, cfg, pre) in prefilter_bases() {
+            let range = crate::base_range::get_base_range_u128(base).unwrap().unwrap();
+            let span = range.range_end - range.range_start;
+            let mut x: u128 = 0xdead_beef_cafe_f00d_0d15_ea5e_feed_face;
+            let mut rejected = 0u32;
+            for i in 0..SAMPLES {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(u128::from(i));
+                let n = range.range_start + (x % span);
+                if mirror_prefilter(n, &cfg, &pre).0 {
+                    continue;
+                }
+                rejected += 1;
+                assert!(
+                    !crate::client_process::get_is_nice(n, base),
+                    "prefilter rejected a nice number: b{base} n={n}"
+                );
+            }
+            assert!(
+                rejected * 2 > SAMPLES,
+                "prefilter suspiciously weak at b{base}: {rejected}/{SAMPLES}"
+            );
+            #[allow(clippy::cast_precision_loss)]
+            {
+                println!(
+                    "b{base}: {} digits/value, kill rate {:.1}%",
+                    pre.digits,
+                    100.0 * f64::from(rejected) / f64::from(SAMPLES)
+                );
+            }
+        }
+    }
+
+    /// The shader must carry the prefilter exactly when the config says so, and
+    /// route candidates through `candidate_is_nice` either way — a base where
+    /// it is disabled must not so much as mention it.
+    #[test]
+    fn prefilter_is_emitted_only_where_configured() {
+        let mut with = 0;
+        let mut without = 0;
+        for base in 10..=MAX_GPU_DIGIT_MASK_BASE {
+            if !gpu_supports_base(base)
+                || crate::residue_filter::get_residue_filter_u128(&base).is_empty()
+            {
+                continue;
+            }
+            let table = StrideTable::new(base, crate::gpu_niceonly::GPU_LSD_K);
+            let cfg = NiceonlyConfig::new(KernelConfig::new(base).unwrap(), &table).unwrap();
+            let src = niceonly_wgsl(&cfg);
+            assert!(src.contains("candidate_is_nice(n_lo, n_hi)"), "base {base}");
+            if cfg.prefilter.is_some() {
+                assert!(src.contains("fn prefilter("), "base {base} lost its prefilter");
+                with += 1;
+            } else {
+                assert!(!src.contains("prefilter"), "base {base} gained a prefilter");
+                without += 1;
+            }
+        }
+        assert!(with > 0, "no base emitted a prefilter");
+        assert!(without > 0, "every base emitted a prefilter");
+    }
+
+    /// The measurement knob, without touching the process environment.
+    #[test]
+    fn the_prefilter_knob_only_accepts_off_switches() {
+        assert!(prefilter_enabled_for(None));
+        assert!(prefilter_enabled_for(Some("1")));
+        assert!(prefilter_enabled_for(Some("")));
+        for off in ["0", "off", "false"] {
+            assert!(!prefilter_enabled_for(Some(off)), "{off} should disable");
         }
     }
 

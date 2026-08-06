@@ -90,7 +90,7 @@ pub fn chunk_constants_u16(base: u32) -> (u32, u32) {
     chunk_constants_below(base, 1 << 16)
 }
 
-/// Parameters for the niceonly kernels' low-digit modular prefilter.
+/// Parameters for the CUDA niceonly kernel's low-digit modular prefilter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefilterParams {
     /// Digits checked per value (the lowest `digits` of n² and of n³).
@@ -112,6 +112,29 @@ pub struct PrefilterParams {
 /// from b42 up (4%+ survival, 4-27% slower). b41 has no live range.
 pub const GPU_PREFILTER_MAX_BASE: u32 = 40;
 
+/// Fewest base-`b` digits that both n² and n³ are guaranteed to have across
+/// the base's whole search range, or `None` for a base with no range.
+///
+/// This is the soundness bound for any low-digit prefilter: it may only check
+/// `p` digits per value if both powers really *have* `p` digits everywhere in
+/// the range, or the digit loop would extract phantom leading zeros and could
+/// falsely reject a nice number. A conservative log-based bound at the range
+/// start, which is the range's minimum — both powers are increasing in n.
+///
+/// Shared by both backends' derivations so they cannot disagree about what is
+/// sound, only about how many digits they choose to check.
+#[must_use]
+fn guaranteed_low_digits(base: u32) -> Option<u32> {
+    let range = base_range::get_base_range_u128(base).ok()??;
+    #[allow(clippy::cast_precision_loss)]
+    let ln_n_min = (range.range_start as f64).ln();
+    let ln_base = f64::from(base).ln();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let digit_lower_bound =
+        |power: f64| ((power * ln_n_min / ln_base).floor() - 1.0).max(0.0) as u32;
+    Some(digit_lower_bound(2.0).min(digit_lower_bound(3.0)))
+}
+
 /// Compute the prefilter parameters for a base, or None when the prefilter
 /// must stay disabled.
 ///
@@ -119,9 +142,7 @@ pub const GPU_PREFILTER_MAX_BASE: u32 = 40;
 /// `x^k mod b^p == (x mod b^p)^k mod b^p`. Two conditions must hold:
 /// - the modulus must fit the kernel's u64 modular arithmetic, and
 /// - n² and n³ must each be guaranteed at least p digits across the base's
-///   whole range, or the digit loop would extract phantom leading zeros and
-///   could falsely reject a nice number. Verified with a conservative
-///   log-based lower bound on the digit counts at the range start.
+///   whole range (see [`guaranteed_low_digits`]).
 #[must_use]
 pub fn prefilter_params(base: u32) -> Option<PrefilterParams> {
     // Profitability gate (see GPU_PREFILTER_MAX_BASE). Every consumer —
@@ -139,15 +160,7 @@ pub fn prefilter_params(base: u32) -> Option<PrefilterParams> {
         digits += 1;
     }
 
-    let range = base_range::get_base_range_u128(base).ok()??;
-    #[allow(clippy::cast_precision_loss)]
-    let ln_n_min = (range.range_start as f64).ln();
-    let ln_base = f64::from(base).ln();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let digit_lower_bound = |power: f64| ((power * ln_n_min / ln_base).floor() - 1.0).max(0.0) as u32;
-    let sq_digits_min = digit_lower_bound(2.0);
-    let cu_digits_min = digit_lower_bound(3.0);
-    if digits < 4 || sq_digits_min < digits || cu_digits_min < digits {
+    if digits < 4 || guaranteed_low_digits(base)? < digits {
         return None;
     }
 
@@ -158,6 +171,81 @@ pub fn prefilter_params(base: u32) -> Option<PrefilterParams> {
         digits,
         modulus,
         pow64_mod,
+    })
+}
+
+/// Parameters for the Vulkan niceonly shader's low-digit prefilter.
+///
+/// Same idea as [`PrefilterParams`], different number representation. CUDA
+/// holds `n^k mod b^p` in a u64 and reduces with `% b^p`; the Vulkan shader
+/// holds it as [`limbs`](Self::limbs) digits-chunks of base `chunk_div`, so
+/// that every divisor it ever names is a 32-bit constant. See
+/// [`vulkan_prefilter_params`] for why that matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VulkanPrefilterParams {
+    /// Digits checked per value: `limbs * chunk_digits`.
+    pub digits: u32,
+    /// Chunks the value is held in.
+    pub limbs: u32,
+    /// Base-`b` digits per chunk.
+    pub chunk_digits: u32,
+    /// `base^chunk_digits`, below 2^16.
+    pub chunk_div: u32,
+}
+
+/// Chunks the Vulkan prefilter carries, i.e. its modulus is `chunk_div^3`.
+///
+/// Three is the value that matches CUDA's reach without exceeding it: a chunk
+/// is just under 2^16, so three of them is just under the 2^48 modulus the
+/// CUDA prefilter uses, and `digits` comes out equal at base 40 (9 either
+/// way). It also keeps the truncated multiply down to six digit-chunk
+/// mul-adds. A fourth chunk would check more digits per candidate, at ten
+/// mul-adds and a wider reduction — untested, and the measured question at
+/// base 40 is whether the prefilter pays at all, not whether it should be
+/// longer.
+pub const VULKAN_PREFILTER_LIMBS: u32 = 3;
+
+/// Compute the Vulkan prefilter parameters for a base, or None when it must
+/// stay disabled.
+///
+/// # Why this is not just [`prefilter_params`] with a different consumer
+///
+/// The CUDA prefilter is built out of 64-bit divisions by compile-time
+/// constants: `lo % PRE_MOD` in `reduce_pre`, and `sq % BASE` / `sq /= BASE`
+/// on a u64 in the digit peel. That is precisely the one construct RADV/ACO
+/// does not strength-reduce (NIR's `nir_opt_idiv_const` is width-limited to
+/// 32 bits), and the reason the digit scan needed `split16` in the first
+/// place. Ported literally, the prefilter would drag that ~220-instruction
+/// expansion back in three more times — and `__umul64hi`, the difficulty the
+/// port was expected to have, is the least of it.
+///
+/// So the Vulkan prefilter carries `n^k mod b^p` as [`VULKAN_PREFILTER_LIMBS`]
+/// chunks of `chunk_digits` digits each, in base `chunk_div = base^chunk_digits
+/// < 2^16` — the same chunk the digit scan already uses. A truncated schoolbook
+/// multiply over those chunks needs only `u32` intermediates (see
+/// [`VulkanPrefilterParams`] and the codegen), the digits fall straight out of
+/// each chunk with 32-bit divisions, and nothing 64-bit-divided is ever named.
+#[must_use]
+pub fn vulkan_prefilter_params(base: u32) -> Option<VulkanPrefilterParams> {
+    // Same profitability gate as CUDA's. It was measured for CUDA warps
+    // (GPU_PREFILTER_MAX_BASE), and the argument — a prefilter only pays while
+    // per-lane survival is low enough that whole warps skip the full check —
+    // is about SIMT execution rather than about NVIDIA, so it carries over.
+    // The Vulkan filter checks at most as many digits as the CUDA one, so it
+    // cannot be *more* selective at any base and the bound stays valid.
+    if base > GPU_PREFILTER_MAX_BASE {
+        return None;
+    }
+    let (chunk_digits, chunk_div) = chunk_constants_u16(base);
+    let digits = chunk_digits * VULKAN_PREFILTER_LIMBS;
+    if digits < 4 || guaranteed_low_digits(base)? < digits {
+        return None;
+    }
+    Some(VulkanPrefilterParams {
+        digits,
+        limbs: VULKAN_PREFILTER_LIMBS,
+        chunk_digits,
+        chunk_div,
     })
 }
 
@@ -196,6 +284,103 @@ mod tests {
         }
     }
 
+    /// The prefilter's truncated multiply accumulates
+    /// `a*b + acc + carry` with every operand below `chunk_div`, in a `u32`.
+    /// The worst case is `(D-1)^2 + 2(D-1) = D^2 - 1`, so the whole scheme
+    /// rests on `chunk_div^2 <= 2^32` — which `chunk_div < 2^16` gives with
+    /// nothing to spare. If the chunk bound ever loosens, this fails first.
+    #[test]
+    fn prefilter_multiply_cannot_overflow_a_u32() {
+        for base in 2..=MAX_GPU_DIGIT_MASK_BASE {
+            let (_, div) = chunk_constants_u16(base);
+            let d = u64::from(div);
+            assert!(d * d - 1 < (1 << 32), "base {base}: div {div} overflows");
+        }
+    }
+
+    /// The digit-count guarantee is the prefilter's soundness condition, and
+    /// [`guaranteed_low_digits`] computes it in floating point. Check it
+    /// exactly, in integers, for every base that enables either prefilter: n²
+    /// and n³ at the range start must really have at least `digits` digits.
+    #[test]
+    fn enabled_prefilters_really_have_the_digits_they_peel() {
+        let digit_count = |mut v: u128, base: u128| {
+            let mut n = 0;
+            while v != 0 {
+                v /= base;
+                n += 1;
+            }
+            n
+        };
+        let mut checked = 0;
+        // Bases below 10 are not GPU bases at all and `get_base_range_u128`
+        // panics on the degenerate ones, so the prefilter derivations are only
+        // ever asked about supported bases.
+        for base in 10..=MAX_GPU_DIGIT_MASK_BASE {
+            if !gpu_supports_base(base) {
+                continue;
+            }
+            let cuda = prefilter_params(base).map(|p| p.digits);
+            let vulkan = vulkan_prefilter_params(base).map(|p| p.digits);
+            let Some(digits) = cuda.into_iter().chain(vulkan).max() else {
+                continue;
+            };
+            let range = base_range::get_base_range_u128(base).unwrap().unwrap();
+            // The smallest candidate has the fewest digits in both powers.
+            let n = range.range_start;
+            let b = u128::from(base);
+            assert!(
+                digit_count(n * n, b) >= digits,
+                "base {base}: n² of {n} has too few digits for {digits}"
+            );
+            assert!(
+                digit_count(n * n * n, b) >= digits,
+                "base {base}: n³ of {n} has too few digits for {digits}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 5, "only {checked} bases enable a prefilter");
+    }
+
+    /// The Vulkan prefilter must never reach further than the CUDA one where
+    /// both are enabled: its chunks are capped at 2^16 and CUDA's modulus at
+    /// 2^48, so three chunks can only be shorter. Equal is the good case —
+    /// base 40, the one live base for either, gets 9 digits both ways.
+    #[test]
+    fn vulkan_prefilter_is_no_longer_than_cudas() {
+        for base in 10..=MAX_GPU_DIGIT_MASK_BASE {
+            if !gpu_supports_base(base) {
+                continue;
+            }
+            if let (Some(cuda), Some(vulkan)) = (prefilter_params(base), vulkan_prefilter_params(base))
+            {
+                assert!(
+                    vulkan.digits <= cuda.digits,
+                    "base {base}: vulkan {} > cuda {}",
+                    vulkan.digits,
+                    cuda.digits
+                );
+            }
+        }
+        assert_eq!(vulkan_prefilter_params(40).map(|p| p.digits), Some(9));
+        assert_eq!(prefilter_params(40).map(|p| p.digits), Some(9));
+    }
+
+    /// Same guard as the CUDA path's: small bases whose n² is shorter than the
+    /// digits the filter would peel must be refused, and bases past the
+    /// profitability threshold compiled out.
+    #[test]
+    fn vulkan_prefilter_guard_matches_the_cuda_gates() {
+        assert!(vulkan_prefilter_params(10).is_none());
+        assert!(vulkan_prefilter_params(40).is_some());
+        for base in [42, 52, 62, 68] {
+            assert!(
+                vulkan_prefilter_params(base).is_none(),
+                "expected prefilter disabled at b{base}"
+            );
+        }
+    }
+
     #[test]
     fn n_limbs_matches_the_range_width() {
         // Base 40's band tops out below 2^64, so two limbs.
@@ -209,3 +394,4 @@ mod tests {
         }
     }
 }
+

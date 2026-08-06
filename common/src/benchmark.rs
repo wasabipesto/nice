@@ -20,6 +20,13 @@ pub enum BenchmarkMode {
     /// A massive range, much larger than any field you would get from the API:
     /// 1e13 @ base 50.
     Massive,
+    /// A massive range at a base low enough for the niceonly kernels' modular
+    /// prefilter to be active: 1e12 @ base 40.
+    ///
+    /// Every other range big enough to measure niceonly throughput is base 50,
+    /// where the prefilter is compiled out (`GPU_PREFILTER_MAX_BASE`), so
+    /// without this there is no benchmark that exercises it at all.
+    MassiveLowBase,
     /// A benchmark range at a higher range: 1e6 @ base 80.
     HiBase,
     /// A range where MSD filtering is quite effective: 1e12 @ base 50.
@@ -44,6 +51,7 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
         BenchmarkMode::Large => 40,
         BenchmarkMode::ExtraLarge => 40,
         BenchmarkMode::Massive => 50,
+        BenchmarkMode::MassiveLowBase => 40,
         BenchmarkMode::HiBase => 80,
         BenchmarkMode::MsdEffective => 50,
         BenchmarkMode::MsdIneffective => 50,
@@ -60,6 +68,7 @@ pub fn get_benchmark_field(mode: BenchmarkMode) -> DataToClient {
         BenchmarkMode::Large => 100_000_000,
         BenchmarkMode::ExtraLarge => 1_000_000_000,
         BenchmarkMode::Massive => 1e13 as u128,
+        BenchmarkMode::MassiveLowBase => 1e12 as u128,
         BenchmarkMode::HiBase => 1_000_000_000,
         BenchmarkMode::MsdEffective => 1e12 as u128,
         BenchmarkMode::MsdIneffective => 1e7 as u128,
@@ -92,6 +101,7 @@ mod tests {
         let _ = get_benchmark_field(BenchmarkMode::Large);
         let _ = get_benchmark_field(BenchmarkMode::ExtraLarge);
         let _ = get_benchmark_field(BenchmarkMode::Massive);
+        let _ = get_benchmark_field(BenchmarkMode::MassiveLowBase);
         let _ = get_benchmark_field(BenchmarkMode::HiBase);
         let _ = get_benchmark_field(BenchmarkMode::MsdEffective);
         let _ = get_benchmark_field(BenchmarkMode::MsdIneffective);

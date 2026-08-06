@@ -427,6 +427,44 @@ impl VulkanContext {
         Ok(p)
     }
 
+    /// Build an uncached niceonly pipeline that reports prefilter survivors
+    /// instead of nice numbers (see [`codegen::niceonly_probe_wgsl`]).
+    ///
+    /// Uncached and not registered with the context, so the caller owns it and
+    /// must pass it to [`Self::destroy_niceonly_pipeline`]; that keeps a
+    /// test-only shader out of the map `Drop` walks.
+    #[cfg(test)]
+    fn niceonly_probe_pipeline(&self, base: u32) -> Result<Arc<NiceonlyPipeline>> {
+        let table = StrideTable::new(base, GPU_LSD_K);
+        let cfg = NiceonlyConfig::new(KernelConfig::new(base)?, &table)?;
+        let shader = self.build_shader(
+            &codegen::niceonly_probe_wgsl(&cfg),
+            5,
+            NICEONLY_PUSH_CONSTANT_SIZE,
+        )?;
+        let mut residues = self.alloc_buf(table.valid_residues.len()).inspect_err(|_| {
+            self.destroy_shader(&shader);
+        })?;
+        #[allow(clippy::cast_possible_truncation)]
+        for (slot, &r) in residues.as_mut_slice().iter_mut().zip(&table.valid_residues) {
+            *slot = r as u32;
+        }
+        Ok(Arc::new(NiceonlyPipeline {
+            cfg,
+            shader,
+            residues,
+        }))
+    }
+
+    #[cfg(test)]
+    fn destroy_niceonly_pipeline(&self, pipe: &NiceonlyPipeline) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+        self.destroy_shader(&pipe.shader);
+        self.free_buf(&pipe.residues);
+    }
+
     /// Allocate a host-visible storage buffer of `len` u32s.
     fn alloc_buf(&self, len: usize) -> Result<Buf> {
         let size = (len * 4) as vk::DeviceSize;
@@ -760,7 +798,16 @@ impl<'a> NiceonlyRun<'a> {
     /// Returns an error for a residue-empty or unconfigurable base, or on any
     /// Vulkan failure.
     pub(crate) fn new(ctx: &'a VulkanContext, base: u32, field_start: u128) -> Result<Self> {
-        let pipe = ctx.niceonly_pipeline(base)?;
+        Self::from_pipeline(ctx, ctx.niceonly_pipeline(base)?, field_start)
+    }
+
+    /// As [`Self::new`], with the pipeline supplied rather than looked up —
+    /// the seam the probe build hangs off.
+    fn from_pipeline(
+        ctx: &'a VulkanContext,
+        pipe: Arc<NiceonlyPipeline>,
+        field_start: u128,
+    ) -> Result<Self> {
         let range_offsets = ctx.alloc_buf(RANGES_PER_DISPATCH * 2)?;
         let range_lens = ctx.alloc_buf(RANGES_PER_DISPATCH)?;
         let nice_out = ctx.alloc_buf(NICE_OUT_CAPACITY * NICE_STRIDE as usize)?;
@@ -1045,6 +1092,78 @@ mod tests {
             NICEONLY_PUSH_CONSTANT_SIZE as usize,
             std::mem::size_of::<NiceonlyParams>()
         );
+    }
+
+    /// The prefilter's own verdicts, off the device, against the host mirror.
+    ///
+    /// The niceonly parity tests cannot see this filter: the only nice number
+    /// any of them finds is 69, and base 10 has no prefilter, so a filter that
+    /// rejected *every* candidate would pass all of them. That failure is not
+    /// hypothetical — the CUDA kernel shipped it in v3.2.14. So the probe
+    /// shader reports prefilter survivors directly and they must match the
+    /// mirror candidate for candidate, both the passes and the rejections.
+    ///
+    /// Runs on lavapipe too; see `client_process_vulkan` for the invocation.
+    #[test]
+    #[ignore = "requires a Vulkan device"]
+    fn prefilter_survivors_match_the_host_mirror() {
+        use crate::gpu_config::vulkan_prefilter_params;
+        use crate::gpu_niceonly::RangeSink;
+
+        let ctx = VulkanContext::new(0).expect("Vulkan init");
+        // Base 40 is the live prefilter base; 30 and 34 exercise the same
+        // codegen at other chunk/limb constants.
+        for base in [30u32, 34, 40] {
+            let pre = vulkan_prefilter_params(base).expect("base has a prefilter");
+            let kernel = KernelConfig::new(base).unwrap();
+            let table = StrideTable::new(base, GPU_LSD_K);
+            let start = crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap()
+                .range_start;
+            let len: u32 = 5_000_000;
+
+            let pipe = ctx.niceonly_probe_pipeline(base).expect("probe pipeline");
+            assert!(
+                pipe.cfg.prefilter.is_some(),
+                "base {base}: probe built without the prefilter"
+            );
+            let mut run =
+                NiceonlyRun::from_pipeline(&ctx, pipe.clone(), start).expect("probe run");
+            run.launch(&[0], &[len]).expect("dispatch");
+            let got: Vec<u128> = run.finish().expect("results").iter().map(|n| n.number).collect();
+            drop(run);
+            ctx.destroy_niceonly_pipeline(&pipe);
+
+            // Every stride candidate in the range, filtered by the mirror.
+            let end = start + u128::from(len);
+            let (mut n, mut idx) = table.first_valid_at_or_after(start);
+            let mut want = Vec::new();
+            let mut candidates = 0u32;
+            while n < end {
+                candidates += 1;
+                if codegen::mirror_prefilter(n, &kernel, &pre).0 {
+                    want.push(n);
+                }
+                n += table.gap_table[idx];
+                idx = (idx + 1) % table.gap_table.len();
+            }
+
+            assert_eq!(got, want, "base {base}: prefilter survivors differ");
+            assert!(!want.is_empty(), "base {base}: the mirror passed nothing");
+            assert!(
+                want.len() < candidates as usize,
+                "base {base}: the prefilter rejected nothing"
+            );
+            #[allow(clippy::cast_precision_loss)]
+            {
+                println!(
+                    "base {base}: {} of {candidates} candidates survive ({:.2}%), device agrees",
+                    want.len(),
+                    100.0 * want.len() as f64 / f64::from(candidates)
+                );
+            }
+        }
     }
 
     /// The niceonly shader indexes `nice_out` at `NICE_STRIDE * pos`, and the
