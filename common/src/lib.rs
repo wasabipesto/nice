@@ -18,6 +18,7 @@ pub mod fixed_width;
 pub mod generate_chunks;
 pub mod generate_fields;
 pub mod gpu_config;
+pub mod gpu_niceonly;
 pub mod lsd_filter;
 pub mod msd_prefix_filter;
 pub mod number_stats;

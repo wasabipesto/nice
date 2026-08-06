@@ -1,21 +1,20 @@
 //! Field processing on the Vulkan backend.
 //!
-//! Mirrors [`crate::client_process_gpu`]'s detailed path exactly — same
-//! batching, same fallback behaviour, same `FieldResults` — over the Vulkan
-//! compute backend in [`crate::vulkan`] instead of CUDA.
-//!
-//! Niceonly is not implemented here yet and falls back to the CPU. That path
-//! needs the MSD prefix filter pipeline and the stride residue table on the
-//! device; the detailed kernel needs neither (each thread derives its own `n`),
-//! which is why it comes first.
+//! Mirrors [`crate::client_process_gpu`] exactly — same batching, same
+//! fallback behaviour, same `FieldResults` — over the Vulkan compute backend in
+//! [`crate::vulkan`] instead of CUDA. The niceonly host pipeline is not merely
+//! mirrored but *shared*: both backends drive [`crate::gpu_niceonly`], which
+//! runs the MSD prefix filter and streams range descriptors to whichever device
+//! is plugged in behind [`RangeSink`].
 
 #![cfg(feature = "vulkan")]
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::gpu_config::gpu_supports_base;
+use crate::gpu_niceonly::{GPU_LSD_K, report_field, run_range_pipeline};
 use crate::residue_filter;
 use crate::stride_filter::StrideTable;
-use crate::vulkan::{DetailedRun, VulkanContext};
+use crate::vulkan::{DetailedRun, NiceonlyRun, VulkanContext};
 use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
@@ -31,10 +30,6 @@ pub const VULKAN_BATCH_SIZE: u128 = 50_000_000;
 
 /// Near-miss records held on the device per field.
 const NEAR_MISS_CAPACITY: usize = 1 << 20;
-
-/// LSD filter depth used by the CPU niceonly fallback, matching the client's
-/// `DEFAULT_LSD_K_VALUE` so the candidate set is identical.
-const LSD_K: u32 = 2;
 
 /// Vulkan implementation of `process_range_detailed`.
 ///
@@ -118,23 +113,51 @@ fn residue_empty_result(base: u32) -> Option<FieldResults> {
     None
 }
 
-/// Niceonly on the Vulkan backend — CPU for now.
+/// Vulkan implementation of `process_range_niceonly`.
+///
+/// Runs the MSD prefix filter on the CPU (all cores) and checks the surviving
+/// ranges' stride-valid candidates on the GPU, which reconstructs them from the
+/// residue table on-device. Produces the exact same nice-number set as the CPU
+/// path: the coarser MSD floor makes the GPU's candidate set a *superset*, and
+/// the per-candidate check is identical.
+///
+/// **Range semantics**: half-open [`range_start`, `range_end`).
 ///
 /// # Errors
-/// Never returns an error; the signature matches the CUDA path so the two are
-/// interchangeable at the dispatch site.
+/// Returns an error on any Vulkan failure or if the output buffer overflows.
 pub fn process_range_niceonly_vulkan(
-    _ctx: &VulkanContext,
+    ctx: &VulkanContext,
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
     if let Some(empty) = residue_empty_result(base) {
         return Ok(empty);
     }
+    if !gpu_supports_base(base) {
+        warn!("base {base} not supported on GPU, falling back to CPU for this field");
+        let table = StrideTable::new(base, GPU_LSD_K);
+        return Ok(process_range_niceonly(range, base, &table));
+    }
 
-    warn!("niceonly is not implemented on the Vulkan backend; using the CPU for this field");
-    let table = StrideTable::new(base, LSD_K);
-    Ok(process_range_niceonly(range, base, &table))
+    // Build (or fetch cached) the pipeline and device residue table up front,
+    // so the pipeline's timings reflect per-field work only.
+    let mut run = NiceonlyRun::new(ctx, base, range.start())?;
+    let stats = run_range_pipeline(&mut run, range, base)?;
+    let nice_numbers = run.finish()?;
+    debug!(
+        "Vulkan niceonly pipeline: {} ranges in {} dispatches, M={}, R={}, found {}",
+        stats.num_ranges,
+        stats.launches,
+        run.config().stride_m,
+        run.config().stride_r,
+        nice_numbers.len()
+    );
+    report_field("Vulkan", base, range, &stats);
+
+    Ok(FieldResults {
+        distribution: Vec::new(),
+        nice_numbers,
+    })
 }
 
 /// Process a field on the Vulkan backend (detailed mode).
@@ -250,6 +273,66 @@ mod tests {
             );
             println!("base {base}: {count} candidates match the CPU exactly");
         }
+    }
+
+    /// CPU/GPU parity on the niceonly path, over the same range with the same
+    /// stride table. The GPU checks a *superset* of the CPU's candidates (its
+    /// MSD floor is coarser), so the nice-number sets must still be identical —
+    /// that is the whole correctness claim of the pipeline.
+    ///
+    /// Runs on lavapipe as well as real hardware; see
+    /// [`vulkan_matches_cpu_detailed`] for the invocation.
+    #[test]
+    #[ignore = "requires a Vulkan device"]
+    fn vulkan_matches_cpu_niceonly() {
+        let ctx = VulkanContext::new(0).expect("Vulkan init");
+        // 10 is the base with the known solution; 12 and 25 are small bases
+        // where the CUDA path's prefilter is host-disabled (the v3.2.14
+        // phantom-zero regression class); 40 is production; 45 and 62 straddle
+        // the one-word/two-word digit-mask branch at 64.
+        for base in [10u32, 12, 25, 40, 45, 62] {
+            let Ok(Some(base_range)) = crate::base_range::get_base_range_u128(base) else {
+                continue;
+            };
+            let start = base_range.range_start;
+            let end = (start + 5_000_000).min(base_range.range_end);
+            let range = FieldSize::new(start, end);
+
+            let table = StrideTable::new(base, GPU_LSD_K);
+            let mut cpu = process_range_niceonly(&range, base, &table).nice_numbers;
+            cpu.sort_by_key(|n| n.number);
+            let gpu = process_range_niceonly_vulkan(&ctx, &range, base).expect("vulkan run");
+
+            assert_eq!(cpu, gpu.nice_numbers, "base {base}: niceonly mismatch");
+            assert!(
+                gpu.distribution.is_empty(),
+                "base {base}: niceonly must report no distribution"
+            );
+            println!(
+                "base {base}: [{start}, {end}) agrees, {} nice",
+                gpu.nice_numbers.len()
+            );
+        }
+    }
+
+    /// The known solution, through the niceonly path this time: the whole
+    /// pipeline (MSD filter, descriptors, on-device residue reconstruction)
+    /// has to line up for 69 to come back.
+    #[test]
+    #[ignore = "requires a Vulkan device"]
+    fn vulkan_niceonly_finds_69_in_base_10() {
+        let ctx = VulkanContext::new(0).expect("Vulkan init");
+        let base_range = crate::base_range::get_base_range_u128(10).unwrap().unwrap();
+        let range = FieldSize::new(base_range.range_start, base_range.range_end);
+        let results = process_range_niceonly_vulkan(&ctx, &range, 10).expect("vulkan run");
+        assert_eq!(
+            results
+                .nice_numbers
+                .iter()
+                .map(|n| n.number)
+                .collect::<Vec<_>>(),
+            vec![69]
+        );
     }
 
     /// The known solution: 69 is nice in base 10.

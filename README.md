@@ -189,7 +189,7 @@ There are some feature flags that enable specific dependencies:
 - `nice_common/database` is set automatically from binaries that connect directly to postgres (`api` and `jobs`). This requires the `libpq-dev` package to be installed.
 - `nice_client/rustls-tls` is enabled by default and uses rustls for TLS connections, which doesn't require any external dependencies. Disable it and enable `nice_client/openssl-tls` to use `openssl`.
 - In order to build the client with GPU acceleration, enable the `nice_client/gpu` feature. This requires no additional build-time dependencies, but it does require the CUDA toolkit to be available at runtime for kernel compilation.
-- `nice_client/vulkan` builds a second GPU backend that runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, and llvmpipe). Like the CUDA one it needs nothing at build time; at runtime it needs only a Vulkan driver, since shaders are generated per base and compiled with `naga`. Currently detailed mode only — niceonly falls back to the CPU.
+- `nice_client/vulkan` builds a second GPU backend that runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, and llvmpipe). Like the CUDA one it needs nothing at build time; at runtime it needs only a Vulkan driver, since shaders are generated per base and compiled with `naga`. Both modes run on the GPU.
 - The two features are additive: `--features gpu,vulkan` produces one binary that runs on either, selected with `--gpu-backend`. Neither library is needed to *build* it, and `auto` prefers CUDA.
 
 Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack/).

@@ -23,7 +23,13 @@ pub mod codegen;
 
 use anyhow::{Context as _, Result, bail};
 use ash::vk;
-use codegen::{KernelConfig, MISS_STRIDE, WORKGROUP_SIZE, detailed_wgsl};
+use codegen::{
+    KernelConfig, LANES_PER_RANGE, MISS_STRIDE, NICE_STRIDE, NiceonlyConfig, WORKGROUP_SIZE,
+    detailed_wgsl, niceonly_wgsl,
+};
+use crate::NiceNumberSimple;
+use crate::gpu_niceonly::{GPU_LSD_K, RangeSink};
+use crate::stride_filter::StrideTable;
 use log::{debug, info};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -37,7 +43,17 @@ const MAX_WORKGROUPS: u32 = 4096;
 /// Nanoseconds to wait for a dispatch before giving up.
 const FENCE_TIMEOUT_NS: u64 = 120_000_000_000;
 
-/// Push constant block; must match `struct Params` in the generated WGSL.
+/// Range descriptors per niceonly dispatch. The pipeline hands over batches of
+/// `LAUNCH_BATCH_RANGES` plus whatever the last MSD chunk added, so this only
+/// has to be comfortably larger than that; the device buffers are sized from
+/// it and reused across every dispatch of a field.
+const RANGES_PER_DISPATCH: usize = 1 << 17;
+
+/// Capacity of the niceonly output buffer (in nice numbers) per field.
+/// Genuinely nice numbers are astronomically rare; this is pure headroom.
+const NICE_OUT_CAPACITY: usize = 1 << 16;
+
+/// Push constant block for the detailed shader; must match its `struct Params`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Params {
@@ -51,14 +67,38 @@ struct Params {
     pad: u32,
 }
 
+/// Push constant block for the niceonly shader; must match its `struct Params`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NiceonlyParams {
+    fs0: u32,
+    fs1: u32,
+    fs2: u32,
+    fs3: u32,
+    fs_mod_m: u32,
+    num_ranges: u32,
+    nice_cap: u32,
+    pad: u32,
+}
+
 #[allow(clippy::cast_possible_truncation)] // 32 bytes; the const assert below pins it
 const PUSH_CONSTANT_SIZE: u32 = std::mem::size_of::<Params>() as u32;
+#[allow(clippy::cast_possible_truncation)]
+const NICEONLY_PUSH_CONSTANT_SIZE: u32 = std::mem::size_of::<NiceonlyParams>() as u32;
 
 // Vulkan only guarantees 128 bytes of push constant space.
 const _: () = assert!(
-    PUSH_CONSTANT_SIZE <= 128,
+    PUSH_CONSTANT_SIZE <= 128 && NICEONLY_PUSH_CONSTANT_SIZE <= 128,
     "push constant block exceeds the guaranteed minimum"
 );
+
+/// Reinterpret a push constant block as bytes for `cmd_push_constants`.
+///
+/// Safety: `T` is a `#[repr(C)]` struct of `u32`s, so every byte is
+/// initialized and there is no padding to leak.
+unsafe fn push_bytes<T>(params: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(std::ptr::from_ref(params).cast::<u8>(), size_of::<T>()) }
+}
 
 /// A storage buffer with its memory, persistently mapped.
 struct Buf {
@@ -75,19 +115,49 @@ impl Buf {
         unsafe { std::slice::from_raw_parts(self.ptr.cast_const(), self.len) }
     }
 
+    fn as_mut_slice(&mut self) -> &mut [u32] {
+        // Safety: as `as_slice`, and `&mut self` means no dispatch is reading
+        // it — every dispatch is fence-waited before this call can be reached.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
     fn zero(&self) {
         unsafe { std::ptr::write_bytes(self.ptr, 0, self.len) }
     }
 }
 
-/// A compiled detailed-mode pipeline for one base.
-struct DetailedPipeline {
-    cfg: KernelConfig,
+/// A compiled compute pipeline and everything created alongside it.
+struct Shader {
     module: vk::ShaderModule,
     dsl: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 }
+
+/// A compiled detailed-mode pipeline for one base.
+struct DetailedPipeline {
+    cfg: KernelConfig,
+    shader: Shader,
+}
+
+/// A compiled niceonly pipeline for one base, plus the base's residue table
+/// living on the device.
+///
+/// The table is immutable and depends only on the base, so it is built once
+/// with the pipeline and shared by every field — the same arrangement as the
+/// CUDA path's `NiceonlyPlan`, which holds its residues in a `CudaSlice`.
+struct NiceonlyPipeline {
+    cfg: NiceonlyConfig,
+    shader: Shader,
+    residues: Buf,
+}
+
+// Safety: `Buf`'s raw pointer is what makes this !Send. The residue table is
+// filled once, before the pipeline is published behind an `Arc`, and from then
+// on the host never touches the mapping again — only the device reads it, and
+// only `VulkanContext::drop` (which has exclusive access) unmaps it.
+unsafe impl Send for NiceonlyPipeline {}
+unsafe impl Sync for NiceonlyPipeline {}
 
 /// Command buffer + fence, serialized because queue submission needs external
 /// synchronization.
@@ -107,6 +177,7 @@ pub struct VulkanContext {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     submitter: Mutex<Submitter>,
     pipelines: Mutex<HashMap<u32, Arc<DetailedPipeline>>>,
+    niceonly_pipelines: Mutex<HashMap<u32, Arc<NiceonlyPipeline>>>,
     /// Human-readable device name, for logging.
     pub device_name: String,
 }
@@ -204,6 +275,7 @@ impl VulkanContext {
             mem_props,
             submitter: Mutex::new(Submitter { pool, cmd, fence }),
             pipelines: Mutex::new(HashMap::new()),
+            niceonly_pipelines: Mutex::new(HashMap::new()),
             device_name,
         };
 
@@ -219,18 +291,10 @@ impl VulkanContext {
         Ok(ctx)
     }
 
-    /// Get or build the detailed-mode pipeline for a base.
-    fn detailed_pipeline(&self, base: u32) -> Result<Arc<DetailedPipeline>> {
-        if let Some(p) = self.pipelines.lock().unwrap().get(&base) {
-            return Ok(p.clone());
-        }
-        let build = Instant::now();
-        let cfg = KernelConfig::new(base)?;
-        let src = detailed_wgsl(&cfg);
-        let spirv = compile_wgsl(&src)
-            .with_context(|| format!("compiling the detailed shader for base {base}"))?;
-
-        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
+    /// Compile generated WGSL and build the descriptor/pipeline objects for it.
+    fn build_shader(&self, src: &str, num_bindings: u32, push_size: u32) -> Result<Shader> {
+        let spirv = compile_wgsl(src)?;
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..num_bindings)
             .map(|i| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(i)
@@ -248,7 +312,7 @@ impl VulkanContext {
         let ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(PUSH_CONSTANT_SIZE)];
+            .size(push_size)];
         let layouts = [dsl];
         let layout = unsafe {
             self.device.create_pipeline_layout(
@@ -278,22 +342,88 @@ impl VulkanContext {
         }
         .map_err(|(_, e)| e)
         .context("creating the compute pipeline")?[0];
-
-        debug!(
-            "Vulkan detailed pipeline for base {base}: {} SPIR-V words, chunk {} digits (div {}), built in {:.2}s",
-            spirv.len(),
-            cfg.chunk_digits,
-            cfg.chunk_div,
-            build.elapsed().as_secs_f64()
-        );
-        let p = Arc::new(DetailedPipeline {
-            cfg,
+        debug!("Vulkan shader: {} SPIR-V words", spirv.len());
+        Ok(Shader {
             module,
             dsl,
             layout,
             pipeline,
-        });
+        })
+    }
+
+    fn destroy_shader(&self, shader: &Shader) {
+        unsafe {
+            self.device.destroy_pipeline(shader.pipeline, None);
+            self.device.destroy_pipeline_layout(shader.layout, None);
+            self.device.destroy_descriptor_set_layout(shader.dsl, None);
+            self.device.destroy_shader_module(shader.module, None);
+        }
+    }
+
+    /// Get or build the detailed-mode pipeline for a base.
+    fn detailed_pipeline(&self, base: u32) -> Result<Arc<DetailedPipeline>> {
+        if let Some(p) = self.pipelines.lock().unwrap().get(&base) {
+            return Ok(p.clone());
+        }
+        let build = Instant::now();
+        let cfg = KernelConfig::new(base)?;
+        let shader = self
+            .build_shader(&detailed_wgsl(&cfg), 3, PUSH_CONSTANT_SIZE)
+            .with_context(|| format!("compiling the detailed shader for base {base}"))?;
+
+        debug!(
+            "Vulkan detailed pipeline for base {base}: chunk {} digits (div {}), built in {:.2}s",
+            cfg.chunk_digits,
+            cfg.chunk_div,
+            build.elapsed().as_secs_f64()
+        );
+        let p = Arc::new(DetailedPipeline { cfg, shader });
         self.pipelines.lock().unwrap().insert(base, p.clone());
+        Ok(p)
+    }
+
+    /// Get or build the niceonly pipeline and device residue table for a base.
+    ///
+    /// # Errors
+    /// Returns an error for a residue-empty base — callers must short-circuit
+    /// those before they get here (`StrideTable` panics when indexed with no
+    /// valid residues), for bases the shader cannot configure, or on any
+    /// Vulkan failure.
+    fn niceonly_pipeline(&self, base: u32) -> Result<Arc<NiceonlyPipeline>> {
+        if let Some(p) = self.niceonly_pipelines.lock().unwrap().get(&base) {
+            return Ok(p.clone());
+        }
+        let build = Instant::now();
+        let table = StrideTable::new(base, GPU_LSD_K);
+        let cfg = NiceonlyConfig::new(KernelConfig::new(base)?, &table)?;
+        let shader = self
+            .build_shader(
+                &niceonly_wgsl(&cfg),
+                5,
+                NICEONLY_PUSH_CONSTANT_SIZE,
+            )
+            .with_context(|| format!("compiling the niceonly shader for base {base}"))?;
+
+        let mut residues = self.alloc_buf(table.valid_residues.len()).inspect_err(|_| {
+            self.destroy_shader(&shader);
+        })?;
+        #[allow(clippy::cast_possible_truncation)]
+        for (slot, &r) in residues.as_mut_slice().iter_mut().zip(&table.valid_residues) {
+            *slot = r as u32;
+        }
+
+        debug!(
+            "Vulkan niceonly pipeline for base {base}: M={}, R={}, built in {:.2}s",
+            cfg.stride_m,
+            cfg.stride_r,
+            build.elapsed().as_secs_f64()
+        );
+        let p = Arc::new(NiceonlyPipeline {
+            cfg,
+            shader,
+            residues,
+        });
+        self.niceonly_pipelines.lock().unwrap().insert(base, p.clone());
         Ok(p)
     }
 
@@ -358,12 +488,63 @@ impl VulkanContext {
         }
     }
 
+    /// Allocate a single descriptor set bound to `bufs` at bindings 0..n.
+    fn make_descriptor_set(
+        &self,
+        dsl: vk::DescriptorSetLayout,
+        bufs: &[&Buf],
+    ) -> Result<(vk::DescriptorPool, vk::DescriptorSet)> {
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(u32::try_from(bufs.len()).unwrap_or(u32::MAX))];
+        let pool = unsafe {
+            self.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .pool_sizes(&sizes)
+                    .max_sets(1),
+                None,
+            )
+        }?;
+        let layouts = [dsl];
+        let set = unsafe {
+            self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool)
+                    .set_layouts(&layouts),
+            )
+        }?[0];
+
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
+            .iter()
+            .map(|b| {
+                [vk::DescriptorBufferInfo::default()
+                    .buffer(b.buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)]
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet> = infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                #[allow(clippy::cast_possible_truncation)]
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info)
+            })
+            .collect();
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+        Ok((pool, set))
+    }
+
     /// Record and submit one dispatch, waiting for it to complete.
     fn dispatch(
         &self,
-        pipe: &DetailedPipeline,
+        shader: &Shader,
         set: vk::DescriptorSet,
-        params: Params,
+        push: &[u8],
         groups: u32,
     ) -> Result<()> {
         let s = self.submitter.lock().unwrap();
@@ -376,25 +557,21 @@ impl VulkanContext {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
             self.device
-                .cmd_bind_pipeline(s.cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
+                .cmd_bind_pipeline(s.cmd, vk::PipelineBindPoint::COMPUTE, shader.pipeline);
             self.device.cmd_bind_descriptor_sets(
                 s.cmd,
                 vk::PipelineBindPoint::COMPUTE,
-                pipe.layout,
+                shader.layout,
                 0,
                 &[set],
                 &[],
             );
-            let bytes = std::slice::from_raw_parts(
-                std::ptr::from_ref(&params).cast::<u8>(),
-                PUSH_CONSTANT_SIZE as usize,
-            );
             self.device.cmd_push_constants(
                 s.cmd,
-                pipe.layout,
+                shader.layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
-                bytes,
+                push,
             );
             self.device.cmd_dispatch(s.cmd, groups, 1, 1);
             self.device.end_command_buffer(s.cmd)?;
@@ -427,10 +604,11 @@ impl Drop for VulkanContext {
         unsafe {
             let _ = self.device.device_wait_idle();
             for p in self.pipelines.lock().unwrap().values() {
-                self.device.destroy_pipeline(p.pipeline, None);
-                self.device.destroy_pipeline_layout(p.layout, None);
-                self.device.destroy_descriptor_set_layout(p.dsl, None);
-                self.device.destroy_shader_module(p.module, None);
+                self.destroy_shader(&p.shader);
+            }
+            for p in self.niceonly_pipelines.lock().unwrap().values() {
+                self.destroy_shader(&p.shader);
+                self.free_buf(&p.residues);
             }
             let s = self.submitter.lock().unwrap();
             self.device.destroy_fence(s.fence, None);
@@ -461,49 +639,8 @@ impl<'a> DetailedRun<'a> {
         let hist = ctx.alloc_buf(pipe.cfg.hist_bins() as usize)?;
         let miss_count = ctx.alloc_buf(1)?;
         let miss_data = ctx.alloc_buf(miss_capacity * MISS_STRIDE as usize)?;
-
-        let sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(3)];
-        let pool = unsafe {
-            ctx.device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .pool_sizes(&sizes)
-                    .max_sets(1),
-                None,
-            )
-        }?;
-        let layouts = [pipe.dsl];
-        let set = unsafe {
-            ctx.device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(pool)
-                    .set_layouts(&layouts),
-            )
-        }?[0];
-
-        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = [&hist, &miss_count, &miss_data]
-            .iter()
-            .map(|b| {
-                [vk::DescriptorBufferInfo::default()
-                    .buffer(b.buffer)
-                    .offset(0)
-                    .range(vk::WHOLE_SIZE)]
-            })
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = infos
-            .iter()
-            .enumerate()
-            .map(|(i, info)| {
-                #[allow(clippy::cast_possible_truncation)]
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(info)
-            })
-            .collect();
-        unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+        let (pool, set) =
+            ctx.make_descriptor_set(pipe.shader.dsl, &[&hist, &miss_count, &miss_data])?;
 
         Ok(Self {
             ctx,
@@ -534,8 +671,13 @@ impl<'a> DetailedRun<'a> {
         let groups = count
             .div_ceil(u64::from(WORKGROUP_SIZE))
             .min(u64::from(MAX_WORKGROUPS)) as u32;
-        self.ctx
-            .dispatch(&self.pipe, self.set, params, groups.max(1))
+        // Safety: `NiceonlyParams`/`Params` are `#[repr(C)]` u32 blocks.
+        self.ctx.dispatch(
+            &self.pipe.shader,
+            self.set,
+            unsafe { push_bytes(&params) },
+            groups.max(1),
+        )
     }
 
     /// Add the device histogram into `acc` and reset it.
@@ -588,6 +730,157 @@ impl Drop for DetailedRun<'_> {
         self.ctx.free_buf(&self.hist);
         self.ctx.free_buf(&self.miss_count);
         self.ctx.free_buf(&self.miss_data);
+    }
+}
+
+/// One niceonly field in progress.
+///
+/// The output buffers persist across every dispatch of the field; the range
+/// descriptor buffers are reused, which is safe only because
+/// [`VulkanContext::dispatch`] blocks on its fence before returning — nothing
+/// can still be reading last dispatch's descriptors when the next memcpy
+/// starts. Making dispatch asynchronous (spec Phase 3) means double-buffering
+/// these too.
+pub(crate) struct NiceonlyRun<'a> {
+    ctx: &'a VulkanContext,
+    pipe: Arc<NiceonlyPipeline>,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    range_offsets: Buf,
+    range_lens: Buf,
+    nice_out: Buf,
+    nice_count: Buf,
+    /// `field_start mod M`, so the shader only reduces the 64-bit offset.
+    fs_mod_m: u32,
+    field_start: u128,
+}
+
+impl<'a> NiceonlyRun<'a> {
+    /// # Errors
+    /// Returns an error for a residue-empty or unconfigurable base, or on any
+    /// Vulkan failure.
+    pub(crate) fn new(ctx: &'a VulkanContext, base: u32, field_start: u128) -> Result<Self> {
+        let pipe = ctx.niceonly_pipeline(base)?;
+        let range_offsets = ctx.alloc_buf(RANGES_PER_DISPATCH * 2)?;
+        let range_lens = ctx.alloc_buf(RANGES_PER_DISPATCH)?;
+        let nice_out = ctx.alloc_buf(NICE_OUT_CAPACITY * NICE_STRIDE as usize)?;
+        let nice_count = ctx.alloc_buf(1)?;
+        let (pool, set) = ctx.make_descriptor_set(
+            pipe.shader.dsl,
+            &[
+                &pipe.residues,
+                &range_offsets,
+                &range_lens,
+                &nice_out,
+                &nice_count,
+            ],
+        )?;
+        #[allow(clippy::cast_possible_truncation)]
+        let fs_mod_m = (field_start % u128::from(pipe.cfg.stride_m)) as u32;
+        Ok(Self {
+            ctx,
+            pipe,
+            pool,
+            set,
+            range_offsets,
+            range_lens,
+            nice_out,
+            nice_count,
+            fs_mod_m,
+            field_start,
+        })
+    }
+
+    /// Collect the nice numbers found across the whole field.
+    ///
+    /// # Errors
+    /// Returns an error if the kernel tried to write more hits than the buffer
+    /// holds — which, given how rare nice numbers are, means a kernel bug
+    /// rather than a genuine flood.
+    pub(crate) fn finish(&self) -> Result<Vec<NiceNumberSimple>> {
+        let written = self.nice_count.as_slice()[0] as usize;
+        if written > NICE_OUT_CAPACITY {
+            bail!(
+                "niceonly output buffer overflow: {written} > {NICE_OUT_CAPACITY} \
+                 (this strongly suggests a kernel bug)"
+            );
+        }
+        let data = self.nice_out.as_slice();
+        let stride = NICE_STRIDE as usize;
+        let mut hits: Vec<NiceNumberSimple> = (0..written)
+            .map(|i| {
+                let o = i * stride;
+                let lo = u128::from(data[o]) | (u128::from(data[o + 1]) << 32);
+                let hi = u128::from(data[o + 2]) | (u128::from(data[o + 3]) << 32);
+                NiceNumberSimple {
+                    number: (hi << 64) | lo,
+                    num_uniques: self.pipe.cfg.kernel.base,
+                }
+            })
+            .collect();
+        hits.sort_by_key(|n| n.number);
+        Ok(hits)
+    }
+
+    pub(crate) fn config(&self) -> &NiceonlyConfig {
+        &self.pipe.cfg
+    }
+}
+
+impl RangeSink for NiceonlyRun<'_> {
+    fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()> {
+        for (batch_offsets, batch_lens) in offsets
+            .chunks(RANGES_PER_DISPATCH)
+            .zip(lens.chunks(RANGES_PER_DISPATCH))
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                let dst = self.range_offsets.as_mut_slice();
+                for (i, &o) in batch_offsets.iter().enumerate() {
+                    dst[2 * i] = o as u32;
+                    dst[2 * i + 1] = (o >> 32) as u32;
+                }
+            }
+            self.range_lens.as_mut_slice()[..batch_lens.len()].copy_from_slice(batch_lens);
+
+            #[allow(clippy::cast_possible_truncation)]
+            let params = NiceonlyParams {
+                fs0: self.field_start as u32,
+                fs1: (self.field_start >> 32) as u32,
+                fs2: (self.field_start >> 64) as u32,
+                fs3: (self.field_start >> 96) as u32,
+                fs_mod_m: self.fs_mod_m,
+                num_ranges: u32::try_from(batch_offsets.len()).unwrap_or(u32::MAX),
+                nice_cap: NICE_OUT_CAPACITY as u32,
+                pad: 0,
+            };
+            let threads = (batch_offsets.len() as u64) * u64::from(LANES_PER_RANGE);
+            #[allow(clippy::cast_possible_truncation)]
+            let groups = threads
+                .div_ceil(u64::from(WORKGROUP_SIZE))
+                .min(u64::from(MAX_WORKGROUPS)) as u32;
+            // Safety: `NiceonlyParams` is a `#[repr(C)]` block of u32s.
+            self.ctx.dispatch(
+                &self.pipe.shader,
+                self.set,
+                unsafe { push_bytes(&params) },
+                groups.max(1),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NiceonlyRun<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+            self.ctx.device.destroy_descriptor_pool(self.pool, None);
+        }
+        self.ctx.free_buf(&self.range_offsets);
+        self.ctx.free_buf(&self.range_lens);
+        self.ctx.free_buf(&self.nice_out);
+        self.ctx.free_buf(&self.nice_count);
     }
 }
 
@@ -674,6 +967,29 @@ mod tests {
     use super::*;
     use crate::gpu_config::{MAX_GPU_DIGIT_MASK_BASE, gpu_supports_base};
 
+    /// Every supported base with a non-empty residue set must generate a
+    /// niceonly shader that parses, validates and reaches SPIR-V.
+    #[test]
+    fn generated_niceonly_shaders_compile_for_all_supported_bases() {
+        use crate::stride_filter::StrideTable;
+        let mut n = 0;
+        for base in 10..=MAX_GPU_DIGIT_MASK_BASE {
+            if !gpu_supports_base(base) || crate::residue_filter::get_residue_filter_u128(&base).is_empty() {
+                continue;
+            }
+            let table = StrideTable::new(base, crate::gpu_niceonly::GPU_LSD_K);
+            let cfg = NiceonlyConfig::new(KernelConfig::new(base).expect("config"), &table)
+                .expect("niceonly config");
+            let src = niceonly_wgsl(&cfg);
+            let spirv = compile_wgsl(&src)
+                .unwrap_or_else(|e| panic!("base {base} failed to compile: {e}\n\n{src}"));
+            assert!(spirv.len() > 100, "base {base}: suspiciously small SPIR-V");
+            assert_eq!(spirv[0], 0x0723_0203, "base {base}: bad SPIR-V magic");
+            n += 1;
+        }
+        assert!(n > 20, "only {n} bases compiled");
+    }
+
     /// Every supported base must generate WGSL that parses, validates and
     /// reaches SPIR-V. Needs no Vulkan device, so it runs everywhere.
     #[test]
@@ -704,5 +1020,39 @@ mod tests {
             assert!(src.contains(field), "generated Params lacks {field}");
         }
         assert_eq!(PUSH_CONSTANT_SIZE as usize, std::mem::size_of::<Params>());
+    }
+
+    /// Same for the niceonly block. A field-order mismatch here would feed the
+    /// kernel the wrong field start and silently search the wrong numbers.
+    #[test]
+    fn niceonly_push_constant_block_matches_the_generated_struct() {
+        let table = StrideTable::new(40, GPU_LSD_K);
+        let cfg = NiceonlyConfig::new(KernelConfig::new(40).unwrap(), &table).unwrap();
+        let src = niceonly_wgsl(&cfg);
+        for field in [
+            "fs0",
+            "fs1",
+            "fs2",
+            "fs3",
+            "fs_mod_m",
+            "num_ranges",
+            "nice_cap",
+            "pad",
+        ] {
+            assert!(src.contains(field), "generated Params lacks {field}");
+        }
+        assert_eq!(
+            NICEONLY_PUSH_CONSTANT_SIZE as usize,
+            std::mem::size_of::<NiceonlyParams>()
+        );
+    }
+
+    /// The niceonly shader indexes `nice_out` at `NICE_STRIDE * pos`, and the
+    /// host decodes it at the same stride; both must fit the buffer the run
+    /// allocates.
+    #[test]
+    fn nice_out_buffer_holds_its_capacity() {
+        assert_eq!(NICE_STRIDE, 4, "a u128 hit is four u32 slots");
+        assert!(u32::try_from(NICE_OUT_CAPACITY).is_ok());
     }
 }
