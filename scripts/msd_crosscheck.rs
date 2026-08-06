@@ -42,22 +42,9 @@ fn malachite_ref(range: FieldSize, base: u32) -> bool {
     if has_over(&sq_prefix, &cu_prefix) {
         return true;
     }
-    let k = 2usize;
-    let b_k = u128::from(base).saturating_pow(k as u32);
-    if range.first() / b_k == range.last() / b_k {
-        let lsd_sq: Vec<u32> = s_sq.iter().take(k).copied().collect();
-        let lsd_cu: Vec<u32> = s_cu.iter().take(k).copied().collect();
-        if has_over(&sq_prefix, &lsd_sq)
-            || has_over(&cu_prefix, &lsd_cu)
-            || has_over(&sq_prefix, &lsd_cu)
-            || has_over(&cu_prefix, &lsd_sq)
-            || has_dup(&lsd_sq)
-            || has_dup(&lsd_cu)
-            || has_over(&lsd_sq, &lsd_cu)
-        {
-            return true;
-        }
-    }
+    // The cross MSD×LSD branch that used to follow here was removed in the
+    // 2026-08 theory review: it was unsound (low digits vary across a range
+    // even when first/b^k == last/b^k).
     false
 }
 
