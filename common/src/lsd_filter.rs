@@ -43,14 +43,24 @@
 //! (mod b^k) instead of just the last digit. This is more effective because it catches
 //! collisions that occur in the second, third, etc. positions from the right.
 //!
-//! For example, in base 10 with k=2, instead of just checking if the last digit of n² and n³
-//! collide, we check if ANY digit in the last 2 digits of n² collides with ANY digit in the
-//! last 2 digits of n³.
+//! For a suffix s = n mod b^k, the last k digits of n² and n³ are fixed (they depend only
+//! on s). A nice number needs all of its output digits distinct, so all 2k of these fixed
+//! digits — the k low digits of n² and the k low digits of n³, including any leading zeros
+//! within the fixed-width window — must be pairwise distinct. A suffix is valid only if
+//! that holds.
+//!
+//! For example, in base 10 with k=2, suffix 12 gives 12² = 144 (low digits "44") and
+//! 12³ = 1728 (low digits "28"). The two 4s inside the square suffix already make niceness
+//! impossible, so suffix 12 is invalid — even though the square digits {4} and cube digits
+//! {2, 8} do not overlap each other.
+//!
+//! Note on zero padding: the fixed-width window treats value 5 with k=2 as digits "05".
+//! This is sound for any candidate whose square/cube has at least k digits, which holds
+//! for every number inside a legal base range (for k=2 any base ≥ 4; for k=3 any base ≥ 6).
 
 use log::trace;
 use malachite::base::num::arithmetic::traits::Pow;
 use malachite::natural::Natural;
-use std::collections::HashSet;
 
 /// Get a list of valid least significant digits for a base.
 ///
@@ -120,38 +130,17 @@ fn is_valid_lsd(lsd: u32, base: u32) -> bool {
     square_lsd != cube_lsd
 }
 
-/// Extract all digits from a number in the given base.
-///
-/// # Arguments
-/// - `value`: The number to extract digits from
-/// - `base`: The numeric base
-/// - `num_digits`: Maximum number of digits to extract (from least significant)
-///
-/// # Returns
-/// A `HashSet` containing all unique digits that appear in the number
-fn extract_digits(value: u128, base: u32, num_digits: u32) -> HashSet<u32> {
-    let mut digits = HashSet::new();
-    let mut remaining = value;
-    let base_u128 = u128::from(base);
-
-    for _ in 0..num_digits {
-        #[allow(clippy::cast_possible_truncation)]
-        let digit = (remaining % base_u128) as u32;
-        digits.insert(digit);
-        remaining /= base_u128;
-        if remaining == 0 {
-            break;
-        }
-    }
-
-    digits
-}
-
 /// Get a bitmap of valid k-digit suffixes for multi-digit LSD filtering.
 ///
 /// This is Filter A from the Novel Filters document. Instead of checking only the last
-/// digit, it checks the last k digits (mod b^k) and validates that no digit collision
-/// occurs between the k-digit suffixes of n² and n³.
+/// digit, it checks the last k digits (mod b^k): the k low digits of n² and the k low
+/// digits of n³ are fixed by the suffix, and a suffix is valid only if all 2k of those
+/// fixed digits are pairwise distinct.
+///
+/// Digits are extracted at fixed width k, including leading zeros within the window
+/// (e.g. value 5 with k=2 in base 10 contributes digits 0 and 5). This is sound for any
+/// candidate whose square and cube have at least k digits, which holds for every number
+/// inside a legal base range for the k values used in production (k ≤ 3, base ≥ 6).
 ///
 /// # Arguments
 /// - `base`: The numeric base
@@ -164,9 +153,10 @@ fn extract_digits(value: u128, base: u32, num_digits: u32) -> HashSet<u32> {
 /// # Example
 /// For base 10, k=2:
 /// - Check all suffixes 00-99
-/// - For suffix=12: compute 12²=144 (last 2 digits: 44) and 12³=1728 (last 2 digits: 28)
-/// - Extract digits from "44": {4} and from "28": {2, 8}
-/// - Since {4} and {2, 8} are disjoint (no shared digits), suffix 12 is valid
+/// - For suffix=12: compute 12²=144 (last 2 digits: 4,4) and 12³=1728 (last 2 digits: 2,8)
+/// - The digit 4 repeats within the square suffix, so suffix 12 is invalid
+/// - For suffix=69: 69²=4761 (last 2 digits: 6,1) and 69³=328509 (last 2 digits: 0,9)
+/// - All four digits {6,1,0,9} are distinct, so suffix 69 is valid
 ///
 /// # Panics
 /// Panics if base^k would overflow u32
@@ -175,6 +165,7 @@ pub fn get_valid_multi_lsd_bitmap(base: u32, k: u32) -> Vec<bool> {
     // Calculate modulus = base^k
     let modulus = base.checked_pow(k).expect("base^k must fit in u32");
     let modulus_u128 = u128::from(modulus);
+    let base_u128 = u128::from(base);
 
     trace!(
         "Computing multi-digit LSD filter for base {base} with k={k} digits (modulus={modulus})"
@@ -184,33 +175,48 @@ pub fn get_valid_multi_lsd_bitmap(base: u32, k: u32) -> Vec<bool> {
     let mut bitmap = vec![false; modulus as usize];
     let mut valid_count = 0;
 
+    // Reused per-suffix "digit already seen" scratch table.
+    let mut seen = vec![false; base as usize];
+
     for suffix in 0..modulus {
         let suffix_u128 = u128::from(suffix);
 
         // Compute n² mod b^k and n³ mod b^k
-        let sq = suffix_u128.pow(2) % modulus_u128;
-        let cb = suffix_u128.pow(3) % modulus_u128;
+        let mut sq = suffix_u128.pow(2) % modulus_u128;
+        let mut cb = suffix_u128.pow(3) % modulus_u128;
 
-        // Extract all digits from the k-digit representations
-        let sq_digits = extract_digits(sq, base, k);
-        let cb_digits = extract_digits(cb, base, k);
-
-        // Valid if no digit appears in both square and cube
-        let is_valid = sq_digits.is_disjoint(&cb_digits);
+        // All 2k fixed digits (k from the square, k from the cube, zero-padded
+        // to width k) must be pairwise distinct.
+        seen.fill(false);
+        let mut is_valid = true;
+        for _ in 0..k {
+            #[allow(clippy::cast_possible_truncation)]
+            let d = (sq % base_u128) as usize;
+            if seen[d] {
+                is_valid = false;
+                break;
+            }
+            seen[d] = true;
+            sq /= base_u128;
+        }
+        if is_valid {
+            for _ in 0..k {
+                #[allow(clippy::cast_possible_truncation)]
+                let d = (cb % base_u128) as usize;
+                if seen[d] {
+                    is_valid = false;
+                    break;
+                }
+                seen[d] = true;
+                cb /= base_u128;
+            }
+        }
 
         if is_valid {
             bitmap[suffix as usize] = true;
             valid_count += 1;
         } else {
-            trace!(
-                "  Suffix {:0width$} rejected: sq={:0width$} (digits {:?}), cb={:0width$} (digits {:?})",
-                suffix,
-                sq,
-                sq_digits,
-                cb,
-                cb_digits,
-                width = k as usize
-            );
+            trace!("  Suffix {suffix} rejected: duplicate among fixed low digits");
         }
     }
 
@@ -484,28 +490,6 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_extract_digits_base10() {
-        // Test extracting digits from various numbers in base 10
-        assert_eq!(extract_digits(0, 10, 2), HashSet::from([0]));
-        assert_eq!(extract_digits(5, 10, 2), HashSet::from([5]));
-        assert_eq!(extract_digits(12, 10, 2), HashSet::from([1, 2]));
-        assert_eq!(extract_digits(44, 10, 2), HashSet::from([4]));
-        assert_eq!(extract_digits(28, 10, 2), HashSet::from([2, 8]));
-        assert_eq!(extract_digits(123, 10, 3), HashSet::from([1, 2, 3]));
-        assert_eq!(extract_digits(111, 10, 3), HashSet::from([1]));
-    }
-
-    #[test_log::test]
-    fn test_extract_digits_base16() {
-        // Test extracting digits from various numbers in base 16
-        assert_eq!(extract_digits(0x0, 16, 2), HashSet::from([0]));
-        assert_eq!(extract_digits(0xF, 16, 2), HashSet::from([15]));
-        assert_eq!(extract_digits(0x1A, 16, 2), HashSet::from([1, 10]));
-        assert_eq!(extract_digits(0xFF, 16, 2), HashSet::from([15]));
-        assert_eq!(extract_digits(0xAB, 16, 2), HashSet::from([10, 11]));
-    }
-
-    #[test_log::test]
     fn test_get_valid_multi_lsd_bitmap_base10_k1() {
         // With k=1, should match single-digit LSD filter
         let multi_lsd_bitmap = get_valid_multi_lsd_bitmap(10, 1);
@@ -552,14 +536,81 @@ mod tests {
         // 01: 01²=01, 01³=01 → both have digits 0,1 (collision)
         assert!(!bitmap[1]);
 
-        // 12: 12²=144 (last 2: 44={4}), 12³=1728 (last 2: 28={2,8}) → disjoint
+        // 12: 12²=144 (last 2 digits: 4,4) → duplicate 4 within the square
+        // suffix means no number ending in 12 can be nice. The pre-2026-08
+        // set-based implementation missed this (it only checked that square
+        // and cube digit sets were disjoint).
         assert!(
-            bitmap[12],
-            "12 should be valid: sq digits {{4}} ∩ cb digits {{2,8}} = ∅"
+            !bitmap[12],
+            "12 should be invalid: square suffix '44' repeats the digit 4"
         );
 
-        // 69: 69²=4761 (last 2: 61={6,1}), 69³=328509 (last 2: 09={0,9}) → disjoint
+        // 10: 10²=100 (last 2 digits: 0,0) → duplicate 0 via zero padding
+        assert!(
+            !bitmap[10],
+            "10 should be invalid: square suffix '00' repeats the digit 0"
+        );
+
+        // 69: 69²=4761 (last 2: 6,1), 69³=328509 (last 2: 0,9) → all distinct
         assert!(bitmap[69], "69 should be valid (known nice number)");
+    }
+
+    #[test_log::test]
+    fn test_multi_lsd_bitmap_matches_exact_all_different() {
+        // Semantic cross-check: for every suffix, independently compute the
+        // fixed-width 2k low digits of suffix² and suffix³ (with zero padding)
+        // and require the bitmap to equal "all 2k digits pairwise distinct".
+        for (base, k) in [(10u32, 2u32), (10, 3), (12, 2), (16, 2), (40, 2)] {
+            let modulus = u128::from(base.pow(k));
+            let bitmap = get_valid_multi_lsd_bitmap(base, k);
+            for s in 0..modulus {
+                let mut digits = Vec::new();
+                for value in [s * s % modulus, s * s % modulus * s % modulus] {
+                    let mut v = value;
+                    for _ in 0..k {
+                        digits.push(u32::try_from(v % u128::from(base)).unwrap());
+                        v /= u128::from(base);
+                    }
+                }
+                let mut sorted = digits.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                let expect_valid = sorted.len() == digits.len();
+                assert_eq!(
+                    bitmap[usize::try_from(s).unwrap()],
+                    expect_valid,
+                    "base {base} k={k} suffix {s}: fixed digits {digits:?}"
+                );
+            }
+        }
+    }
+
+    #[test_log::test]
+    fn test_multi_lsd_bitmap_accepts_all_nice_numbers_small_bases() {
+        // Soundness: the filter must never reject a nice number's suffix.
+        // Brute-force every number in the base range for small bases and
+        // check its suffix passes the bitmap for k=1..=2 (k=3 where b^3
+        // stays manageable).
+        use crate::base_range::get_base_range_u128;
+        use crate::client_process::get_is_nice;
+
+        for base in 4u32..=16 {
+            let Ok(Some(range)) = get_base_range_u128(base) else {
+                continue;
+            };
+            for k in 1..=3u32 {
+                let modulus = u128::from(base.pow(k));
+                let bitmap = get_valid_multi_lsd_bitmap(base, k);
+                for n in range.start()..range.end() {
+                    if get_is_nice(n, base) {
+                        assert!(
+                            bitmap[usize::try_from(n % modulus).unwrap()],
+                            "base {base} k={k}: nice number {n} rejected by LSD bitmap"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test_log::test]
