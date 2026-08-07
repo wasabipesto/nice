@@ -37,17 +37,25 @@ pub const GPU_LSD_K: u32 = 2;
 /// are still producing.
 pub const LAUNCH_BATCH_RANGES: usize = 1 << 16;
 
-/// Batches of descriptors allowed to queue between the MSD workers and the
-/// consumer thread.
+/// Chunks' worth of descriptors allowed to queue between the MSD workers and
+/// the consumer thread.
 ///
-/// The consumer's cost per batch is what makes this matter, and it differs by
+/// The consumer's cost per item is what makes this matter, and it differs by
 /// backend. A CUDA launch is asynchronous, so that consumer never really
 /// blocks and any bound is slack. A Vulkan dispatch blocks on a fence, so with
 /// an unbounded channel the workers would race arbitrarily far ahead: a base-52
 /// field at floor 250 is ~9e7 surviving ranges, and 12 bytes apiece is over a
 /// gigabyte of queued descriptors. Bounding the channel keeps the overlap —
-/// workers refill the queue while the consumer waits on the device — and caps
-/// the memory at `LAUNCH_BATCH_RANGES * PIPELINE_DEPTH` descriptors.
+/// workers refill the queue while the consumer waits on the device.
+///
+/// **The unit here is one chunk, not one launch batch.** Each item a worker
+/// sends is the whole output of one [`PROCESSING_CHUNK_SIZE`] chunk;
+/// [`LAUNCH_BATCH_RANGES`] is the consumer's flush threshold and never bounds
+/// what sits in the channel. So the cap is `PIPELINE_DEPTH` × the most ranges a
+/// chunk can yield — the recursion returns a range whole once it is at or below
+/// the floor, so that is about `PROCESSING_CHUNK_SIZE / floor`, i.e. ~4000 at
+/// [`MSD_FLOOR_MIN`] and fewer at any coarser floor. Roughly 3 MB of
+/// descriptors at the worst floor, comfortably below the gigabyte above.
 const PIPELINE_DEPTH: usize = 64;
 
 /// Minimum MSD recursion floor (matches the CPU client's default).
