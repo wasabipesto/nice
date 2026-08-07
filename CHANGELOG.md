@@ -1,11 +1,12 @@
 # Changelog
 
-## Unreleased
+## Nice v3.3.0
 
 - Fix an off-by-one error in get_base_range_natural which dropped one trailing candidate per base where base % 5 ∈ {2,3,4}. Thanks to [Janzert](https://github.com/Janzert) for reporting this!
 - Adapt CPU client processing chunk size from field size to reduce memory usage with larger fields and make TQDM output more readable
 - Buffer client claims and overlap the requests that refill them. Thanks to [Janzert](https://github.com/Janzert) for implementing this!
 - Refactor the client to utilize the async API and simplify some codepaths
+- Remove an unsound MSD x LSD cross-check, which could silently skip valid nice numbers searched in niceonly mode by the CPU client. Submissions from clients 3.2.12-3.1.15 may be annulled while we re-check results. Detailed mode was unaffected.
 
 ## Nice v3.2.15
 
