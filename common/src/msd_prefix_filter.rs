@@ -266,8 +266,15 @@ fn has_overlapping_digits_small(d1: &[u32], d2: &[u32]) -> bool {
 // Recursive MSD filter subdivision parameters for the binary search.
 // These are tuned to try and find the natural bounds of MSD shifts without wasting too much
 // time when they are naturally chaotic.
+//
+// The floor trades MSD recursion time against extra candidates for the
+// stride table: halving it roughly doubles the number of endpoint
+// digit-extractions while the deepest levels skip only slivers. With the
+// k=3 stride table and the seeded nice check keeping per-candidate cost
+// low, 1000 benchmarks 10-25% faster end-to-end than 250 across bases
+// 40-52 in both MSD-strong and MSD-weak regions.
 pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 22;
-pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 250;
+pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 1000;
 pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 
 /// Find the longest common prefix of the most significant digits.
