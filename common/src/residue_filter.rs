@@ -75,6 +75,66 @@ mod tests {
         assert_eq!(get_residue_filter(&120), Vec::from([0, 34, 84, 118]));
     }
 
+    /// Closed-form count of valid residues, from the 2026-08 theory review
+    /// (scratchpad/2026-08-theory-review/THEORY_AND_SEARCH_DIRECTIONS.md §2).
+    ///
+    /// The filter keeps n mod (b-1) with n²(n+1) ≡ b(b-1)/2 (mod b-1). By CRT
+    /// over the prime powers p^a || b-1:
+    /// - even b: each prime power contributes p^⌊a/2⌋ + 1 residues
+    /// - b ≡ 3 (mod 4): no solutions (the target m/2 is odd but n²(n+1) is
+    ///   always even), so every such base is dead
+    /// - b ≡ 1 (mod 4): odd prime powers as above; the 2^a component
+    ///   contributes 1 if a is even, 2^((a-1)/2) + 1 if a is odd
+    fn predicted_residue_count(b: u64) -> u64 {
+        let mut m = b - 1;
+        let mut factors = Vec::new();
+        let mut p = 2u64;
+        while p * p <= m {
+            if m.is_multiple_of(p) {
+                let mut a = 0u32;
+                while m.is_multiple_of(p) {
+                    m /= p;
+                    a += 1;
+                }
+                factors.push((p, a));
+            }
+            p += 1;
+        }
+        if m > 1 {
+            factors.push((m, 1));
+        }
+        if b.is_multiple_of(2) {
+            factors.iter().map(|&(p, a)| p.pow(a / 2) + 1).product()
+        } else if b % 4 == 3 {
+            0
+        } else {
+            factors
+                .iter()
+                .map(|&(p, a)| {
+                    if p == 2 {
+                        if a % 2 == 0 { 1 } else { 2u64.pow((a - 1) / 2) + 1 }
+                    } else {
+                        p.pow(a / 2) + 1
+                    }
+                })
+                .product()
+        }
+    }
+
+    #[test_log::test]
+    fn test_residue_count_matches_closed_form() {
+        // Independent oracle: the enumerated residue count must match the
+        // closed-form classification for every base. This also pins down the
+        // theorem that every base ≡ 3 (mod 4) has no valid residues.
+        for b in 5u32..=512 {
+            assert_eq!(
+                get_residue_filter(&b).len() as u64,
+                predicted_residue_count(u64::from(b)),
+                "residue count mismatch at base {b}"
+            );
+        }
+    }
+
     #[test_log::test]
     fn test_get_residue_filter_u128() {
         assert_eq!(get_residue_filter_u128(&10), Vec::from([0, 3, 6, 8]));
