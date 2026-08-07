@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
     "api_base": "https://api.nicenumbers.net",
     "username": "wasabipesto-fleet",
     "vastai_cmd": ["uvx", "vastai"],
+    "user_agent": "nice-fleet-controller/1.0",
     "label_prefix": "nice-fleet",
     "db_path": "fleet.sqlite3",
     "kill_switch_path": "KILL",
@@ -362,10 +363,15 @@ def api_estimate(cfg, offer):
         "cpu_model": offer.get("cpu_name"),
         "gpu_model": offer.get("gpu_name"),
     }
+    # A real User-Agent matters: the production API sits behind Cloudflare,
+    # which rejects urllib's default Python-urllib UA with a 403.
     req = urllib.request.Request(
         f"{cfg['api_base']}/estimate",
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": cfg["user_agent"],
+        },
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
