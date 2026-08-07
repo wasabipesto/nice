@@ -3,8 +3,7 @@
 Budgeted explore/exploit over the Vast.ai interruptible market. One tick per
 cron invocation: reconcile → accrue budget → probe pounces → search & estimate
 offers → benchmark unknown hardware (explore) → buy the best hold-amortized
-EV (exploit). Design rationale in `scratchpad/2026-08-vast-fleet/PLAN.md`
-(local) and the PR descriptions for fleet plan stages 1–5.
+EV (exploit).
 
 ## Setup
 

@@ -11,3 +11,4 @@ output
 cache
 scratchpad
 .worktrees
+__pycache__

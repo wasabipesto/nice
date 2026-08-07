@@ -1,7 +1,7 @@
 {
   "dry_run": true,
   "api_base": "https://api.nicenumbers.net",
-  "username": "wasabipesto-fleet",
+  "username": "gilgamesh-fleet",
   "db_path": "fleet.sqlite3",
   "kill_switch_path": "KILL",
 
@@ -18,7 +18,7 @@
   "gpu": true,
   "max_exploit_instances": 2,
   "exploit_ttl_hours": 6.0,
-  "image": "ghcr.io/wasabipesto/nice_client:latest-gpu",
+  "image": "ghcr.io/wasabipesto/nice_client:3-gpu",
   "disk_gb": 30,
 
   "explore_per_tick": 2,
