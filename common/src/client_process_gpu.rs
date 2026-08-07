@@ -1017,7 +1017,7 @@ mod tests {
         let (mut n, mut idx) = table.first_valid_at_or_after(range.start());
         while n < range.end() {
             out.push(n);
-            n += table.gap_table[idx];
+            n += u128::from(table.gap_table[idx]);
             idx = (idx + 1) % table.gap_table.len();
         }
         out
@@ -1041,7 +1041,7 @@ mod tests {
             // residue, forcing the kernel's lower_bound to return R (the
             // next-cycle wraparound case).
             let past_last = {
-                let m_target = table.valid_residues.last().unwrap() + 1;
+                let m_target = u128::from(table.valid_residues.last().unwrap() + 1);
                 let cycle_base = base_range.range_start - (base_range.range_start % modulus);
                 let mut s = cycle_base + m_target.min(modulus - 1);
                 if s < base_range.range_start {
