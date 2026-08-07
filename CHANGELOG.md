@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `POST /estimate`: predicts per-scenario and blended performance for a hardware configuration from recent benchmark uploads, via hierarchical matching (exact → same-GPU/similar-CPU → same-GPU → same-CPU-scaled → CPU-family-scaled → floor → none). Responses name the `prediction_stage` that produced the numbers alongside a confidence percent, report P25/P50/P75 spreads widened for lower-trust stages, scale CPU rates to a requested thread count using each report's single-thread/multi-thread pair, and note when the requested client version has no samples.
+
 - Add benchmark uploads: after a sweep the client offers to upload the report (prompted on a terminal, defaulting to yes; `--benchmark-upload` skips the prompt for automation; non-interactive runs without the flag never upload). Reports are stored in a new `benchmarks` table via `POST /benchmark`, which validates the schema version and caps report size.
 - Add opt-in submission telemetry: `--telemetry` attaches hardware, scheduler environment, client config, and client-side processing time to each submission, stored in a new nullable `telemetry` jsonb column. Submissions from clients without the flag (including all older versions) are unchanged; oversized telemetry is dropped server-side without failing the submission.
 - First manual migration: `schema/migrations/2026-08-09_benchmarks_and_telemetry.sql`.

@@ -22,6 +22,18 @@ struct BenchmarkNew {
     data: Value,
 }
 
+/// Fetch the most recent benchmark reports for estimation.
+pub fn get_recent_benchmarks(conn: &mut PgConnection, limit: i64) -> Result<Vec<(String, Value)>> {
+    use self::benchmarks::dsl::*;
+
+    benchmarks
+        .select((client_version, data))
+        .order(submit_time.desc())
+        .limit(limit)
+        .load::<(String, Value)>(conn)
+        .map_err(|e| anyhow!("{e}"))
+}
+
 /// Store one uploaded benchmark report. `client_version` is extracted from
 /// the report by the caller (it lives inside `data` too; the column exists
 /// for cheap filtering).

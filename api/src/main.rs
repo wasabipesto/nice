@@ -9,16 +9,19 @@ extern crate rocket;
 use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
-    PgPool, benchmarks::insert_benchmark, claims::get_claim_by_id, claims::insert_claim,
+    PgPool, benchmarks::get_recent_benchmarks, benchmarks::insert_benchmark,
+    claims::get_claim_by_id, claims::insert_claim,
     fields::get_field_by_id, fields::get_validation_field, fields::try_claim_field,
     fields::update_field_canon_and_cl, get_database_pool, get_pooled_database_connection,
     submissions::insert_submission,
 };
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
+use nice_common::estimator;
 use nice_common::{
     BenchmarkToServer, CLAIM_DURATION_HOURS, DETAILED_SEARCH_MAX_FIELD_SIZE, DataToClient,
-    DataToServer, FieldClaimStrategy, NiceNumber, SearchMode, ValidationData,
+    DataToServer, EstimateRequest, EstimateResponse, FieldClaimStrategy, NiceNumber,
+    ScenarioEstimateResponse, SearchMode, ValidationData,
 };
 
 /// Caps on stored metadata blobs. Reports and telemetry beyond these sizes
@@ -28,6 +31,14 @@ const TELEMETRY_MAX_BYTES: usize = 16_384;
 
 /// Benchmark report schema versions this server accepts.
 const BENCHMARK_SCHEMA_VERSIONS: &[u64] = &[1];
+
+/// How many recent benchmark reports the estimator considers. This is a
+/// recency window: raising it improves rare-hardware coverage and burst-spam
+/// resilience, at the price of per-request fetch+decode work (~2 KB/row —
+/// revisit with an in-memory cache or SQL-side filtering if the fleet
+/// controller's call rate makes it hot) and, once client versions drift,
+/// more stale-version samples pooled into the quantiles.
+const ESTIMATE_SAMPLE_LIMIT: i64 = 2000;
 use rand::RngExt;
 use rocket::State;
 use rocket::http::Status;
@@ -475,6 +486,62 @@ fn post_benchmark(data: Json<BenchmarkToServer>, pool: &State<PgPool>) -> ApiRes
     })))
 }
 
+/// Estimate what a hardware configuration will achieve, from recent
+/// benchmark uploads. Hierarchical matching; the response names the
+/// fallback stage that produced the numbers alongside a confidence percent.
+#[post("/estimate", data = "<data>")]
+#[allow(clippy::needless_pass_by_value)]
+fn post_estimate(data: Json<EstimateRequest>, pool: &State<PgPool>) -> ApiResult<EstimateResponse> {
+    let Some(mode) = estimator::mode_string(&data.mode) else {
+        return Err(unprocessable_entity_error(format!(
+            "Unknown mode {:?} (expected \"niceonly\" or \"detailed\").",
+            data.mode
+        )));
+    };
+
+    let mut conn = get_pooled_database_connection(pool);
+    let rows = get_recent_benchmarks(&mut conn, ESTIMATE_SAMPLE_LIMIT)
+        .map_err(|e| internal_error(format!("Database error while loading benchmarks: {e}")))?;
+    let samples: Vec<estimator::BenchmarkSample> = rows
+        .iter()
+        .filter_map(|(version, report)| estimator::decode_sample(version, report))
+        .collect();
+
+    let input = estimator::EstimateInput {
+        gpu: data.gpu,
+        mode: mode.to_string(),
+        threads: data.threads,
+        cpu_model: data.cpu_model.clone(),
+        gpu_model: data.gpu_model.clone(),
+        base: data.base,
+        client_version: data.client_version.clone(),
+    };
+    let outcome = estimator::estimate(&samples, &input);
+
+    Ok(Json(EstimateResponse {
+        prediction_stage: outcome.prediction_stage.to_string(),
+        confidence: outcome.confidence,
+        samples_used: outcome.samples_used,
+        versions_used: outcome.versions_used,
+        scenarios: outcome
+            .scenarios
+            .into_iter()
+            .map(|s| ScenarioEstimateResponse {
+                key: s.key,
+                base: s.base,
+                samples: s.samples,
+                rate_p25: s.rate_p25,
+                rate_p50: s.rate_p50,
+                rate_p75: s.rate_p75,
+            })
+            .collect(),
+        blended_rate_p25: outcome.blended_rate_p25,
+        blended_rate_p50: outcome.blended_rate_p50,
+        blended_rate_p75: outcome.blended_rate_p75,
+        notes: outcome.notes,
+    }))
+}
+
 #[get("/")]
 fn index() -> rocket_status::Custom<Json<ApiErrorBody>> {
     not_found_error(
@@ -526,6 +593,7 @@ fn rocket() -> _ {
                 status,
                 ping,
                 post_benchmark,
+                post_estimate,
                 index,
                 options_handler
             ],
