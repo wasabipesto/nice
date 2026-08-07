@@ -32,8 +32,13 @@ const TELEMETRY_MAX_BYTES: usize = 16_384;
 /// Benchmark report schema versions this server accepts.
 const BENCHMARK_SCHEMA_VERSIONS: &[u64] = &[1];
 
-/// How many recent benchmark reports the estimator considers.
-const ESTIMATE_SAMPLE_LIMIT: i64 = 500;
+/// How many recent benchmark reports the estimator considers. This is a
+/// recency window: raising it improves rare-hardware coverage and burst-spam
+/// resilience, at the price of per-request fetch+decode work (~2 KB/row —
+/// revisit with an in-memory cache or SQL-side filtering if the fleet
+/// controller's call rate makes it hot) and, once client versions drift,
+/// more stale-version samples pooled into the quantiles.
+const ESTIMATE_SAMPLE_LIMIT: i64 = 2000;
 use rand::RngExt;
 use rocket::State;
 use rocket::http::Status;
