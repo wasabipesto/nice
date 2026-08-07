@@ -324,6 +324,127 @@ fn get_is_nice_u256_const<const BASE: u32>(num: u128) -> bool {
     true
 }
 
+/// Check niceness for a stride-table candidate whose low `k` digits of n²
+/// and n³ are already known (and known to be pairwise distinct).
+///
+/// The stride table fixes `n mod b^k`, which fixes the low `k` digits of
+/// both powers. `seed_mask` is the bitmask of those `2k` digits. Instead of
+/// re-extracting them digit by digit, the specialized paths divide each
+/// power by `b^k` once (a single multiply-by-magic-constant division) and
+/// start the duplicate scan from the seeded mask.
+///
+/// Sound only when n² and n³ each have at least `k` digits, which holds for
+/// every number inside a legal base range for k ≤ 3 and base ≥ 6.
+///
+/// Falls back to the plain check for (base, k) combinations without a
+/// specialization, so callers may use it unconditionally.
+#[must_use]
+#[inline]
+pub fn get_is_nice_with_known_lsd(num: u128, base: u32, k: u32, seed_mask: u64) -> bool {
+    if k == 3 {
+        match base {
+            40 => return get_is_nice_seeded_u128_const::<40, { 40 * 40 * 40 }>(num, seed_mask),
+            42 => return get_is_nice_seeded_u256_const::<42, { 42 * 42 * 42 }>(num, seed_mask),
+            43 => return get_is_nice_seeded_u256_const::<43, { 43 * 43 * 43 }>(num, seed_mask),
+            44 => return get_is_nice_seeded_u256_const::<44, { 44 * 44 * 44 }>(num, seed_mask),
+            45 => return get_is_nice_seeded_u256_const::<45, { 45 * 45 * 45 }>(num, seed_mask),
+            47 => return get_is_nice_seeded_u256_const::<47, { 47 * 47 * 47 }>(num, seed_mask),
+            48 => return get_is_nice_seeded_u256_const::<48, { 48 * 48 * 48 }>(num, seed_mask),
+            49 => return get_is_nice_seeded_u256_const::<49, { 49 * 49 * 49 }>(num, seed_mask),
+            50 => return get_is_nice_seeded_u256_const::<50, { 50 * 50 * 50 }>(num, seed_mask),
+            52 => return get_is_nice_seeded_u256_const::<52, { 52 * 52 * 52 }>(num, seed_mask),
+            53 => return get_is_nice_seeded_u256_const::<53, { 53 * 53 * 53 }>(num, seed_mask),
+            54 => return get_is_nice_seeded_u256_const::<54, { 54 * 54 * 54 }>(num, seed_mask),
+            55 => return get_is_nice_seeded_u256_const::<55, { 55 * 55 * 55 }>(num, seed_mask),
+            57 => return get_is_nice_seeded_u256_const::<57, { 57 * 57 * 57 }>(num, seed_mask),
+            58 => return get_is_nice_seeded_u256_const::<58, { 58 * 58 * 58 }>(num, seed_mask),
+            59 => return get_is_nice_seeded_u256_const::<59, { 59 * 59 * 59 }>(num, seed_mask),
+            60 => return get_is_nice_seeded_u256_const::<60, { 60 * 60 * 60 }>(num, seed_mask),
+            62 => return get_is_nice_seeded_u256_const::<62, { 62 * 62 * 62 }>(num, seed_mask),
+            64 => return get_is_nice_seeded_u256_const::<64, { 64 * 64 * 64 }>(num, seed_mask),
+            _ => {}
+        }
+    }
+    get_is_nice(num, base)
+}
+
+/// u128 variant of the seeded check (see `get_is_nice_with_known_lsd`).
+/// `BK` must equal `BASE^k` for the caller's stride k.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn get_is_nice_seeded_u128_const<const BASE: u32, const BK: u32>(
+    num: u128,
+    seed_mask: u64,
+) -> bool {
+    const { assert!(BASE <= 64, "u64 bitmask can't index past bit 63") };
+    let base_u128 = u128::from(BASE);
+    let mut digits_indicator: u64 = seed_mask;
+
+    let squared = num * num;
+
+    // Low digits are pre-seeded; drop them with one division.
+    let mut n = squared / u128::from(BK);
+    while n != 0 {
+        let d = (n % base_u128) as u32;
+        n /= base_u128;
+        let bit = 1u64 << d;
+        if digits_indicator & bit != 0 {
+            return false;
+        }
+        digits_indicator |= bit;
+    }
+
+    let mut n = squared * num / u128::from(BK);
+    while n != 0 {
+        let d = (n % base_u128) as u32;
+        n /= base_u128;
+        let bit = 1u64 << d;
+        if digits_indicator & bit != 0 {
+            return false;
+        }
+        digits_indicator |= bit;
+    }
+    true
+}
+
+/// U256 variant of the seeded check (see `get_is_nice_with_known_lsd`).
+/// `BK` must equal `BASE^k` for the caller's stride k.
+#[inline]
+fn get_is_nice_seeded_u256_const<const BASE: u32, const BK: u32>(
+    num: u128,
+    seed_mask: u64,
+) -> bool {
+    const { assert!(BASE <= 64, "u64 bitmask can't index past bit 63") };
+    // 🔥🔥🔥 HOT LOOP 🔥🔥🔥
+    let mut digits_indicator: u64 = seed_mask;
+
+    let squared = U256::mul_u128_u128(num, num);
+
+    // Low digits are pre-seeded; drop them with one division.
+    let mut n = squared;
+    n.div_assign_rem_u32_const::<BK>();
+    while !n.is_zero() {
+        let d = n.div_assign_rem_u32_const::<BASE>();
+        let bit = 1u64 << d;
+        if digits_indicator & bit != 0 {
+            return false;
+        }
+        digits_indicator |= bit;
+    }
+
+    let mut n = squared.mul_u128_truncating(num);
+    n.div_assign_rem_u32_const::<BK>();
+    while !n.is_zero() {
+        let d = n.div_assign_rem_u32_const::<BASE>();
+        let bit = 1u64 << d;
+        if digits_indicator & bit != 0 {
+            return false;
+        }
+        digits_indicator |= bit;
+    }
+    true
+}
+
 /// u128 fast path. Safe for bases ≤ 40.
 #[inline]
 fn get_is_nice_u128(num: u128, base: u32) -> bool {

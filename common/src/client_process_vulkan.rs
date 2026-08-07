@@ -289,8 +289,11 @@ mod tests {
         // 10 is the base with the known solution; 12 and 25 are small bases
         // where the CUDA path's prefilter is host-disabled (the v3.2.14
         // phantom-zero regression class); 40 is production; 45 and 62 straddle
-        // the one-word/two-word digit-mask branch at 64.
-        for base in [10u32, 12, 25, 40, 45, 62] {
+        // the one-word/two-word digit-mask branch at 64. 80 is production and
+        // sits past the k=3 modulus crossing at base 65, so it is the only
+        // entry here that exercises the 4-bit Horner chunk on the device —
+        // everything below it reduces the offset a byte at a time.
+        for base in [10u32, 12, 25, 40, 45, 62, 80] {
             let Ok(Some(base_range)) = crate::base_range::get_base_range_u128(base) else {
                 continue;
             };

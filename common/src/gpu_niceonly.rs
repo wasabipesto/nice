@@ -30,7 +30,15 @@ pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
 
 /// LSD filter depth for the stride table, matching the CPU client's
 /// `DEFAULT_LSD_K_VALUE` so GPU and CPU check the identical candidate set.
-pub const GPU_LSD_K: u32 = 2;
+///
+/// Upstream #88 raised this 2 → 3: the all-different check on 3+3 fixed low
+/// digits removes 15-22% of stride candidates at production bases before any
+/// per-candidate work, and the u32 residue/gap representation keeps the larger
+/// table cheap. Both GPU backends upload the host-built table, so they inherit
+/// the reduction without a kernel change — but the k=3 modulus is `b³`, which
+/// is what `stride_modulus_fits_the_byte_horner_bound` in the Vulkan codegen
+/// now has to hold against.
+pub const GPU_LSD_K: u32 = 3;
 
 /// Ranges buffered before each dispatch. Big enough to amortize submission and
 /// upload overhead, small enough that dispatches start while the MSD workers
@@ -511,7 +519,7 @@ mod tests {
                 "candidate {n} is in no emitted range"
             );
             checked += 1;
-            n += table.gap_table[idx];
+            n += u128::from(table.gap_table[idx]);
             idx = (idx + 1) % table.gap_table.len();
         }
         assert!(checked > 0, "base {base} produced no candidates to check");

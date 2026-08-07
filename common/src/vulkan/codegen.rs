@@ -121,12 +121,31 @@ pub fn lane_shift_for(num_ranges: u64, mean_len: u64, stride_m: u32, stride_r: u
 ///
 /// `n mod M` cannot be computed as a 64-bit division by a constant — that is
 /// the one construct RADV/ACO does not strength-reduce (see the module docs).
-/// Instead the shader reduces the range's 64-bit *offset* byte by byte,
-/// `acc = (acc << 8 | byte) % M`, with `M` a 32-bit compile-time constant. The
-/// running remainder satisfies `acc < M`, so `acc << 8` stays inside a u32
-/// exactly while `M <= 2^24`. Real moduli are far below it: `M = (b-1)·b^k`
-/// with `k = 2`, so even base 128 gives 127·16384 ≈ 2^21.
-pub const MAX_STRIDE_MODULUS: u128 = 1 << 24;
+/// Instead the shader reduces the range's 64-bit *offset* one chunk at a time,
+/// `acc = (acc << c | chunk) % M`, with `M` a 32-bit compile-time constant. The
+/// running remainder satisfies `acc < M`, so the shift stays inside a u32
+/// exactly while `M <= 2^(32-c)`.
+///
+/// `c` is picked per base by [`stride_chunk_bits`]. It used to be a fixed 8,
+/// on the premise that `M = (b-1)·b^k` with `k = 2` put even base 128 at
+/// 127·16384 ≈ 2^21. Upstream #88 raised `k` to 3, which multiplies every
+/// modulus by `b`: base 65 reaches 17 576 000 and base 128 reaches
+/// 266 338 304, so the fixed byte chunk would have refused every base ≥ 65 —
+/// base 80 among them. A 4-bit chunk covers the whole supported range with
+/// room to spare, and costs nothing measurable because this reduction runs
+/// once per *range descriptor*, not per candidate.
+pub const MAX_STRIDE_MODULUS: u128 = 1 << 28;
+
+/// Width in bits of one Horner chunk in the shader's offset reduction.
+///
+/// The largest `c` with `M << c` still inside a u32, restricted to widths that
+/// divide 64 evenly so the unrolled loop covers the offset exactly. Both the
+/// emitted shader and the host mirror derive `c` from the same modulus, so they
+/// cannot disagree.
+#[must_use]
+pub fn stride_chunk_bits(stride_m: u32) -> u32 {
+    if u128::from(stride_m) <= 1 << 24 { 8 } else { 4 }
+}
 
 /// Everything the generator needs for one base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,13 +550,17 @@ fn prefilter_enabled_for(value: Option<&str>) -> bool {
 
 /// Reduce a u64 range offset mod `M` on the host, the way the shader does.
 ///
-/// Exposed so the mirror test can check the byte-wise Horner against `%`
+/// Exposed so the mirror test can check the chunked Horner against `%`
 /// directly; the shader emits exactly this, unrolled.
 #[must_use]
 pub fn offset_mod_m(offset: u64, stride_m: u32) -> u32 {
+    let c = stride_chunk_bits(stride_m);
+    let mask = (1u64 << c) - 1;
     let mut acc: u32 = 0;
-    for byte in offset.to_be_bytes() {
-        acc = ((acc << 8) | u32::from(byte)) % stride_m;
+    for i in (0..64 / c).rev() {
+        #[allow(clippy::cast_possible_truncation)]
+        let chunk = ((offset >> (i * c)) & mask) as u32;
+        acc = ((acc << c) | chunk) % stride_m;
     }
     acc
 }
@@ -843,18 +866,23 @@ fn niceonly_wgsl_impl(cfg: &NiceonlyConfig, probe: bool) -> String {
     // `n mod M` the CUDA way would be two 64-bit divisions by a constant, and
     // that is precisely the construct ACO does not strength-reduce. The host
     // pushes `field_start mod M` instead, leaving only the 64-bit *offset* to
-    // reduce here — byte by byte, every divisor a 32-bit literal. Exact
-    // because `acc < M <= 2^24`, so `acc << 8` never leaves a u32.
+    // reduce here — one chunk at a time, every divisor a 32-bit literal. Exact
+    // because `acc < M <= 2^(32-c)`, so `acc << c` never leaves a u32; `c`
+    // comes from `stride_chunk_bits`, the same function the host mirror uses.
+    let chunk_bits = stride_chunk_bits(stride_m);
+    let chunk_mask = (1u32 << chunk_bits) - 1;
+    let per_word = 32 / chunk_bits;
     s.push_str("fn offset_mod_m(lo: u32, hi: u32) -> u32 {\n    var acc: u32 = 0u;\n");
-    for byte in 0..8u32 {
-        let (word, shift) = if byte < 4 {
-            ("hi", 24 - byte * 8)
+    for chunk in 0..64 / chunk_bits {
+        let (word, idx) = if chunk < per_word {
+            ("hi", chunk)
         } else {
-            ("lo", 24 - (byte - 4) * 8)
+            ("lo", chunk - per_word)
         };
+        let shift = 32 - chunk_bits - idx * chunk_bits;
         let _ = writeln!(
             s,
-            "    acc = ((acc << 8u) | (({word} >> {shift}u) & 0xffu)) % {stride_m}u;"
+            "    acc = ((acc << {chunk_bits}u) | (({word} >> {shift}u) & {chunk_mask:#x}u)) % {stride_m}u;"
         );
     }
     s.push_str("    return acc;\n}\n\n");
@@ -994,13 +1022,17 @@ mod tests {
     }
 
     /// Every base a niceonly shader can be built for must have a stride modulus
-    /// inside the byte-wise reduction's bound — the invariant that lets
-    /// `acc << 8` stay in a u32 and so keeps every divisor 32-bit. Bases with
-    /// `M > 2^24` would have to fall back to a narrower chunk, and
-    /// `NiceonlyConfig::new` refuses them rather than generating a shader that
-    /// silently computes the wrong residue.
+    /// inside the chunked reduction's bound — the invariant that lets
+    /// `acc << c` stay in a u32 and so keeps every divisor 32-bit.
+    /// `NiceonlyConfig::new` refuses anything past it rather than generating a
+    /// shader that silently computes the wrong residue.
+    ///
+    /// The margin is no longer generous. At the k=3 stride depth #88 introduced,
+    /// `M = (b-1)·b³` reaches 266 338 304 at base 128 against the 4-bit chunk's
+    /// 2^28 = 268 435 456 — under 1% of headroom. A k=4 table, or a supported
+    /// base above 128, would need a 2-bit chunk; this test is what would catch it.
     #[test]
-    fn stride_modulus_fits_the_byte_horner_bound() {
+    fn stride_modulus_fits_the_chunked_horner_bound() {
         let mut n = 0;
         for base in 10..=MAX_GPU_DIGIT_MASK_BASE {
             if !gpu_supports_base(base)
@@ -1114,7 +1146,7 @@ mod tests {
         let (mut n, mut idx) = table.first_valid_at_or_after(start);
         while n < end {
             out.push(n);
-            n += table.gap_table[idx];
+            n += u128::from(table.gap_table[idx]);
             idx = (idx + 1) % table.gap_table.len();
         }
         out
@@ -1143,7 +1175,7 @@ mod tests {
 
             // An offset whose residue lands past the last valid residue.
             let past_last = {
-                let target = table.valid_residues.last().unwrap() + 1;
+                let target = u128::from(table.valid_residues.last().unwrap() + 1);
                 let cycle_base = field_start - (field_start % modulus);
                 let mut s = cycle_base + target.min(modulus - 1);
                 if s < field_start {

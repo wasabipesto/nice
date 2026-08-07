@@ -1372,7 +1372,7 @@ mod tests {
                 if codegen::mirror_prefilter(n, &kernel, &pre).0 {
                     want.push(n);
                 }
-                n += table.gap_table[idx];
+                n += u128::from(table.gap_table[idx]);
                 idx = (idx + 1) % table.gap_table.len();
             }
 
