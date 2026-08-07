@@ -34,7 +34,6 @@ pub const BENCH_SCHEMA_VERSION: u32 = 1;
 /// account-related is ever collected.
 const ENV_ALLOWLIST: &[&str] = &[
     "VAST_CONTAINERLABEL",
-    "VAST_INSTANCE_ID",
     "CONTAINER_ID",
     "SLURM_JOB_ID",
     "SLURM_CLUSTER_NAME",
@@ -635,10 +634,20 @@ fn gpu_name(_cli: &Cli) -> Option<String> {
 
 /// Scheduler/instance identifiers from the environment allowlist, for
 /// cross-correlating benchmark results with rented instances or cluster jobs.
+///
+/// Falls back to the container init process's environment for keys not in
+/// our own: Vast injects its identifiers into PID 1, and a client started
+/// from an SSH session (rather than the container entrypoint) doesn't
+/// inherit them. Allowlist-only either way — PID 1 also holds credentials.
 fn collect_environment() -> Value {
+    let init_environ = std::fs::read("/proc/1/environ").unwrap_or_default();
+    let init_vars = parse_environ(&init_environ);
     let mut map = serde_json::Map::new();
     for key in ENV_ALLOWLIST {
-        if let Ok(value) = std::env::var(key)
+        let value = std::env::var(key)
+            .ok()
+            .or_else(|| init_vars.get(*key).cloned());
+        if let Some(value) = value
             && !value.is_empty()
         {
             map.insert((*key).to_string(), Value::String(value));
@@ -646,6 +655,17 @@ fn collect_environment() -> Value {
     }
     debug!("environment correlation keys collected: {}", map.len());
     Value::Object(map)
+}
+
+/// Parse a NUL-separated `KEY=value` environment block (`/proc/N/environ`).
+fn parse_environ(data: &[u8]) -> HashMap<String, String> {
+    data.split(|&b| b == 0)
+        .filter_map(|entry| {
+            let entry = std::str::from_utf8(entry).ok()?;
+            let (key, value) = entry.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -678,6 +698,17 @@ mod tests {
                 .as_deref(),
             Some("Debian GNU/Linux 13 (trixie)")
         );
+    }
+
+    #[test]
+    fn environ_block_parses() {
+        let vars = parse_environ(b"CONTAINER_ID=47102363\0VAST_CONTAINERLABEL=C.47102363\0BAD\0");
+        assert_eq!(vars.get("CONTAINER_ID").map(String::as_str), Some("47102363"));
+        assert_eq!(
+            vars.get("VAST_CONTAINERLABEL").map(String::as_str),
+            Some("C.47102363")
+        );
+        assert!(!vars.contains_key("BAD"));
     }
 
     #[test]
