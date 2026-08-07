@@ -51,6 +51,14 @@ fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
     Ok(Json(data))
 }
 
+/// Static liveness endpoint for client-side latency measurement. Touches
+/// nothing — the point is to measure the network and server front-end alone,
+/// unlike `/status` which reads the claim queues.
+#[get("/ping")]
+fn ping() -> &'static str {
+    "pong"
+}
+
 #[get("/status")]
 fn status(queue: &State<FieldQueue>) -> Json<Value> {
     let niceonly_queue_size = queue.niceonly_queue_size();
@@ -452,6 +460,7 @@ fn rocket() -> _ {
                 validate,
                 submit,
                 status,
+                ping,
                 index,
                 options_handler
             ],

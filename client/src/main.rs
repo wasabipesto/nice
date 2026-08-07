@@ -4,7 +4,6 @@
 #![allow(clippy::too_many_lines)]
 
 extern crate nice_common;
-use nice_common::benchmark::{BenchmarkMode, get_benchmark_field};
 use nice_common::client_api_async::{
     Client, get_field_from_server_async, get_validation_data_from_server_async,
     submit_field_to_server_async,
@@ -34,6 +33,8 @@ const DEFAULT_PREFETCH_CONCURRENCY: usize = 4;
 /// Submissions are small and were measured to cost far less than a claim, but an
 /// unbounded queue would quietly absorb a server outage instead of surfacing it.
 const MAX_SUBMITS_IN_FLIGHT: usize = 8;
+
+mod bench;
 
 #[cfg(feature = "gpu")]
 use nice_common::client_process_gpu::{
@@ -137,9 +138,13 @@ pub struct Cli {
     #[arg(long, default_value_t = DEFAULT_PREFETCH_CONCURRENCY, env = "NICE_PREFETCH_CONCURRENCY")]
     prefetch_concurrency: usize,
 
-    /// Run an offline benchmark
+    /// Run an offline benchmark sweep and print a detailed report
     #[arg(short, long, env = "NICE_BENCHMARK")]
-    benchmark: Option<BenchmarkMode>,
+    benchmark: bool,
+
+    /// Approximate time budget for the benchmark sweep, in seconds
+    #[arg(long, default_value_t = 10.0, env = "NICE_BENCHMARK_SECS")]
+    benchmark_secs: f64,
 
     /// Validate results against the server before submitting
     #[arg(long, env = "NICE_VALIDATE")]
@@ -160,7 +165,17 @@ pub struct Cli {
 
 /// Process a field synchronously (`CPU` or `GPU`).
 /// This is wrapped in `spawn_blocking` when called from async context.
-fn process_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Vec<FieldResults> {
+///
+/// `stride_table` lets a caller reuse a prebuilt table across many calls for
+/// the same base (the benchmark sweep times many small windows, where a
+/// per-call table build would dominate); `None` builds one for this field,
+/// which is negligible at production field sizes.
+fn process_field_sync(
+    claim_data: &DataToClient,
+    cli: &Cli,
+    gpu: &GpuCtx,
+    stride_table: Option<&Arc<stride_filter::StrideTable>>,
+) -> Vec<FieldResults> {
     let mode = cli.mode;
     if cli.gpu {
         // GPU processing path
@@ -211,10 +226,13 @@ fn process_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Vec
         // in each chunk. The table is wrapped in Arc for thread-safe sharing across
         // parallel chunk processing.
         let stride_table_opt = if mode == SearchMode::Niceonly {
-            Some(Arc::new(stride_filter::StrideTable::new(
-                claim_data.base,
-                DEFAULT_LSD_K_VALUE,
-            )))
+            Some(match stride_table {
+                Some(table) => Arc::clone(table),
+                None => Arc::new(stride_filter::StrideTable::new(
+                    claim_data.base,
+                    DEFAULT_LSD_K_VALUE,
+                )),
+            })
         } else {
             None
         };
@@ -261,7 +279,7 @@ async fn process_field(
     let start_time = std::time::Instant::now();
 
     tokio::task::spawn_blocking(move || {
-        let results = process_field_sync(&claim_data, &cli, &gpu);
+        let results = process_field_sync(&claim_data, &cli, &gpu, None);
         (claim_data, results, start_time.elapsed())
     })
     .await
@@ -424,31 +442,6 @@ async fn run_validation(cli: &Arc<Cli>, client: &Client, gpu: &GpuCtx) -> Result
         }
     }
     Ok(())
-}
-
-/// Process a fixed offline field to measure this machine.
-///
-/// Never contacts the server, hence no HTTP client and no `Result`.
-async fn run_benchmark(cli: &Arc<Cli>, benchmark: BenchmarkMode, gpu: &GpuCtx) {
-    loop {
-        let claim_data = get_benchmark_field(benchmark);
-
-        info!("Beginning benchmark:  {benchmark}");
-        debug!(
-            "Claim Data: {}",
-            serde_json::to_string(&claim_data).unwrap()
-        );
-
-        let (claim_data, results, elapsed) = process_field(claim_data, cli, gpu).await;
-        log_field_rate(&claim_data, elapsed, cli);
-
-        // Compiled but never sent; the debug trace it emits is the point.
-        compile_results(results, &claim_data, &cli.username, cli.mode);
-
-        if !cli.repeat {
-            break;
-        }
-    }
 }
 
 /// How many claims to keep on hand — buffered or in flight — counting the one
@@ -729,7 +722,7 @@ async fn main() -> Result<()> {
     if cli.validate {
         debug!("Validating correctness by checking against accepted field.");
     }
-    if cli.repeat && !cli.validate && cli.benchmark.is_none() {
+    if cli.repeat && !cli.validate && !cli.benchmark {
         debug!("Pipeline mode enabled: overlapping API calls with processing.");
     }
     debug!("CLI Inputs: {cli:?}");
@@ -786,8 +779,8 @@ async fn main() -> Result<()> {
     // that the pipelined one can keep its claim buffer full across fields.
     if cli.validate {
         run_validation(&cli, &http_client, &gpu_ctx).await?;
-    } else if let Some(benchmark) = cli.benchmark {
-        run_benchmark(&cli, benchmark, &gpu_ctx).await;
+    } else if cli.benchmark {
+        bench::run_benchmark_sweep(&cli, &gpu_ctx, &http_client).await;
     } else {
         run_pipelined_loop(&cli, &http_client, &gpu_ctx).await?;
     }

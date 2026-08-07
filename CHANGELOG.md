@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Rework `--benchmark` into a structured sweep: fixed measurement windows across bases 40-52 in MSD-strong, MSD-weak, and residue-dense regions (plus uniform regions for detailed mode), repeated to fill an adjustable time budget (`--benchmark-secs`, default 10). Reports per-scenario rates, a single-thread scenario for thread-scaling analysis, API latency against the new lightweight `/ping` endpoint, hardware info (CPU/GPU model, cores, memory, arch), scheduler correlation IDs (Vast/Slurm) from an allowlist, and a complete machine-readable JSON report. Ends with a synthetic version-paired "NiceMark" score for bragging rights.
+- Add `GET /ping` to the API: a static response for client-side latency measurement.
+
+## Unreleased
+
 - Deepen the stride table's LSD filter from k=2 to k=3, removing 15-22% of candidates before the nice check. The table now stores residues and gaps as u32 to keep the larger table compact, and precomputes each residue's fixed low digits so the nice check can skip re-extracting them (seeding its duplicate mask and dropping both powers' low digits with a single division each).
 - Raise the CPU MSD recursion floor from 250 to 1000: with cheaper per-candidate checks, the deepest recursion levels cost more than the slivers they skip. Combined CPU nice-only speedup from the above: 24-47% on bases 40-52 across MSD-strong and MSD-weak regions.
 - Replace the MSD filter's common-prefix duplicate/overlap checks with an interval digit-domain analysis (Hall's theorem): each near-fixed output position of n² and n³ gets a conservative digit domain, and a range is skipped when the constrained positions cannot all receive distinct digits. Strictly stronger than the prefix checks at the same cost; removes an additional 2-12% of must-process candidates (0-8% nice-only wall clock) on bases 40-52.
