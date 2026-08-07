@@ -170,13 +170,13 @@ const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
     ("b40_detailed", false, 1.4e7),
     ("b50_detailed", false, 8.9e6),
     ("b50_detailed_1t", false, 2.2e6),
-    ("b40_msd_strong", true, 2.0e11),
-    ("b40_msd_weak", true, 1.7e11),
-    ("b50_residue_dense", true, 4.0e11),
-    ("b50_msd_weak", true, 3.5e11),
-    ("b52_msd_weak", true, 1.8e11),
-    ("b40_detailed", true, 1.0e9),
-    ("b50_detailed", true, 8.0e8),
+    ("b40_msd_strong", true, 2.3e11),
+    ("b40_msd_weak", true, 1.5e11),
+    ("b50_residue_dense", true, 1.3e11),
+    ("b50_msd_weak", true, 1.3e11),
+    ("b52_msd_weak", true, 1.6e11),
+    ("b40_detailed", true, 4.5e9),
+    ("b50_detailed", true, 3.2e9),
 ];
 
 /// Prebuilt stride tables per base, so table construction is paid once per
