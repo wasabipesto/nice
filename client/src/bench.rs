@@ -20,7 +20,8 @@ use log::debug;
 use nice_common::base_range::get_base_range_u128;
 use nice_common::client_api_async::Client;
 use nice_common::stride_filter::StrideTable;
-use nice_common::{CLIENT_VERSION, DataToClient, SearchMode};
+use nice_common::{BenchmarkToServer, CLIENT_VERSION, DataToClient, SearchMode};
+use std::io::{IsTerminal, Write};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +29,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Version of the JSON report layout. Bump on breaking changes.
 pub const BENCH_SCHEMA_VERSION: u32 = 1;
+
+/// Version of the per-submission telemetry layout. Bump on breaking changes.
+pub const TELEMETRY_SCHEMA_VERSION: u32 = 1;
 
 /// Environment variables worth attaching to a report for cross-correlating
 /// runs with rented instances or cluster jobs. Allowlist only — nothing
@@ -260,6 +264,21 @@ pub async fn run_benchmark_sweep(cli: &Arc<Cli>, gpu: &GpuCtx, client: &Client) 
     );
     println!("\n--- benchmark report (json) ---");
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    println!();
+
+    match decide_upload(cli.benchmark_upload, std::io::stdin().is_terminal()) {
+        UploadDecision::Yes => upload_report(client, cli, &report).await,
+        UploadDecision::Prompt => {
+            if prompt_yes(&cli.api_base) {
+                upload_report(client, cli, &report).await;
+            } else {
+                println!("Not uploaded.");
+            }
+        }
+        UploadDecision::No => {
+            println!("Not uploading (non-interactive; pass --benchmark-upload to upload).");
+        }
+    }
 }
 
 /// The blocking part: calibrate and run every scenario within the budget.
@@ -563,6 +582,85 @@ fn build_report_json(
     })
 }
 
+/// The constant part of a submission telemetry payload: hardware, scheduler
+/// environment, and client configuration. Collected once per process.
+pub fn telemetry_base(cli: &Cli) -> Value {
+    json!({
+        "schema_version": TELEMETRY_SCHEMA_VERSION,
+        "hardware": collect_hardware(cli),
+        "environment": collect_environment(),
+        "config": {
+            "gpu": cli.gpu,
+            "threads": cli.threads,
+        },
+    })
+}
+
+/// Stamp the constant telemetry base with this field's processing time
+/// (client-side wall time, unlike the server's claim-to-submit elapsed).
+pub fn field_telemetry(base: &Value, processing_secs: f64) -> Value {
+    let mut value = base.clone();
+    if let Value::Object(map) = &mut value {
+        map.insert("processing_secs".to_string(), json!(processing_secs));
+    }
+    value
+}
+
+/// Whether to upload the report: the flag skips the prompt as a yes, a
+/// terminal gets asked (default yes), and a non-interactive run without the
+/// flag never uploads.
+#[derive(Debug, PartialEq)]
+enum UploadDecision {
+    Yes,
+    Prompt,
+    No,
+}
+
+fn decide_upload(upload_flag: bool, is_tty: bool) -> UploadDecision {
+    if upload_flag {
+        UploadDecision::Yes
+    } else if is_tty {
+        UploadDecision::Prompt
+    } else {
+        UploadDecision::No
+    }
+}
+
+/// Ask on the terminal, defaulting to yes on an empty answer.
+fn prompt_yes(api_base: &str) -> bool {
+    print!("Upload results to {api_base}? [Y/n] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    let answer = answer.trim().to_lowercase();
+    answer.is_empty() || answer == "y" || answer == "yes"
+}
+
+/// Send the report to the server. Failures are reported but never fatal —
+/// the benchmark already served its local purpose.
+async fn upload_report(client: &Client, cli: &Cli, report: &Value) {
+    let body = BenchmarkToServer {
+        username: cli.username.clone(),
+        data: report.clone(),
+    };
+    let url = format!("{}/benchmark", cli.api_base);
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let msg = resp
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("message").and_then(Value::as_str).map(String::from))
+                .unwrap_or_else(|| "ok".to_string());
+            println!("Upload accepted: {msg}");
+        }
+        Ok(resp) => println!("Upload rejected ({}).", resp.status()),
+        Err(e) => println!("Upload failed: {e}"),
+    }
+}
+
 /// Collect hardware info. Linux-oriented (`/proc`), with graceful absence
 /// elsewhere; every field is optional downstream.
 fn collect_hardware(cli: &Cli) -> Value {
@@ -698,6 +796,24 @@ mod tests {
                 .as_deref(),
             Some("Debian GNU/Linux 13 (trixie)")
         );
+    }
+
+    #[test]
+    fn upload_decision_matrix() {
+        assert_eq!(decide_upload(true, true), UploadDecision::Yes);
+        assert_eq!(decide_upload(true, false), UploadDecision::Yes);
+        assert_eq!(decide_upload(false, true), UploadDecision::Prompt);
+        assert_eq!(decide_upload(false, false), UploadDecision::No);
+    }
+
+    #[test]
+    fn field_telemetry_stamps_timing() {
+        let base = json!({"schema_version": TELEMETRY_SCHEMA_VERSION, "hardware": {}});
+        let stamped = field_telemetry(&base, 12.5);
+        assert_eq!(stamped["processing_secs"], json!(12.5));
+        assert_eq!(stamped["schema_version"], json!(TELEMETRY_SCHEMA_VERSION));
+        // The base is not mutated; every field gets a fresh stamp.
+        assert!(base.get("processing_secs").is_none());
     }
 
     #[test]

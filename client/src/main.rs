@@ -146,6 +146,14 @@ pub struct Cli {
     #[arg(long, default_value_t = 10.0, env = "NICE_BENCHMARK_SECS")]
     benchmark_secs: f64,
 
+    /// Upload benchmark results without prompting
+    #[arg(long, env = "NICE_BENCHMARK_UPLOAD")]
+    benchmark_upload: bool,
+
+    /// Attach hardware/config telemetry to each submission
+    #[arg(long, env = "NICE_TELEMETRY")]
+    telemetry: bool,
+
     /// Validate results against the server before submitting
     #[arg(long, env = "NICE_VALIDATE")]
     validate: bool,
@@ -322,6 +330,7 @@ fn compile_results(
     claim_data: &DataToClient,
     username: &str,
     mode: SearchMode,
+    telemetry: Option<serde_json::Value>,
 ) -> DataToServer {
     // Take the pieces out of the results rather than cloning them back out.
     // Niceonly runs always report an empty distribution, so summing it costs
@@ -353,6 +362,7 @@ fn compile_results(
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution,
         nice_numbers,
+        telemetry,
     };
     debug!(
         "Submit Data: {}",
@@ -424,7 +434,7 @@ async fn run_validation(cli: &Arc<Cli>, client: &Client, gpu: &GpuCtx) -> Result
         let (claim_data, results, elapsed) = process_field(claim_data, cli, gpu).await;
         log_field_rate(&claim_data, elapsed, cli);
 
-        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
+        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode, None);
 
         if validate_results(&submit_data, &validation_data, cli.mode) {
             println!();
@@ -531,6 +541,10 @@ async fn run_pipelined_fields(
     // process, this is what the target buffer depth is derived from.
     let mut field_process_ewma: Option<f64> = None;
 
+    // Hardware/config context is constant for the process; collect it once
+    // and stamp each submission with it plus the per-field timing.
+    let telemetry_base = cli.telemetry.then(|| bench::telemetry_base(cli));
+
     loop {
         // Without --repeat there is exactly one field to do, so claim exactly
         // one: anything extra would be claimed, never processed, and left for
@@ -584,7 +598,10 @@ async fn run_pipelined_fields(
         });
 
         // Compile results for submission
-        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
+        let telemetry = telemetry_base
+            .as_ref()
+            .map(|base| bench::field_telemetry(base, elapsed_secs));
+        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode, telemetry);
 
         // Submit without blocking the next field on the round trip.
         //

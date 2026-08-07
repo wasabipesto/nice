@@ -9,16 +9,25 @@ extern crate rocket;
 use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
-    PgPool, claims::get_claim_by_id, claims::insert_claim, fields::get_field_by_id,
-    fields::get_validation_field, fields::try_claim_field, fields::update_field_canon_and_cl,
-    get_database_pool, get_pooled_database_connection, submissions::insert_submission,
+    PgPool, benchmarks::insert_benchmark, claims::get_claim_by_id, claims::insert_claim,
+    fields::get_field_by_id, fields::get_validation_field, fields::try_claim_field,
+    fields::update_field_canon_and_cl, get_database_pool, get_pooled_database_connection,
+    submissions::insert_submission,
 };
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
 use nice_common::{
-    CLAIM_DURATION_HOURS, DETAILED_SEARCH_MAX_FIELD_SIZE, DataToClient, DataToServer,
-    FieldClaimStrategy, NiceNumber, SearchMode, ValidationData,
+    BenchmarkToServer, CLAIM_DURATION_HOURS, DETAILED_SEARCH_MAX_FIELD_SIZE, DataToClient,
+    DataToServer, FieldClaimStrategy, NiceNumber, SearchMode, ValidationData,
 };
+
+/// Caps on stored metadata blobs. Reports and telemetry beyond these sizes
+/// are junk or abuse; the limits are generous multiples of real payloads.
+const BENCHMARK_MAX_BYTES: usize = 65_536;
+const TELEMETRY_MAX_BYTES: usize = 16_384;
+
+/// Benchmark report schema versions this server accepts.
+const BENCHMARK_SCHEMA_VERSIONS: &[u64] = &[1];
 use rand::RngExt;
 use rocket::State;
 use rocket::http::Status;
@@ -252,13 +261,24 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
     // Get database connection from the shared pool
     let mut conn = get_pooled_database_connection(pool);
 
-    // Get submission data from JSON
+    // Get submission data from JSON. Oversized telemetry is dropped rather
+    // than failing the submission: the search result always outranks its
+    // metadata.
+    let telemetry = data.telemetry.clone().filter(|t| {
+        let len = t.to_string().len();
+        let ok = len <= TELEMETRY_MAX_BYTES;
+        if !ok {
+            tracing::warn!(len, "dropping oversized telemetry payload");
+        }
+        ok
+    });
     let submit_data = DataToServer {
         claim_id: data.claim_id,
         username: data.username.clone(),
         client_version: data.client_version.clone(),
         unique_distribution: data.unique_distribution.clone(),
         nice_numbers: data.nice_numbers.clone(),
+        telemetry,
     };
 
     // Get user IP
@@ -411,6 +431,50 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
     Ok(Json(json!("OK")))
 }
 
+/// Accept an uploaded benchmark sweep report and store it for performance
+/// analysis. The report is stored as-is in a jsonb column; only the schema
+/// version and size are validated here, with quality filtering left to
+/// analysis time (matching the trust posture of /submit).
+#[post("/benchmark", data = "<data>")]
+#[allow(clippy::needless_pass_by_value)]
+fn post_benchmark(data: Json<BenchmarkToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
+    let schema_version = data.data.get("schema_version").and_then(Value::as_u64);
+    if !schema_version.is_some_and(|v| BENCHMARK_SCHEMA_VERSIONS.contains(&v)) {
+        return Err(unprocessable_entity_error(format!(
+            "Unsupported benchmark schema_version {schema_version:?} (accepted: {BENCHMARK_SCHEMA_VERSIONS:?})."
+        )));
+    }
+    let size = data.data.to_string().len();
+    if size > BENCHMARK_MAX_BYTES {
+        return Err(unprocessable_entity_error(format!(
+            "Benchmark report too large ({size} bytes, cap {BENCHMARK_MAX_BYTES})."
+        )));
+    }
+    let client_version = data
+        .data
+        .get("client_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    let mut conn = get_pooled_database_connection(pool);
+    let user_ip = "unknown".to_string();
+    let benchmark_id = insert_benchmark(
+        &mut conn,
+        data.username.clone(),
+        user_ip,
+        client_version,
+        data.data.clone(),
+    )
+    .map_err(|e| internal_error(format!("Database error while inserting benchmark: {e}")))?;
+
+    tracing::info!(benchmark_id, username = data.username, "benchmark stored");
+    Ok(Json(json!({
+        "message": "Benchmark stored, thanks!",
+        "benchmark_id": benchmark_id,
+    })))
+}
+
 #[get("/")]
 fn index() -> rocket_status::Custom<Json<ApiErrorBody>> {
     not_found_error(
@@ -461,6 +525,7 @@ fn rocket() -> _ {
                 submit,
                 status,
                 ping,
+                post_benchmark,
                 index,
                 options_handler
             ],
