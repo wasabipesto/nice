@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Deepen the stride table's LSD filter from k=2 to k=3, removing 15-22% of candidates before the nice check. The table now stores residues and gaps as u32 to keep the larger table compact, and precomputes each residue's fixed low digits so the nice check can skip re-extracting them (seeding its duplicate mask and dropping both powers' low digits with a single division each).
+- Raise the CPU MSD recursion floor from 250 to 1000: with cheaper per-candidate checks, the deepest recursion levels cost more than the slivers they skip. Combined CPU nice-only speedup from the above: 24-47% on bases 40-52 across MSD-strong and MSD-weak regions.
+
 ## Nice v3.3.0
 
 - Fix an off-by-one error in get_base_range_natural which dropped one trailing candidate per base where base % 5 ∈ {2,3,4}. Thanks to [Janzert](https://github.com/Janzert) for reporting this!
