@@ -4,7 +4,6 @@
 #![allow(clippy::match_same_arms)]
 
 pub mod base_range;
-pub mod benchmark;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
 pub mod client_api_async;
 pub mod client_process;
