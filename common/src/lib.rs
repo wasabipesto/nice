@@ -262,6 +262,19 @@ pub struct DataToServer {
     pub client_version: String,
     pub unique_distribution: Option<Vec<UniquesDistributionSimple>>,
     pub nice_numbers: Vec<NiceNumberSimple>,
+    /// Optional hardware/config context from clients running with
+    /// --telemetry. Absent on the wire when None, so submissions from and
+    /// to older versions are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<serde_json::Value>,
+}
+
+/// A benchmark report upload (client → server).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct BenchmarkToServer {
+    pub username: String,
+    /// The full versioned JSON report produced by the benchmark sweep.
+    pub data: serde_json::Value,
 }
 
 /// Both the field info for processing and the compiled results

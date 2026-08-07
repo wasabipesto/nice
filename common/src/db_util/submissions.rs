@@ -16,6 +16,7 @@ table! {
         disqualified -> Bool,
         distribution -> Nullable<Jsonb>,
         numbers -> Jsonb,
+        telemetry -> Nullable<Jsonb>,
     }
 }
 
@@ -34,6 +35,7 @@ struct SubmissionPrivate {
     disqualified: bool,
     distribution: Option<Value>,
     numbers: Value,
+    telemetry: Option<Value>,
 }
 
 #[derive(Insertable)]
@@ -48,6 +50,7 @@ struct SubmissionPrivateNew {
     client_version: String,
     distribution: Option<Value>,
     numbers: Value,
+    telemetry: Option<Value>,
 }
 
 fn private_to_public(p: SubmissionPrivate) -> Result<SubmissionRecord> {
@@ -83,6 +86,7 @@ fn public_to_private(p: SubmissionRecord) -> Result<SubmissionPrivate> {
         disqualified: p.disqualified,
         distribution: serialize_opt_distribution(p.distribution)?,
         numbers: serialize_numbers(p.numbers)?,
+        telemetry: None,
     })
 }
 
@@ -105,6 +109,7 @@ fn build_new_row(
         client_version: submit_data.client_version.clone(),
         distribution: serialize_opt_distribution(distribution)?,
         numbers: serialize_numbers(numbers)?,
+        telemetry: submit_data.telemetry.clone(),
     })
 }
 
