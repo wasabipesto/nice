@@ -4,6 +4,7 @@
 
 - Deepen the stride table's LSD filter from k=2 to k=3, removing 15-22% of candidates before the nice check. The table now stores residues and gaps as u32 to keep the larger table compact, and precomputes each residue's fixed low digits so the nice check can skip re-extracting them (seeding its duplicate mask and dropping both powers' low digits with a single division each).
 - Raise the CPU MSD recursion floor from 250 to 1000: with cheaper per-candidate checks, the deepest recursion levels cost more than the slivers they skip. Combined CPU nice-only speedup from the above: 24-47% on bases 40-52 across MSD-strong and MSD-weak regions.
+- Replace the MSD filter's common-prefix duplicate/overlap checks with an interval digit-domain analysis (Hall's theorem): each near-fixed output position of n² and n³ gets a conservative digit domain, and a range is skipped when the constrained positions cannot all receive distinct digits. Strictly stronger than the prefix checks at the same cost; removes an additional 2-12% of must-process candidates (0-8% nice-only wall clock) on bases 40-52.
 
 ## Nice v3.3.0
 

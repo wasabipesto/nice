@@ -98,10 +98,126 @@ fn extract_digits_u256_const<const BASE: u32>(mut n: U256) -> FwDigits {
     FwDigits { buf, len }
 }
 
-/// Common MSD-prefix-overlap analysis given pre-extracted digit arrays.
-/// Factored out so both u128 and U256 paths share identical post-extraction
-/// logic. The early-exit pattern matches the original malachite-based
-/// implementation exactly.
+/// Maximum number of constrained output positions the Hall check tracks:
+/// every digit position of both powers, plus slack.
+const HALL_MAX_POSITIONS: usize = 2 * MAX_FW_DIGITS + 2;
+
+/// Append the digit domains of one power's constrained output positions.
+///
+/// `xd`/`yd` are the LSD-first digit arrays of `low^p` and `high^p` for a
+/// contiguous range `[low, high]`; they must have equal length. For output
+/// position `j`, every value of `n^p` in between has its digit-`j` quotient
+/// `q = floor(n^p / b^j)` inside `[u_j, v_j]` where `u_j = floor(low^p / b^j)`
+/// and `v_j = floor(high^p / b^j)` (the power is monotone). The digit at
+/// position `j` is `q mod b`, so it lies in the cyclic residue interval
+/// starting at `u_j mod b = xd[j]` of size `v_j - u_j + 1` — a conservative
+/// superset of the digits that actually occur.
+///
+/// Walking positions from most significant down, the interval width follows
+/// `diff_{j-1} = diff_j * b + (yd[j-1] - xd[j-1])` with `diff_top` seeded by
+/// the leading digits, so no wide arithmetic is needed. Once
+/// `diff >= base - 1` the domain covers all digits and every lower position
+/// is unconstrained (the width only grows as `j` decreases).
+///
+/// A `diff == 0` position is a singleton — exactly a digit of the classic
+/// common MSD prefix — so this generalizes the previous prefix extraction.
+#[inline]
+fn collect_power_domains(base: u32, xd: &[u32], yd: &[u32], doms: &mut [u64], count: &mut usize) {
+    debug_assert_eq!(xd.len(), yd.len());
+    debug_assert!(base <= 64);
+    let mut diff: i64 = 0;
+    for j in (0..xd.len()).rev() {
+        if *count == doms.len() {
+            // Out of slots (only possible for very long digit arrays outside
+            // the fixed-width path). Dropping the remaining positions just
+            // loses constraints, which is sound.
+            return;
+        }
+        diff = diff * i64::from(base) + (i64::from(yd[j]) - i64::from(xd[j]));
+        debug_assert!(diff >= 0, "endpoint digits imply high < low");
+        if diff >= i64::from(base) - 1 {
+            return;
+        }
+        // Cyclic interval of `diff + 1` residues starting at xd[j].
+        // diff is bounded by base² here, so the cast is lossless.
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let size = (diff as u32) + 1;
+        let lo = xd[j];
+        #[allow(clippy::cast_possible_truncation)]
+        let mask: u64 = if lo + size <= base {
+            (((1u128 << size) - 1) << lo) as u64
+        } else {
+            // Interval wraps past digit base-1 back to 0.
+            let wrapped = lo + size - base;
+            ((((1u128 << (base - lo)) - 1) << lo) | ((1u128 << wrapped) - 1)) as u64
+        };
+        doms[*count] = mask;
+        *count += 1;
+    }
+}
+
+/// Try to give position `i` a digit from its domain, recursively evicting
+/// current owners along an augmenting path (Kuhn's matching algorithm).
+fn hall_augment(i: usize, doms: &[u64], visited: &mut u64, owner: &mut [usize; 64]) -> bool {
+    let mut cand = doms[i] & !*visited;
+    while cand != 0 {
+        let d = cand.trailing_zeros() as usize;
+        *visited |= 1u64 << d;
+        if owner[d] == usize::MAX || hall_augment(owner[d], doms, visited, owner) {
+            owner[d] = i;
+            return true;
+        }
+        cand = doms[i] & !*visited;
+    }
+    false
+}
+
+/// Can every constrained position be assigned a distinct digit from its
+/// domain? By Hall's theorem this fails exactly when some set of positions
+/// collectively offers fewer digits than positions — which makes a nice
+/// number in the range impossible, since a nice number's actual digits are
+/// one such distinct assignment.
+fn has_distinct_assignment(doms: &[u64]) -> bool {
+    let m = doms.len();
+    if m <= 1 {
+        return true;
+    }
+    // Fast global check: m positions need at least m distinct digits.
+    let mut union: u64 = 0;
+    for &d in doms {
+        union |= d;
+    }
+    if (union.count_ones() as usize) < m {
+        return false;
+    }
+    let mut owner = [usize::MAX; 64];
+    for i in 0..m {
+        let mut visited: u64 = 0;
+        if !hall_augment(i, doms, &mut visited, &mut owner) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Interval digit-domain analysis (Hall check) given pre-extracted endpoint
+/// digit arrays. Factored out so both u128 and U256 paths share identical
+/// post-extraction logic.
+///
+/// This subsumes the previous common-MSD-prefix duplicate/overlap checks:
+/// prefix digits are exactly the singleton domains, and pairwise
+/// duplicate/overlap failures are two-position Hall violations. The interval
+/// domains additionally catch collective violations among near-fixed
+/// positions (e.g. three positions that only have two digits between them)
+/// that no pairwise test can see.
+///
+/// A power whose endpoint digit counts differ contributes no domains (its
+/// positions are unconstrained), matching the previous bail-out behavior.
+///
+/// NOTE (2026-08 theory review): an unsound cross MSD×LSD collision check
+/// was removed from this spot; low-digit filtering is handled soundly by
+/// the stride table (`lsd_filter`), whose fixed low digits are per-candidate
+/// facts rather than per-range ones.
 #[inline(always)]
 fn analyze_msd_prefix<const BASE: u32>(
     start_sq_d: &FwDigits,
@@ -109,42 +225,31 @@ fn analyze_msd_prefix<const BASE: u32>(
     start_cu_d: &FwDigits,
     end_cu_d: &FwDigits,
 ) -> bool {
-    if start_sq_d.len != end_sq_d.len {
+    const { assert!(BASE <= 64, "u64 digit-domain masks can't index past bit 63") };
+    let mut doms = [0u64; HALL_MAX_POSITIONS];
+    let mut m = 0usize;
+    if start_sq_d.len == end_sq_d.len {
+        collect_power_domains(
+            BASE,
+            start_sq_d.as_slice(),
+            end_sq_d.as_slice(),
+            &mut doms,
+            &mut m,
+        );
+    }
+    if start_cu_d.len == end_cu_d.len {
+        collect_power_domains(
+            BASE,
+            start_cu_d.as_slice(),
+            end_cu_d.as_slice(),
+            &mut doms,
+            &mut m,
+        );
+    }
+    if m == 0 {
         return false;
     }
-
-    let square_prefix_len = common_msd_prefix_len(start_sq_d.as_slice(), end_sq_d.as_slice());
-    let square_prefix = &start_sq_d.buf[start_sq_d.len - square_prefix_len..start_sq_d.len];
-    if has_duplicate_digits_small(square_prefix) {
-        return true;
-    }
-
-    if start_cu_d.len != end_cu_d.len {
-        return false;
-    }
-
-    let cube_prefix_len = common_msd_prefix_len(start_cu_d.as_slice(), end_cu_d.as_slice());
-    let cube_prefix = &start_cu_d.buf[start_cu_d.len - cube_prefix_len..start_cu_d.len];
-    if has_duplicate_digits_small(cube_prefix) {
-        return true;
-    }
-
-    if has_overlapping_digits_small(square_prefix, cube_prefix) {
-        return true;
-    }
-
-    // NOTE (2026-08 theory review): this function used to run a cross
-    // MSD×LSD collision check here, gated on
-    // `first / b^k == last / b^k`. That condition only says the range fits
-    // inside one quotient block of b^k — the residues n mod b^k (and hence
-    // the low digits of n² and n³) still VARY across the range, so treating
-    // the first number's low digits as fixed for the whole range was
-    // unsound: it skipped ranges that can contain nice numbers (e.g.
-    // [68, 70) in base 10 was "skippable" while containing 69). The check
-    // has been removed from both this path and the malachite path. Low-digit
-    // filtering is handled soundly by the stride table (lsd_filter).
-
-    false
+    !has_distinct_assignment(&doms[..m])
 }
 
 /// Specialized const-generic MSD prefix check for bases where `n³` fits
@@ -208,59 +313,6 @@ fn has_duplicate_msd_prefix_u256_const<const BASE: u32>(range: FieldSize) -> boo
     let end_cu_d = extract_digits_u256_const::<BASE>(end_cu);
 
     analyze_msd_prefix::<BASE>(&start_sq_d, &end_sq_d, &start_cu_d, &end_cu_d)
-}
-
-/// Common-MSD-prefix length on slices in LSD-first ordering. Equivalent
-/// to `find_common_msd_prefix(...).len()` but doesn't allocate.
-#[inline(always)]
-fn common_msd_prefix_len(d1: &[u32], d2: &[u32]) -> usize {
-    let len1 = d1.len();
-    let len2 = d2.len();
-    let min_len = len1.min(len2);
-    let mut common = 0;
-    for i in 0..min_len {
-        if d1[len1 - 1 - i] == d2[len2 - 1 - i] {
-            common += 1;
-        } else {
-            break;
-        }
-    }
-    common
-}
-
-/// Stack-resident replacement for `has_duplicate_digits` (which allocates
-/// a `vec![false; 256]` per call). Uses a u64 bitmask, valid because
-/// the const-generic dispatch only routes bases ≤ 64 here. (For bases
-/// > 64 the malachite path is still used.)
-#[inline(always)]
-fn has_duplicate_digits_small(digits: &[u32]) -> bool {
-    let mut seen: u64 = 0;
-    for &d in digits {
-        debug_assert!(d < 64);
-        let bit = 1u64 << d;
-        if seen & bit != 0 {
-            return true;
-        }
-        seen |= bit;
-    }
-    false
-}
-
-/// Stack-resident replacement for `has_overlapping_digits`.
-#[inline(always)]
-fn has_overlapping_digits_small(d1: &[u32], d2: &[u32]) -> bool {
-    let mut seen: u64 = 0;
-    for &d in d1 {
-        debug_assert!(d < 64);
-        seen |= 1u64 << d;
-    }
-    for &d in d2 {
-        debug_assert!(d < 64);
-        if seen & (1u64 << d) != 0 {
-            return true;
-        }
-    }
-    false
 }
 
 // Recursive MSD filter subdivision parameters for the binary search.
@@ -398,6 +450,31 @@ pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
         trace!("Range has only a single value, cannot use prefix optimization.");
         return false;
     }
+
+    // Interval digit-domain (Hall) analysis for unspecialized bases that
+    // still fit u64 digit masks — mirrors analyze_msd_prefix so the
+    // fixed-width and malachite paths stay behaviorally identical.
+    if base <= 64 {
+        let s_sq = Natural::from(range.first()).pow(2).to_digits_asc(&base);
+        let e_sq = Natural::from(range.last()).pow(2).to_digits_asc(&base);
+        let s_cu = Natural::from(range.first()).pow(3).to_digits_asc(&base);
+        let e_cu = Natural::from(range.last()).pow(3).to_digits_asc(&base);
+        let mut doms = [0u64; HALL_MAX_POSITIONS];
+        let mut m = 0usize;
+        if s_sq.len() == e_sq.len() {
+            collect_power_domains(base, &s_sq, &e_sq, &mut doms, &mut m);
+        }
+        if s_cu.len() == e_cu.len() {
+            collect_power_domains(base, &s_cu, &e_cu, &mut doms, &mut m);
+        }
+        if m == 0 {
+            return false;
+        }
+        return !has_distinct_assignment(&doms[..m]);
+    }
+
+    // Bases above 64 don't fit u64 digit masks; keep the classic
+    // common-MSD-prefix duplicate/overlap analysis for them.
 
     // Convert range boundaries to digit representations and find common prefixes of most significant digits
     let range_start_square = Natural::from(range.first()).pow(2).to_digits_asc(&base);
@@ -602,26 +679,20 @@ mod tests {
         }
         let s_sq = Natural::from(range.first()).pow(2).to_digits_asc(&base);
         let e_sq = Natural::from(range.last()).pow(2).to_digits_asc(&base);
-        if s_sq.len() != e_sq.len() {
-            return false;
-        }
-        let sq_p = find_common_msd_prefix(&s_sq, &e_sq);
-        if has_duplicate_digits(&sq_p) {
-            return true;
-        }
         let s_cu = Natural::from(range.first()).pow(3).to_digits_asc(&base);
         let e_cu = Natural::from(range.last()).pow(3).to_digits_asc(&base);
-        if s_cu.len() != e_cu.len() {
+        let mut doms = [0u64; HALL_MAX_POSITIONS];
+        let mut m = 0usize;
+        if s_sq.len() == e_sq.len() {
+            collect_power_domains(base, &s_sq, &e_sq, &mut doms, &mut m);
+        }
+        if s_cu.len() == e_cu.len() {
+            collect_power_domains(base, &s_cu, &e_cu, &mut doms, &mut m);
+        }
+        if m == 0 {
             return false;
         }
-        let cu_p = find_common_msd_prefix(&s_cu, &e_cu);
-        if has_duplicate_digits(&cu_p) {
-            return true;
-        }
-        if has_overlapping_digits(&sq_p, &cu_p) {
-            return true;
-        }
-        false
+        !has_distinct_assignment(&doms[..m])
     }
 
     /// Cross-check: every (base, range) sample must produce the same
@@ -871,6 +942,53 @@ mod tests {
             let can_skip = has_duplicate_msd_prefix(range, base);
             assert_eq!(can_skip, expected_result);
         }
+    }
+
+    #[test_log::test]
+    fn test_collect_power_domains() {
+        // 68² = 4624, 69² = 4761 in base 10 (LSD-first digit arrays).
+        // Top digit: fixed 4 (singleton). Next: quotients 46..47 → {6,7}.
+        // Next: quotients 462..476 span ≥ 10 values → unconstrained, stop.
+        let xd = [4u32, 2, 6, 4];
+        let yd = [1u32, 6, 7, 4];
+        let mut doms = [0u64; HALL_MAX_POSITIONS];
+        let mut m = 0;
+        collect_power_domains(10, &xd, &yd, &mut doms, &mut m);
+        assert_eq!(&doms[..m], &[1 << 4, (1 << 6) | (1 << 7)]);
+
+        // Wraparound: 193..207 → digits [3,9,1] vs [7,0,2].
+        // Top: {1,2}. Next: quotients 19..20 → digits {9,0} (wraps).
+        let xd = [3u32, 9, 1];
+        let yd = [7u32, 0, 2];
+        let mut doms = [0u64; HALL_MAX_POSITIONS];
+        let mut m = 0;
+        collect_power_domains(10, &xd, &yd, &mut doms, &mut m);
+        assert_eq!(&doms[..m], &[(1 << 1) | (1 << 2), (1 << 9) | (1 << 0)]);
+    }
+
+    #[test_log::test]
+    fn test_has_distinct_assignment() {
+        // Two positions, two digits: fine.
+        assert!(has_distinct_assignment(&[0b01, 0b10]));
+        // Duplicate singletons (the classic prefix-duplicate case): fail.
+        assert!(!has_distinct_assignment(&[0b100, 0b100]));
+        // Three positions sharing two digits: no pairwise conflict between
+        // distinct masks, but collectively impossible.
+        assert!(!has_distinct_assignment(&[0b11, 0b11, 0b11]));
+        // Four positions over three digits, every pair satisfiable: fail.
+        assert!(!has_distinct_assignment(&[0b011, 0b011, 0b110, 0b101]));
+        // Augmenting path required: position order forces reassignment.
+        assert!(has_distinct_assignment(&[0b01, 0b11, 0b110]));
+    }
+
+    #[test_log::test]
+    fn test_hall_rejects_more_than_prefix_checks() {
+        // Regression pin for the interval-domain upgrade: this b42 range has
+        // no duplicate or overlap among its fixed common-prefix digits, but
+        // the constrained near-fixed positions collectively lack enough
+        // distinct digits, so the range is skippable only via the Hall check.
+        let range = FieldSize::new(12_283_591_331_194, 12_297_719_016_486);
+        assert!(has_duplicate_msd_prefix(range, 42));
     }
 
     #[test_log::test]
