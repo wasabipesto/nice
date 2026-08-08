@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix GPU model matching in the estimator: Vast offer listings name GPUs differently than CUDA device names recorded in benchmarks ("RTX 3080" vs "NVIDIA GeForce RTX 3080", "A100 SXM4" vs "NVIDIA A100-SXM4-40GB"), so estimates for offers never reached the trusted exact/same-gpu stages. GPU names are now canonicalized (vendor tokens and memory-size suffixes dropped, hyphens split) while distinct models (3060 vs 3060 Ti) stay distinct.
+
 - Add `POST /estimate`: predicts per-scenario and blended performance for a hardware configuration from recent benchmark uploads, via hierarchical matching (exact → same-GPU/similar-CPU → same-GPU → same-CPU-scaled → CPU-family-scaled → floor → none). Responses name the `prediction_stage` that produced the numbers alongside a confidence percent, report P25/P50/P75 spreads widened for lower-trust stages, scale CPU rates to a requested thread count using each report's single-thread/multi-thread pair, and note when the requested client version has no samples.
 
 - Add benchmark uploads: after a sweep the client offers to upload the report (prompted on a terminal, defaulting to yes; `--benchmark-upload` skips the prompt for automation; non-interactive runs without the flag never upload). Reports are stored in a new `benchmarks` table via `POST /benchmark`, which validates the schema version and caps report size.
