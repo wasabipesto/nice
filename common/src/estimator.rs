@@ -158,18 +158,41 @@ pub fn normalize_model(raw: &str) -> String {
 /// split, because the two naming authorities disagree: Vast offer listings
 /// say "RTX 3080" or "A100 SXM4" while CUDA device names (what benchmarks
 /// record) say "NVIDIA GeForce RTX 3080" or "NVIDIA A100-SXM4-40GB".
-/// Remaining tokens must match exactly, so "rtx 3060" never matches
-/// "rtx 3060 ti".
+/// Remaining tokens must match exactly (see `gpu_models_match` for the one
+/// exception: optional trailing form-factor tokens), so "rtx 3060" never
+/// matches "rtx 3060 ti".
 #[must_use]
 pub fn normalize_gpu_model(raw: &str) -> String {
     normalize_model(&raw.replace('-', " "))
         .split_whitespace()
         .filter(|t| !matches!(*t, "nvidia" | "geforce"))
-        .filter(|t| {
-            !(t.ends_with("gb") && t[..t.len() - 2].chars().all(|c| c.is_ascii_digit()))
-        })
+        .filter(|t| !(t.ends_with("gb") && t[..t.len() - 2].chars().all(|c| c.is_ascii_digit())))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Do two normalized GPU model names refer to the same silicon? Exact token
+/// match, except the longer name may carry extra trailing form-factor
+/// detail from a known set — Vast says "Tesla V100" where CUDA reports
+/// "Tesla V100-SXM2-16GB". The allowlist keeps genuinely different SKUs
+/// apart: "ti"/"laptop" are not in it, and "a100 sxm4" vs "a100 pcie"
+/// diverge rather than extend.
+#[must_use]
+pub fn gpu_models_match(a: &str, b: &str) -> bool {
+    const DETAIL_TOKENS: &[&str] = &["sxm", "sxm2", "sxm3", "sxm4", "sxm5", "pcie", "nvl"];
+    let ta: Vec<&str> = a.split_whitespace().collect();
+    let tb: Vec<&str> = b.split_whitespace().collect();
+    let (short, long) = if ta.len() <= tb.len() {
+        (&ta, &tb)
+    } else {
+        (&tb, &ta)
+    };
+    if long[..short.len()] != short[..] {
+        return false;
+    }
+    long[short.len()..]
+        .iter()
+        .all(|t| DETAIL_TOKENS.contains(t))
 }
 
 /// A coarse CPU family key: the first two normalized tokens
@@ -205,10 +228,7 @@ fn thread_scale(sample: &BenchmarkSample, target: u32) -> Option<f64> {
         .scenarios
         .iter()
         .find(|s| !s.key.ends_with("_1t") && s.key.starts_with("b50"))?;
-    let anchor_single = sample
-        .scenarios
-        .iter()
-        .find(|s| s.key.ends_with("_1t"))?;
+    let anchor_single = sample.scenarios.iter().find(|s| s.key.ends_with("_1t"))?;
     let source = f64::from(sample.threads.max(1));
     let target_f = f64::from(target.max(1));
     let linear = target_f / source;
@@ -252,7 +272,11 @@ fn match_stage<'a>(samples: &'a [BenchmarkSample], input: &EstimateInput) -> Sta
             let same_gpu: Vec<&BenchmarkSample> = pool
                 .iter()
                 .copied()
-                .filter(|s| s.gpu_model.as_deref() == Some(want_gpu.as_str()))
+                .filter(|s| {
+                    s.gpu_model
+                        .as_deref()
+                        .is_some_and(|m| gpu_models_match(m, want_gpu))
+                })
                 .collect();
             if !same_gpu.is_empty() {
                 if let Some(want_cpu) = &want_cpu {
@@ -531,7 +555,7 @@ mod tests {
             mode: "Nice-only".to_string(),
             threads,
             cpu_model: Some(normalize_model(cpu_model)),
-            gpu_model: gpu_model.map(normalize_model),
+            gpu_model: gpu_model.map(normalize_gpu_model),
             scenarios: vec![
                 ScenarioSample {
                     key: "b50_msd_weak".to_string(),
@@ -549,7 +573,12 @@ mod tests {
         }
     }
 
-    fn input(gpu: bool, cpu: Option<&str>, gpu_model: Option<&str>, threads: Option<u32>) -> EstimateInput {
+    fn input(
+        gpu: bool,
+        cpu: Option<&str>,
+        gpu_model: Option<&str>,
+        threads: Option<u32>,
+    ) -> EstimateInput {
         EstimateInput {
             gpu,
             mode: "Nice-only".to_string(),
@@ -571,18 +600,22 @@ mod tests {
             ("A100 SXM4", "NVIDIA A100-SXM4-40GB"),
             ("Tesla V100", "Tesla V100-SXM2-16GB"),
         ] {
-            assert_eq!(
-                normalize_gpu_model(vast),
-                normalize_gpu_model(cuda),
+            assert!(
+                gpu_models_match(&normalize_gpu_model(vast), &normalize_gpu_model(cuda)),
                 "{vast} vs {cuda}"
             );
         }
         // Distinct models must stay distinct.
-        assert_ne!(normalize_gpu_model("RTX 3060"), normalize_gpu_model("RTX 3060 Ti"));
-        assert_ne!(
-            normalize_gpu_model("RTX 3070"),
-            normalize_gpu_model("RTX 3070 laptop")
-        );
+        for (a, b) in [
+            ("RTX 3060", "RTX 3060 Ti"),
+            ("RTX 3070", "RTX 3070 laptop"),
+            ("A100 SXM4", "NVIDIA A100-PCIE-40GB"),
+        ] {
+            assert!(
+                !gpu_models_match(&normalize_gpu_model(a), &normalize_gpu_model(b)),
+                "{a} must not match {b}"
+            );
+        }
     }
 
     #[test]
@@ -600,10 +633,17 @@ mod tests {
     #[test]
     fn exact_cpu_match() {
         let samples = vec![sample(false, "AMD EPYC 7763", None, 8, 2.0e9, 3.0e8)];
-        let out = estimate(&samples, &input(false, Some("AMD EPYC 7763"), None, Some(8)));
+        let out = estimate(
+            &samples,
+            &input(false, Some("AMD EPYC 7763"), None, Some(8)),
+        );
         assert_eq!(out.prediction_stage, "exact");
         assert_eq!(out.confidence, 85);
-        let multi = out.scenarios.iter().find(|s| s.key == "b50_msd_weak").unwrap();
+        let multi = out
+            .scenarios
+            .iter()
+            .find(|s| s.key == "b50_msd_weak")
+            .unwrap();
         assert!((multi.rate_p50 - 2.0e9).abs() < 1.0);
     }
 
@@ -612,45 +652,85 @@ mod tests {
         // 8 threads measured at 2e9; asking for 16 doubles linearly (3e8
         // single-thread rate x 16 = 4.8e9 ceiling doesn't bind).
         let samples = vec![sample(false, "AMD EPYC 7763", None, 8, 2.0e9, 3.0e8)];
-        let out = estimate(&samples, &input(false, Some("AMD EPYC 7763"), None, Some(16)));
+        let out = estimate(
+            &samples,
+            &input(false, Some("AMD EPYC 7763"), None, Some(16)),
+        );
         assert_eq!(out.prediction_stage, "same-cpu-scaled");
-        let multi = out.scenarios.iter().find(|s| s.key == "b50_msd_weak").unwrap();
+        let multi = out
+            .scenarios
+            .iter()
+            .find(|s| s.key == "b50_msd_weak")
+            .unwrap();
         assert!((multi.rate_p50 - 4.0e9).abs() < 1.0);
 
         // Asking for 64: linear would be 16e9 but the single-thread ceiling
         // (3e8 x 64 = 19.2e9) still doesn't bind; make the ceiling bind with
         // a low single-thread rate.
         let samples = vec![sample(false, "AMD EPYC 7763", None, 8, 2.0e9, 1.0e8)];
-        let out = estimate(&samples, &input(false, Some("AMD EPYC 7763"), None, Some(64)));
-        let multi = out.scenarios.iter().find(|s| s.key == "b50_msd_weak").unwrap();
+        let out = estimate(
+            &samples,
+            &input(false, Some("AMD EPYC 7763"), None, Some(64)),
+        );
+        let multi = out
+            .scenarios
+            .iter()
+            .find(|s| s.key == "b50_msd_weak")
+            .unwrap();
         // ceiling: 1e8 x 64 = 6.4e9 < linear 16e9
         assert!((multi.rate_p50 - 6.4e9).abs() < 1.0);
-        assert!(out.confidence < 60, "extrapolation must discount confidence");
+        assert!(
+            out.confidence < 60,
+            "extrapolation must discount confidence"
+        );
     }
 
     #[test]
     fn family_fallback_and_floor() {
         let samples = vec![sample(false, "AMD EPYC 7763", None, 8, 2.0e9, 3.0e8)];
-        let out = estimate(&samples, &input(false, Some("AMD EPYC 9654"), None, Some(8)));
+        let out = estimate(
+            &samples,
+            &input(false, Some("AMD EPYC 9654"), None, Some(8)),
+        );
         assert_eq!(out.prediction_stage, "cpu-family-scaled");
-        let out = estimate(&samples, &input(false, Some("Raspberry Pi 5"), None, Some(4)));
+        let out = estimate(
+            &samples,
+            &input(false, Some("Raspberry Pi 5"), None, Some(4)),
+        );
         assert_eq!(out.prediction_stage, "floor");
         assert_eq!(out.confidence, 15);
     }
 
     #[test]
     fn gpu_chain() {
-        let samples = vec![sample(true, "Intel Xeon E5", Some("NVIDIA GeForce RTX 3060"), 4, 1.3e11, 0.0)];
+        let samples = vec![sample(
+            true,
+            "Intel Xeon E5",
+            Some("NVIDIA GeForce RTX 3060"),
+            4,
+            1.3e11,
+            0.0,
+        )];
         // exact
         let out = estimate(
             &samples,
-            &input(true, Some("Intel Xeon E5"), Some("NVIDIA GeForce RTX 3060"), None),
+            &input(
+                true,
+                Some("Intel Xeon E5"),
+                Some("NVIDIA GeForce RTX 3060"),
+                None,
+            ),
         );
         assert_eq!(out.prediction_stage, "exact");
         // same gpu, different cpu
         let out = estimate(
             &samples,
-            &input(true, Some("AMD Ryzen 9"), Some("NVIDIA GeForce RTX 3060"), None),
+            &input(
+                true,
+                Some("AMD Ryzen 9"),
+                Some("NVIDIA GeForce RTX 3060"),
+                None,
+            ),
         );
         assert_eq!(out.prediction_stage, "same-gpu");
         assert!(out.notes.iter().any(|n| n.contains("MSD")));
@@ -658,7 +738,10 @@ mod tests {
         let out = estimate(&samples, &input(true, None, Some("NVIDIA H100"), None));
         assert_eq!(out.prediction_stage, "floor");
         // wrong device class entirely
-        let out = estimate(&samples, &input(false, Some("Intel Xeon E5"), None, Some(4)));
+        let out = estimate(
+            &samples,
+            &input(false, Some("Intel Xeon E5"), None, Some(4)),
+        );
         assert_eq!(out.prediction_stage, "none");
         assert_eq!(out.confidence, 0);
     }
