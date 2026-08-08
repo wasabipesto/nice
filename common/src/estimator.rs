@@ -85,7 +85,7 @@ pub fn decode_sample(client_version: &str, data: &Value) -> Option<BenchmarkSamp
         gpu_model: hardware
             .get("gpu_model")
             .and_then(Value::as_str)
-            .map(normalize_model),
+            .map(|m| normalize_gpu_model(m)),
         scenarios,
     })
 }
@@ -149,6 +149,25 @@ pub fn normalize_model(raw: &str) -> String {
         .replace("(r)", " ")
         .replace("(tm)", " ")
         .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Normalize a GPU model for matching. On top of the base normalization,
+/// vendor/branding tokens and memory-size suffixes are dropped and hyphens
+/// split, because the two naming authorities disagree: Vast offer listings
+/// say "RTX 3080" or "A100 SXM4" while CUDA device names (what benchmarks
+/// record) say "NVIDIA GeForce RTX 3080" or "NVIDIA A100-SXM4-40GB".
+/// Remaining tokens must match exactly, so "rtx 3060" never matches
+/// "rtx 3060 ti".
+#[must_use]
+pub fn normalize_gpu_model(raw: &str) -> String {
+    normalize_model(&raw.replace('-', " "))
+        .split_whitespace()
+        .filter(|t| !matches!(*t, "nvidia" | "geforce"))
+        .filter(|t| {
+            !(t.ends_with("gb") && t[..t.len() - 2].chars().all(|c| c.is_ascii_digit()))
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -226,7 +245,7 @@ fn match_stage<'a>(samples: &'a [BenchmarkSample], input: &EstimateInput) -> Sta
     }
 
     let want_cpu = input.cpu_model.as_deref().map(normalize_model);
-    let want_gpu = input.gpu_model.as_deref().map(normalize_model);
+    let want_gpu = input.gpu_model.as_deref().map(normalize_gpu_model);
 
     if input.gpu {
         if let Some(want_gpu) = &want_gpu {
@@ -540,6 +559,30 @@ mod tests {
             base: None,
             client_version: None,
         }
+    }
+
+    #[test]
+    fn gpu_names_match_across_vast_and_cuda() {
+        // Vast offer listings vs CUDA device names must land on the same key.
+        for (vast, cuda) in [
+            ("RTX 3080", "NVIDIA GeForce RTX 3080"),
+            ("RTX 3060", "NVIDIA GeForce RTX 3060"),
+            ("RTX A4000", "NVIDIA RTX A4000"),
+            ("A100 SXM4", "NVIDIA A100-SXM4-40GB"),
+            ("Tesla V100", "Tesla V100-SXM2-16GB"),
+        ] {
+            assert_eq!(
+                normalize_gpu_model(vast),
+                normalize_gpu_model(cuda),
+                "{vast} vs {cuda}"
+            );
+        }
+        // Distinct models must stay distinct.
+        assert_ne!(normalize_gpu_model("RTX 3060"), normalize_gpu_model("RTX 3060 Ti"));
+        assert_ne!(
+            normalize_gpu_model("RTX 3070"),
+            normalize_gpu_model("RTX 3070 laptop")
+        );
     }
 
     #[test]
