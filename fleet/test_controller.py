@@ -135,6 +135,17 @@ class LedgerTests(unittest.TestCase):
                 (i, now - hold_h * 3600, now, now, now),
             )
         self.assertAlmostEqual(e_hold_hours(db, c, "RTX 4090"), 3.0, places=2)
+        # Explore disappearances (self-retirement) must not count as holds.
+        db.execute(
+            "INSERT INTO instances (vast_id, label, purpose, gpu_name, bid, "
+            "created_at, ttl_at, last_charged_at, destroyed_at, destroy_reason) "
+            "VALUES (99, 'x', 'explore', 'RTX 4090', 0.05, ?, ?, ?, ?, 'preempted')",
+            (now - 0.1 * 3600, now, now, now),
+        )
+        self.assertAlmostEqual(
+            e_hold_hours(db, c, "RTX 4090"), 3.0, places=2,
+            msg="explore self-retirement polluted the hold estimate",
+        )
 
     def test_trailing_median_needs_history(self):
         db = memory_db()

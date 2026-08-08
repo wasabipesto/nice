@@ -95,15 +95,21 @@ DEFAULT_CONFIG = {
         "exec nice_client {mode} --gpu --repeat --telemetry --no-progress "
         "--api-base {api_base} --username {username} --threads {threads}"
     ),
+    # After the benchmark uploads, the explore instance retires itself using
+    # the instance-scoped API key Vast injects into the environment; the
+    # controller's TTL remains the backstop if that ever fails.
     "onstart_explore": (
         "nice_client {mode} --gpu --benchmark --benchmark-upload --no-progress "
         "--api-base {api_base} --username {username} --threads {threads} ; "
+        "curl -s -X DELETE "
+        "\"https://console.vast.ai/api/v0/instances/${{CONTAINER_ID}}/?api_key=${{CONTAINER_API_KEY}}\" ; "
         "sleep infinity"
     ),
     # --- explore slice ---
     "explore_confidence_threshold": 80,
     "explore_stages": ["floor", "none", "gpu-family-scaled", "cpu-family-scaled"],
     "explore_per_tick": 2,
+    "explore_max_concurrent": 3,
     "explore_per_day": 10,
     "explore_cooldown_days": 14,
     "explore_ttl_minutes": 30,
@@ -260,11 +266,14 @@ def pounce_eligible(ev, trailing_median, cfg):
 
 def e_hold_hours(db, cfg, gpu_name):
     """Expected hold for a GPU type: our own realized holds when we have
-    them (ground truth), else the market-study seed table."""
+    them (ground truth), else the market-study seed table. Only exploit
+    instances count — explore instances retire themselves after their
+    benchmark, which reconcile can't distinguish from a preemption."""
     rows = db.execute(
         "SELECT (destroyed_at - created_at) / 3600.0 AS h FROM instances "
         "WHERE gpu_name = ? AND destroyed_at IS NOT NULL "
-        "AND destroy_reason = 'preempted' ORDER BY destroyed_at DESC LIMIT 20",
+        "AND destroy_reason = 'preempted' AND purpose = 'exploit' "
+        "ORDER BY destroyed_at DESC LIMIT 20",
         (gpu_name,),
     ).fetchall()
     if len(rows) >= 3:
@@ -354,7 +363,11 @@ def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry):
             cancel_unavail=True,
         )
     except Exception as e:  # SDK raises assorted request errors; log fully
-        log_event(db, "ERROR", f"create failed for offer {offer['id']}: {e!r}")
+        body = getattr(getattr(e, "response", None), "text", "") or ""
+        log_event(
+            db, "ERROR",
+            f"create failed for offer {offer['id']}: {e!r} {body[:200]}",
+        )
         return
     if not isinstance(result, dict) or not result.get("success"):
         log_event(db, "ERROR", f"create rejected for offer {offer['id']}: {result!r}")
@@ -543,13 +556,22 @@ def record_market(db, offers_by_est):
 
 def plan_explore(cfg, db, offers_by_est, dry):
     now = time.time()
+    balance = db.execute("SELECT balance FROM bucket WHERE id = 1").fetchone()["balance"]
+    if balance <= 0:
+        log_event(db, "EXPLORE-SKIP", f"bucket at ${balance:.3f}; exploring costs money too")
+        return
     today = now - 86400
     launched_today = db.execute(
         "SELECT COUNT(*) FROM instances WHERE purpose = 'explore' AND created_at > ?",
         (today,),
     ).fetchone()[0]
+    active_explores = db.execute(
+        "SELECT COUNT(*) FROM instances WHERE purpose = 'explore' AND destroyed_at IS NULL"
+    ).fetchone()[0]
     slots = min(
-        cfg["explore_per_tick"], max(0, cfg["explore_per_day"] - launched_today)
+        cfg["explore_per_tick"],
+        max(0, cfg["explore_per_day"] - launched_today),
+        max(0, cfg["explore_max_concurrent"] - active_explores),
     )
     if slots == 0:
         return
