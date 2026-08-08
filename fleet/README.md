@@ -10,14 +10,14 @@ EV (exploit).
 ```sh
 cp config.example.json config.json   # edit: username, api_base if needed
 # vastai CLI must be configured: `uvx vastai set api-key <key>`
-python3 -m unittest discover .       # 9 tests
-python3 controller.py --config config.json   # dry-run tick (default)
+uv run -m unittest discover .        # 11 tests
+uv run controller.py --config config.json   # dry-run tick (default)
 ```
 
 Cron (10–15 minute cadence is plenty — market hold times are hours):
 
 ```cron
-*/10 * * * * cd /path/to/fleet && python3 controller.py --config config.json >> tick.log 2>&1
+*/10 * * * * cd /path/to/fleet && uv run controller.py --config config.json >> tick.log 2>&1
 ```
 
 ## Trust ramp
