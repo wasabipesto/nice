@@ -23,63 +23,75 @@ fn malachite_ref(range: FieldSize, base: u32) -> bool {
     }
     let s_sq = Natural::from(range.first()).pow(2).to_digits_asc(&base);
     let e_sq = Natural::from(range.last()).pow(2).to_digits_asc(&base);
-    if s_sq.len() != e_sq.len() {
-        return false;
-    }
-    let sq_prefix = common_prefix(&s_sq, &e_sq);
-    if has_dup(&sq_prefix) {
-        return true;
-    }
     let s_cu = Natural::from(range.first()).pow(3).to_digits_asc(&base);
     let e_cu = Natural::from(range.last()).pow(3).to_digits_asc(&base);
-    if s_cu.len() != e_cu.len() {
+    // Interval digit-domain (Hall) reference, mirroring msd_prefix_filter:
+    // conservative per-position digit domains from the endpoint digit
+    // arrays, then reject iff no distinct-digit assignment exists.
+    let mut doms: Vec<u64> = Vec::new();
+    if s_sq.len() == e_sq.len() {
+        collect_domains(base, &s_sq, &e_sq, &mut doms);
+    }
+    if s_cu.len() == e_cu.len() {
+        collect_domains(base, &s_cu, &e_cu, &mut doms);
+    }
+    if doms.is_empty() {
         return false;
     }
-    let cu_prefix = common_prefix(&s_cu, &e_cu);
-    if has_dup(&cu_prefix) {
-        return true;
-    }
-    if has_over(&sq_prefix, &cu_prefix) {
-        return true;
-    }
-    // The cross MSD×LSD branch that used to follow here was removed in the
-    // 2026-08 theory review: it was unsound (low digits vary across a range
-    // even when first/b^k == last/b^k).
-    false
+    !has_distinct_assignment(&doms)
 }
 
-fn common_prefix(d1: &[u32], d2: &[u32]) -> Vec<u32> {
-    let l1 = d1.len();
-    let l2 = d2.len();
-    let mut out = Vec::new();
-    for i in 0..l1.min(l2) {
-        if d1[l1 - 1 - i] == d2[l2 - 1 - i] {
-            out.push(d1[l1 - 1 - i]);
+fn collect_domains(base: u32, xd: &[u32], yd: &[u32], doms: &mut Vec<u64>) {
+    let mut diff: i64 = 0;
+    for j in (0..xd.len()).rev() {
+        diff = diff * i64::from(base) + (i64::from(yd[j]) - i64::from(xd[j]));
+        if diff >= i64::from(base) - 1 {
+            return;
+        }
+        let size = (diff as u32) + 1;
+        let lo = xd[j];
+        let mask: u64 = if lo + size <= base {
+            (((1u128 << size) - 1) << lo) as u64
         } else {
-            break;
+            let wrapped = lo + size - base;
+            ((((1u128 << (base - lo)) - 1) << lo) | ((1u128 << wrapped) - 1)) as u64
+        };
+        doms.push(mask);
+    }
+}
+
+fn has_distinct_assignment(doms: &[u64]) -> bool {
+    let m = doms.len();
+    if m <= 1 {
+        return true;
+    }
+    let mut union: u64 = 0;
+    for &d in doms {
+        union |= d;
+    }
+    if (union.count_ones() as usize) < m {
+        return false;
+    }
+    let mut owner = [usize::MAX; 64];
+    for i in 0..m {
+        let mut visited: u64 = 0;
+        if !augment(i, doms, &mut visited, &mut owner) {
+            return false;
         }
     }
-    out
+    true
 }
-fn has_dup(d: &[u32]) -> bool {
-    let mut s = vec![false; 256];
-    for &x in d {
-        if s[x as usize] {
+
+fn augment(i: usize, doms: &[u64], visited: &mut u64, owner: &mut [usize; 64]) -> bool {
+    let mut cand = doms[i] & !*visited;
+    while cand != 0 {
+        let d = cand.trailing_zeros() as usize;
+        *visited |= 1u64 << d;
+        if owner[d] == usize::MAX || augment(owner[d], doms, visited, owner) {
+            owner[d] = i;
             return true;
         }
-        s[x as usize] = true;
-    }
-    false
-}
-fn has_over(d1: &[u32], d2: &[u32]) -> bool {
-    let mut s = vec![false; 256];
-    for &x in d1 {
-        s[x as usize] = true;
-    }
-    for &x in d2 {
-        if s[x as usize] {
-            return true;
-        }
+        cand = doms[i] & !*visited;
     }
     false
 }

@@ -9,16 +9,36 @@ extern crate rocket;
 use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
-    PgPool, claims::get_claim_by_id, claims::insert_claim, fields::get_field_by_id,
-    fields::get_validation_field, fields::try_claim_field, fields::update_field_canon_and_cl,
-    get_database_pool, get_pooled_database_connection, submissions::insert_submission,
+    PgPool, benchmarks::get_recent_benchmarks, benchmarks::insert_benchmark,
+    claims::get_claim_by_id, claims::insert_claim,
+    fields::get_field_by_id, fields::get_validation_field, fields::try_claim_field,
+    fields::update_field_canon_and_cl, get_database_pool, get_pooled_database_connection,
+    submissions::insert_submission,
 };
 use nice_common::distribution_stats::expand_distribution;
 use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
+use nice_common::estimator;
 use nice_common::{
-    CLAIM_DURATION_HOURS, DETAILED_SEARCH_MAX_FIELD_SIZE, DataToClient, DataToServer,
-    FieldClaimStrategy, NiceNumber, SearchMode, ValidationData,
+    BenchmarkToServer, CLAIM_DURATION_HOURS, DETAILED_SEARCH_MAX_FIELD_SIZE, DataToClient,
+    DataToServer, EstimateRequest, EstimateResponse, FieldClaimStrategy, NiceNumber,
+    ScenarioEstimateResponse, SearchMode, ValidationData,
 };
+
+/// Caps on stored metadata blobs. Reports and telemetry beyond these sizes
+/// are junk or abuse; the limits are generous multiples of real payloads.
+const BENCHMARK_MAX_BYTES: usize = 65_536;
+const TELEMETRY_MAX_BYTES: usize = 16_384;
+
+/// Benchmark report schema versions this server accepts.
+const BENCHMARK_SCHEMA_VERSIONS: &[u64] = &[1];
+
+/// How many recent benchmark reports the estimator considers. This is a
+/// recency window: raising it improves rare-hardware coverage and burst-spam
+/// resilience, at the price of per-request fetch+decode work (~2 KB/row —
+/// revisit with an in-memory cache or SQL-side filtering if the fleet
+/// controller's call rate makes it hot) and, once client versions drift,
+/// more stale-version samples pooled into the quantiles.
+const ESTIMATE_SAMPLE_LIMIT: i64 = 2000;
 use rand::RngExt;
 use rocket::State;
 use rocket::http::Status;
@@ -49,6 +69,14 @@ fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
         ))
     })?;
     Ok(Json(data))
+}
+
+/// Static liveness endpoint for client-side latency measurement. Touches
+/// nothing — the point is to measure the network and server front-end alone,
+/// unlike `/status` which reads the claim queues.
+#[get("/ping")]
+fn ping() -> &'static str {
+    "pong"
 }
 
 #[get("/status")]
@@ -244,13 +272,24 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
     // Get database connection from the shared pool
     let mut conn = get_pooled_database_connection(pool);
 
-    // Get submission data from JSON
+    // Get submission data from JSON. Oversized telemetry is dropped rather
+    // than failing the submission: the search result always outranks its
+    // metadata.
+    let telemetry = data.telemetry.clone().filter(|t| {
+        let len = t.to_string().len();
+        let ok = len <= TELEMETRY_MAX_BYTES;
+        if !ok {
+            tracing::warn!(len, "dropping oversized telemetry payload");
+        }
+        ok
+    });
     let submit_data = DataToServer {
         claim_id: data.claim_id,
         username: data.username.clone(),
         client_version: data.client_version.clone(),
         unique_distribution: data.unique_distribution.clone(),
         nice_numbers: data.nice_numbers.clone(),
+        telemetry,
     };
 
     // Get user IP
@@ -403,6 +442,106 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
     Ok(Json(json!("OK")))
 }
 
+/// Accept an uploaded benchmark sweep report and store it for performance
+/// analysis. The report is stored as-is in a jsonb column; only the schema
+/// version and size are validated here, with quality filtering left to
+/// analysis time (matching the trust posture of /submit).
+#[post("/benchmark", data = "<data>")]
+#[allow(clippy::needless_pass_by_value)]
+fn post_benchmark(data: Json<BenchmarkToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
+    let schema_version = data.data.get("schema_version").and_then(Value::as_u64);
+    if !schema_version.is_some_and(|v| BENCHMARK_SCHEMA_VERSIONS.contains(&v)) {
+        return Err(unprocessable_entity_error(format!(
+            "Unsupported benchmark schema_version {schema_version:?} (accepted: {BENCHMARK_SCHEMA_VERSIONS:?})."
+        )));
+    }
+    let size = data.data.to_string().len();
+    if size > BENCHMARK_MAX_BYTES {
+        return Err(unprocessable_entity_error(format!(
+            "Benchmark report too large ({size} bytes, cap {BENCHMARK_MAX_BYTES})."
+        )));
+    }
+    let client_version = data
+        .data
+        .get("client_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    let mut conn = get_pooled_database_connection(pool);
+    let user_ip = "unknown".to_string();
+    let benchmark_id = insert_benchmark(
+        &mut conn,
+        data.username.clone(),
+        user_ip,
+        client_version,
+        data.data.clone(),
+    )
+    .map_err(|e| internal_error(format!("Database error while inserting benchmark: {e}")))?;
+
+    tracing::info!(benchmark_id, username = data.username, "benchmark stored");
+    Ok(Json(json!({
+        "message": "Benchmark stored, thanks!",
+        "benchmark_id": benchmark_id,
+    })))
+}
+
+/// Estimate what a hardware configuration will achieve, from recent
+/// benchmark uploads. Hierarchical matching; the response names the
+/// fallback stage that produced the numbers alongside a confidence percent.
+#[post("/estimate", data = "<data>")]
+#[allow(clippy::needless_pass_by_value)]
+fn post_estimate(data: Json<EstimateRequest>, pool: &State<PgPool>) -> ApiResult<EstimateResponse> {
+    let Some(mode) = estimator::mode_string(&data.mode) else {
+        return Err(unprocessable_entity_error(format!(
+            "Unknown mode {:?} (expected \"niceonly\" or \"detailed\").",
+            data.mode
+        )));
+    };
+
+    let mut conn = get_pooled_database_connection(pool);
+    let rows = get_recent_benchmarks(&mut conn, ESTIMATE_SAMPLE_LIMIT)
+        .map_err(|e| internal_error(format!("Database error while loading benchmarks: {e}")))?;
+    let samples: Vec<estimator::BenchmarkSample> = rows
+        .iter()
+        .filter_map(|(version, report)| estimator::decode_sample(version, report))
+        .collect();
+
+    let input = estimator::EstimateInput {
+        gpu: data.gpu,
+        mode: mode.to_string(),
+        threads: data.threads,
+        cpu_model: data.cpu_model.clone(),
+        gpu_model: data.gpu_model.clone(),
+        base: data.base,
+        client_version: data.client_version.clone(),
+    };
+    let outcome = estimator::estimate(&samples, &input);
+
+    Ok(Json(EstimateResponse {
+        prediction_stage: outcome.prediction_stage.to_string(),
+        confidence: outcome.confidence,
+        samples_used: outcome.samples_used,
+        versions_used: outcome.versions_used,
+        scenarios: outcome
+            .scenarios
+            .into_iter()
+            .map(|s| ScenarioEstimateResponse {
+                key: s.key,
+                base: s.base,
+                samples: s.samples,
+                rate_p25: s.rate_p25,
+                rate_p50: s.rate_p50,
+                rate_p75: s.rate_p75,
+            })
+            .collect(),
+        blended_rate_p25: outcome.blended_rate_p25,
+        blended_rate_p50: outcome.blended_rate_p50,
+        blended_rate_p75: outcome.blended_rate_p75,
+        notes: outcome.notes,
+    }))
+}
+
 #[get("/")]
 fn index() -> rocket_status::Custom<Json<ApiErrorBody>> {
     not_found_error(
@@ -452,6 +591,9 @@ fn rocket() -> _ {
                 validate,
                 submit,
                 status,
+                ping,
+                post_benchmark,
+                post_estimate,
                 index,
                 options_handler
             ],

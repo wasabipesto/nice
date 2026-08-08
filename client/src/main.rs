@@ -4,7 +4,6 @@
 #![allow(clippy::too_many_lines)]
 
 extern crate nice_common;
-use nice_common::benchmark::{BenchmarkMode, get_benchmark_field};
 use nice_common::client_api_async::{
     Client, get_field_from_server_async, get_validation_data_from_server_async,
     submit_field_to_server_async,
@@ -34,6 +33,8 @@ const DEFAULT_PREFETCH_CONCURRENCY: usize = 4;
 /// Submissions are small and were measured to cost far less than a claim, but an
 /// unbounded queue would quietly absorb a server outage instead of surfacing it.
 const MAX_SUBMITS_IN_FLIGHT: usize = 8;
+
+mod bench;
 
 #[cfg(feature = "gpu")]
 use nice_common::client_process_gpu::{
@@ -75,6 +76,43 @@ enum GpuHandle {
     Cuda(GpuContext),
     #[cfg(feature = "vulkan")]
     Vulkan(VulkanContext),
+}
+
+impl GpuHandle {
+    /// The name of the device this backend is actually running on, for the
+    /// benchmark report and submission telemetry.
+    ///
+    /// Asking the live handle rather than the CLI flag is what keeps the two
+    /// backends apart: on a box with both, `--gpu-backend vulkan` (or a CUDA
+    /// init that failed over to Vulkan) would otherwise be reported under the
+    /// CUDA device's name. Vulkan recorded its name at init; the CUDA handle
+    /// does not carry one, so that arm asks the driver again by device index.
+    // Both lints fire only in configurations this function degenerates in: a
+    // Vulkan-only build reaches no `None` arm, and a build with no backend at
+    // all reaches neither `self` nor `device`.
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn device_name(&self, device: usize) -> Option<String> {
+        let _ = device; // only the CUDA arm needs it, and it may be absent
+        // With no backend feature the enum is uninhabited, but `self` is a
+        // reference and references are always considered inhabited, so an
+        // empty match does not type-check. Same `#[cfg]` split as
+        // `process_field_sync`.
+        #[cfg(any(feature = "gpu", feature = "vulkan"))]
+        {
+            match self {
+                #[cfg(feature = "gpu")]
+                GpuHandle::Cuda(_) => cudarc::driver::CudaContext::new(device)
+                    .ok()
+                    .and_then(|d| d.name().ok()),
+                #[cfg(feature = "vulkan")]
+                GpuHandle::Vulkan(ctx) => Some(ctx.device_name.clone()),
+            }
+        }
+        #[cfg(not(any(feature = "gpu", feature = "vulkan")))]
+        {
+            None
+        }
+    }
 }
 
 /// The GPU context, if this build has one and the user asked for it.
@@ -169,9 +207,21 @@ pub struct Cli {
     #[arg(long, default_value_t = DEFAULT_PREFETCH_CONCURRENCY, env = "NICE_PREFETCH_CONCURRENCY")]
     prefetch_concurrency: usize,
 
-    /// Run an offline benchmark
+    /// Run an offline benchmark sweep and print a detailed report
     #[arg(short, long, env = "NICE_BENCHMARK")]
-    benchmark: Option<BenchmarkMode>,
+    benchmark: bool,
+
+    /// Approximate time budget for the benchmark sweep, in seconds
+    #[arg(long, default_value_t = 10.0, env = "NICE_BENCHMARK_SECS")]
+    benchmark_secs: f64,
+
+    /// Upload benchmark results without prompting
+    #[arg(long, env = "NICE_BENCHMARK_UPLOAD")]
+    benchmark_upload: bool,
+
+    /// Attach hardware/config telemetry to each submission
+    #[arg(long, env = "NICE_TELEMETRY")]
+    telemetry: bool,
 
     /// Validate results against the server before submitting
     #[arg(long, env = "NICE_VALIDATE")]
@@ -322,7 +372,17 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
 
 /// Process a field synchronously (`CPU` or `GPU`).
 /// This is wrapped in `spawn_blocking` when called from async context.
-fn process_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Vec<FieldResults> {
+///
+/// `stride_table` lets a caller reuse a prebuilt table across many calls for
+/// the same base (the benchmark sweep times many small windows, where a
+/// per-call table build would dominate); `None` builds one for this field,
+/// which is negligible at production field sizes.
+fn process_field_sync(
+    claim_data: &DataToClient,
+    cli: &Cli,
+    gpu: &GpuCtx,
+    stride_table: Option<&Arc<stride_filter::StrideTable>>,
+) -> Vec<FieldResults> {
     let mode = cli.mode;
     if cli.gpu {
         // GPU processing path
@@ -386,10 +446,13 @@ fn process_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Vec
         // in each chunk. The table is wrapped in Arc for thread-safe sharing across
         // parallel chunk processing.
         let stride_table_opt = if mode == SearchMode::Niceonly {
-            Some(Arc::new(stride_filter::StrideTable::new(
-                claim_data.base,
-                DEFAULT_LSD_K_VALUE,
-            )))
+            Some(match stride_table {
+                Some(table) => Arc::clone(table),
+                None => Arc::new(stride_filter::StrideTable::new(
+                    claim_data.base,
+                    DEFAULT_LSD_K_VALUE,
+                )),
+            })
         } else {
             None
         };
@@ -436,7 +499,7 @@ async fn process_field(
     let start_time = std::time::Instant::now();
 
     tokio::task::spawn_blocking(move || {
-        let results = process_field_sync(&claim_data, &cli, &gpu);
+        let results = process_field_sync(&claim_data, &cli, &gpu, None);
         (claim_data, results, start_time.elapsed())
     })
     .await
@@ -479,6 +542,7 @@ fn compile_results(
     claim_data: &DataToClient,
     username: &str,
     mode: SearchMode,
+    telemetry: Option<serde_json::Value>,
 ) -> DataToServer {
     // Take the pieces out of the results rather than cloning them back out.
     // Niceonly runs always report an empty distribution, so summing it costs
@@ -510,6 +574,7 @@ fn compile_results(
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution,
         nice_numbers,
+        telemetry,
     };
     debug!(
         "Submit Data: {}",
@@ -581,7 +646,7 @@ async fn run_validation(cli: &Arc<Cli>, client: &Client, gpu: &GpuCtx) -> Result
         let (claim_data, results, elapsed) = process_field(claim_data, cli, gpu).await;
         log_field_rate(&claim_data, elapsed, cli);
 
-        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
+        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode, None);
 
         if validate_results(&submit_data, &validation_data, cli.mode) {
             println!();
@@ -599,31 +664,6 @@ async fn run_validation(cli: &Arc<Cli>, client: &Client, gpu: &GpuCtx) -> Result
         }
     }
     Ok(())
-}
-
-/// Process a fixed offline field to measure this machine.
-///
-/// Never contacts the server, hence no HTTP client and no `Result`.
-async fn run_benchmark(cli: &Arc<Cli>, benchmark: BenchmarkMode, gpu: &GpuCtx) {
-    loop {
-        let claim_data = get_benchmark_field(benchmark);
-
-        info!("Beginning benchmark:  {benchmark}");
-        debug!(
-            "Claim Data: {}",
-            serde_json::to_string(&claim_data).unwrap()
-        );
-
-        let (claim_data, results, elapsed) = process_field(claim_data, cli, gpu).await;
-        log_field_rate(&claim_data, elapsed, cli);
-
-        // Compiled but never sent; the debug trace it emits is the point.
-        compile_results(results, &claim_data, &cli.username, cli.mode);
-
-        if !cli.repeat {
-            break;
-        }
-    }
 }
 
 /// How many claims to keep on hand — buffered or in flight — counting the one
@@ -713,6 +753,10 @@ async fn run_pipelined_fields(
     // process, this is what the target buffer depth is derived from.
     let mut field_process_ewma: Option<f64> = None;
 
+    // Hardware/config context is constant for the process; collect it once
+    // and stamp each submission with it plus the per-field timing.
+    let telemetry_base = cli.telemetry.then(|| bench::telemetry_base(cli, gpu));
+
     loop {
         // Without --repeat there is exactly one field to do, so claim exactly
         // one: anything extra would be claimed, never processed, and left for
@@ -766,7 +810,10 @@ async fn run_pipelined_fields(
         });
 
         // Compile results for submission
-        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode);
+        let telemetry = telemetry_base
+            .as_ref()
+            .map(|base| bench::field_telemetry(base, elapsed_secs));
+        let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode, telemetry);
 
         // Submit without blocking the next field on the round trip.
         //
@@ -904,7 +951,7 @@ async fn main() -> Result<()> {
     if cli.validate {
         debug!("Validating correctness by checking against accepted field.");
     }
-    if cli.repeat && !cli.validate && cli.benchmark.is_none() {
+    if cli.repeat && !cli.validate && !cli.benchmark {
         debug!("Pipeline mode enabled: overlapping API calls with processing.");
     }
     debug!("CLI Inputs: {cli:?}");
@@ -930,8 +977,8 @@ async fn main() -> Result<()> {
     // that the pipelined one can keep its claim buffer full across fields.
     if cli.validate {
         run_validation(&cli, &http_client, &gpu_ctx).await?;
-    } else if let Some(benchmark) = cli.benchmark {
-        run_benchmark(&cli, benchmark, &gpu_ctx).await;
+    } else if cli.benchmark {
+        bench::run_benchmark_sweep(&cli, &gpu_ctx, &http_client).await;
     } else {
         run_pipelined_loop(&cli, &http_client, &gpu_ctx).await?;
     }

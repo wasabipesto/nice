@@ -75,8 +75,23 @@ CREATE TABLE submissions (
     client_version VARCHAR NOT NULL,
     disqualified BOOLEAN NOT NULL DEFAULT 'false',
     distribution JSONB,
-    numbers JSONB NOT NULL DEFAULT '[]'
+    numbers JSONB NOT NULL DEFAULT '[]',
+    telemetry JSONB
 );
+
+-- BENCHMARKS: UPLOADED --benchmark SWEEP REPORTS
+-- Full versioned report in `data`; client_version extracted for filtering.
+-- Not granted to web_anon: rows carry user_ip.
+CREATE TABLE benchmarks (
+    id BIGSERIAL PRIMARY KEY,
+    submit_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    username VARCHAR NOT NULL,
+    user_ip VARCHAR NOT NULL,
+    client_version VARCHAR NOT NULL,
+    data JSONB NOT NULL
+);
+CREATE INDEX idx_benchmarks_submit_time ON benchmarks(submit_time);
+CREATE INDEX idx_benchmarks_client_version ON benchmarks(client_version);
 
 -- POSTGREST USER ACCESS
 CREATE ROLE web_anon NOLOGIN;

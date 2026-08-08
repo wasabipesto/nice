@@ -4,7 +4,6 @@
 #![allow(clippy::match_same_arms)]
 
 pub mod base_range;
-pub mod benchmark;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
 pub mod client_api_async;
 pub mod client_process;
@@ -14,6 +13,7 @@ pub mod consensus;
 #[cfg(feature = "database")]
 pub mod db_util;
 pub mod distribution_stats;
+pub mod estimator;
 pub mod fixed_width;
 pub mod generate_chunks;
 pub mod generate_fields;
@@ -267,6 +267,65 @@ pub struct DataToServer {
     pub client_version: String,
     pub unique_distribution: Option<Vec<UniquesDistributionSimple>>,
     pub nice_numbers: Vec<NiceNumberSimple>,
+    /// Optional hardware/config context from clients running with
+    /// --telemetry. Absent on the wire when None, so submissions from and
+    /// to older versions are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<serde_json::Value>,
+}
+
+/// A performance estimate request (fleet controller / users → server).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct EstimateRequest {
+    /// "niceonly" or "detailed" (case- and hyphen-insensitive).
+    pub mode: String,
+    pub gpu: bool,
+    #[serde(default)]
+    pub threads: Option<u32>,
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    #[serde(default)]
+    pub gpu_model: Option<String>,
+    #[serde(default)]
+    pub base: Option<u32>,
+    #[serde(default)]
+    pub client_version: Option<String>,
+}
+
+/// A performance estimate response. `prediction_stage` names the matching
+/// fallback that produced the numbers (exact | same-gpu-similar-cpu |
+/// same-gpu | same-cpu-scaled | cpu-family-scaled | floor | none) so
+/// consumers can gate on how the estimate was derived, not just the
+/// confidence percent.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct EstimateResponse {
+    pub prediction_stage: String,
+    pub confidence: u32,
+    pub samples_used: usize,
+    pub versions_used: Vec<String>,
+    pub scenarios: Vec<ScenarioEstimateResponse>,
+    pub blended_rate_p25: Option<f64>,
+    pub blended_rate_p50: Option<f64>,
+    pub blended_rate_p75: Option<f64>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct ScenarioEstimateResponse {
+    pub key: String,
+    pub base: u32,
+    pub samples: usize,
+    pub rate_p25: f64,
+    pub rate_p50: f64,
+    pub rate_p75: f64,
+}
+
+/// A benchmark report upload (client → server).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct BenchmarkToServer {
+    pub username: String,
+    /// The full versioned JSON report produced by the benchmark sweep.
+    pub data: serde_json::Value,
 }
 
 /// Both the field info for processing and the compiled results

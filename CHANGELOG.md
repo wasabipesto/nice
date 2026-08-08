@@ -2,8 +2,19 @@
 
 ## Unreleased
 
+- Fix GPU model matching in the estimator: Vast offer listings name GPUs differently than CUDA device names recorded in benchmarks ("RTX 3080" vs "NVIDIA GeForce RTX 3080", "A100 SXM4" vs "NVIDIA A100-SXM4-40GB"), so estimates for offers never reached the trusted exact/same-gpu stages. GPU names are now canonicalized (vendor tokens and memory-size suffixes dropped, hyphens split) while distinct models (3060 vs 3060 Ti) stay distinct.
+
+- Add `POST /estimate`: predicts per-scenario and blended performance for a hardware configuration from recent benchmark uploads, via hierarchical matching (exact → same-GPU/similar-CPU → same-GPU → same-CPU-scaled → CPU-family-scaled → floor → none). Responses name the `prediction_stage` that produced the numbers alongside a confidence percent, report P25/P50/P75 spreads widened for lower-trust stages, scale CPU rates to a requested thread count using each report's single-thread/multi-thread pair, and note when the requested client version has no samples.
+
+- Add benchmark uploads: after a sweep the client offers to upload the report (prompted on a terminal, defaulting to yes; `--benchmark-upload` skips the prompt for automation; non-interactive runs without the flag never upload). Reports are stored in a new `benchmarks` table via `POST /benchmark`, which validates the schema version and caps report size.
+- Add opt-in submission telemetry: `--telemetry` attaches hardware, scheduler environment, client config, and client-side processing time to each submission, stored in a new nullable `telemetry` jsonb column. Submissions from clients without the flag (including all older versions) are unchanged; oversized telemetry is dropped server-side without failing the submission.
+- First manual migration: `schema/migrations/2026-08-09_benchmarks_and_telemetry.sql`.
+- Rework `--benchmark` into a structured sweep: fixed measurement windows across bases 40-52 in MSD-strong, MSD-weak, and residue-dense regions (plus uniform regions for detailed mode), repeated to fill an adjustable time budget (`--benchmark-secs`, default 10). Reports per-scenario rates, a single-thread scenario for thread-scaling analysis, API latency against the new lightweight `/ping` endpoint, hardware info (CPU/GPU model, cores, memory, arch), scheduler correlation IDs (Vast/Slurm) from an allowlist, and a complete machine-readable JSON report. Ends with a synthetic version-paired "NiceMark" score for bragging rights.
+- Add `GET /ping` to the API: a static response for client-side latency measurement.
+
 - Deepen the stride table's LSD filter from k=2 to k=3, removing 15-22% of candidates before the nice check. The table now stores residues and gaps as u32 to keep the larger table compact, and precomputes each residue's fixed low digits so the nice check can skip re-extracting them (seeding its duplicate mask and dropping both powers' low digits with a single division each).
 - Raise the CPU MSD recursion floor from 250 to 1000: with cheaper per-candidate checks, the deepest recursion levels cost more than the slivers they skip. Combined CPU nice-only speedup from the above: 24-47% on bases 40-52 across MSD-strong and MSD-weak regions.
+- Replace the MSD filter's common-prefix duplicate/overlap checks with an interval digit-domain analysis (Hall's theorem): each near-fixed output position of n² and n³ gets a conservative digit domain, and a range is skipped when the constrained positions cannot all receive distinct digits. Strictly stronger than the prefix checks at the same cost; removes an additional 2-12% of must-process candidates (0-8% nice-only wall clock) on bases 40-52.
 
 ## Nice v3.3.0
 

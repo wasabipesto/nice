@@ -566,6 +566,7 @@ pub fn process_detailed_gpu(
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution: Some(results.distribution),
         nice_numbers: results.nice_numbers,
+        telemetry: None,
     })
 }
 
@@ -586,6 +587,7 @@ pub fn process_niceonly_gpu(
         client_version: CLIENT_VERSION.to_string(),
         unique_distribution: None,
         nice_numbers: results.nice_numbers,
+        telemetry: None,
     })
 }
 

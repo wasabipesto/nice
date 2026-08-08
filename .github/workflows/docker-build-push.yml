@@ -11,6 +11,12 @@ on:
 env:
     REGISTRY: ghcr.io
     IMAGE_NAME: nice_client
+    # Push policy: branch/tag builds and same-repo PRs push images (PRs get
+    # pullable :pr-xx tags via the manifest jobs). Fork PRs build for
+    # validation only — their tokens are read-only by platform rule, and
+    # granting write via pull_request_target would run untrusted code with
+    # push credentials. Skipped pushes on forks are intentional, not failures.
+    PUSH_IMAGES: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
 jobs:
     build-and-push-amd64:
@@ -68,7 +74,7 @@ jobs:
                   context: /tmp/docker-context
                   file: /tmp/docker-context/Dockerfile
                   platforms: linux/amd64
-                  push: true
+                  push: ${{ env.PUSH_IMAGES == 'true' }}
                   tags: |
                       ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
 
@@ -127,7 +133,7 @@ jobs:
                   context: /tmp/docker-context-gpu
                   file: /tmp/docker-context-gpu/Dockerfile
                   platforms: linux/amd64
-                  push: true
+                  push: ${{ env.PUSH_IMAGES == 'true' }}
                   tags: |
                       ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64-gpu
 
@@ -186,13 +192,15 @@ jobs:
                   context: /tmp/docker-context
                   file: /tmp/docker-context/Dockerfile
                   platforms: linux/arm64
-                  push: true
+                  push: ${{ env.PUSH_IMAGES == 'true' }}
                   tags: |
                       ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64
 
     publish-manifest-cpu:
         name: Publish multi-arch manifest (CPU)
         runs-on: ubuntu-latest
+        # Nothing to publish when the per-arch pushes were skipped (fork PRs).
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         needs: [build-and-push-amd64, build-and-push-arm64]
         permissions:
             contents: read
@@ -254,6 +262,8 @@ jobs:
     publish-manifest-gpu:
         name: Publish multi-arch manifest (GPU)
         runs-on: ubuntu-latest
+        # Nothing to publish when the per-arch pushes were skipped (fork PRs).
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         needs: [build-and-push-amd64-gpu]
         permissions:
             contents: read
