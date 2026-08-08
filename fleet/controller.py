@@ -101,8 +101,8 @@ DEFAULT_CONFIG = {
     "onstart_explore": (
         "nice_client {mode} --gpu --benchmark --benchmark-upload --no-progress "
         "--api-base {api_base} --username {username} --threads {threads} ; "
-        "curl -s -X DELETE "
-        "\"https://console.vast.ai/api/v0/instances/${{CONTAINER_ID}}/?api_key=${{CONTAINER_API_KEY}}\" ; "
+        "curl -s -X DELETE -H \"Authorization: Bearer ${{CONTAINER_API_KEY}}\" "
+        "\"https://console.vast.ai/api/v0/instances/${{CONTAINER_ID}}/\" ; "
         "sleep infinity"
     ),
     # --- explore slice ---
