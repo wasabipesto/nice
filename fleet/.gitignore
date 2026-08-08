@@ -1,3 +1,5 @@
-__pycache__
+__pycache__/
+*.sqlite3
 config.json
-fleet.sqlite3
+tick.log
+KILL

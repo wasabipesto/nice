@@ -11,6 +11,7 @@ import controller
 from controller import (
     DEFAULT_CONFIG,
     exploit_allowed,
+    instance_alive,
     accrue_bucket,
     e_hold_hours,
     effective_rate,
@@ -90,6 +91,24 @@ class EconomicsTests(unittest.TestCase):
         self.assertFalse(
             exploit_allowed({"prediction_stage": "same-gpu", "confidence": 20}, c),
             "low confidence fails even on a trusted stage",
+        )
+
+    def test_outbid_detection(self):
+        c = cfg()
+        self.assertTrue(instance_alive({"actual_status": "running"}, c))
+        self.assertTrue(instance_alive({"actual_status": "loading"}, c, age_minutes=5))
+        self.assertTrue(instance_alive({}, c, age_minutes=1), "just created counts as alive")
+        self.assertFalse(
+            instance_alive({"actual_status": "exited"}, c),
+            "an outbid bid instance is stopped, not gone, and must be reaped",
+        )
+        self.assertFalse(instance_alive({"actual_status": "offline"}, c))
+        # Transitional states go stale after the grace period: a loaded-but-
+        # never-running instance (bid slipped under the floor) must be reaped.
+        self.assertFalse(instance_alive({"actual_status": "created"}, c, age_minutes=25))
+        self.assertTrue(
+            instance_alive({"actual_status": "running"}, c, age_minutes=999),
+            "running never goes stale",
         )
 
     def test_pounce_gate(self):

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["vastai-sdk"]
+# ///
 """Nice fleet controller: budgeted explore/exploit over the Vast bid market.
 
 One tick per cron invocation:
@@ -24,10 +28,8 @@ token bucket, ~$30/mo accrual, ~$7 cap, half-full reserve line, pounce at
 
 import argparse
 import json
-import math
 import sqlite3
 import statistics
-import subprocess
 import sys
 import time
 import urllib.request
@@ -39,8 +41,8 @@ DEFAULT_CONFIG = {
     "dry_run": True,
     "api_base": "https://api.nicenumbers.net",
     "username": "wasabipesto-fleet",
-    "vastai_cmd": ["uvx", "vastai"],
     "user_agent": "nice-fleet-controller/1.0",
+    "vast_api_key": None,
     "label_prefix": "nice-fleet",
     "db_path": "fleet.sqlite3",
     "kill_switch_path": "KILL",
@@ -55,6 +57,16 @@ DEFAULT_CONFIG = {
     "setup_hours": 0.12,
     "lost_interval_hours": 0.25,
     "heat_guard_multiplier": 1.15,
+    # Statuses that count as "making progress". Anything else (exited,
+    # stopped, offline...) means the bid lost or the host died: on Vast an
+    # outbid instance is STOPPED, not destroyed — it lingers accruing
+    # storage cost and must be reaped as a preemption.
+    "alive_statuses": ["running", "loading", "created", "connecting"],
+    # A non-running instance older than this is stuck (bid slipped below the
+    # floor between create and start, pull failure, dead host...) and is
+    # reaped; the next tick simply buys elsewhere. Generous enough for slow
+    # image pulls.
+    "stuck_grace_minutes": 20,
     "e_hold_seed_hours": {
         "default": 3.0,
         "RTX 4090": 0.6,
@@ -74,10 +86,9 @@ DEFAULT_CONFIG = {
     "exploit_ttl_hours": 6.0,
     "image": "ghcr.io/wasabipesto/nice_client:latest-gpu",
     "disk_gb": 30,
-    # Instance launch is config-driven: the image ENTRYPOINT is nice_client,
-    # so we override to bash and run a small script. Verified/adjusted on
-    # the first live explore runs.
-    "entrypoint": "/bin/bash",
+    # Instances launch in ssh runtype: Vast runs its own init and executes
+    # onstart_cmd in a shell, so the image ENTRYPOINT is bypassed and the
+    # templates below can call nice_client (on PATH in the image) directly.
     "onstart_exploit": (
         "nice_client {mode} --gpu --benchmark --benchmark-upload --no-progress "
         "--api-base {api_base} --username {username} --threads {threads} && "
@@ -218,6 +229,15 @@ def suggested_bid(offer, cfg):
     return round(float(offer.get("min_bid", offer.get("dph_total", 0))) * cfg["bid_multiplier"], 5)
 
 
+def instance_alive(live_row, cfg, age_minutes=0.0):
+    """Is this live-listed instance still doing useful work? Running always
+    counts; transitional states count only within the stuck grace period."""
+    status = live_row.get("actual_status") or "created"
+    if status == "running":
+        return True
+    return status in cfg["alive_statuses"] and age_minutes < cfg["stuck_grace_minutes"]
+
+
 def exploit_allowed(est, cfg):
     """Exploit buys only trust estimates from the allowlisted prediction
     stages at sufficient confidence. Floor/none-stage hardware — where a
@@ -275,21 +295,35 @@ def heat_ok(db, cfg, gpu_name, current_p10):
 
 
 # ---------------------------------------------------------------------------
-# Vast CLI and API shims
+# Vast SDK and API shims
+
+_client = None
 
 
-def vast(cfg, *args, parse=True):
-    cmd = list(cfg["vastai_cmd"]) + list(args) + (["--raw"] if parse else [])
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True)
-    return json.loads(out.stdout) if parse else out.stdout
+def vast_client(cfg):
+    """One SDK client per process; the key falls back to the CLI's saved
+    configuration when not set in the config. Imported lazily so the pure
+    budget/economics logic (and its tests) need no dependencies."""
+    global _client
+    if _client is None:
+        from vastai_sdk import VastAI
+
+        _client = VastAI(api_key=cfg.get("vast_api_key") or None)
+    return _client
+
+
+class VastError(Exception):
+    """A Vast operation failed; the message carries the full response."""
 
 
 def search_offers(cfg):
-    return vast(cfg, "search", "offers", "--type", cfg["offer_type"], cfg["offer_query"])
+    return vast_client(cfg).search_offers(
+        query=cfg["offer_query"], type=cfg["offer_type"], limit=200
+    )
 
 
 def show_instances(cfg):
-    return vast(cfg, "show", "instances")
+    return vast_client(cfg).show_instances()
 
 
 def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry):
@@ -308,18 +342,23 @@ def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry):
     if dry:
         log_event(db, "DRY-CREATE", desc)
         return
-    result = vast(
-        cfg,
-        "create",
-        "instance",
-        str(offer["id"]),
-        "--image", cfg["image"],
-        "--disk", str(cfg["disk_gb"]),
-        "--label", label,
-        "--entrypoint", cfg["entrypoint"],
-        "--onstart-cmd", onstart,
-        "--price", str(bid),
-    )
+    try:
+        result = vast_client(cfg).create_instance(
+            id=offer["id"],
+            image=cfg["image"],
+            disk=cfg["disk_gb"],
+            label=label,
+            onstart_cmd=onstart,
+            price=bid,
+            runtype="ssh",
+            cancel_unavail=True,
+        )
+    except Exception as e:  # SDK raises assorted request errors; log fully
+        log_event(db, "ERROR", f"create failed for offer {offer['id']}: {e!r}")
+        return
+    if not isinstance(result, dict) or not result.get("success"):
+        log_event(db, "ERROR", f"create rejected for offer {offer['id']}: {result!r}")
+        return
     vast_id = result.get("new_contract")
     now = time.time()
     db.execute(
@@ -344,9 +383,9 @@ def destroy_instance(cfg, db, vast_id, reason, dry):
         log_event(db, "DRY-DESTROY", f"instance {vast_id} ({reason})")
         return
     try:
-        vast(cfg, "destroy", "instance", str(vast_id), parse=False)
-    except subprocess.CalledProcessError as e:
-        log_event(db, "ERROR", f"destroy {vast_id} failed: {e.stderr[:200]}")
+        vast_client(cfg).destroy_instance(id=vast_id)
+    except Exception as e:
+        log_event(db, "ERROR", f"destroy {vast_id} failed: {e!r}")
         return
     db.execute(
         "UPDATE instances SET destroyed_at = ?, destroy_reason = ? WHERE vast_id = ?",
@@ -386,8 +425,8 @@ def reconcile(cfg, db, dry):
     now = time.time()
     try:
         live = show_instances(cfg)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
-        log_event(db, "ERROR", f"show instances failed, skipping tick: {e}")
+    except Exception as e:
+        log_event(db, "ERROR", f"show instances failed, skipping tick: {e!r}")
         return None
     ours_live = {
         i["id"]: i for i in live if (i.get("label") or "").startswith(cfg["label_prefix"])
@@ -412,14 +451,29 @@ def reconcile(cfg, db, dry):
             )
             log_event(db, "PREEMPTED", f"instance {vast_id} after {hold_h:.2f}h")
             continue
-        # Charge runtime spend since the last tick.
-        dt_h = (now - row["last_charged_at"]) / 3600.0
-        cost = dt_h * row["bid"]
-        db.execute(
-            "UPDATE instances SET spend = spend + ?, last_charged_at = ? WHERE vast_id = ?",
-            (cost, now, vast_id),
-        )
-        db.execute("UPDATE bucket SET balance = balance - ? WHERE id = 1", (cost,))
+        age_minutes = (now - row["created_at"]) / 60.0
+        if not instance_alive(ours_live[vast_id], cfg, age_minutes):
+            # Outbid or dead: the instance is stopped, not gone, and pays
+            # storage until destroyed. Reap it and record the hold.
+            hold_h = (now - row["created_at"]) / 3600.0
+            destroy_instance(cfg, db, vast_id, "preempted", dry)
+            log_event(db, "OUTBID", f"instance {vast_id} stopped after {hold_h:.2f}h; reaped")
+            continue
+        # Charge runtime spend since the last tick (GPU time only accrues
+        # while running; a loading instance pays storage, which is noise at
+        # our scale and reconciled against invoices).
+        if ours_live[vast_id].get("actual_status") == "running":
+            dt_h = (now - row["last_charged_at"]) / 3600.0
+            cost = dt_h * row["bid"]
+            db.execute(
+                "UPDATE instances SET spend = spend + ?, last_charged_at = ? WHERE vast_id = ?",
+                (cost, now, vast_id),
+            )
+            db.execute("UPDATE bucket SET balance = balance - ? WHERE id = 1", (cost,))
+        else:
+            db.execute(
+                "UPDATE instances SET last_charged_at = ? WHERE vast_id = ?", (now, vast_id)
+            )
         if now >= row["ttl_at"]:
             destroy_instance(cfg, db, vast_id, "ttl", dry)
     db.commit()
@@ -601,8 +655,8 @@ def tick(cfg):
     # 4. Market snapshot + estimates.
     try:
         offers = search_offers(cfg)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
-        log_event(db, "ERROR", f"offer search failed: {e}")
+    except Exception as e:
+        log_event(db, "ERROR", f"offer search failed: {e!r}")
         return
     offers_by_est = []
     for offer in offers:
