@@ -102,6 +102,7 @@ DEFAULT_CONFIG = {
         "nice_client {mode} --gpu --benchmark --benchmark-upload --no-progress "
         "--api-base {api_base} --username {username} --threads {threads} ; "
         "curl -s -X DELETE -H \"Authorization: Bearer ${{CONTAINER_API_KEY}}\" "
+        "-H \"Content-Type: application/json\" -d \"{{}}\" "
         "\"https://console.vast.ai/api/v0/instances/${{CONTAINER_ID}}/\" ; "
         "sleep infinity"
     ),
