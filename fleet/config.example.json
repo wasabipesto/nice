@@ -1,0 +1,37 @@
+{
+  "dry_run": true,
+  "api_base": "https://api.nicenumbers.net",
+  "username": "gilgamesh-fleet",
+  "db_path": "fleet.sqlite3",
+  "kill_switch_path": "KILL",
+
+  "accrual_usd_per_month": 30.0,
+  "bucket_cap_usd": 7.0,
+  "reserve_fraction": 0.5,
+  "pounce_multiplier": 1.4,
+  "pounce_probe_hours": 1.0,
+
+  "bid_multiplier": 1.2,
+  "heat_guard_multiplier": 1.15,
+
+  "mode": "niceonly",
+  "gpu": true,
+  "max_exploit_instances": 2,
+  "exploit_ttl_hours": 6.0,
+
+  "__exploit_modes_help__": "Omit exploit_modes for a single-mode fleet (uses 'mode' + the top-level budget). To run independent per-mode budget tracks, list each mode with its own overrides; keys omitted fall back to the top-level values. Each mode is its OWN bucket (accrual/cap), so per-mode accrual_usd_per_month + bucket_cap_usd should sum to your intended total. Explore benchmarks all modes and is funded from the first (primary) mode. Example:",
+  "__exploit_modes_example__": {
+    "niceonly": {"accrual_usd_per_month": 35.0, "bucket_cap_usd": 5.0, "max_exploit_instances": 8},
+    "detailed": {"accrual_usd_per_month": 15.0, "bucket_cap_usd": 3.0, "max_exploit_instances": 3}
+  },
+
+  "image": "ghcr.io/wasabipesto/nice_client:3-gpu",
+  "disk_gb": 30,
+
+  "explore_per_tick": 2,
+  "explore_per_day": 10,
+  "explore_cooldown_days": 14,
+  "explore_ttl_minutes": 30,
+
+  "offer_query": "reliability>0.95 num_gpus=1 gpu_ram>=8 cuda_vers>=12.0 rentable=true inet_down>100 disk_space>=30 dph_total<0.40"
+}

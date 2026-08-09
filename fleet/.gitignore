@@ -1,0 +1,6 @@
+__pycache__/
+*.sqlite3
+*.sh
+config.json
+tick.log
+KILL
