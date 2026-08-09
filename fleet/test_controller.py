@@ -21,6 +21,7 @@ from controller import (
     plan_invoice_trueup,
     pounce_eligible,
     reconcile_invoices,
+    renew_exploits,
     suggested_bid,
     trailing_median_ev,
 )
@@ -271,6 +272,101 @@ class InvoiceReconcileTests(unittest.TestCase):
                 "second run within the hour must not re-true-up")
         finally:
             controller.show_invoices = orig
+
+
+class RenewExploitTests(unittest.TestCase):
+    def _seed_expired_exploit(self, db, vast_id=1, created_ago_h=2.0):
+        now = time.time()
+        db.execute(
+            "INSERT INTO instances (vast_id, label, purpose, gpu_name, cpu_name, bid, "
+            "ev_predicted, pounce, created_at, ttl_at, last_charged_at) "
+            "VALUES (?, 'x', 'exploit', 'RTX A4000', 'EPYC', 0.048, 1e11, 0, ?, ?, ?)",
+            (vast_id, now - created_ago_h * 3600, now - 60, now),  # ttl 60s in the past
+        )
+        # Trailing EV baseline so the above-median gate has something to compare.
+        for i in range(25):
+            db.execute("INSERT INTO ev_seen (ts, ev) VALUES (?, ?)", (now, 1.0e11 + i))
+        db.commit()
+
+    def _patch_estimate(self, est):
+        orig = controller.api_estimate
+        controller.api_estimate = lambda cfg, offer: est
+        return orig
+
+    def test_healthy_winner_is_renewed_not_reaped(self):
+        db = memory_db()
+        self._seed_expired_exploit(db)
+        # A strong estimate: trusted stage, high confidence, EV well above median.
+        orig = self._patch_estimate(
+            {"prediction_stage": "exact", "confidence": 85, "blended_rate_p25": 5.0e10})
+        try:
+            renew_exploits(cfg(bid_multiplier=1.2, exploit_ttl_hours=24.0), db, dry=False)
+        finally:
+            controller.api_estimate = orig
+        row = db.execute("SELECT ttl_at, destroyed_at FROM instances WHERE vast_id = 1").fetchone()
+        self.assertIsNone(row["destroyed_at"], "a healthy winner must not be reaped")
+        self.assertGreater(row["ttl_at"], time.time() + 20 * 3600, "TTL should be pushed ~24h out")
+
+    def test_faded_instance_past_ttl_is_reaped(self):
+        db = memory_db()
+        self._seed_expired_exploit(db)
+        # Trusted stage but EV far below the trailing median -> no longer a winner.
+        orig_est = self._patch_estimate(
+            {"prediction_stage": "exact", "confidence": 85, "blended_rate_p25": 1.0})
+        reaped = []
+        orig_destroy = controller.destroy_instance
+        controller.destroy_instance = lambda cfg, db, vid, reason, dry: reaped.append((vid, reason))
+        try:
+            renew_exploits(cfg(bid_multiplier=1.2, exploit_ttl_hours=24.0), db, dry=False)
+        finally:
+            controller.api_estimate = orig_est
+            controller.destroy_instance = orig_destroy
+        self.assertEqual(reaped, [(1, "ttl")], "a faded instance out of time must be reaped")
+        # TTL was not extended.
+        row = db.execute("SELECT ttl_at FROM instances WHERE vast_id = 1").fetchone()
+        self.assertLess(row["ttl_at"], time.time(), "faded instance TTL must not be renewed")
+
+    def test_renew_disabled_leaves_it_for_reconcile(self):
+        db = memory_db()
+        self._seed_expired_exploit(db)
+        called = {"n": 0}
+        orig = controller.api_estimate
+        controller.api_estimate = lambda cfg, offer: called.__setitem__("n", called["n"] + 1)
+        try:
+            renew_exploits(cfg(exploit_renew_window_hours=0), db, dry=False)
+        finally:
+            controller.api_estimate = orig
+        self.assertEqual(called["n"], 0, "disabled renewal must not estimate or touch instances")
+        row = db.execute("SELECT ttl_at, destroyed_at FROM instances WHERE vast_id = 1").fetchone()
+        self.assertIsNone(row["destroyed_at"])
+
+
+class OnstartTemplateTests(unittest.TestCase):
+    def test_explore_benchmarks_all_four_configs(self):
+        # create_instance formats with these kwargs; the explore template no
+        # longer uses {mode} (it runs every mode) but the extra kwarg is fine.
+        rendered = DEFAULT_CONFIG["onstart_explore"].format(
+            mode="niceonly", api_base="http://x", username="u", threads=8)
+        for frag in (
+            "nice_client niceonly --gpu --benchmark",   # niceonly on GPU
+            "nice_client detailed --gpu --benchmark",   # detailed on GPU
+            "nice_client niceonly --benchmark",         # niceonly on CPU (no --gpu)
+            "nice_client detailed --benchmark",         # detailed on CPU (no --gpu)
+        ):
+            self.assertIn(frag, rendered, f"missing benchmark config: {frag}")
+        # Alternate GPU/CPU so same-subsystem runs are never back-to-back.
+        order = [seg for seg in rendered.split("nice_client ")[1:]]
+        gpu = ["--gpu" in seg.split(";")[0] for seg in order]
+        self.assertEqual(gpu, [True, False, True, False], "runs must alternate GPU/CPU")
+        # Shell vars for self-retirement survive .format() intact.
+        self.assertIn("${CONTAINER_ID}", rendered)
+        self.assertIn("${CONTAINER_API_KEY}", rendered)
+
+    def test_exploit_template_still_single_mode(self):
+        rendered = DEFAULT_CONFIG["onstart_exploit"].format(
+            mode="niceonly", api_base="http://x", username="u", threads=8)
+        self.assertIn("nice_client niceonly --gpu --benchmark", rendered)
+        self.assertIn("--repeat", rendered)
 
 
 if __name__ == "__main__":

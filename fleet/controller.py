@@ -88,6 +88,13 @@ DEFAULT_CONFIG = {
     "exploit_stages": ["exact", "same-gpu-similar-cpu", "same-gpu", "same-cpu-scaled"],
     "exploit_min_confidence": 40,
     "exploit_ttl_hours": 6.0,
+    # Keep proven winners: an ordinary exploit within this window of its TTL is
+    # re-estimated and, if it still clears the trust bar and holds above-median
+    # EV, renewed in place instead of churned (re-buying re-pays the benchmark
+    # warmup + setup and risks a worse offer). The lifetime cap forces periodic
+    # re-evaluation via a fresh buy. Set the window to 0 to disable renewal.
+    "exploit_renew_window_hours": 1.0,
+    "exploit_max_lifetime_hours": 168.0,
     "image": "ghcr.io/wasabipesto/nice_client:latest-gpu",
     "disk_gb": 30,
     # Instances launch in ssh runtype: Vast runs its own init and executes
@@ -99,11 +106,21 @@ DEFAULT_CONFIG = {
         "exec nice_client {mode} --gpu --repeat --telemetry --no-progress "
         "--api-base {api_base} --username {username} --threads {threads}"
     ),
-    # After the benchmark uploads, the explore instance retires itself using
-    # the instance-scoped API key Vast injects into the environment; the
-    # controller's TTL remains the backstop if that ever fails.
+    # Explore benchmarks all four mode x hardware configs so the estimator has
+    # a datapoint for each: niceonly/detailed on GPU and on CPU. Order alternates
+    # GPU/CPU so no two same-subsystem runs are back-to-back, with a short settle
+    # between, to keep thermal throttling from skewing the later runs. ';' (not
+    # '&&') so one config failing (e.g. no GPU) can't block the rest — partial
+    # data still uploads. After the sweep the instance retires itself using the
+    # instance-scoped API key Vast injects; the controller's TTL is the backstop.
     "onstart_explore": (
-        "nice_client {mode} --gpu --benchmark --benchmark-upload --no-progress "
+        "nice_client niceonly --gpu --benchmark --benchmark-upload --no-progress "
+        "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
+        "nice_client detailed --benchmark --benchmark-upload --no-progress "
+        "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
+        "nice_client detailed --gpu --benchmark --benchmark-upload --no-progress "
+        "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
+        "nice_client niceonly --benchmark --benchmark-upload --no-progress "
         "--api-base {api_base} --username {username} --threads {threads} ; "
         "curl -s -X DELETE -H \"Authorization: Bearer ${{CONTAINER_API_KEY}}\" "
         "-H \"Content-Type: application/json\" -d \"{{}}\" "
@@ -608,7 +625,10 @@ def reconcile(cfg, db, dry):
             db.execute(
                 "UPDATE instances SET last_charged_at = ? WHERE vast_id = ?", (now, vast_id)
             )
-        if now >= row["ttl_at"]:
+        # Ordinary exploits get a renewal decision (renew_exploits) instead of
+        # a blind TTL reap; explore and pounce instances still lapse here.
+        ordinary_exploit = row["purpose"] == "exploit" and not row["pounce"]
+        if now >= row["ttl_at"] and not (ordinary_exploit and cfg.get("exploit_renew_window_hours", 0) > 0):
             destroy_instance(cfg, db, vast_id, "ttl", dry)
     db.commit()
     return ours_live
@@ -647,6 +667,62 @@ def extend_or_probe_pounces(cfg, db, dry):
             )
         elif now >= row["ttl_at"]:
             destroy_instance(cfg, db, row["vast_id"], "pounce-unconfirmed", dry)
+    db.commit()
+
+
+def renew_exploits(cfg, db, dry):
+    """Keep proven winners. An ordinary exploit within its renew window of TTL
+    is re-estimated; if it still clears the trust bar and holds above-median EV
+    it is renewed in place, otherwise it is reaped now (reconcile deferred the
+    ordinary-exploit TTL decision to here). A hard lifetime cap forces a fresh
+    buy periodically. Pounces are handled by extend_or_probe_pounces."""
+    window_h = cfg.get("exploit_renew_window_hours", 0)
+    if not window_h or window_h <= 0:
+        return
+    now = time.time()
+    window_end = now + window_h * 3600.0
+    max_life = cfg.get("exploit_max_lifetime_hours", 168.0) * 3600.0
+    rows = db.execute(
+        "SELECT * FROM instances WHERE destroyed_at IS NULL AND purpose = 'exploit' "
+        "AND pounce = 0 AND ttl_at <= ?",
+        (window_end,),
+    ).fetchall()
+    trailing = trailing_median_ev(db)
+    for row in rows:
+        expired = now >= row["ttl_at"]
+        if now - row["created_at"] >= max_life:
+            if expired:  # aged out: force re-evaluation via a fresh buy
+                destroy_instance(cfg, db, row["vast_id"], "ttl-max-life", dry)
+            continue
+        offer_like = {
+            "cpu_name": row["cpu_name"],
+            "gpu_name": row["gpu_name"],
+            "min_bid": row["bid"] / cfg["bid_multiplier"],
+        }
+        try:
+            est = api_estimate(cfg, offer_like)
+        except OSError as e:
+            log_event(db, "WARN", f"renew estimate for {row['vast_id']} failed: {e}")
+            continue  # can't judge; leave TTL as-is, re-check next tick
+        ev = offer_ev(offer_like, est, e_hold_hours(db, cfg, row["gpu_name"]), cfg)
+        healthy = (
+            exploit_allowed(est, cfg)
+            and ev > 0
+            and (trailing is None or ev >= trailing)
+        )
+        if healthy:
+            if not dry:
+                db.execute(
+                    "UPDATE instances SET ttl_at = ? WHERE vast_id = ?",
+                    (now + cfg["exploit_ttl_hours"] * 3600.0, row["vast_id"]),
+                )
+            log_event(
+                db, "RENEW",
+                f"instance {row['vast_id']} {row['gpu_name']} held; "
+                f"stage={est.get('prediction_stage')} ev={ev:.3e}{' [DRY]' if dry else ''}",
+            )
+        elif expired:  # no longer a winner and out of time: reap
+            destroy_instance(cfg, db, row["vast_id"], "ttl", dry)
     db.commit()
 
 
@@ -808,6 +884,9 @@ def tick(cfg):
     # 1b. True-up spend + bucket from actual Vast invoices (hourly by default),
     # correcting the drift the per-tick bid*hold estimate leaves behind.
     reconcile_invoices(cfg, db, dry)
+
+    # 1c. Renew proven winners before their TTL churns them.
+    renew_exploits(cfg, db, dry)
 
     # 2. Accrue the bucket.
     row = db.execute("SELECT balance, updated_at FROM bucket WHERE id = 1").fetchone()
