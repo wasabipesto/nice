@@ -17,7 +17,10 @@ from controller import (
     effective_rate,
     heat_ok,
     offer_ev,
+    parse_invoice_charges,
+    plan_invoice_trueup,
     pounce_eligible,
+    reconcile_invoices,
     suggested_bid,
     trailing_median_ev,
 )
@@ -168,6 +171,106 @@ class LedgerTests(unittest.TestCase):
             )
         self.assertTrue(heat_ok(db, c, "RTX 3060", 0.055))
         self.assertFalse(heat_ok(db, c, "RTX 3060", 0.06), "15% above trailing floor is hot")
+
+
+class InvoiceReconcileTests(unittest.TestCase):
+    def test_parse_sums_owned_charges_only(self):
+        rows = [
+            {"type": "charge", "instance_id": 1, "amount": "0.040",
+             "description": "Instance 1 GPU charge"},
+            {"type": "charge", "instance_id": 1, "amount": "0.010",
+             "description": "Instance 1 storage charge"},
+            {"type": "charge", "instance_id": 2, "amount": "0.500",
+             "description": "Instance 2 GPU charge"},   # not ours
+            {"type": "credit", "instance_id": 1, "amount": "-50.0",
+             "description": "top-up"},                   # not a charge
+            {"type": "charge", "instance_id": 1, "amount": "oops",
+             "description": "garbage amount"},           # unparseable
+        ]
+        actual = parse_invoice_charges(rows, owned_ids={1})
+        # GPU + storage for instance 1 only; foreign/credit/garbage ignored.
+        self.assertEqual(set(actual), {1})
+        self.assertAlmostEqual(actual[1], 0.050, places=6)
+
+    def test_plan_detects_drift_and_is_idempotent(self):
+        # id 1 under-charged (bug: $0 estimate, $0.05 real); id 2 over-charged.
+        spend = {1: 0.0, 2: 0.10}
+        actual = {1: 0.05, 2: 0.06}
+        updates, net = plan_invoice_trueup(spend, actual)
+        self.assertEqual({u[0] for u in updates}, {1, 2})
+        # net owed = (0.05-0) + (0.06-0.10) = +0.01
+        self.assertAlmostEqual(net, 0.01, places=6)
+        # Re-running once spend == actual yields nothing.
+        updates2, net2 = plan_invoice_trueup(actual, actual)
+        self.assertEqual(updates2, [])
+        self.assertEqual(net2, 0.0)
+
+    def _seed(self, db, vast_id, spend):
+        now = time.time()
+        db.execute(
+            "INSERT INTO instances (vast_id, label, purpose, gpu_name, bid, "
+            "created_at, ttl_at, last_charged_at, destroyed_at, destroy_reason, spend) "
+            "VALUES (?, 'x', 'exploit', 'RTX A4000', 0.04, ?, ?, ?, ?, 'preempted', ?)",
+            (vast_id, now - 3600, now, now, now, spend),
+        )
+
+    def test_reconcile_trues_up_spend_and_bucket(self):
+        db = memory_db()
+        db.execute("INSERT INTO bucket (id, balance, updated_at) VALUES (1, 5.0, ?)",
+                   (time.time(),))
+        self._seed(db, 101, spend=0.0)    # preempted, never charged (the bug)
+        self._seed(db, 102, spend=0.10)   # over-charged estimate
+        db.commit()
+        invoices = {"invoices": [
+            {"type": "charge", "instance_id": 101, "amount": "0.050",
+             "description": "Instance 101 GPU charge"},
+            {"type": "charge", "instance_id": 102, "amount": "0.060",
+             "description": "Instance 102 GPU charge"},
+            {"type": "charge", "instance_id": 999, "amount": "9.99",
+             "description": "someone else's box"},
+        ]}
+        orig = controller.show_invoices
+        controller.show_invoices = lambda cfg: invoices
+        try:
+            reconcile_invoices(cfg(invoice_reconcile_hours=1.0), db, dry=False)
+        finally:
+            controller.show_invoices = orig
+        spends = {r["vast_id"]: (r["spend"], r["invoiced"])
+                  for r in db.execute("SELECT vast_id, spend, invoiced FROM instances")}
+        self.assertAlmostEqual(spends[101][0], 0.05, places=6)
+        self.assertAlmostEqual(spends[101][1], 0.05, places=6)
+        self.assertAlmostEqual(spends[102][0], 0.06, places=6)
+        # Bucket charged the net drift: (0.05-0)+(0.06-0.10) = +0.01 -> 5.0-0.01.
+        bal = db.execute("SELECT balance FROM bucket WHERE id = 1").fetchone()["balance"]
+        self.assertAlmostEqual(bal, 4.99, places=6)
+
+    def test_reconcile_respects_frequency_gate_and_disable(self):
+        db = memory_db()
+        db.execute("INSERT INTO bucket (id, balance, updated_at) VALUES (1, 5.0, ?)",
+                   (time.time(),))
+        self._seed(db, 201, spend=0.0)
+        db.commit()
+        invoices = {"invoices": [
+            {"type": "charge", "instance_id": 201, "amount": "0.050",
+             "description": "Instance 201 GPU charge"}]}
+        orig = controller.show_invoices
+        controller.show_invoices = lambda cfg: invoices
+        try:
+            # Disabled: no true-up at all.
+            reconcile_invoices(cfg(invoice_reconcile_hours=0), db, dry=False)
+            self.assertIsNone(
+                db.execute("SELECT invoiced FROM instances WHERE vast_id = 201")
+                .fetchone()["invoiced"])
+            # First enabled run applies; an immediate second is frequency-gated.
+            reconcile_invoices(cfg(invoice_reconcile_hours=1.0), db, dry=False)
+            db.execute("UPDATE instances SET spend = 0 WHERE vast_id = 201")  # pretend drift
+            reconcile_invoices(cfg(invoice_reconcile_hours=1.0), db, dry=False)
+            self.assertEqual(
+                db.execute("SELECT spend FROM instances WHERE vast_id = 201")
+                .fetchone()["spend"], 0,
+                "second run within the hour must not re-true-up")
+        finally:
+            controller.show_invoices = orig
 
 
 if __name__ == "__main__":

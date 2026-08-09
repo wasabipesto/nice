@@ -52,6 +52,10 @@ DEFAULT_CONFIG = {
     "reserve_fraction": 0.5,
     "pounce_multiplier": 1.4,
     "pounce_probe_hours": 1.0,
+    # How often to pull Vast's actual per-instance invoices and true-up the
+    # ledger + bucket to ground truth. <= 0 disables (estimate-only). Invoices
+    # finalize at day boundaries, so this is a lagging correction, not a meter.
+    "invoice_reconcile_hours": 1.0,
     # --- economics ---
     "bid_multiplier": 1.2,
     "setup_hours": 0.12,
@@ -143,7 +147,14 @@ CREATE TABLE IF NOT EXISTS instances (
     last_charged_at REAL NOT NULL,
     destroyed_at REAL,
     destroy_reason TEXT,
-    spend REAL NOT NULL DEFAULT 0
+    spend REAL NOT NULL DEFAULT 0,   -- charged to the bucket so far (estimate,
+                                     -- trued-up to invoiced once billing posts)
+    invoiced REAL                    -- actual Vast charge (GPU+storage+net),
+                                     -- NULL until the instance is invoiced
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value REAL
 );
 CREATE TABLE IF NOT EXISTS explored (
     gpu_name TEXT NOT NULL,
@@ -178,6 +189,10 @@ def open_db(path):
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    # Migration: ledgers created before invoice reconciliation lack this column.
+    cols = {r["name"] for r in db.execute("PRAGMA table_info(instances)").fetchall()}
+    if "invoiced" not in cols:
+        db.execute("ALTER TABLE instances ADD COLUMN invoiced REAL")
     if db.execute("SELECT COUNT(*) FROM bucket").fetchone()[0] == 0:
         db.execute(
             "INSERT INTO bucket (id, balance, updated_at) VALUES (1, 0, ?)",
@@ -195,6 +210,19 @@ def log_event(db, kind, detail):
     print(f"[{kind}] {detail}")
 
 
+def meta_get(db, key, default=None):
+    row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def meta_set(db, key, value):
+    db.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure budget / economics logic (unit-tested)
 
@@ -204,6 +232,43 @@ def accrue_bucket(balance, updated_at, now, cfg):
     hours = max(0.0, (now - updated_at) / 3600.0)
     rate = cfg["accrual_usd_per_month"] / (30.0 * 24.0)
     return min(balance + hours * rate, cfg["bucket_cap_usd"])
+
+
+def parse_invoice_charges(invoices, owned_ids):
+    """Sum actual charge amounts per instance we own, across every charge kind
+    (GPU + storage + upload + download). Vast returns amounts as strings and
+    mixes in credits and foreign instances; non-charge rows, unparseable
+    amounts, and ids we don't own are ignored."""
+    actual = {}
+    for r in invoices:
+        if r.get("type") != "charge":
+            continue
+        iid = r.get("instance_id")
+        if iid not in owned_ids:
+            continue
+        try:
+            amt = float(r.get("amount") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        actual[iid] = actual.get(iid, 0.0) + amt
+    return actual
+
+
+def plan_invoice_trueup(spend_by_id, actual_by_id, eps=1e-6):
+    """Pure planner for the invoice true-up. Given each instance's charged-so-far
+    `spend` and its actual invoiced total, return (updates, net) where updates is
+    [(vast_id, new_spend, delta)] for instances whose charge drifted from actual
+    and net is the total to subtract from the bucket (positive = we under-charged
+    and owe more). Idempotent: once spend == actual, nothing is returned."""
+    updates = []
+    net = 0.0
+    for iid, actual in actual_by_id.items():
+        delta = actual - spend_by_id.get(iid, 0.0)
+        if abs(delta) < eps:
+            continue
+        updates.append((iid, actual, delta))
+        net += delta
+    return updates, net
 
 
 def effective_rate(p25_rate, e_hold_hours, setup_hours, lost_hours):
@@ -334,6 +399,61 @@ def search_offers(cfg):
 
 def show_instances(cfg):
     return vast_client(cfg).show_instances()
+
+
+def show_invoices(cfg):
+    """Actual per-instance billing rows: {invoices: [{type, description,
+    timestamp, quantity, rate, amount, instance_id}, ...], current: {...}}."""
+    return vast_client(cfg).show_invoices()
+
+
+def reconcile_invoices(cfg, db, dry):
+    """True-up ledger spend and the bucket from Vast's actual invoices, at most
+    once per `invoice_reconcile_hours` (<= 0 disables).
+
+    Vast bills the bid rate but only for GPU-running time, plus storage and
+    network — none of which the per-tick bid*hold estimate captures, so left
+    alone the bucket drifts (most visibly, it misses the runtime of instances
+    preempted between ticks and records $0). This pulls the real charges and
+    resets each instance's `spend` to actual, correcting the bucket by exactly
+    the drift. Invoices finalize at day boundaries, so instances launched since
+    the last close won't appear yet; those keep their conservative bid*hold
+    estimate (an over-estimate — the safe direction for a budget gate) until a
+    later pull trues them up."""
+    every_h = cfg.get("invoice_reconcile_hours", 1.0)
+    if not every_h or every_h <= 0:
+        return
+    now = time.time()
+    if now - (meta_get(db, "last_invoice_reconcile_at", 0.0) or 0.0) < every_h * 3600.0:
+        return
+    try:
+        resp = show_invoices(cfg)
+    except Exception as e:
+        log_event(db, "WARN", f"invoice pull failed, keeping estimates: {e!r}")
+        return
+    invoices = resp.get("invoices", []) if isinstance(resp, dict) else (resp or [])
+    owned = {r["vast_id"] for r in db.execute("SELECT vast_id FROM instances").fetchall()}
+    actual = parse_invoice_charges(invoices, owned)
+    spend_by_id = {
+        r["vast_id"]: r["spend"]
+        for r in db.execute("SELECT vast_id, spend FROM instances").fetchall()
+    }
+    updates, net = plan_invoice_trueup(spend_by_id, actual)
+    total = sum(actual.values())
+    if not dry:
+        for iid, amt in actual.items():
+            db.execute("UPDATE instances SET invoiced = ? WHERE vast_id = ?", (amt, iid))
+        for iid, new_spend, _delta in updates:
+            db.execute("UPDATE instances SET spend = ? WHERE vast_id = ?", (new_spend, iid))
+        if net:
+            db.execute("UPDATE bucket SET balance = balance - ? WHERE id = 1", (net,))
+        meta_set(db, "last_invoice_reconcile_at", now)
+        db.commit()
+    log_event(
+        db, "INVOICE",
+        f"trued-up {len(updates)}/{len(actual)} invoiced instances; "
+        f"bucket adj ${-net:+.3f}; actual-to-date ${total:.2f}{' [DRY]' if dry else ''}",
+    )
 
 
 def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry):
@@ -647,6 +767,25 @@ def plan_exploit(cfg, db, offers_by_est, dry):
     db.commit()
 
 
+def confidence_spread(offers_by_est, cfg):
+    """One-line summary of estimator confidence across this tick's offers, so
+    the MARKET log shows how much the estimator has actually learned from the
+    survey: median + p25/p75 spread + full range, and how many offers clear
+    the exploit trust bar (confidence >= exploit_min_confidence)."""
+    confs = sorted(float(est.get("confidence") or 0) for _, est, _ in offers_by_est)
+    if not confs:
+        return "confidence: n/a"
+    pct = lambda q: confs[min(len(confs) - 1, max(0, int(len(confs) * q)))]
+    bar = cfg["exploit_min_confidence"]
+    n_bar = sum(1 for c in confs if c >= bar)
+    return (
+        f"confidence% p50={statistics.median(confs):.0f} "
+        f"p25={pct(0.25):.0f} p75={pct(0.75):.0f} "
+        f"range={confs[0]:.0f}-{confs[-1]:.0f}; "
+        f"{n_bar}/{len(confs)} >= exploit bar ({bar})"
+    )
+
+
 def tick(cfg):
     dry = cfg["dry_run"]
     db = open_db(cfg["db_path"])
@@ -665,6 +804,10 @@ def tick(cfg):
     live = reconcile(cfg, db, dry)
     if live is None:
         return  # Vast API unreachable; budget state untouched, try next tick
+
+    # 1b. True-up spend + bucket from actual Vast invoices (hourly by default),
+    # correcting the drift the per-tick bid*hold estimate leaves behind.
+    reconcile_invoices(cfg, db, dry)
 
     # 2. Accrue the bucket.
     row = db.execute("SELECT balance, updated_at FROM bucket WHERE id = 1").fetchone()
@@ -691,7 +834,7 @@ def tick(cfg):
         ev = offer_ev(offer, est, e_hold_hours(db, cfg, offer.get("gpu_name") or "?"), cfg)
         offers_by_est.append((offer, est, ev))
     record_market(db, offers_by_est)
-    log_event(db, "MARKET", f"{len(offers_by_est)} offers estimated")
+    log_event(db, "MARKET", f"{len(offers_by_est)} offers estimated; {confidence_spread(offers_by_est, cfg)}")
 
     # 5. Explore, then exploit.
     plan_explore(cfg, db, offers_by_est, dry)
