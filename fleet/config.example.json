@@ -18,6 +18,13 @@
   "gpu": true,
   "max_exploit_instances": 2,
   "exploit_ttl_hours": 6.0,
+
+  "__exploit_modes_help__": "Omit exploit_modes for a single-mode fleet (uses 'mode' + the top-level budget). To run independent per-mode budget tracks, list each mode with its own overrides; keys omitted fall back to the top-level values. Each mode is its OWN bucket (accrual/cap), so per-mode accrual_usd_per_month + bucket_cap_usd should sum to your intended total. Explore benchmarks all modes and is funded from the first (primary) mode. Example:",
+  "__exploit_modes_example__": {
+    "niceonly": {"accrual_usd_per_month": 35.0, "bucket_cap_usd": 5.0, "max_exploit_instances": 8},
+    "detailed": {"accrual_usd_per_month": 15.0, "bucket_cap_usd": 3.0, "max_exploit_instances": 3}
+  },
+
   "image": "ghcr.io/wasabipesto/nice_client:3-gpu",
   "disk_gb": 30,
 

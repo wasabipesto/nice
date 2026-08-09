@@ -210,14 +210,14 @@ class InvoiceReconcileTests(unittest.TestCase):
         now = time.time()
         db.execute(
             "INSERT INTO instances (vast_id, label, purpose, gpu_name, bid, "
-            "created_at, ttl_at, last_charged_at, destroyed_at, destroy_reason, spend) "
-            "VALUES (?, 'x', 'exploit', 'RTX A4000', 0.04, ?, ?, ?, ?, 'preempted', ?)",
+            "created_at, ttl_at, last_charged_at, destroyed_at, destroy_reason, spend, mode) "
+            "VALUES (?, 'x', 'exploit', 'RTX A4000', 0.04, ?, ?, ?, ?, 'preempted', ?, 'niceonly')",
             (vast_id, now - 3600, now, now, now, spend),
         )
 
     def test_reconcile_trues_up_spend_and_bucket(self):
         db = memory_db()
-        db.execute("INSERT INTO bucket (id, balance, updated_at) VALUES (1, 5.0, ?)",
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
                    (time.time(),))
         self._seed(db, 101, spend=0.0)    # preempted, never charged (the bug)
         self._seed(db, 102, spend=0.10)   # over-charged estimate
@@ -241,8 +241,8 @@ class InvoiceReconcileTests(unittest.TestCase):
         self.assertAlmostEqual(spends[101][0], 0.05, places=6)
         self.assertAlmostEqual(spends[101][1], 0.05, places=6)
         self.assertAlmostEqual(spends[102][0], 0.06, places=6)
-        # Bucket charged the net drift: (0.05-0)+(0.06-0.10) = +0.01 -> 5.0-0.01.
-        bal = db.execute("SELECT balance FROM bucket WHERE id = 1").fetchone()["balance"]
+        # niceonly bucket charged the net drift: (0.05-0)+(0.06-0.10) = +0.01.
+        bal = db.execute("SELECT balance FROM buckets WHERE mode = 'niceonly'").fetchone()["balance"]
         self.assertAlmostEqual(bal, 4.99, places=6)
 
     def test_reconcile_respects_frequency_gate_and_disable(self):
@@ -279,18 +279,18 @@ class RenewExploitTests(unittest.TestCase):
         now = time.time()
         db.execute(
             "INSERT INTO instances (vast_id, label, purpose, gpu_name, cpu_name, bid, "
-            "ev_predicted, pounce, created_at, ttl_at, last_charged_at) "
-            "VALUES (?, 'x', 'exploit', 'RTX A4000', 'EPYC', 0.048, 1e11, 0, ?, ?, ?)",
+            "ev_predicted, pounce, created_at, ttl_at, last_charged_at, mode) "
+            "VALUES (?, 'x', 'exploit', 'RTX A4000', 'EPYC', 0.048, 1e11, 0, ?, ?, ?, 'niceonly')",
             (vast_id, now - created_ago_h * 3600, now - 60, now),  # ttl 60s in the past
         )
-        # Trailing EV baseline so the above-median gate has something to compare.
+        # Trailing EV baseline (per-mode) so the above-median gate has a compare.
         for i in range(25):
-            db.execute("INSERT INTO ev_seen (ts, ev) VALUES (?, ?)", (now, 1.0e11 + i))
+            db.execute("INSERT INTO ev_seen (ts, ev, mode) VALUES (?, ?, 'niceonly')", (now, 1.0e11 + i))
         db.commit()
 
     def _patch_estimate(self, est):
         orig = controller.api_estimate
-        controller.api_estimate = lambda cfg, offer: est
+        controller.api_estimate = lambda cfg, offer, mode=None: est
         return orig
 
     def test_healthy_winner_is_renewed_not_reaped(self):
@@ -341,6 +341,75 @@ class RenewExploitTests(unittest.TestCase):
         self.assertIsNone(row["destroyed_at"])
 
 
+class MultiModeTests(unittest.TestCase):
+    def test_mode_helpers(self):
+        one = cfg()  # DEFAULT_CONFIG: exploit_modes = {"niceonly": {}}
+        self.assertEqual(controller.exploit_modes(one), ["niceonly"])
+        self.assertEqual(controller.primary_mode(one), "niceonly")
+        two = cfg(exploit_modes={
+            "niceonly": {},
+            "detailed": {"accrual_usd_per_month": 15.0, "bucket_cap_usd": 3.0},
+        })
+        self.assertEqual(controller.exploit_modes(two), ["niceonly", "detailed"])
+        self.assertEqual(controller.primary_mode(two), "niceonly")
+        # mcfg: override wins, omitted keys fall back to top level.
+        self.assertEqual(controller.mcfg(two, "detailed", "bucket_cap_usd"), 3.0)
+        self.assertEqual(controller.mcfg(two, "niceonly", "bucket_cap_usd"),
+                         two["bucket_cap_usd"])
+        # bucket_mode: own exploit mode kept; explore/legacy/unknown -> primary.
+        self.assertEqual(controller.bucket_mode("detailed", two), "detailed")
+        self.assertEqual(controller.bucket_mode(None, two), "niceonly")
+        self.assertEqual(controller.bucket_mode("stale-mode", two), "niceonly")
+
+    def test_ensure_buckets_migrates_legacy_into_primary(self):
+        db = memory_db()
+        now = 1_000_000.0
+        db.execute("INSERT INTO bucket (id, balance, updated_at) VALUES (1, 4.2, ?)", (now,))
+        c = cfg(exploit_modes={"niceonly": {}, "detailed": {}})
+        controller.ensure_buckets(db, c, now)
+        rows = {r["mode"]: r["balance"]
+                for r in db.execute("SELECT mode, balance FROM buckets")}
+        self.assertAlmostEqual(rows["niceonly"], 4.2)  # primary inherits legacy balance
+        self.assertAlmostEqual(rows["detailed"], 0.0)  # added mode starts empty
+        # Idempotent: a second call adds nothing and preserves balances.
+        db.execute("UPDATE buckets SET balance = 1.0 WHERE mode = 'niceonly'")
+        controller.ensure_buckets(db, c, now)
+        self.assertAlmostEqual(
+            db.execute("SELECT balance FROM buckets WHERE mode='niceonly'").fetchone()["balance"],
+            1.0)
+
+    def test_exploit_split_is_per_mode_with_dedup(self):
+        db = memory_db()
+        now = 1_000_000.0
+        # Two well-funded modes; a strong estimate so every offer clears the bar.
+        c = cfg(exploit_modes={
+            "niceonly": {"max_exploit_instances": 1},  # takes only the top offer
+            "detailed": {"max_exploit_instances": 5},   # gets the rest (deduped)
+        }, bucket_cap_usd=10.0, reserve_fraction=0.5, dry_run=False)
+        for m in ("niceonly", "detailed"):
+            db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES (?, 9.0, ?)", (m, now))
+        est = {"prediction_stage": "exact", "confidence": 85, "blended_rate_p25": 5.0e10}
+        def offers(ev_scale):
+            return [({"id": i, "min_bid": 0.05, "gpu_name": "RTX A4000",
+                      "cpu_name": "EPYC"}, est, ev_scale * (10 - i)) for i in range(3)]
+        by_mode = {"niceonly": offers(1.0), "detailed": offers(1.0)}
+        created = []
+        orig = controller.create_instance
+        controller.create_instance = (
+            lambda cfg, db, offer, purpose, bid, ttl, ev, pounce, dry, mode=None:
+            created.append((offer["id"], mode)))
+        try:
+            controller.plan_exploit(c, db, by_mode, dry=False)
+        finally:
+            controller.create_instance = orig
+        # Each physical offer id bought at most once across both modes (dedup).
+        ids = [oid for oid, _m in created]
+        self.assertEqual(len(ids), len(set(ids)), "an offer was double-bought across modes")
+        # Both modes participated, and niceonly (config order) got first pick.
+        modes_used = {m for _oid, m in created}
+        self.assertEqual(modes_used, {"niceonly", "detailed"})
+
+
 class OnstartTemplateTests(unittest.TestCase):
     def test_explore_benchmarks_all_four_configs(self):
         # create_instance formats with these kwargs; the explore template no
@@ -362,11 +431,24 @@ class OnstartTemplateTests(unittest.TestCase):
         self.assertIn("${CONTAINER_ID}", rendered)
         self.assertIn("${CONTAINER_API_KEY}", rendered)
 
-    def test_exploit_template_still_single_mode(self):
+    def test_exploit_also_benchmarks_all_four_then_works(self):
         rendered = DEFAULT_CONFIG["onstart_exploit"].format(
-            mode="niceonly", api_base="http://x", username="u", threads=8)
-        self.assertIn("nice_client niceonly --gpu --benchmark", rendered)
-        self.assertIn("--repeat", rendered)
+            mode="detailed", api_base="http://x", username="u", threads=8)
+        # Same four-config sweep as explore ...
+        for frag in ("nice_client niceonly --gpu --benchmark",
+                     "nice_client detailed --gpu --benchmark",
+                     "nice_client niceonly --benchmark",
+                     "nice_client detailed --benchmark"):
+            self.assertIn(frag, rendered, f"exploit missing benchmark config: {frag}")
+        # ... then execs the instance's own mode work loop (here: detailed).
+        self.assertIn("exec nice_client detailed --gpu --repeat", rendered)
+
+    def test_explore_and_exploit_share_the_sweep(self):
+        kw = dict(mode="niceonly", api_base="http://x", username="u", threads=8)
+        expl = DEFAULT_CONFIG["onstart_explore"].format(**kw)
+        expo = DEFAULT_CONFIG["onstart_exploit"].format(**kw)
+        sweep = controller._BENCH_SWEEP.format(**kw)
+        self.assertTrue(expl.startswith(sweep) and expo.startswith(sweep))
 
 
 if __name__ == "__main__":

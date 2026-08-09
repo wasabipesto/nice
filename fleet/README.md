@@ -56,6 +56,26 @@ Worst-case month ≈ accrual + one bucket. Runtime spend is charged to the
 bucket every tick from bid × elapsed; reconcile against Vast invoices
 periodically (`uvx vastai show invoices`) until that's automated.
 
+### Manual bucket adjustments (kickstart / correction)
+
+There is no CLI for this by design; adjust the ledger row directly and always
+tag it so the `events` log stays a complete audit trail. Use a **relative**
+delta (`balance + N`), never an absolute set — the per-tick accrue writes an
+absolute balance, so apply the credit **between ticks** (mid-slot, not near
+`:00`/`:10`) to avoid a race clobbering it. Tag `kind = 'MANUAL-CREDIT'`:
+
+```sh
+sqlite3 fleet.sqlite3 "
+UPDATE bucket SET balance = balance + 2.0 WHERE id = 1;
+INSERT INTO events (ts, kind, detail)
+VALUES (strftime('%s','now'), 'MANUAL-CREDIT', '+\$2.00 kickstart: <reason>');"
+```
+
+A credit above `$0` re-enables explores; keep it below the reserve line
+(`reserve_fraction × bucket_cap_usd`) if you want to avoid also unblocking a
+wave of ordinary exploit buys. `MANUAL-CREDIT` is a one-time injection outside
+the accrual bound, so note why.
+
 ## Notes / known gaps
 
 - **First live explore run validates the launch incantation.** The GPU

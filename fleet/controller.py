@@ -37,6 +37,24 @@ import urllib.request
 # ---------------------------------------------------------------------------
 # Config and state
 
+# Benchmark every mode x hardware config (niceonly/detailed x GPU/CPU) so the
+# estimator gets a datapoint for each. Order alternates GPU/CPU so no two
+# same-subsystem runs are back-to-back, with a short settle between, to keep
+# thermal throttling from skewing the later runs. ';' (not '&&') so one config
+# failing (e.g. no GPU) can't block the rest — partial data still uploads.
+# Shared by explore (which then self-retires) and exploit (which then runs its
+# work loop), so every machine we pay for seeds both estimators for its hardware.
+_BENCH_SWEEP = (
+    "nice_client niceonly --gpu --benchmark --benchmark-upload --no-progress "
+    "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
+    "nice_client detailed --benchmark --benchmark-upload --no-progress "
+    "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
+    "nice_client detailed --gpu --benchmark --benchmark-upload --no-progress "
+    "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
+    "nice_client niceonly --benchmark --benchmark-upload --no-progress "
+    "--api-base {api_base} --username {username} --threads {threads}"
+)
+
 DEFAULT_CONFIG = {
     "dry_run": True,
     "api_base": "https://api.nicenumbers.net",
@@ -82,7 +100,16 @@ DEFAULT_CONFIG = {
         "L40S": 0.5,
     },
     # --- fleet shape ---
-    "mode": "niceonly",
+    "mode": "niceonly",  # legacy single-mode default / api_estimate fallback
+    # Exploit tracks: one independent budget per mode. Each mode gets its own
+    # token bucket (accrual/cap/reserve/pounce) and instance cap; explore
+    # benchmarks all modes and is funded from the FIRST (primary) mode's bucket.
+    # A mode's block overrides top-level budget/shape keys; anything it omits
+    # inherits the top-level default. The default here — one mode inheriting
+    # everything — is byte-identical to the pre-multi-mode controller. To add a
+    # second track, give each mode explicit accrual_usd_per_month/bucket_cap_usd
+    # that SUM to the intended total (they are independent buckets, not a split).
+    "exploit_modes": {"niceonly": {}},
     "gpu": True,
     "max_exploit_instances": 2,
     "exploit_stages": ["exact", "same-gpu-similar-cpu", "same-gpu", "same-cpu-scaled"],
@@ -100,28 +127,18 @@ DEFAULT_CONFIG = {
     # Instances launch in ssh runtype: Vast runs its own init and executes
     # onstart_cmd in a shell, so the image ENTRYPOINT is bypassed and the
     # templates below can call nice_client (on PATH in the image) directly.
+    # Exploit runs the full sweep (a broken GPU crashes the repeat below anyway
+    # and gets reaped), then execs its own mode's work loop. exec so nice_client
+    # replaces the shell — Vast injects env into PID 1 and the client reads it.
     "onstart_exploit": (
-        "nice_client {mode} --gpu --benchmark --benchmark-upload --no-progress "
-        "--api-base {api_base} --username {username} --threads {threads} && "
+        _BENCH_SWEEP + " ; "
         "exec nice_client {mode} --gpu --repeat --telemetry --no-progress "
         "--api-base {api_base} --username {username} --threads {threads}"
     ),
-    # Explore benchmarks all four mode x hardware configs so the estimator has
-    # a datapoint for each: niceonly/detailed on GPU and on CPU. Order alternates
-    # GPU/CPU so no two same-subsystem runs are back-to-back, with a short settle
-    # between, to keep thermal throttling from skewing the later runs. ';' (not
-    # '&&') so one config failing (e.g. no GPU) can't block the rest — partial
-    # data still uploads. After the sweep the instance retires itself using the
-    # instance-scoped API key Vast injects; the controller's TTL is the backstop.
+    # Explore runs the sweep then retires itself using the instance-scoped API
+    # key Vast injects; the controller's TTL is the backstop if that fails.
     "onstart_explore": (
-        "nice_client niceonly --gpu --benchmark --benchmark-upload --no-progress "
-        "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
-        "nice_client detailed --benchmark --benchmark-upload --no-progress "
-        "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
-        "nice_client detailed --gpu --benchmark --benchmark-upload --no-progress "
-        "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
-        "nice_client niceonly --benchmark --benchmark-upload --no-progress "
-        "--api-base {api_base} --username {username} --threads {threads} ; "
+        _BENCH_SWEEP + " ; "
         "curl -s -X DELETE -H \"Authorization: Bearer ${{CONTAINER_API_KEY}}\" "
         "-H \"Content-Type: application/json\" -d \"{{}}\" "
         "\"https://console.vast.ai/api/v0/instances/${{CONTAINER_ID}}/\" ; "
@@ -144,8 +161,13 @@ DEFAULT_CONFIG = {
 }
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS bucket (
+CREATE TABLE IF NOT EXISTS bucket (   -- legacy single bucket; migrated to buckets
     id INTEGER PRIMARY KEY CHECK (id = 1),
+    balance REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS buckets (  -- one token bucket per exploit mode
+    mode TEXT PRIMARY KEY,
     balance REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -166,8 +188,10 @@ CREATE TABLE IF NOT EXISTS instances (
     destroy_reason TEXT,
     spend REAL NOT NULL DEFAULT 0,   -- charged to the bucket so far (estimate,
                                      -- trued-up to invoiced once billing posts)
-    invoiced REAL                    -- actual Vast charge (GPU+storage+net),
+    invoiced REAL,                   -- actual Vast charge (GPU+storage+net),
                                      -- NULL until the instance is invoiced
+    mode TEXT                        -- exploit mode (which bucket it charges);
+                                     -- NULL for explore (funded by primary mode)
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -180,7 +204,8 @@ CREATE TABLE IF NOT EXISTS explored (
 );
 CREATE TABLE IF NOT EXISTS ev_seen (
     ts REAL NOT NULL,
-    ev REAL NOT NULL
+    ev REAL NOT NULL,
+    mode TEXT                        -- exploit mode this EV was priced for
 );
 CREATE TABLE IF NOT EXISTS type_floor (
     ts REAL NOT NULL,
@@ -206,10 +231,15 @@ def open_db(path):
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
-    # Migration: ledgers created before invoice reconciliation lack this column.
-    cols = {r["name"] for r in db.execute("PRAGMA table_info(instances)").fetchall()}
-    if "invoiced" not in cols:
+    # Migrations: add columns older ledgers predate.
+    icols = {r["name"] for r in db.execute("PRAGMA table_info(instances)").fetchall()}
+    if "invoiced" not in icols:
         db.execute("ALTER TABLE instances ADD COLUMN invoiced REAL")
+    if "mode" not in icols:
+        db.execute("ALTER TABLE instances ADD COLUMN mode TEXT")
+    ecols = {r["name"] for r in db.execute("PRAGMA table_info(ev_seen)").fetchall()}
+    if "mode" not in ecols:
+        db.execute("ALTER TABLE ev_seen ADD COLUMN mode TEXT")
     if db.execute("SELECT COUNT(*) FROM bucket").fetchone()[0] == 0:
         db.execute(
             "INSERT INTO bucket (id, balance, updated_at) VALUES (1, 0, ?)",
@@ -225,6 +255,62 @@ def log_event(db, kind, detail):
         (time.time(), kind, detail),
     )
     print(f"[{kind}] {detail}")
+
+
+# ---------------------------------------------------------------------------
+# Exploit modes: each mode is an independent budget track (its own bucket).
+
+def exploit_modes(cfg):
+    """Ordered list of exploit modes. Backward-compat: falls back to the single
+    legacy cfg['mode'] when exploit_modes isn't configured."""
+    modes = cfg.get("exploit_modes")
+    return list(modes) if modes else [cfg.get("mode", "niceonly")]
+
+
+def primary_mode(cfg):
+    """The first mode: funds/charges explore and seeds the legacy bucket balance."""
+    return exploit_modes(cfg)[0]
+
+
+def mcfg(cfg, mode, key):
+    """Per-mode config value, falling back to the top-level default when the
+    mode's override block omits it."""
+    return ((cfg.get("exploit_modes") or {}).get(mode) or {}).get(key, cfg[key])
+
+
+def bucket_mode(row_mode, cfg):
+    """Which bucket funds/charges an instance: its own exploit mode, else the
+    primary mode (explore instances and legacy NULL-mode rows)."""
+    return row_mode if row_mode in exploit_modes(cfg) else primary_mode(cfg)
+
+
+def ensure_buckets(db, cfg, now):
+    """Create a per-mode bucket for each exploit mode; on first migration seed
+    the primary mode from the legacy single-row `bucket`, others from zero."""
+    have = {r["mode"] for r in db.execute("SELECT mode FROM buckets").fetchall()}
+    fresh = not have
+    legacy = db.execute("SELECT balance, updated_at FROM bucket WHERE id = 1").fetchone()
+    for i, mode in enumerate(exploit_modes(cfg)):
+        if mode in have:
+            continue
+        if i == 0 and fresh and legacy is not None:
+            bal, upd = legacy["balance"], legacy["updated_at"]
+        else:
+            bal, upd = 0.0, now
+        db.execute(
+            "INSERT INTO buckets (mode, balance, updated_at) VALUES (?, ?, ?)",
+            (mode, bal, upd),
+        )
+
+
+def bucket_balance(db, mode):
+    row = db.execute("SELECT balance FROM buckets WHERE mode = ?", (mode,)).fetchone()
+    return row["balance"] if row else 0.0
+
+
+def charge_bucket(db, mode, amt):
+    """Debit (amt>0) or credit (amt<0) a mode's bucket."""
+    db.execute("UPDATE buckets SET balance = balance - ? WHERE mode = ?", (amt, mode))
 
 
 def meta_get(db, key, default=None):
@@ -297,9 +383,9 @@ def effective_rate(p25_rate, e_hold_hours, setup_hours, lost_hours):
     return p25_rate * e_hold_hours / (e_hold_hours + setup_hours + lost_hours)
 
 
-def offer_ev(offer, estimate, e_hold_hours, cfg):
+def offer_ev(offer, estimate, e_hold_hours, cfg, mode=None):
     """Numbers per dollar, using the conservative P25 of the prediction."""
-    bid = suggested_bid(offer, cfg)
+    bid = suggested_bid(offer, cfg, mode)
     if bid <= 0:
         return 0.0
     rate = effective_rate(
@@ -311,11 +397,12 @@ def offer_ev(offer, estimate, e_hold_hours, cfg):
     return rate / bid
 
 
-def suggested_bid(offer, cfg):
+def suggested_bid(offer, cfg, mode=None):
     """Ride the floor: a small multiplier on the offer's minimum bid.
     Premium buys hours, not days (2026-07 market study), so protection
     comes from type selection and buffer depth, not big overbids."""
-    return round(float(offer.get("min_bid", offer.get("dph_total", 0))) * cfg["bid_multiplier"], 5)
+    mult = mcfg(cfg, mode, "bid_multiplier") if mode else cfg["bid_multiplier"]
+    return round(float(offer.get("min_bid", offer.get("dph_total", 0))) * mult, 5)
 
 
 def instance_alive(live_row, cfg, age_minutes=0.0):
@@ -327,15 +414,14 @@ def instance_alive(live_row, cfg, age_minutes=0.0):
     return status in cfg["alive_statuses"] and age_minutes < cfg["stuck_grace_minutes"]
 
 
-def exploit_allowed(est, cfg):
+def exploit_allowed(est, cfg, mode=None):
     """Exploit buys only trust estimates from the allowlisted prediction
     stages at sufficient confidence. Floor/none-stage hardware — where a
     single wild sample can produce an absurd EV with no spread to hedge it
     — is the explore slice's job, not a purchase signal."""
-    return (
-        est.get("prediction_stage") in cfg["exploit_stages"]
-        and est.get("confidence", 0) >= cfg["exploit_min_confidence"]
-    )
+    stages = mcfg(cfg, mode, "exploit_stages") if mode else cfg["exploit_stages"]
+    min_conf = mcfg(cfg, mode, "exploit_min_confidence") if mode else cfg["exploit_min_confidence"]
+    return est.get("prediction_stage") in stages and est.get("confidence", 0) >= min_conf
 
 
 def pounce_eligible(ev, trailing_median, cfg):
@@ -365,10 +451,17 @@ def e_hold_hours(db, cfg, gpu_name):
     return seeds.get(gpu_name, seeds["default"])
 
 
-def trailing_median_ev(db, days=3.0):
-    rows = db.execute(
-        "SELECT ev FROM ev_seen WHERE ts > ?", (time.time() - days * 86400,)
-    ).fetchall()
+def trailing_median_ev(db, days=3.0, mode=None):
+    """Trailing median EV for the pounce baseline. EV scales are mode-specific
+    (detailed is ~20x slower than niceonly), so a mode compares only to its own
+    history. mode=None pools all rows (legacy / single-mode)."""
+    cutoff = time.time() - days * 86400
+    if mode is None:
+        rows = db.execute("SELECT ev FROM ev_seen WHERE ts > ?", (cutoff,)).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT ev FROM ev_seen WHERE ts > ? AND mode = ?", (cutoff, mode)
+        ).fetchall()
     values = [r["ev"] for r in rows if r["ev"] > 0]
     return statistics.median(values) if len(values) >= 20 else None
 
@@ -449,21 +542,25 @@ def reconcile_invoices(cfg, db, dry):
         log_event(db, "WARN", f"invoice pull failed, keeping estimates: {e!r}")
         return
     invoices = resp.get("invoices", []) if isinstance(resp, dict) else (resp or [])
-    owned = {r["vast_id"] for r in db.execute("SELECT vast_id FROM instances").fetchall()}
+    rows = db.execute("SELECT vast_id, spend, mode FROM instances").fetchall()
+    owned = {r["vast_id"] for r in rows}
+    mode_by_id = {r["vast_id"]: r["mode"] for r in rows}
     actual = parse_invoice_charges(invoices, owned)
-    spend_by_id = {
-        r["vast_id"]: r["spend"]
-        for r in db.execute("SELECT vast_id, spend FROM instances").fetchall()
-    }
+    spend_by_id = {r["vast_id"]: r["spend"] for r in rows}
     updates, net = plan_invoice_trueup(spend_by_id, actual)
     total = sum(actual.values())
+    # Route each instance's drift to the bucket that funds its mode.
+    net_by_bucket = {}
+    for iid, _new_spend, delta in updates:
+        bm = bucket_mode(mode_by_id.get(iid), cfg)
+        net_by_bucket[bm] = net_by_bucket.get(bm, 0.0) + delta
     if not dry:
         for iid, amt in actual.items():
             db.execute("UPDATE instances SET invoiced = ? WHERE vast_id = ?", (amt, iid))
         for iid, new_spend, _delta in updates:
             db.execute("UPDATE instances SET spend = ? WHERE vast_id = ?", (new_spend, iid))
-        if net:
-            db.execute("UPDATE bucket SET balance = balance - ? WHERE id = 1", (net,))
+        for bm, d in net_by_bucket.items():
+            charge_bucket(db, bm, d)
         meta_set(db, "last_invoice_reconcile_at", now)
         db.commit()
     log_event(
@@ -473,10 +570,10 @@ def reconcile_invoices(cfg, db, dry):
     )
 
 
-def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry):
+def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry, mode=None):
     onstart_tpl = cfg["onstart_exploit"] if purpose == "exploit" else cfg["onstart_explore"]
     onstart = onstart_tpl.format(
-        mode=cfg["mode"],
+        mode=mode or cfg.get("mode", "niceonly"),  # exploit runs this mode; explore ignores it
         api_base=cfg["api_base"],
         username=cfg["username"],
         threads=int(offer.get("cpu_cores_effective") or 4),
@@ -514,11 +611,11 @@ def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry):
     now = time.time()
     db.execute(
         "INSERT INTO instances (vast_id, label, purpose, gpu_name, cpu_name, bid, "
-        "ev_predicted, pounce, created_at, ttl_at, last_charged_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "ev_predicted, pounce, created_at, ttl_at, last_charged_at, mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             vast_id, label, purpose, offer.get("gpu_name"), offer.get("cpu_name"),
-            bid, ev, int(pounce), now, now + ttl_hours * 3600, now,
+            bid, ev, int(pounce), now, now + ttl_hours * 3600, now, mode,
         ),
     )
     if purpose == "explore":
@@ -545,9 +642,9 @@ def destroy_instance(cfg, db, vast_id, reason, dry):
     log_event(db, "DESTROY", f"instance {vast_id} ({reason})")
 
 
-def api_estimate(cfg, offer):
+def api_estimate(cfg, offer, mode=None):
     body = {
-        "mode": cfg["mode"],
+        "mode": mode or cfg["mode"],
         "gpu": cfg["gpu"],
         "threads": int(offer.get("cpu_cores_effective") or 0) or None,
         "cpu_model": offer.get("cpu_name"),
@@ -620,7 +717,7 @@ def reconcile(cfg, db, dry):
                 "UPDATE instances SET spend = spend + ?, last_charged_at = ? WHERE vast_id = ?",
                 (cost, now, vast_id),
             )
-            db.execute("UPDATE bucket SET balance = balance - ? WHERE id = 1", (cost,))
+            charge_bucket(db, bucket_mode(row["mode"], cfg), cost)
         else:
             db.execute(
                 "UPDATE instances SET last_charged_at = ? WHERE vast_id = ?", (now, vast_id)
@@ -643,23 +740,24 @@ def extend_or_probe_pounces(cfg, db, dry):
         "SELECT * FROM instances WHERE destroyed_at IS NULL AND pounce = 1 AND confirmed = 0"
     ).fetchall()
     for row in rows:
+        m = bucket_mode(row["mode"], cfg)
         offer_like = {
             "cpu_name": row["cpu_name"],
             "gpu_name": row["gpu_name"],
-            "min_bid": row["bid"] / cfg["bid_multiplier"],
+            "min_bid": row["bid"] / mcfg(cfg, m, "bid_multiplier"),
         }
         try:
-            est = api_estimate(cfg, offer_like)
+            est = api_estimate(cfg, offer_like, mode=m)
         except OSError as e:
             log_event(db, "WARN", f"estimate for pounce {row['vast_id']} failed: {e}")
             continue
-        ev = offer_ev(offer_like, est, e_hold_hours(db, cfg, row["gpu_name"]), cfg)
-        trailing = trailing_median_ev(db)
+        ev = offer_ev(offer_like, est, e_hold_hours(db, cfg, row["gpu_name"]), cfg, mode=m)
+        trailing = trailing_median_ev(db, mode=m)
         good_stage = est.get("prediction_stage") in ("exact", "same-gpu-similar-cpu")
         if good_stage and pounce_eligible(ev, trailing, cfg):
             db.execute(
                 "UPDATE instances SET confirmed = 1, ttl_at = ? WHERE vast_id = ?",
-                (now + cfg["exploit_ttl_hours"] * 3600, row["vast_id"]),
+                (now + mcfg(cfg, m, "exploit_ttl_hours") * 3600, row["vast_id"]),
             )
             log_event(
                 db, "POUNCE-CONFIRMED",
@@ -687,26 +785,27 @@ def renew_exploits(cfg, db, dry):
         "AND pounce = 0 AND ttl_at <= ?",
         (window_end,),
     ).fetchall()
-    trailing = trailing_median_ev(db)
     for row in rows:
         expired = now >= row["ttl_at"]
         if now - row["created_at"] >= max_life:
             if expired:  # aged out: force re-evaluation via a fresh buy
                 destroy_instance(cfg, db, row["vast_id"], "ttl-max-life", dry)
             continue
+        m = bucket_mode(row["mode"], cfg)
         offer_like = {
             "cpu_name": row["cpu_name"],
             "gpu_name": row["gpu_name"],
-            "min_bid": row["bid"] / cfg["bid_multiplier"],
+            "min_bid": row["bid"] / mcfg(cfg, m, "bid_multiplier"),
         }
         try:
-            est = api_estimate(cfg, offer_like)
+            est = api_estimate(cfg, offer_like, mode=m)
         except OSError as e:
             log_event(db, "WARN", f"renew estimate for {row['vast_id']} failed: {e}")
             continue  # can't judge; leave TTL as-is, re-check next tick
-        ev = offer_ev(offer_like, est, e_hold_hours(db, cfg, row["gpu_name"]), cfg)
+        ev = offer_ev(offer_like, est, e_hold_hours(db, cfg, row["gpu_name"]), cfg, mode=m)
+        trailing = trailing_median_ev(db, mode=m)
         healthy = (
-            exploit_allowed(est, cfg)
+            exploit_allowed(est, cfg, mode=m)
             and ev > 0
             and (trailing is None or ev >= trailing)
         )
@@ -714,7 +813,7 @@ def renew_exploits(cfg, db, dry):
             if not dry:
                 db.execute(
                     "UPDATE instances SET ttl_at = ? WHERE vast_id = ?",
-                    (now + cfg["exploit_ttl_hours"] * 3600.0, row["vast_id"]),
+                    (now + mcfg(cfg, m, "exploit_ttl_hours") * 3600.0, row["vast_id"]),
                 )
             log_event(
                 db, "RENEW",
@@ -726,17 +825,15 @@ def renew_exploits(cfg, db, dry):
     db.commit()
 
 
-def record_market(db, offers_by_est):
-    """Persist per-type p10 floors and the EV distribution for the heat
-    guard and the pounce baseline."""
+def record_type_floors(db, offers):
+    """Persist per-type p10 price floors (mode-independent) for the heat guard,
+    and keep the market tables bounded. Runs once per tick over the raw offers."""
     now = time.time()
     by_type = {}
-    for offer, _est, ev in offers_by_est:
+    for offer in offers:
         by_type.setdefault(offer.get("gpu_name") or "?", []).append(
             float(offer.get("min_bid", offer.get("dph_total", 0)))
         )
-        if ev > 0:
-            db.execute("INSERT INTO ev_seen (ts, ev) VALUES (?, ?)", (now, ev))
     for gpu_name, prices in by_type.items():
         prices.sort()
         p10 = prices[max(0, int(len(prices) * 0.10) - 1)] if len(prices) > 1 else prices[0]
@@ -744,16 +841,26 @@ def record_market(db, offers_by_est):
             "INSERT INTO type_floor (ts, gpu_name, p10_dph) VALUES (?, ?, ?)",
             (now, gpu_name, p10),
         )
-    # Keep the market tables bounded.
     cutoff = now - 30 * 86400
     db.execute("DELETE FROM ev_seen WHERE ts < ?", (cutoff,))
     db.execute("DELETE FROM type_floor WHERE ts < ?", (cutoff,))
     db.commit()
 
 
-def plan_explore(cfg, db, offers_by_est, dry):
+def record_ev_seen(db, mode, mode_offers):
+    """Persist the EV distribution for one mode (its own pounce baseline)."""
     now = time.time()
-    balance = db.execute("SELECT balance FROM bucket WHERE id = 1").fetchone()["balance"]
+    for _offer, _est, ev in mode_offers:
+        if ev > 0:
+            db.execute("INSERT INTO ev_seen (ts, ev, mode) VALUES (?, ?, ?)", (now, ev, mode))
+    db.commit()
+
+
+def plan_explore(cfg, db, by_mode, dry):
+    """One explore instance benchmarks every mode, so a (gpu,cpu) pair is worth
+    exploring if it's uncertain in ANY mode. Funded from the primary bucket."""
+    now = time.time()
+    balance = bucket_balance(db, primary_mode(cfg))
     if balance <= 0:
         log_event(db, "EXPLORE-SKIP", f"bucket at ${balance:.3f}; exploring costs money too")
         return
@@ -772,15 +879,21 @@ def plan_explore(cfg, db, offers_by_est, dry):
     )
     if slots == 0:
         return
-    cooldown = now - cfg["explore_cooldown_days"] * 86400
-    for offer, est, ev in sorted(offers_by_est, key=lambda t: float(t[0].get("min_bid", 9e9))):
-        if slots == 0:
-            break
-        uncertain = (
+    # Per offer id: the estimates across every mode, plus the offer object.
+    ests = {}
+    for m, mode_offers in by_mode.items():
+        for offer, est, _ev in mode_offers:
+            ests.setdefault(offer["id"], (offer, []))[1].append(est)
+    def uncertain(est):
+        return (
             est.get("confidence", 0) < cfg["explore_confidence_threshold"]
             or est.get("prediction_stage") in cfg["explore_stages"]
         )
-        if not uncertain:
+    cooldown = now - cfg["explore_cooldown_days"] * 86400
+    for offer, mode_ests in sorted(ests.values(), key=lambda t: float(t[0].get("min_bid", 9e9))):
+        if slots == 0:
+            break
+        if not any(uncertain(e) for e in mode_ests):
             continue
         seen = db.execute(
             "SELECT COUNT(*) FROM explored WHERE gpu_name = ? AND cpu_name = ? AND explored_at > ?",
@@ -788,58 +901,72 @@ def plan_explore(cfg, db, offers_by_est, dry):
         ).fetchone()[0]
         if seen:
             continue
-        bid = suggested_bid(offer, cfg)
+        bid = suggested_bid(offer, cfg, primary_mode(cfg))
         create_instance(
             cfg, db, offer, "explore", bid,
-            cfg["explore_ttl_minutes"] / 60.0, ev, pounce=False, dry=dry,
+            cfg["explore_ttl_minutes"] / 60.0, 0.0, pounce=False, dry=dry, mode=None,
         )
         slots -= 1
     db.commit()
 
 
-def plan_exploit(cfg, db, offers_by_est, dry):
-    now = time.time()
-    balance = db.execute("SELECT balance FROM bucket WHERE id = 1").fetchone()["balance"]
-    reserve = cfg["bucket_cap_usd"] * cfg["reserve_fraction"]
-    active = db.execute(
-        "SELECT COUNT(*) FROM instances WHERE destroyed_at IS NULL AND purpose = 'exploit'"
-    ).fetchone()[0]
-    trailing = trailing_median_ev(db)
+def plan_exploit(cfg, db, by_mode, dry):
+    """One independent exploit pass per mode, each against its own bucket, EV
+    ranking, instance cap, reserve and pounce baseline. A physical offer can be
+    bought for only one mode per tick, so passes share a `claimed` set; modes
+    run in config order (earlier = first pick)."""
+    # Active exploit instances tallied per funding bucket (legacy NULL -> primary).
+    active_by_mode = {}
+    for r in db.execute(
+        "SELECT mode FROM instances WHERE destroyed_at IS NULL AND purpose = 'exploit'"
+    ).fetchall():
+        bm = bucket_mode(r["mode"], cfg)
+        active_by_mode[bm] = active_by_mode.get(bm, 0) + 1
 
-    ranked = sorted(
-        (t for t in offers_by_est if t[2] > 0 and exploit_allowed(t[1], cfg)),
-        key=lambda t: t[2],
-        reverse=True,
-    )
-    skipped = sum(1 for t in offers_by_est if t[2] > 0 and not exploit_allowed(t[1], cfg))
-    if skipped:
-        log_event(db, "STAGE-SKIP", f"{skipped} offers below exploit trust bar (explore's job)")
-    for offer, est, ev in ranked:
-        if active >= cfg["max_exploit_instances"]:
-            break
-        gpu_name = offer.get("gpu_name") or "?"
-        prices = sorted(
-            float(o.get("min_bid", o.get("dph_total", 9e9)))
-            for o, _e, _v in offers_by_est
-            if (o.get("gpu_name") or "?") == gpu_name
+    claimed = set()
+    for m in exploit_modes(cfg):
+        mode_offers = by_mode.get(m, [])
+        balance = bucket_balance(db, m)
+        reserve = mcfg(cfg, m, "bucket_cap_usd") * mcfg(cfg, m, "reserve_fraction")
+        cap = mcfg(cfg, m, "max_exploit_instances")
+        active = active_by_mode.get(m, 0)
+        trailing = trailing_median_ev(db, mode=m)
+
+        ranked = sorted(
+            (t for t in mode_offers if t[2] > 0 and exploit_allowed(t[1], cfg, mode=m)),
+            key=lambda t: t[2],
+            reverse=True,
         )
-        current_p10 = prices[max(0, int(len(prices) * 0.10) - 1)] if prices else 9e9
-        if not heat_ok(db, cfg, gpu_name, current_p10):
-            log_event(db, "HEAT-SKIP", f"{gpu_name} running hot; skipping this tick")
-            continue
-        bid = suggested_bid(offer, cfg)
-        ordinary = balance > reserve
-        pounce = not ordinary and pounce_eligible(ev, trailing, cfg) and balance > 0
-        if pounce:
-            probe_cost = bid * cfg["pounce_probe_hours"]
-            if probe_cost > balance / 2:
+        skipped = sum(1 for t in mode_offers if t[2] > 0 and not exploit_allowed(t[1], cfg, mode=m))
+        if skipped:
+            log_event(db, "STAGE-SKIP", f"[{m}] {skipped} offers below exploit trust bar")
+        for offer, est, ev in ranked:
+            if active >= cap:
+                break
+            if offer["id"] in claimed:
+                continue  # another mode already took this physical offer this tick
+            gpu_name = offer.get("gpu_name") or "?"
+            prices = sorted(
+                float(o.get("min_bid", o.get("dph_total", 9e9)))
+                for o, _e, _v in mode_offers
+                if (o.get("gpu_name") or "?") == gpu_name
+            )
+            current_p10 = prices[max(0, int(len(prices) * 0.10) - 1)] if prices else 9e9
+            if not heat_ok(db, cfg, gpu_name, current_p10):
+                log_event(db, "HEAT-SKIP", f"[{m}] {gpu_name} running hot; skipping this tick")
                 continue
-        if not ordinary and not pounce:
-            break  # bucket at/below reserve and nothing exceptional: hold
-        ttl = cfg["pounce_probe_hours"] if pounce else cfg["exploit_ttl_hours"]
-        create_instance(cfg, db, offer, "exploit", bid, ttl, ev, pounce, dry)
-        active += 1
-        balance -= bid * ttl  # planning estimate only; real charge accrues per tick
+            bid = suggested_bid(offer, cfg, m)
+            ordinary = balance > reserve
+            pounce = not ordinary and pounce_eligible(ev, trailing, cfg) and balance > 0
+            if pounce and bid * mcfg(cfg, m, "pounce_probe_hours") > balance / 2:
+                continue
+            if not ordinary and not pounce:
+                break  # bucket at/below reserve and nothing exceptional: hold
+            ttl = mcfg(cfg, m, "pounce_probe_hours") if pounce else mcfg(cfg, m, "exploit_ttl_hours")
+            create_instance(cfg, db, offer, "exploit", bid, ttl, ev, pounce, dry, mode=m)
+            claimed.add(offer["id"])
+            active += 1
+            balance -= bid * ttl  # planning estimate only; real charge accrues per tick
     db.commit()
 
 
@@ -866,6 +993,8 @@ def tick(cfg):
     dry = cfg["dry_run"]
     db = open_db(cfg["db_path"])
     now = time.time()
+    ensure_buckets(db, cfg, now)  # create/migrate per-mode buckets
+    db.commit()
 
     import os
     if os.path.exists(cfg["kill_switch_path"]):
@@ -888,36 +1017,47 @@ def tick(cfg):
     # 1c. Renew proven winners before their TTL churns them.
     renew_exploits(cfg, db, dry)
 
-    # 2. Accrue the bucket.
-    row = db.execute("SELECT balance, updated_at FROM bucket WHERE id = 1").fetchone()
-    balance = accrue_bucket(row["balance"], row["updated_at"], now, cfg)
-    db.execute("UPDATE bucket SET balance = ?, updated_at = ? WHERE id = 1", (balance, now))
-    log_event(db, "BUCKET", f"balance ${balance:.3f} / cap ${cfg['bucket_cap_usd']:.2f}")
+    # 2. Accrue each mode's bucket.
+    balances = {}
+    for m in exploit_modes(cfg):
+        row = db.execute("SELECT balance, updated_at FROM buckets WHERE mode = ?", (m,)).fetchone()
+        cap = mcfg(cfg, m, "bucket_cap_usd")
+        bal = accrue_bucket(row["balance"], row["updated_at"], now, {**cfg, "bucket_cap_usd": cap,
+              "accrual_usd_per_month": mcfg(cfg, m, "accrual_usd_per_month")})
+        db.execute("UPDATE buckets SET balance = ?, updated_at = ? WHERE mode = ?", (bal, now, m))
+        balances[m] = bal
+        log_event(db, "BUCKET", f"[{m}] balance ${bal:.3f} / cap ${cap:.2f}")
+    db.commit()
 
     # 3. Pounce probes come before new purchases.
     extend_or_probe_pounces(cfg, db, dry)
 
-    # 4. Market snapshot + estimates.
+    # 4. Market snapshot + estimates, priced for each exploit mode.
     try:
         offers = search_offers(cfg)
     except Exception as e:
         log_event(db, "ERROR", f"offer search failed: {e!r}")
         return
-    offers_by_est = []
+    modes = exploit_modes(cfg)
+    by_mode = {m: [] for m in modes}
     for offer in offers:
-        try:
-            est = api_estimate(cfg, offer)
-        except OSError as e:
-            log_event(db, "WARN", f"estimate failed for offer {offer.get('id')}: {e}")
-            continue
-        ev = offer_ev(offer, est, e_hold_hours(db, cfg, offer.get("gpu_name") or "?"), cfg)
-        offers_by_est.append((offer, est, ev))
-    record_market(db, offers_by_est)
-    log_event(db, "MARKET", f"{len(offers_by_est)} offers estimated; {confidence_spread(offers_by_est, cfg)}")
+        gpu = offer.get("gpu_name") or "?"
+        hold = e_hold_hours(db, cfg, gpu)
+        for m in modes:
+            try:
+                est = api_estimate(cfg, offer, mode=m)
+            except OSError as e:
+                log_event(db, "WARN", f"estimate [{m}] failed for offer {offer.get('id')}: {e}")
+                continue
+            by_mode[m].append((offer, est, offer_ev(offer, est, hold, cfg, mode=m)))
+    record_type_floors(db, offers)
+    for m in modes:
+        record_ev_seen(db, m, by_mode[m])
+        log_event(db, "MARKET", f"[{m}] {len(by_mode[m])} offers; {confidence_spread(by_mode[m], cfg)}")
 
-    # 5. Explore, then exploit.
-    plan_explore(cfg, db, offers_by_est, dry)
-    plan_exploit(cfg, db, offers_by_est, dry)
+    # 5. Explore (all modes at once), then exploit (per mode).
+    plan_explore(cfg, db, by_mode, dry)
+    plan_exploit(cfg, db, by_mode, dry)
 
     # Tick summary.
     active = db.execute(
@@ -927,10 +1067,11 @@ def tick(cfg):
         "SELECT COALESCE(SUM(spend), 0) FROM instances WHERE created_at > ?",
         (now - 30 * 86400,),
     ).fetchone()[0]
+    buckets_str = " ".join(f"{m}=${balances[m]:.3f}" for m in modes)
     log_event(
         db, "SUMMARY",
         f"active={active[0]} active_spend=${active[1]:.3f} 30d_spend=${month_spend:.3f} "
-        f"bucket=${balance:.3f}{' [DRY RUN]' if dry else ''}",
+        f"buckets[{buckets_str}]{' [DRY RUN]' if dry else ''}",
     )
     db.commit()
 
