@@ -909,8 +909,11 @@ impl<'a> DetailedRun<'a> {
 
 impl Drop for DetailedRun<'_> {
     fn drop(&mut self) {
+        // Not `device_wait_idle`: see the note on `Drop for NiceonlyRun`. The
+        // submitted work this has to outlive is its own dispatches, and those
+        // are exactly the slots `wait_all` waits on.
+        let _ = self.ctx.wait_all();
         unsafe {
-            let _ = self.ctx.device.device_wait_idle();
             self.ctx.device.destroy_descriptor_pool(self.pool, None);
         }
         self.ctx.free_buf(&self.hist);
@@ -1121,8 +1124,23 @@ impl RangeSink for NiceonlyRun<'_> {
 
 impl Drop for NiceonlyRun<'_> {
     fn drop(&mut self) {
+        // Wait on the submission slots, not on the whole device.
+        //
+        // `vkDeviceWaitIdle` is specified as a `vkQueueWaitIdle` on *every*
+        // queue of the device, so it requires external synchronization against
+        // all of them. Today that is free — one field is processed at a time and
+        // only the pipeline's consumer thread submits — but nothing states that
+        // invariant, and it is not the sort of thing a caller notices breaking:
+        // racing a teardown wait against a live submission is undefined
+        // behaviour, and `nice-count` measured its cost as whole dispatches
+        // silently doing nothing rather than as a crash.
+        //
+        // `wait_all` needs no such invariant. It takes the submitter lock and
+        // waits the fences of the slots actually in flight, which is a superset
+        // of this run's own work and the only work that can still be reading the
+        // descriptor sets and buffers freed below.
+        let _ = self.ctx.wait_all();
         unsafe {
-            let _ = self.ctx.device.device_wait_idle();
             for slot in &self.slots {
                 self.ctx.device.destroy_descriptor_pool(slot.pool, None);
             }
