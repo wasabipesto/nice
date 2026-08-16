@@ -6,7 +6,7 @@
 use chrono::{TimeDelta, Utc};
 use nice_common::db_util::{
     PgPool, fields::bulk_claim_fields, fields::bulk_claim_thin_fields,
-    get_pooled_database_connection,
+    try_get_pooled_database_connection,
 };
 use nice_common::{CLAIM_DURATION_HOURS, DETAILED_SEARCH_MAX_FIELD_SIZE, FieldRecord};
 use std::collections::VecDeque;
@@ -66,8 +66,16 @@ impl FieldQueue {
     fn refill_niceonly(&self) {
         let pool = self.pool.clone();
 
-        // Perform the bulk claim synchronously
-        let mut conn = get_pooled_database_connection(&pool);
+        // Perform the bulk claim synchronously. Refills run inline in the
+        // claim path, so pool pressure degrades to an empty queue (and the
+        // caller's direct-claim fallback) rather than a panic.
+        let mut conn = match try_get_pooled_database_connection(&pool) {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to refill niceonly queue: no pool connection");
+                return;
+            }
+        };
         let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
         let max_check_level = 0;
         let max_range_size = u128::MAX;
@@ -146,8 +154,15 @@ impl FieldQueue {
     fn refill_detailed_thin(&self) {
         let pool = self.pool.clone();
 
-        // Perform the bulk claim synchronously
-        let mut conn = get_pooled_database_connection(&pool);
+        // Perform the bulk claim synchronously. See refill_niceonly on the
+        // graceful pool-failure path.
+        let mut conn = match try_get_pooled_database_connection(&pool) {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to refill detailed-thin queue: no pool connection");
+                return;
+            }
+        };
         let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
         let max_check_level = 1;
         let max_range_size = DETAILED_SEARCH_MAX_FIELD_SIZE;

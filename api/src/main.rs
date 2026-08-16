@@ -9,10 +9,11 @@ extern crate rocket;
 use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
-    PgPool, benchmarks::get_recent_benchmarks, benchmarks::insert_benchmark,
+    PgPool, benchmarks::insert_benchmark,
     claims::get_claim_by_id, claims::insert_claim,
     fields::get_field_by_id, fields::get_validation_field, fields::try_claim_field,
-    fields::update_field_canon_and_cl, get_database_pool, get_pooled_database_connection,
+    fields::update_field_canon_and_cl, get_database_pool,
+    try_get_pooled_database_connection,
     submissions::insert_submission,
 };
 use nice_common::distribution_stats::expand_distribution;
@@ -34,11 +35,16 @@ const BENCHMARK_SCHEMA_VERSIONS: &[u64] = &[1];
 
 /// How many recent benchmark reports the estimator considers. This is a
 /// recency window: raising it improves rare-hardware coverage and burst-spam
-/// resilience, at the price of per-request fetch+decode work (~2 KB/row —
-/// revisit with an in-memory cache or SQL-side filtering if the fleet
-/// controller's call rate makes it hot) and, once client versions drift,
-/// more stale-version samples pooled into the quantiles.
+/// resilience, at the price of one fetch+decode per cache refresh (~3 KB/row)
+/// and, once client versions drift, more stale-version samples pooled into
+/// the quantiles.
 const ESTIMATE_SAMPLE_LIMIT: i64 = 2000;
+
+/// How long `/estimate` serves a cached benchmark corpus before re-fetching.
+/// New uploads invalidate the cache immediately, so this only bounds how
+/// long a *deletion* (e.g. manual cleanup of junk rows) can go unnoticed.
+/// Overridable via `ESTIMATE_CACHE_TTL_SECS`.
+const ESTIMATE_CACHE_TTL_SECS: u64 = 60;
 use rand::RngExt;
 use rocket::State;
 use rocket::http::Status;
@@ -47,19 +53,34 @@ use rocket::serde::json::{Json, Value, json};
 use rocket_prometheus::PrometheusMetrics;
 use tracing_subscriber::EnvFilter;
 
+mod benchmark_cache;
 mod field_queue;
 mod helpers;
 
+use benchmark_cache::BenchmarkCache;
 use field_queue::FieldQueue;
 use helpers::{
     ApiErrorBody, ApiResult, CorsFairing, RequestTimingFairing, bad_request_error, internal_error,
-    not_found_error, unprocessable_entity_error,
+    not_found_error, service_unavailable_error, unprocessable_entity_error,
 };
+
+/// Check out a pooled connection or fail the request with a 503. The pool's
+/// checkout timeout is short (see `get_database_pool`), so under pool
+/// exhaustion handlers fail fast instead of pinning a request worker.
+fn db_conn(
+    pool: &State<PgPool>,
+) -> Result<
+    nice_common::db_util::PgPooledConnection,
+    rocket::response::status::Custom<Json<ApiErrorBody>>,
+> {
+    try_get_pooled_database_connection(pool)
+        .map_err(|e| service_unavailable_error(format!("Database connection unavailable: {e}")))
+}
 
 #[get("/claim/validate")]
 fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
     // Get database connection from the shared pool
-    let mut conn = get_pooled_database_connection(pool);
+    let mut conn = db_conn(pool)?;
 
     // For validation requests, we return a random completed field and the
     // results so the client can perform a self-check.
@@ -97,7 +118,7 @@ fn claim_helper(
     queue: &State<FieldQueue>,
 ) -> ApiResult<DataToClient> {
     // Get database connection from the shared pool
-    let mut conn = get_pooled_database_connection(pool);
+    let mut conn = db_conn(pool)?;
 
     // Get the user's IP
     // TODO: Actually do this
@@ -270,7 +291,7 @@ fn claim_niceonly(pool: &State<PgPool>, queue: &State<FieldQueue>) -> ApiResult<
 #[allow(clippy::needless_pass_by_value)]
 fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
     // Get database connection from the shared pool
-    let mut conn = get_pooled_database_connection(pool);
+    let mut conn = db_conn(pool)?;
 
     // Get submission data from JSON. Oversized telemetry is dropped rather
     // than failing the submission: the search result always outranks its
@@ -448,7 +469,11 @@ fn submit(data: Json<DataToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
 /// analysis time (matching the trust posture of /submit).
 #[post("/benchmark", data = "<data>")]
 #[allow(clippy::needless_pass_by_value)]
-fn post_benchmark(data: Json<BenchmarkToServer>, pool: &State<PgPool>) -> ApiResult<Value> {
+fn post_benchmark(
+    data: Json<BenchmarkToServer>,
+    pool: &State<PgPool>,
+    cache: &State<BenchmarkCache>,
+) -> ApiResult<Value> {
     let schema_version = data.data.get("schema_version").and_then(Value::as_u64);
     if !schema_version.is_some_and(|v| BENCHMARK_SCHEMA_VERSIONS.contains(&v)) {
         return Err(unprocessable_entity_error(format!(
@@ -468,7 +493,7 @@ fn post_benchmark(data: Json<BenchmarkToServer>, pool: &State<PgPool>) -> ApiRes
         .unwrap_or("unknown")
         .to_string();
 
-    let mut conn = get_pooled_database_connection(pool);
+    let mut conn = db_conn(pool)?;
     let user_ip = "unknown".to_string();
     let benchmark_id = insert_benchmark(
         &mut conn,
@@ -478,6 +503,9 @@ fn post_benchmark(data: Json<BenchmarkToServer>, pool: &State<PgPool>) -> ApiRes
         data.data.clone(),
     )
     .map_err(|e| internal_error(format!("Database error while inserting benchmark: {e}")))?;
+
+    // New reports should show up in estimates without waiting out the TTL.
+    cache.invalidate();
 
     tracing::info!(benchmark_id, username = data.username, "benchmark stored");
     Ok(Json(json!({
@@ -489,9 +517,14 @@ fn post_benchmark(data: Json<BenchmarkToServer>, pool: &State<PgPool>) -> ApiRes
 /// Estimate what a hardware configuration will achieve, from recent
 /// benchmark uploads. Hierarchical matching; the response names the
 /// fallback stage that produced the numbers alongside a confidence percent.
+/// Served from the in-memory benchmark cache — the handler touches the
+/// database at most once per cache refresh, not per request.
 #[post("/estimate", data = "<data>")]
 #[allow(clippy::needless_pass_by_value)]
-fn post_estimate(data: Json<EstimateRequest>, pool: &State<PgPool>) -> ApiResult<EstimateResponse> {
+fn post_estimate(
+    data: Json<EstimateRequest>,
+    cache: &State<BenchmarkCache>,
+) -> ApiResult<EstimateResponse> {
     let Some(mode) = estimator::mode_string(&data.mode) else {
         return Err(unprocessable_entity_error(format!(
             "Unknown mode {:?} (expected \"niceonly\" or \"detailed\").",
@@ -499,13 +532,9 @@ fn post_estimate(data: Json<EstimateRequest>, pool: &State<PgPool>) -> ApiResult
         )));
     };
 
-    let mut conn = get_pooled_database_connection(pool);
-    let rows = get_recent_benchmarks(&mut conn, ESTIMATE_SAMPLE_LIMIT)
-        .map_err(|e| internal_error(format!("Database error while loading benchmarks: {e}")))?;
-    let samples: Vec<estimator::BenchmarkSample> = rows
-        .iter()
-        .filter_map(|(version, report)| estimator::decode_sample(version, report))
-        .collect();
+    let samples = cache
+        .get()
+        .map_err(|e| service_unavailable_error(format!("Benchmark data unavailable: {e}")))?;
 
     let input = estimator::EstimateInput {
         gpu: data.gpu,
@@ -574,6 +603,19 @@ fn rocket() -> _ {
     queue.prefill_niceonly();
     queue.prefill_detailed_thin();
 
+    // Initialize the benchmark corpus cache for /estimate and pre-fill it
+    let cache_ttl = std::env::var("ESTIMATE_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(ESTIMATE_CACHE_TTL_SECS);
+    let cache = BenchmarkCache::new(
+        pool.clone(),
+        std::time::Duration::from_secs(cache_ttl),
+        ESTIMATE_SAMPLE_LIMIT,
+    );
+    cache.prefill();
+
     // Initialize Prometheus metrics
     let prometheus = PrometheusMetrics::new();
 
@@ -583,6 +625,7 @@ fn rocket() -> _ {
         .attach(RequestTimingFairing)
         .manage(pool)
         .manage(queue)
+        .manage(cache)
         .mount(
             "/",
             routes![
