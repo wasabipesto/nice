@@ -8,12 +8,17 @@ repository.workspace = true
 readme.workspace = true
 license-file.workspace = true
 
+# `gpu` is an umbrella that builds both backends; `cuda` and `vulkan` build one
+# each. Note that cargo does not propagate feature cfgs upward — a `--features
+# cuda` build has `cfg(feature = "cuda")` and *not* `cfg(feature = "gpu")` — so
+# source `#[cfg]`s must always name `cuda`/`vulkan`, never `gpu`.
 [features]
 database = ["dep:diesel", "dep:dotenvy", "dep:bigdecimal", "dep:rand"]
 openssl-tls = ["reqwest/default-tls", "dep:openssl", "dep:tokio"]
 rustls-tls = ["reqwest/rustls-tls", "dep:tokio"]
-gpu = ["dep:cudarc"]
+cuda = ["dep:cudarc"]
 vulkan = ["dep:ash", "dep:naga"]
+gpu = ["cuda", "vulkan"]
 
 [dependencies]
 anyhow = { version = "1.0" }

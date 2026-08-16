@@ -146,7 +146,7 @@ Options:
           [env: NICE_VALIDATE=]
 
       --gpu
-          Use GPU acceleration (requires gpu feature)
+          Use GPU acceleration
 
           [env: NICE_GPU=]
 
@@ -188,9 +188,10 @@ There are some feature flags that enable specific dependencies:
 
 - `nice_common/database` is set automatically from binaries that connect directly to postgres (`api` and `jobs`). This requires the `libpq-dev` package to be installed.
 - `nice_client/rustls-tls` is enabled by default and uses rustls for TLS connections, which doesn't require any external dependencies. Disable it and enable `nice_client/openssl-tls` to use `openssl`.
-- In order to build the client with GPU acceleration, enable the `nice_client/gpu` feature. This requires no additional build-time dependencies, but it does require the CUDA toolkit to be available at runtime for kernel compilation.
-- `nice_client/vulkan` builds a second GPU backend that runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, and llvmpipe). Like the CUDA one it needs nothing at build time; at runtime it needs only a Vulkan driver, since shaders are generated per base and compiled with `naga`. Both modes run on the GPU.
-- The two features are additive: `--features gpu,vulkan` produces one binary that runs on either, selected with `--gpu-backend`. Neither library is needed to *build* it, and `auto` prefers CUDA.
+- In order to build the client with GPU acceleration, enable the `nice_client/gpu` feature. There are two backends and `gpu` is an umbrella that builds both, producing one binary that runs on either, selected at runtime with `--gpu-backend` (`auto` prefers CUDA). Neither GPU library is needed to *build* it — both are loaded at runtime — so this adds no build-time dependencies.
+  - `nice_client/cuda` builds the CUDA backend alone. It requires the CUDA toolkit to be available at runtime for kernel compilation.
+  - `nice_client/vulkan` builds the Vulkan backend alone. It runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, and llvmpipe), and at runtime it needs only a Vulkan driver, since shaders are generated per base and compiled with `naga`.
+  - Both backends support both search modes, so `gpu` is the right default unless you are targeting one vendor.
 
 Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack/).
 
@@ -198,7 +199,13 @@ There are also a few scripts, to be used with [rust-script](https://rust-script.
 
 If you want to run a copy of this server yourself, a SQL schema file has been provided. You can build the bases and fields with the `insert_fields` script.
 
-### GPU development
+### CUDA GPU development
+
+The commands in this section build `--features cuda` rather than the `gpu`
+umbrella, because everything below is specific to the CUDA backend and the
+umbrella would compile the Vulkan tree as well for no benefit. Use
+`--features gpu` if you do want both. The Vulkan backend's own tests are in
+`common/src/vulkan` and run with `--features vulkan`.
 
 The CUDA kernels in `common/src/cuda` are compiled at runtime by NVRTC, once
 per (base, mode), with all base-dependent constants baked in as defines. Most
@@ -214,7 +221,7 @@ The easiest way to get `libnvrtc` is the pip wheel, via [uv](https://docs.astral
 # Fetch libnvrtc from the pip wheel and point the linker at it (no GPU needed)
 NVRTC_LIB=$(uv run --no-project --with nvidia-cuda-nvrtc-cu12 python -c \
     "import nvidia.cuda_nvrtc; print(nvidia.cuda_nvrtc.__path__[0] + '/lib')")
-LD_LIBRARY_PATH="$NVRTC_LIB" cargo test --features gpu -p nice_common
+LD_LIBRARY_PATH="$NVRTC_LIB" cargo test --features cuda -p nice_common
 ```
 
 Or run the tests inside a CUDA container, which ships `libnvrtc`:
@@ -223,11 +230,11 @@ Or run the tests inside a CUDA container, which ships `libnvrtc`:
 docker run --rm -v "$PWD":/work -w /work nvidia/cuda:12.4.1-devel-ubuntu22.04 \
     bash -c "apt-get update -qq && apt-get install -y -qq curl build-essential > /dev/null && \
              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q && \
-             . ~/.cargo/env && cargo test --features gpu -p nice_common"
+             . ~/.cargo/env && cargo test --features cuda -p nice_common"
 ```
 
-Functional GPU tests (CPU/GPU result parity) still need real hardware; they
-are `#[ignore]`d and run with `cargo test --features gpu -- --ignored`.
+Functional CUDA tests (CPU/GPU result parity) still need real hardware; they
+are `#[ignore]`d and run with `cargo test --features cuda -- --ignored`.
 
 ## Why are you writing this from scratch for like the tenth time
 

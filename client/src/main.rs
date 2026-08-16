@@ -36,7 +36,7 @@ const MAX_SUBMITS_IN_FLIGHT: usize = 8;
 
 mod bench;
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda")]
 use nice_common::client_process_gpu::{
     GPU_BATCH_SIZE, GpuContext, process_range_detailed_gpu, process_range_niceonly_gpu,
 };
@@ -50,8 +50,8 @@ use nice_common::vulkan::VulkanContext;
 /// Which GPU backend to drive.
 ///
 /// Both backends `dlopen` their driver at runtime, so a single binary can carry
-/// both and require neither at build time. `Auto` tries CUDA first, leaving
-/// behaviour on an NVIDIA machine exactly as it was.
+/// both (`--features gpu`) and require neither at build time. `Auto` tries CUDA
+/// first, leaving behaviour on an NVIDIA machine exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
     /// CUDA if available, otherwise Vulkan.
@@ -72,7 +72,7 @@ enum GpuBackend {
 /// exactly one of these, behind an `Arc`, for its whole run.
 #[allow(clippy::large_enum_variant)]
 enum GpuHandle {
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
     Cuda(GpuContext),
     #[cfg(feature = "vulkan")]
     Vulkan(VulkanContext),
@@ -97,10 +97,10 @@ impl GpuHandle {
         // reference and references are always considered inhabited, so an
         // empty match does not type-check. Same `#[cfg]` split as
         // `process_field_sync`.
-        #[cfg(any(feature = "gpu", feature = "vulkan"))]
+        #[cfg(any(feature = "cuda", feature = "vulkan"))]
         {
             match self {
-                #[cfg(feature = "gpu")]
+                #[cfg(feature = "cuda")]
                 GpuHandle::Cuda(_) => cudarc::driver::CudaContext::new(device)
                     .ok()
                     .and_then(|d| d.name().ok()),
@@ -108,7 +108,7 @@ impl GpuHandle {
                 GpuHandle::Vulkan(ctx) => Some(ctx.device_name.clone()),
             }
         }
-        #[cfg(not(any(feature = "gpu", feature = "vulkan")))]
+        #[cfg(not(any(feature = "cuda", feature = "vulkan")))]
         {
             None
         }
@@ -227,16 +227,16 @@ pub struct Cli {
     #[arg(long, env = "NICE_VALIDATE")]
     validate: bool,
 
-    /// Use GPU acceleration (requires gpu feature)
-    #[arg(long, env = "NICE_GPU")]
+    /// Use GPU acceleration
+    #[arg(long, env = "NICE_GPU", hide = !HAS_GPU_BACKEND)]
     gpu: bool,
 
     /// GPU device to use (0 for first GPU, 1 for second, etc.)
-    #[arg(long, default_value_t = 0, env = "NICE_GPU_DEVICE")]
+    #[arg(long, default_value_t = 0, env = "NICE_GPU_DEVICE", hide = !HAS_GPU_BACKEND)]
     gpu_device: usize,
 
     /// Which GPU backend to use with --gpu
-    #[arg(long, value_enum, default_value_t = GpuBackend::Auto, env = "NICE_GPU_BACKEND")]
+    #[arg(long, value_enum, default_value_t = GpuBackend::Auto, env = "NICE_GPU_BACKEND", hide = !HAS_GPU_BACKEND)]
     gpu_backend: GpuBackend,
 
     /// Set the log level (overrides `RUST_LOG` environment variable)
@@ -244,9 +244,18 @@ pub struct Cli {
     log_level: Option<LogLevel>,
 }
 
+/// Whether this build carries any GPU backend at all.
+///
+/// The `--gpu*` flags are *hidden* from `--help` when it does not, rather than
+/// removed: they still parse, so `--gpu` or `NICE_GPU=1` against a CPU-only
+/// build gets the explanatory error below instead of clap's "unexpected
+/// argument", which matters most for the docker images where the flag is the
+/// only difference between the two tags.
+const HAS_GPU_BACKEND: bool = cfg!(any(feature = "cuda", feature = "vulkan"));
+
 /// Which backends this build carries, for error messages.
 fn compiled_backends() -> &'static str {
-    match (cfg!(feature = "gpu"), cfg!(feature = "vulkan")) {
+    match (cfg!(feature = "cuda"), cfg!(feature = "vulkan")) {
         (true, true) => "cuda, vulkan",
         (true, false) => "cuda",
         (false, true) => "vulkan",
@@ -268,7 +277,7 @@ fn compiled_backends() -> &'static str {
 ///
 /// Note this relies on unwinding; under `panic = "abort"` the process would die
 /// as before. The workspace does not set that.
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda")]
 fn try_init_cuda(device: usize) -> Result<GpuContext> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -302,7 +311,7 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
     }
     let want = cli.gpu_backend;
 
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
     if matches!(want, GpuBackend::Auto | GpuBackend::Cuda) {
         match try_init_cuda(cli.gpu_device) {
             Ok(ctx) => {
@@ -386,13 +395,13 @@ fn process_field_sync(
     let mode = cli.mode;
     if cli.gpu {
         // GPU processing path
-        #[cfg(any(feature = "gpu", feature = "vulkan"))]
+        #[cfg(any(feature = "cuda", feature = "vulkan"))]
         {
             let handle = gpu.as_ref().expect("GPU context failed to initialize");
             let range: FieldSize = claim_data.into();
 
             let gpu_results = match &**handle {
-                #[cfg(feature = "gpu")]
+                #[cfg(feature = "cuda")]
                 GpuHandle::Cuda(ctx) => match mode {
                     SearchMode::Detailed => {
                         process_range_detailed_gpu(ctx, &range, claim_data.base)
@@ -420,7 +429,7 @@ fn process_field_sync(
                 }
             }
         }
-        #[cfg(not(any(feature = "gpu", feature = "vulkan")))]
+        #[cfg(not(any(feature = "cuda", feature = "vulkan")))]
         {
             let _ = gpu; // there is no context to look at in this build
             error!("GPU support not compiled in");
@@ -923,10 +932,10 @@ async fn main() -> Result<()> {
     builder.init();
 
     // Check for GPU support
-    if cli.gpu && !(cfg!(feature = "gpu") || cfg!(feature = "vulkan")) {
+    if cli.gpu && !HAS_GPU_BACKEND {
         error!(
-            "Error: GPU support not enabled. Rebuild with --features gpu (CUDA) \
-             and/or --features vulkan"
+            "Error: GPU support not enabled. Rebuild with --features gpu \
+             or at least one of the GPU specific backends"
         );
         std::process::exit(1);
     }
@@ -939,7 +948,7 @@ async fn main() -> Result<()> {
     #[allow(unused_mut)]
     let mut cpu_or_gpu = format!("CPU with {} threads", cli.threads);
 
-    #[cfg(any(feature = "gpu", feature = "vulkan"))]
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
     if cli.gpu {
         cpu_or_gpu = format!("GPU device {}", cli.gpu_device);
     };
@@ -1108,7 +1117,7 @@ mod tests {
     /// could fall through to Vulkan. Whatever this machine has installed,
     /// initialization must *return* — Ok on a CUDA box, Err on one without —
     /// and never unwind past here.
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
     #[test]
     fn cuda_init_returns_instead_of_panicking() {
         // The result depends on the host; only the absence of a panic matters.

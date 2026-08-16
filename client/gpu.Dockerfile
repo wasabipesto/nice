@@ -3,6 +3,11 @@
 # with the filename `nice_client`.
 #
 # This image includes CUDA 12.0 runtime libraries required for GPU acceleration.
+#
+# CI builds the binary with `--features gpu`, which is the umbrella over both
+# backends, so it also carries the Vulkan one. This base image ships no Vulkan
+# ICD, so that backend is inert here unless a loader is mounted in; `auto` still
+# prefers CUDA, so behaviour is unchanged.
 
 FROM nvidia/cuda:12.0.0-runtime-ubuntu22.04 AS runtime
 

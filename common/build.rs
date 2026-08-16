@@ -1,10 +1,12 @@
 //! Build script for nice_common.
 //!
-//! When the GPU feature is enabled, this script manages CUDA-related build configuration.
+//! When the CUDA feature is enabled, this script manages CUDA-related build configuration.
 //! The CUDA kernels are embedded in the binary and compiled at runtime via NVRTC.
+//! The Vulkan backend needs nothing here: its shaders are generated per base and
+//! compiled at runtime by `naga`.
 
 fn main() {
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
     {
         // The CUDA kernels are embedded in the binary via include_str!()
         // and compiled at runtime using NVRTC, so we don't need to compile
@@ -25,8 +27,8 @@ fn main() {
         );
     }
 
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(not(feature = "cuda"))]
     {
-        // Nothing to do when GPU feature is disabled
+        // Nothing to do when the CUDA feature is disabled
     }
 }

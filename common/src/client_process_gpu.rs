@@ -31,7 +31,7 @@
 //! above 64 use a two-word digit mask. Bases with no u128 range fall back to
 //! the CPU implementation with a logged warning.
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "cuda")]
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};

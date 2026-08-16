@@ -12,10 +12,14 @@
 //! CUDA enqueues asynchronous launches on its stream, Vulkan records and
 //! submits a dispatch. This is the same split as [`crate::gpu_config`], which
 //! holds the per-base kernel constants for the same reason —
-//! [`crate::client_process_gpu`] is `#![cfg(feature = "gpu")]` and unreachable
+//! [`crate::client_process_gpu`] is `#![cfg(feature = "cuda")]` and unreachable
 //! from a Vulkan-only build.
+//!
+//! Note the cfg below names both backends rather than the `gpu` umbrella
+//! feature: cargo sets `cfg(feature = "gpu")` only when `gpu` itself is
+//! enabled, not when it is reached through `--features cuda`.
 
-#![cfg(any(feature = "gpu", feature = "vulkan"))]
+#![cfg(any(feature = "cuda", feature = "vulkan"))]
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use crate::{FieldSize, msd_prefix_filter};

@@ -8,12 +8,16 @@ repository.workspace = true
 readme.workspace = true
 license-file.workspace = true
 
+# `gpu` is an umbrella that builds both backends; `cuda` and `vulkan` build one
+# each. Source `#[cfg]`s must name `cuda`/`vulkan` and never `gpu` — see the
+# note in common/Cargo.toml.
 [features]
 default = ["rustls-tls"]
 openssl-tls = ["nice_common/openssl-tls"]
 rustls-tls = ["nice_common/rustls-tls"]
-gpu = ["nice_common/gpu", "dep:cudarc"]
+cuda = ["nice_common/cuda", "dep:cudarc"]
 vulkan = ["nice_common/vulkan"]
+gpu = ["cuda", "vulkan"]
 
 [dependencies]
 nice_common = { workspace = true }
