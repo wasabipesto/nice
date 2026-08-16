@@ -88,6 +88,7 @@ fn detailed_kernel(
     #[comptime] chunk_digits: u32,
     #[comptime] chunk_div: u32,
     #[comptime] cutoff: u32,
+    #[comptime] wide_chunk: bool,
 ) {
     let hist_bins = comptime!(base + 1);
     let sq_limbs = comptime!(2 * limbs);
@@ -210,21 +211,36 @@ fn detailed_kernel(
                 top -= 1;
             }
 
-            // Chunked split16 radix scan, destroying sv.
+            // Chunked radix scan, destroying sv. Two flavors, chosen at
+            // comptime per runtime: `wide_chunk` divides limb-pairs by a
+            // sub-2^31 constant with one u64 division per limb (nvcc
+            // strength-reduces it; 5 digits/chunk at base 40), while the
+            // split16 flavor uses two u32 divisions over 16-bit halves
+            // (for drivers that cannot strength-reduce u64, 3 digits/chunk).
             while top >= 0 {
-                // rem = sv mod chunk_div; sv /= chunk_div — 16-bit halves,
-                // so every division is 32-bit by a comptime constant.
                 let mut rem = 0u32;
-                let mut i: i32 = top;
-                while i >= 0 {
-                    let vi = sv[i as usize];
-                    let c1 = (rem << 16u32) | (vi >> 16u32);
-                    let q1 = c1 / chunk_div;
-                    let c2 = ((c1 % chunk_div) << 16u32) | (vi & 0xFFFFu32);
-                    let q2 = c2 / chunk_div;
-                    rem = c2 % chunk_div;
-                    sv[i as usize] = (q1 << 16u32) | q2;
-                    i -= 1;
+                if wide_chunk {
+                    let mut rem64 = 0u64;
+                    let mut i: i32 = top;
+                    while i >= 0 {
+                        let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
+                        sv[i as usize] = u32::cast_from(cur / u64::cast_from(chunk_div));
+                        rem64 = cur % u64::cast_from(chunk_div);
+                        i -= 1;
+                    }
+                    rem = u32::cast_from(rem64); // rem < chunk_div < 2^31
+                } else {
+                    let mut i: i32 = top;
+                    while i >= 0 {
+                        let vi = sv[i as usize];
+                        let c1 = (rem << 16u32) | (vi >> 16u32);
+                        let q1 = c1 / chunk_div;
+                        let c2 = ((c1 % chunk_div) << 16u32) | (vi & 0xFFFFu32);
+                        let q2 = c2 / chunk_div;
+                        rem = c2 % chunk_div;
+                        sv[i as usize] = (q1 << 16u32) | q2;
+                        i -= 1;
+                    }
                 }
                 while top >= 0 {
                     if sv[top as usize] != 0u32 {
@@ -401,9 +417,9 @@ pub fn process_range_detailed_cubecl(
     }
 
     match ctx {
-        CubeclContext::Wgpu { client, .. } => detailed_impl(client, range, base),
+        CubeclContext::Wgpu { client, .. } => detailed_impl(client, range, base, false),
         #[cfg(feature = "cubecl-cuda")]
-        CubeclContext::Cuda { client, .. } => detailed_impl(client, range, base),
+        CubeclContext::Cuda { client, .. } => detailed_impl(client, range, base, true),
     }
 }
 
@@ -412,10 +428,15 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     range: &FieldSize,
     base: u32,
+    wide_chunk: bool,
 ) -> Result<FieldResults> {
     let start_time = Instant::now();
     let limbs = n_limbs(base).with_context(|| format!("base {base} has no u128 range"))?;
-    let (chunk_digits, chunk_div) = chunk_constants_u16(base);
+    let (chunk_digits, chunk_div) = if wide_chunk {
+        crate::gpu_config::chunk_constants(base)
+    } else {
+        chunk_constants_u16(base)
+    };
     let cutoff = get_near_miss_cutoff(base);
     let hist_bins = (base + 1) as usize;
 
@@ -458,6 +479,7 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
                 chunk_digits,
                 chunk_div,
                 cutoff,
+                wide_chunk,
             );
         }
 
