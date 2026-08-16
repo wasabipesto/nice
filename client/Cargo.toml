@@ -14,6 +14,8 @@ openssl-tls = ["nice_common/openssl-tls"]
 rustls-tls = ["nice_common/rustls-tls"]
 gpu = ["nice_common/gpu", "dep:cudarc"]
 vulkan = ["nice_common/vulkan"]
+cubecl = ["nice_common/cubecl"]
+cubecl-cuda = ["nice_common/cubecl-cuda"]
 
 [dependencies]
 nice_common = { workspace = true }

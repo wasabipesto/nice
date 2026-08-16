@@ -46,6 +46,8 @@ use nice_common::client_process_vulkan::{
 };
 #[cfg(feature = "vulkan")]
 use nice_common::vulkan::VulkanContext;
+#[cfg(feature = "cubecl")]
+use nice_common::cubecl_backend::{CUBECL_BATCH_SIZE, CubeclContext, process_range_detailed_cubecl};
 
 /// Which GPU backend to drive.
 ///
@@ -60,6 +62,8 @@ enum GpuBackend {
     Cuda,
     /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe).
     Vulkan,
+    /// CubeCL over wgpu (detailed mode only; benchmark-grade evaluation port).
+    Cubecl,
 }
 
 /// An initialized GPU backend.
@@ -76,6 +80,8 @@ enum GpuHandle {
     Cuda(GpuContext),
     #[cfg(feature = "vulkan")]
     Vulkan(VulkanContext),
+    #[cfg(feature = "cubecl")]
+    Cubecl(CubeclContext),
 }
 
 impl GpuHandle {
@@ -97,7 +103,7 @@ impl GpuHandle {
         // reference and references are always considered inhabited, so an
         // empty match does not type-check. Same `#[cfg]` split as
         // `process_field_sync`.
-        #[cfg(any(feature = "gpu", feature = "vulkan"))]
+        #[cfg(any(feature = "gpu", feature = "vulkan", feature = "cubecl"))]
         {
             match self {
                 #[cfg(feature = "gpu")]
@@ -106,9 +112,11 @@ impl GpuHandle {
                     .and_then(|d| d.name().ok()),
                 #[cfg(feature = "vulkan")]
                 GpuHandle::Vulkan(ctx) => Some(ctx.device_name.clone()),
+                #[cfg(feature = "cubecl")]
+                GpuHandle::Cubecl(ctx) => Some(ctx.device_name.clone()),
             }
         }
-        #[cfg(not(any(feature = "gpu", feature = "vulkan")))]
+        #[cfg(not(any(feature = "gpu", feature = "vulkan", feature = "cubecl")))]
         {
             None
         }
@@ -245,12 +253,21 @@ pub struct Cli {
 }
 
 /// Which backends this build carries, for error messages.
-fn compiled_backends() -> &'static str {
-    match (cfg!(feature = "gpu"), cfg!(feature = "vulkan")) {
-        (true, true) => "cuda, vulkan",
-        (true, false) => "cuda",
-        (false, true) => "vulkan",
-        (false, false) => "none",
+fn compiled_backends() -> String {
+    let mut have = Vec::new();
+    if cfg!(feature = "gpu") {
+        have.push("cuda");
+    }
+    if cfg!(feature = "vulkan") {
+        have.push("vulkan");
+    }
+    if cfg!(feature = "cubecl") {
+        have.push("cubecl");
+    }
+    if have.is_empty() {
+        "none".to_string()
+    } else {
+        have.join(", ")
     }
 }
 
@@ -363,6 +380,23 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
         }
     }
 
+    #[cfg(feature = "cubecl")]
+    if want == GpuBackend::Cubecl {
+        match CubeclContext::new_default() {
+            Ok(ctx) => {
+                info!(
+                    "GPU initialized: CubeCL wgpu device ({}), batch size {}",
+                    ctx.device_name, CUBECL_BATCH_SIZE
+                );
+                return Some(Arc::new(GpuHandle::Cubecl(ctx)));
+            }
+            Err(e) => {
+                error!("Failed to initialize CubeCL wgpu runtime: {e:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     error!(
         "No usable GPU backend for --gpu-backend {want:?}; this build has: {}",
         compiled_backends()
@@ -386,7 +420,7 @@ fn process_field_sync(
     let mode = cli.mode;
     if cli.gpu {
         // GPU processing path
-        #[cfg(any(feature = "gpu", feature = "vulkan"))]
+        #[cfg(any(feature = "gpu", feature = "vulkan", feature = "cubecl"))]
         {
             let handle = gpu.as_ref().expect("GPU context failed to initialize");
             let range: FieldSize = claim_data.into();
@@ -410,6 +444,15 @@ fn process_field_sync(
                         process_range_niceonly_vulkan(ctx, &range, claim_data.base)
                     }
                 },
+                #[cfg(feature = "cubecl")]
+                GpuHandle::Cubecl(ctx) => match mode {
+                    SearchMode::Detailed => {
+                        process_range_detailed_cubecl(ctx, &range, claim_data.base)
+                    }
+                    SearchMode::Niceonly => Err(anyhow::anyhow!(
+                        "the CubeCL backend is detailed-only for now; use --mode detailed"
+                    )),
+                },
             };
 
             match gpu_results {
@@ -420,7 +463,7 @@ fn process_field_sync(
                 }
             }
         }
-        #[cfg(not(any(feature = "gpu", feature = "vulkan")))]
+        #[cfg(not(any(feature = "gpu", feature = "vulkan", feature = "cubecl")))]
         {
             let _ = gpu; // there is no context to look at in this build
             error!("GPU support not compiled in");
@@ -923,7 +966,7 @@ async fn main() -> Result<()> {
     builder.init();
 
     // Check for GPU support
-    if cli.gpu && !(cfg!(feature = "gpu") || cfg!(feature = "vulkan")) {
+    if cli.gpu && !(cfg!(feature = "gpu") || cfg!(feature = "vulkan") || cfg!(feature = "cubecl")) {
         error!(
             "Error: GPU support not enabled. Rebuild with --features gpu (CUDA) \
              and/or --features vulkan"
@@ -939,7 +982,7 @@ async fn main() -> Result<()> {
     #[allow(unused_mut)]
     let mut cpu_or_gpu = format!("CPU with {} threads", cli.threads);
 
-    #[cfg(any(feature = "gpu", feature = "vulkan"))]
+    #[cfg(any(feature = "gpu", feature = "vulkan", feature = "cubecl"))]
     if cli.gpu {
         cpu_or_gpu = format!("GPU device {}", cli.gpu_device);
     };

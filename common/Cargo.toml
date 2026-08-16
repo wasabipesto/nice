@@ -14,8 +14,11 @@ openssl-tls = ["reqwest/default-tls", "dep:openssl", "dep:tokio"]
 rustls-tls = ["reqwest/rustls-tls", "dep:tokio"]
 gpu = ["dep:cudarc"]
 vulkan = ["dep:ash", "dep:naga"]
+cubecl = ["dep:cubecl"]
+cubecl-cuda = ["cubecl", "cubecl/cuda"]
 
 [dependencies]
+cubecl = { version = "0.10", features = ["wgpu"], optional = true }
 anyhow = { version = "1.0" }
 bigdecimal = { version = "0.4.10", optional = true }
 chrono = { version = "0.4.43", features = ["serde"] }
