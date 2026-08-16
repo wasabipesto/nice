@@ -35,7 +35,7 @@ tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time"], opt
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 rand = { version = "0.10.1", optional = true }
-cudarc = { version = "0.19", features = ["cuda-12000"], optional = true }
+cudarc = { version = "0.19", features = ["cuda-12080"], optional = true }
 ash = { version = "0.38", optional = true }
 naga = { version = "30.0", features = ["wgsl-in", "spv-out"], optional = true }
 
