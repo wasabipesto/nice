@@ -569,6 +569,31 @@ mod tests {
         }
     }
 
+    /// CPU/CubeCL parity through the native CUDA runtime, on real silicon.
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_matches_cpu_detailed() {
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        for (base, count) in [
+            (10u32, 1_000_000u128),
+            (40, 2_000_000),
+            (62, 200_000),
+            (80, 100_000),
+        ] {
+            let start = crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap()
+                .range_start;
+            let range = FieldSize::new(start, start + count);
+            let gpu = process_range_detailed_cubecl(&ctx, &range, base).expect("cubecl-cuda run");
+            let cpu = process_range_detailed(&range, base);
+            assert_eq!(gpu.distribution, cpu.distribution, "base {base}: distribution mismatch");
+            assert_eq!(gpu.nice_numbers, cpu.nice_numbers, "base {base}: near-miss mismatch");
+            println!("base {base}: {count} candidates match the CPU exactly (CUDA runtime)");
+        }
+    }
+
     /// The known solution: 69 is nice in base 10.
     #[test]
     #[ignore = "requires a wgpu device"]
