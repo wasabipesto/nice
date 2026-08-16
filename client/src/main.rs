@@ -64,6 +64,8 @@ enum GpuBackend {
     Vulkan,
     /// CubeCL over wgpu (detailed mode only; benchmark-grade evaluation port).
     Cubecl,
+    /// CubeCL over its native CUDA runtime (needs the cubecl-cuda feature).
+    CubeclCuda,
 }
 
 /// An initialized GPU backend.
@@ -113,7 +115,7 @@ impl GpuHandle {
                 #[cfg(feature = "vulkan")]
                 GpuHandle::Vulkan(ctx) => Some(ctx.device_name.clone()),
                 #[cfg(feature = "cubecl")]
-                GpuHandle::Cubecl(ctx) => Some(ctx.device_name.clone()),
+                GpuHandle::Cubecl(ctx) => Some(ctx.device_name()),
             }
         }
         #[cfg(not(any(feature = "gpu", feature = "vulkan", feature = "cubecl")))]
@@ -386,12 +388,30 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
             Ok(ctx) => {
                 info!(
                     "GPU initialized: CubeCL wgpu device ({}), batch size {}",
-                    ctx.device_name, CUBECL_BATCH_SIZE
+                    ctx.device_name(),
+                    CUBECL_BATCH_SIZE
                 );
                 return Some(Arc::new(GpuHandle::Cubecl(ctx)));
             }
             Err(e) => {
                 error!("Failed to initialize CubeCL wgpu runtime: {e:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(feature = "cubecl-cuda")]
+    if want == GpuBackend::CubeclCuda {
+        match CubeclContext::new_cuda(cli.gpu_device) {
+            Ok(ctx) => {
+                info!(
+                    "GPU initialized: CubeCL CUDA device {} , batch size {}",
+                    cli.gpu_device, CUBECL_BATCH_SIZE
+                );
+                return Some(Arc::new(GpuHandle::Cubecl(ctx)));
+            }
+            Err(e) => {
+                error!("Failed to initialize CubeCL CUDA runtime: {e:?}");
                 std::process::exit(1);
             }
         }

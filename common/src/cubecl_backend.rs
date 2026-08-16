@@ -312,10 +312,19 @@ fn detailed_kernel(
 // Host side
 // ============================================================================
 
-/// One initialized `CubeCL` device, wgpu-backed.
-pub struct CubeclContext {
-    client: cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime>,
-    pub device_name: String,
+/// One initialized `CubeCL` device: wgpu everywhere, or the native CUDA
+/// runtime when built with `cubecl-cuda` (the meaningful NVIDIA comparison,
+/// since it exercises CubeCL's CUDA codegen against the hand kernels).
+pub enum CubeclContext {
+    Wgpu {
+        client: cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        device_name: String,
+    },
+    #[cfg(feature = "cubecl-cuda")]
+    Cuda {
+        client: cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+        device_name: String,
+    },
 }
 
 impl CubeclContext {
@@ -343,10 +352,34 @@ impl CubeclContext {
             let client = cubecl::wgpu::WgpuRuntime::client(&device);
             (client, device_name)
         });
-        Ok(Self {
+        Ok(Self::Wgpu {
             client: client.clone(),
             device_name: device_name.clone(),
         })
+    }
+
+    /// Initialize `CubeCL`'s native CUDA runtime on `device_index`.
+    ///
+    /// # Errors
+    /// Returns an error if CUDA is unavailable.
+    #[cfg(feature = "cubecl-cuda")]
+    pub fn new_cuda(device_index: usize) -> Result<Self> {
+        let device = cubecl::cuda::CudaDevice::new(device_index);
+        let client = cubecl::cuda::CudaRuntime::client(&device);
+        Ok(Self::Cuda {
+            client,
+            device_name: format!("cubecl-cuda device {device_index}"),
+        })
+    }
+
+    /// The adapter/device name, for reports.
+    #[must_use]
+    pub fn device_name(&self) -> String {
+        match self {
+            Self::Wgpu { device_name, .. } => device_name.clone(),
+            #[cfg(feature = "cubecl-cuda")]
+            Self::Cuda { device_name, .. } => device_name.clone(),
+        }
     }
 }
 
@@ -367,13 +400,25 @@ pub fn process_range_detailed_cubecl(
         return Ok(process_range_detailed(range, base));
     }
 
+    match ctx {
+        CubeclContext::Wgpu { client, .. } => detailed_impl(client, range, base),
+        #[cfg(feature = "cubecl-cuda")]
+        CubeclContext::Cuda { client, .. } => detailed_impl(client, range, base),
+    }
+}
+
+/// Runtime-generic body of [`process_range_detailed_cubecl`].
+fn detailed_impl<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    range: &FieldSize,
+    base: u32,
+) -> Result<FieldResults> {
     let start_time = Instant::now();
     let limbs = n_limbs(base).with_context(|| format!("base {base} has no u128 range"))?;
     let (chunk_digits, chunk_div) = chunk_constants_u16(base);
     let cutoff = get_near_miss_cutoff(base);
     let hist_bins = (base + 1) as usize;
 
-    let client = &ctx.client;
     let miss_count_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
     let miss_data_handle =
         client.empty(NEAR_MISS_CAPACITY * MISS_STRIDE as usize * core::mem::size_of::<u32>());
@@ -391,7 +436,7 @@ pub fn process_range_detailed_cubecl(
             .clamp(1, MAX_CUBES);
 
         unsafe {
-            detailed_kernel::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+            detailed_kernel::launch_unchecked::<R>(
                 client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(WORKGROUP_SIZE),
