@@ -876,6 +876,17 @@ impl CubeclContext {
             Self::Cuda { device_name, .. } => device_name.clone(),
         }
     }
+
+    /// Which runtime this context drives, matching the `--gpu-backend` value
+    /// that selects it — for benchmark reports and submission telemetry.
+    #[must_use]
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Wgpu { .. } => "cubecl",
+            #[cfg(feature = "cubecl-cuda")]
+            Self::Cuda { .. } => "cubecl-cuda",
+        }
+    }
 }
 
 /// `CubeCL` implementation of `process_range_detailed`.

@@ -125,6 +125,31 @@ impl GpuHandle {
             None
         }
     }
+
+    /// The backend actually processing fields, as its `--gpu-backend` value —
+    /// asked of the live handle for the same reason as `device_name`: with
+    /// `auto` and multiple compiled backends, the CLI flag does not say which
+    /// one won. Three backends at very different throughputs can share one
+    /// device name, so telemetry without this cannot be compared.
+    // Same degenerate-configuration lints as `device_name`.
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn backend_name(&self) -> Option<&'static str> {
+        #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+        {
+            match self {
+                #[cfg(feature = "cuda")]
+                GpuHandle::Cuda(_) => Some("cuda"),
+                #[cfg(feature = "vulkan")]
+                GpuHandle::Vulkan(_) => Some("vulkan"),
+                #[cfg(feature = "cubecl")]
+                GpuHandle::Cubecl(ctx) => Some(ctx.backend_name()),
+            }
+        }
+        #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
+        {
+            None
+        }
+    }
 }
 
 /// The GPU context, if this build has one and the user asked for it.

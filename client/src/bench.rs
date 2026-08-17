@@ -676,6 +676,7 @@ fn collect_hardware(cli: &Cli, gpu: &GpuCtx) -> Value {
         "os": std::env::consts::OS,
         "os_pretty": parse_os_pretty(&os_release),
         "gpu_model": gpu_name(cli, gpu),
+        "gpu_backend": gpu_backend(cli, gpu),
     })
 }
 
@@ -724,6 +725,15 @@ fn gpu_name(cli: &Cli, gpu: &GpuCtx) -> Option<String> {
     }
     gpu.as_ref()
         .and_then(|handle| handle.device_name(cli.gpu_device))
+}
+
+/// The backend processing fields, as its `--gpu-backend` value — from the
+/// live handle, since `auto` decides at init which compiled backend wins.
+fn gpu_backend(cli: &Cli, gpu: &GpuCtx) -> Option<&'static str> {
+    if !cli.gpu {
+        return None;
+    }
+    gpu.as_ref().and_then(|handle| handle.backend_name())
 }
 
 /// Scheduler/instance identifiers from the environment allowlist, for
