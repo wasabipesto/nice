@@ -18,7 +18,7 @@ cuda = ["dep:cudarc"]
 # at runtime.
 gpu = ["cuda", "vulkan", "cubecl", "cubecl-cuda"]
 vulkan = ["dep:ash", "dep:naga"]
-cubecl = ["dep:cubecl", "dep:getrandom", "dep:cubecl-common"]
+cubecl = ["dep:cubecl", "dep:getrandom", "dep:cubecl-common", "dep:web-time"]
 cubecl-cuda = ["cubecl", "cubecl/cuda"]
 
 [dependencies]
@@ -26,6 +26,9 @@ cubecl-cuda = ["cubecl", "cubecl/cuda"]
 # releases (0.10 differed from its own docs in places). Bump deliberately,
 # with the device parity suite as the gate.
 cubecl = { version = "=0.10.0", features = ["wgpu"], optional = true }
+# std::time::Instant panics at runtime on wasm32; web-time re-exports std on
+# native, so the cubecl backend imports Instant from here unconditionally.
+web-time = { version = "1", optional = true }
 anyhow = { version = "1.0" }
 bigdecimal = { version = "0.4.10", optional = true }
 chrono = { version = "0.4.43", features = ["serde"] }

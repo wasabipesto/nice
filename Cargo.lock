@@ -2806,6 +2806,7 @@ dependencies = [
  "serde_json",
  "test-log",
  "tokio",
+ "web-time",
 ]
 
 [[package]]

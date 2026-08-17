@@ -43,7 +43,7 @@ use cubecl::prelude::*;
 use log::{debug, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use web_time::Instant;
 
 /// Threads per cube (workgroup); matches the Vulkan backend.
 pub const WORKGROUP_SIZE: u32 = 256;
@@ -934,6 +934,14 @@ fn smoke_kernel(out: &mut Array<u32>) {
 // Host side
 // ============================================================================
 
+/// The process-wide wgpu client: `init_setup` registers the device server
+/// and is not idempotent, so setup runs exactly once per process and later
+/// contexts clone the client — shared by the sync and async constructors.
+static WGPU_DEFAULT: OnceLock<(
+    cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime>,
+    String,
+)> = OnceLock::new();
+
 /// One initialized `CubeCL` device: wgpu everywhere, or the native CUDA
 /// runtime when built with `cubecl-cuda` (the meaningful NVIDIA comparison,
 /// since it exercises `CubeCL`'s CUDA codegen against the hand kernels).
@@ -964,11 +972,7 @@ impl CubeclContext {
     /// # Errors
     /// Returns an error if no wgpu device is available.
     pub fn new_default() -> Result<Self> {
-        static DEFAULT: OnceLock<(
-            cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime>,
-            String,
-        )> = OnceLock::new();
-        let (client, device_name) = DEFAULT.get_or_init(|| {
+        let (client, device_name) = WGPU_DEFAULT.get_or_init(|| {
             let device = cubecl::wgpu::WgpuDevice::default();
             let setup = cubecl::wgpu::init_setup::<cubecl::wgpu::AutoGraphicsApi>(
                 &device,
@@ -982,6 +986,41 @@ impl CubeclContext {
             let client = cubecl::wgpu::WgpuRuntime::client(&device);
             (client, device_name)
         });
+        Ok(Self::Wgpu {
+            client: client.clone(),
+            device_name: device_name.clone(),
+            niceonly_plans: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// As [`Self::new_default`], but awaiting adapter acquisition — the only
+    /// form a browser permits (`init_setup` panics on wasm by design). Native
+    /// callers can use either; both share one process-wide client.
+    ///
+    /// # Errors
+    /// Returns an error if no wgpu device is available.
+    ///
+    /// # Panics
+    /// Cannot in practice: the read of the just-initialized process-wide
+    /// client is infallible once the set above has happened.
+    pub async fn new_default_async() -> Result<Self> {
+        if WGPU_DEFAULT.get().is_none() {
+            let device = cubecl::wgpu::WgpuDevice::default();
+            let setup = cubecl::wgpu::init_setup_async::<cubecl::wgpu::AutoGraphicsApi>(
+                &device,
+                cubecl::wgpu::RuntimeOptions::default(),
+            )
+            .await;
+            let info = setup.adapter.get_info();
+            let device_name = format!("{} ({:?})", info.name, info.backend);
+            let client = cubecl::wgpu::WgpuRuntime::client(&device);
+            // A racing initializer winning this set is fine: both describe
+            // the same process-wide runtime registration.
+            let _ = WGPU_DEFAULT.set((client, device_name));
+        }
+        let (client, device_name) = WGPU_DEFAULT
+            .get()
+            .expect("just initialized the wgpu default client");
         Ok(Self::Wgpu {
             client: client.clone(),
             device_name: device_name.clone(),
@@ -1067,21 +1106,59 @@ pub fn process_range_detailed_cubecl(
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
+    cubecl::future::block_on(process_range_detailed_cubecl_async(ctx, range, base))
+}
+
+/// As [`process_range_detailed_cubecl`], awaiting device reads instead of
+/// blocking on them — the only form a browser permits. The sync wrapper is
+/// this future under `block_on`, so both paths run the same body (and the
+/// native device tests cover it).
+///
+/// # Errors
+/// Returns an error on any device failure or if the near-miss buffer
+/// overflows.
+pub async fn process_range_detailed_cubecl_async(
+    ctx: &CubeclContext,
+    range: &FieldSize,
+    base: u32,
+) -> Result<FieldResults> {
     if !gpu_supports_base(base) {
         warn!("base {base} not supported on GPU, falling back to CPU for this field");
         return Ok(process_range_detailed(range, base));
     }
 
     match ctx {
-        CubeclContext::Wgpu { client, .. } => detailed_impl(client, range, base, false),
+        CubeclContext::Wgpu { client, .. } => detailed_impl(client, range, base, false).await,
         #[cfg(feature = "cubecl-cuda")]
-        CubeclContext::Cuda { client, .. } => detailed_impl(client, range, base, true),
+        CubeclContext::Cuda { client, .. } => detailed_impl(client, range, base, true).await,
     }
+}
+
+/// Read one histogram buffer and fold its bins into the accumulator.
+///
+/// An async fn rather than a closure (async closures aren't stable), and
+/// `read_async` rather than `read_one` so [`detailed_impl`] stays runnable
+/// on wasm, where a future cannot block.
+async fn drain<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    handle: cubecl::server::Handle,
+    histogram: &mut [u128],
+) -> Result<()> {
+    let bytes = client
+        .read_async(vec![handle])
+        .await
+        .map_err(|e| anyhow::anyhow!("histogram read failed: {e:?}"))?
+        .remove(0);
+    let bins = u32::from_bytes(&bytes);
+    for (acc, &bin) in histogram.iter_mut().zip(bins.iter()) {
+        *acc += u128::from(bin);
+    }
+    Ok(())
 }
 
 /// Runtime-generic body of [`process_range_detailed_cubecl`].
 #[allow(clippy::too_many_lines)]
-fn detailed_impl<R: cubecl::prelude::Runtime>(
+async fn detailed_impl<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     range: &FieldSize,
     base: u32,
@@ -1118,16 +1195,6 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
     // bins; WGSL has no u64 atomics, and this host loop serves both.)
     let mut hist_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; hist_bins]));
     let mut undrained = 0usize;
-    let drain = |handle: cubecl::server::Handle, histogram: &mut Vec<u128>| -> Result<()> {
-        let bytes = client
-            .read_one(handle)
-            .map_err(|e| anyhow::anyhow!("histogram read failed: {e:?}"))?;
-        let bins = u32::from_bytes(&bytes);
-        for (acc, &bin) in histogram.iter_mut().zip(bins.iter()) {
-            *acc += u128::from(bin);
-        }
-        Ok(())
-    };
 
     for batch in range.chunks(CUBECL_BATCH_SIZE) {
         let start = batch.start();
@@ -1189,12 +1256,12 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
 
         undrained += 1;
         if undrained == DRAIN_INTERVAL {
-            drain(hist_handle, &mut histogram)?;
+            drain(client, hist_handle, &mut histogram).await?;
             hist_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; hist_bins]));
             undrained = 0;
         }
     }
-    drain(hist_handle, &mut histogram)?;
+    drain(client, hist_handle, &mut histogram).await?;
 
     // Every candidate lands in exactly one bin, so a mismatch means the
     // device silently did nothing for some batch — refuse to report
@@ -1216,16 +1283,20 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
 
     // Near misses.
     let bytes = client
-        .read_one(miss_count_handle.clone())
-        .map_err(|e| anyhow::anyhow!("miss count read failed: {e:?}"))?;
+        .read_async(vec![miss_count_handle.clone()])
+        .await
+        .map_err(|e| anyhow::anyhow!("miss count read failed: {e:?}"))?
+        .remove(0);
     let miss_total = u32::from_bytes(&bytes)[0] as usize;
     ensure!(
         miss_total <= NEAR_MISS_CAPACITY,
         "near-miss buffer overflow: {miss_total} > {NEAR_MISS_CAPACITY}"
     );
     let bytes = client
-        .read_one(miss_data_handle)
-        .map_err(|e| anyhow::anyhow!("miss data read failed: {e:?}"))?;
+        .read_async(vec![miss_data_handle])
+        .await
+        .map_err(|e| anyhow::anyhow!("miss data read failed: {e:?}"))?
+        .remove(0);
     let words = u32::from_bytes(&bytes);
     let mut nice_numbers: Vec<NiceNumberSimple> = (0..miss_total)
         .map(|i| {

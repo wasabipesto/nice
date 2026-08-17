@@ -278,6 +278,15 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = GpuBackend::Auto, env = "NICE_GPU_BACKEND")]
     gpu_backend: GpuBackend,
 
+    /// Which wgpu adapter the `CubeCL` backend uses, in `CubeCL`'s device
+    /// spelling: `DiscreteGpu(0)`, `IntegratedGpu(1)`, `Cpu`, ... Unset picks
+    /// the best adapter. This exists because --gpu-device indexes a
+    /// per-backend namespace (CUDA ordinals != Vulkan ordinals != wgpu
+    /// adapters), so on a multi-GPU box no single number is right for every
+    /// backend; the chosen adapter and its graphics API are always logged.
+    #[arg(long, env = "NICE_GPU_WGPU_DEVICE")]
+    gpu_wgpu_device: Option<String>,
+
     /// Set the log level (overrides `RUST_LOG` environment variable)
     #[arg(short, long, value_enum, env = "NICE_LOG_LEVEL")]
     log_level: Option<LogLevel>,
@@ -363,6 +372,17 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
     }
     let want = cli.gpu_backend;
     let detailed = cli.mode == SearchMode::Detailed;
+
+    // The CubeCL wgpu runtime reads its device selection from this env var
+    // (typed adapter namespaces; --gpu-device's flat ordinal cannot name
+    // them). Translating our flag here keeps one parser — CubeCL's own.
+    #[cfg(feature = "cubecl")]
+    if let Some(spec) = &cli.gpu_wgpu_device {
+        // Safety: init_gpu runs before any worker thread starts (same
+        // argument as try_init_cuda's panic-hook swap).
+        unsafe { std::env::set_var("CUBECL_WGPU_DEFAULT_DEVICE", spec) };
+        info!("CubeCL wgpu adapter pinned to {spec}");
+    }
 
     // Detailed auto leads with the CubeCL CUDA runtime; a clean init failure
     // (validated by its smoke kernel) falls through to the wgpu runtime.
