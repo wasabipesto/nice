@@ -12,7 +12,11 @@ license-file.workspace = true
 database = ["dep:diesel", "dep:dotenvy", "dep:bigdecimal", "dep:rand"]
 openssl-tls = ["reqwest/default-tls", "dep:openssl", "dep:tokio"]
 rustls-tls = ["reqwest/rustls-tls", "dep:tokio"]
-gpu = ["dep:cudarc"]
+cuda = ["dep:cudarc"]
+# Umbrella: every GPU backend this crate knows how to build. Building any of
+# them needs no GPU libraries at compile time; each backend dlopens its driver
+# at runtime.
+gpu = ["cuda", "vulkan", "cubecl", "cubecl-cuda"]
 vulkan = ["dep:ash", "dep:naga"]
 cubecl = ["dep:cubecl"]
 cubecl-cuda = ["cubecl", "cubecl/cuda"]

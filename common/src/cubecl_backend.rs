@@ -330,7 +330,7 @@ fn detailed_kernel(
 
 /// One initialized `CubeCL` device: wgpu everywhere, or the native CUDA
 /// runtime when built with `cubecl-cuda` (the meaningful NVIDIA comparison,
-/// since it exercises CubeCL's CUDA codegen against the hand kernels).
+/// since it exercises `CubeCL`'s CUDA codegen against the hand kernels).
 pub enum CubeclContext {
     Wgpu {
         client: cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime>,

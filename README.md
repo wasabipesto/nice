@@ -188,9 +188,10 @@ There are some feature flags that enable specific dependencies:
 
 - `nice_common/database` is set automatically from binaries that connect directly to postgres (`api` and `jobs`). This requires the `libpq-dev` package to be installed.
 - `nice_client/rustls-tls` is enabled by default and uses rustls for TLS connections, which doesn't require any external dependencies. Disable it and enable `nice_client/openssl-tls` to use `openssl`.
-- In order to build the client with GPU acceleration, enable the `nice_client/gpu` feature. This requires no additional build-time dependencies, but it does require the CUDA toolkit to be available at runtime for kernel compilation.
-- `nice_client/vulkan` builds a second GPU backend that runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, and llvmpipe). Like the CUDA one it needs nothing at build time; at runtime it needs only a Vulkan driver, since shaders are generated per base and compiled with `naga`. Both modes run on the GPU.
-- The two features are additive: `--features gpu,vulkan` produces one binary that runs on either, selected with `--gpu-backend`. Neither library is needed to *build* it, and `auto` prefers CUDA.
+- In order to build the client with GPU acceleration, enable the `nice_client/gpu` feature. It is an umbrella over every backend below, so the release recipe is two builds: default features for a lightweight CPU-only binary, `--features gpu` for one binary that runs on the CPU or any supported GPU. No backend needs its GPU libraries at *build* time — each one `dlopen`s its driver at runtime — and the backend is selected at runtime with `--gpu-backend` (`auto` prefers CUDA, then CubeCL, then Vulkan, in measured-speed order; CubeCL is skipped by `auto` in niceonly mode until its niceonly kernel lands).
+- `nice_client/cuda` is the hand-written CUDA backend (NVIDIA only). It requires the CUDA toolkit at runtime for NVRTC kernel compilation.
+- `nice_client/vulkan` is the hand-written WGSL backend; it runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe, and MoltenVK on macOS). At runtime it needs only a Vulkan driver, since shaders are generated per base and compiled with `naga`.
+- `nice_client/cubecl` is the [CubeCL](https://github.com/tracel-ai/cubecl) backend (kernels written in Rust), running over wgpu: Vulkan on Linux/Windows, Metal on macOS. `nice_client/cubecl-cuda` adds its native CUDA runtime. Detailed mode only for now.
 
 Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack/).
 
@@ -214,7 +215,7 @@ The easiest way to get `libnvrtc` is the pip wheel, via [uv](https://docs.astral
 # Fetch libnvrtc from the pip wheel and point the linker at it (no GPU needed)
 NVRTC_LIB=$(uv run --no-project --with nvidia-cuda-nvrtc-cu12 python -c \
     "import nvidia.cuda_nvrtc; print(nvidia.cuda_nvrtc.__path__[0] + '/lib')")
-LD_LIBRARY_PATH="$NVRTC_LIB" cargo test --features gpu -p nice_common
+LD_LIBRARY_PATH="$NVRTC_LIB" cargo test --features cuda -p nice_common
 ```
 
 Or run the tests inside a CUDA container, which ships `libnvrtc`:
@@ -223,11 +224,11 @@ Or run the tests inside a CUDA container, which ships `libnvrtc`:
 docker run --rm -v "$PWD":/work -w /work nvidia/cuda:12.4.1-devel-ubuntu22.04 \
     bash -c "apt-get update -qq && apt-get install -y -qq curl build-essential > /dev/null && \
              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q && \
-             . ~/.cargo/env && cargo test --features gpu -p nice_common"
+             . ~/.cargo/env && cargo test --features cuda -p nice_common"
 ```
 
 Functional GPU tests (CPU/GPU result parity) still need real hardware; they
-are `#[ignore]`d and run with `cargo test --features gpu -- --ignored`.
+are `#[ignore]`d and run with `cargo test --features cuda -- --ignored`.
 
 ## Why are you writing this from scratch for like the tenth time
 

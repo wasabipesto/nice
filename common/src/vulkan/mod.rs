@@ -2,7 +2,7 @@
 
 //! Vulkan compute backend.
 //!
-//! The GPU-portable sibling of [`crate::client_process_gpu`]. Same algorithm,
+//! The GPU-portable sibling of [`crate::client_process_cuda`]. Same algorithm,
 //! same results; the difference is that kernels are generated as WGSL per base
 //! (see [`codegen`]) and compiled to SPIR-V by `naga` at runtime, instead of
 //! being compiled from CUDA C by NVRTC.

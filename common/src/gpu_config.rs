@@ -2,7 +2,7 @@
 //!
 //! Everything here derives per-base constants from the search range and the
 //! stride/residue machinery, with no reference to any particular GPU API. It
-//! exists because [`crate::client_process_gpu`] is `#![cfg(feature = "gpu")]` —
+//! exists because [`crate::client_process_cuda`] is `#![cfg(feature = "cuda")]` —
 //! nothing in it is reachable from a Vulkan-only build — while the constants
 //! themselves are the same whichever backend consumes them.
 //!

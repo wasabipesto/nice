@@ -36,9 +36,9 @@ const MAX_SUBMITS_IN_FLIGHT: usize = 8;
 
 mod bench;
 
-#[cfg(feature = "gpu")]
-use nice_common::client_process_gpu::{
-    GPU_BATCH_SIZE, GpuContext, process_range_detailed_gpu, process_range_niceonly_gpu,
+#[cfg(feature = "cuda")]
+use nice_common::client_process_cuda::{
+    CUDA_BATCH_SIZE, CudaContext, process_range_detailed_cuda, process_range_niceonly_cuda,
 };
 #[cfg(feature = "vulkan")]
 use nice_common::client_process_vulkan::{
@@ -51,20 +51,20 @@ use nice_common::cubecl_backend::{CUBECL_BATCH_SIZE, CubeclContext, process_rang
 
 /// Which GPU backend to drive.
 ///
-/// Both backends `dlopen` their driver at runtime, so a single binary can carry
-/// both and require neither at build time. `Auto` tries CUDA first, leaving
-/// behaviour on an NVIDIA machine exactly as it was.
+/// Every backend `dlopen`s its driver at runtime, so a single binary can carry
+/// all of them and require none at build time. `Auto` tries CUDA first,
+/// leaving behaviour on an NVIDIA machine exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
-    /// CUDA if available, otherwise Vulkan.
+    /// CUDA if available, then `CubeCL` (detailed mode), then Vulkan.
     Auto,
     /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC.
     Cuda,
     /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe).
     Vulkan,
-    /// CubeCL over wgpu (detailed mode only; benchmark-grade evaluation port).
+    /// `CubeCL` over wgpu (detailed mode only; benchmark-grade evaluation port).
     Cubecl,
-    /// CubeCL over its native CUDA runtime (needs the cubecl-cuda feature).
+    /// `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature).
     CubeclCuda,
 }
 
@@ -78,8 +78,8 @@ enum GpuBackend {
 /// exactly one of these, behind an `Arc`, for its whole run.
 #[allow(clippy::large_enum_variant)]
 enum GpuHandle {
-    #[cfg(feature = "gpu")]
-    Cuda(GpuContext),
+    #[cfg(feature = "cuda")]
+    Cuda(CudaContext),
     #[cfg(feature = "vulkan")]
     Vulkan(VulkanContext),
     #[cfg(feature = "cubecl")]
@@ -105,10 +105,10 @@ impl GpuHandle {
         // reference and references are always considered inhabited, so an
         // empty match does not type-check. Same `#[cfg]` split as
         // `process_field_sync`.
-        #[cfg(any(feature = "gpu", feature = "vulkan", feature = "cubecl"))]
+        #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
         {
             match self {
-                #[cfg(feature = "gpu")]
+                #[cfg(feature = "cuda")]
                 GpuHandle::Cuda(_) => cudarc::driver::CudaContext::new(device)
                     .ok()
                     .and_then(|d| d.name().ok()),
@@ -118,7 +118,7 @@ impl GpuHandle {
                 GpuHandle::Cubecl(ctx) => Some(ctx.device_name()),
             }
         }
-        #[cfg(not(any(feature = "gpu", feature = "vulkan", feature = "cubecl")))]
+        #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
         {
             None
         }
@@ -257,7 +257,7 @@ pub struct Cli {
 /// Which backends this build carries, for error messages.
 fn compiled_backends() -> String {
     let mut have = Vec::new();
-    if cfg!(feature = "gpu") {
+    if cfg!(feature = "cuda") {
         have.push("cuda");
     }
     if cfg!(feature = "vulkan") {
@@ -287,11 +287,11 @@ fn compiled_backends() -> String {
 ///
 /// Note this relies on unwinding; under `panic = "abort"` the process would die
 /// as before. The workspace does not set that.
-#[cfg(feature = "gpu")]
-fn try_init_cuda(device: usize) -> Result<GpuContext> {
+#[cfg(feature = "cuda")]
+fn try_init_cuda(device: usize) -> Result<CudaContext> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let caught = std::panic::catch_unwind(|| GpuContext::new(device));
+    let caught = std::panic::catch_unwind(|| CudaContext::new(device));
     std::panic::set_hook(previous);
 
     match caught {
@@ -309,25 +309,31 @@ fn try_init_cuda(device: usize) -> Result<GpuContext> {
 
 /// Bring up the GPU backend the user asked for.
 ///
-/// `Auto` tries CUDA first and falls back to Vulkan, so an NVIDIA machine
-/// behaves exactly as it did before this existed. An **explicitly named**
-/// backend that fails to initialize is fatal rather than falling back: for a
-/// distributed compute client, silently dropping to a much slower path is a
-/// worse outcome than stopping and saying so.
+/// `Auto` prefers CUDA (fastest measured everywhere it exists), then `CubeCL`,
+/// then Vulkan — `CubeCL` measured 1.4x the hand-WGSL backend on RDNA4/RADV and
+/// 2.5x on NVIDIA, so it outranks Vulkan wherever both could run. The one
+/// exception is niceonly mode, where `CubeCL` has no kernel yet: there `Auto`
+/// skips it and falls through to Vulkan. An **explicitly named** backend that
+/// fails to initialize is fatal rather than falling back: for a distributed
+/// compute client, silently dropping to a much slower path is a worse outcome
+/// than stopping and saying so.
 #[allow(unused_variables)]
 fn init_gpu(cli: &Cli) -> GpuCtx {
     if !cli.gpu {
         return None;
     }
     let want = cli.gpu_backend;
+    // CubeCL is detailed-only until its niceonly port lands; `Auto` must not
+    // select a backend that will refuse half the field types at claim time.
+    let cubecl_in_auto = cli.mode == SearchMode::Detailed;
 
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
     if matches!(want, GpuBackend::Auto | GpuBackend::Cuda) {
         match try_init_cuda(cli.gpu_device) {
             Ok(ctx) => {
                 info!(
                     "GPU initialized: CUDA device {}, batch size {}",
-                    cli.gpu_device, GPU_BATCH_SIZE
+                    cli.gpu_device, CUDA_BATCH_SIZE
                 );
                 if let Ok(device) = cudarc::driver::CudaContext::new(cli.gpu_device)
                     && let Ok(name) = device.name()
@@ -352,8 +358,30 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                     }
                     std::process::exit(1);
                 }
-                info!("CUDA unavailable; trying Vulkan");
+                info!("CUDA unavailable; trying the next backend");
                 debug!("  CUDA init failed: {e:#}");
+            }
+        }
+    }
+
+    #[cfg(feature = "cubecl")]
+    if want == GpuBackend::Cubecl || (want == GpuBackend::Auto && cubecl_in_auto) {
+        match CubeclContext::new_default() {
+            Ok(ctx) => {
+                info!(
+                    "GPU initialized: CubeCL wgpu device ({}), batch size {}",
+                    ctx.device_name(),
+                    CUBECL_BATCH_SIZE
+                );
+                return Some(Arc::new(GpuHandle::Cubecl(ctx)));
+            }
+            Err(e) if want == GpuBackend::Cubecl => {
+                error!("Failed to initialize CubeCL wgpu runtime: {e:?}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                info!("CubeCL unavailable; trying Vulkan");
+                debug!("  CubeCL init failed: {e:#}");
             }
         }
     }
@@ -377,24 +405,6 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 eprintln!("1. Ensure a Vulkan driver is installed (try vulkaninfo)");
                 eprintln!("2. The device must support shaderInt64");
                 eprintln!("3. Try a different device with --gpu-device <N>");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    #[cfg(feature = "cubecl")]
-    if want == GpuBackend::Cubecl {
-        match CubeclContext::new_default() {
-            Ok(ctx) => {
-                info!(
-                    "GPU initialized: CubeCL wgpu device ({}), batch size {}",
-                    ctx.device_name(),
-                    CUBECL_BATCH_SIZE
-                );
-                return Some(Arc::new(GpuHandle::Cubecl(ctx)));
-            }
-            Err(e) => {
-                error!("Failed to initialize CubeCL wgpu runtime: {e:?}");
                 std::process::exit(1);
             }
         }
@@ -440,19 +450,19 @@ fn process_field_sync(
     let mode = cli.mode;
     if cli.gpu {
         // GPU processing path
-        #[cfg(any(feature = "gpu", feature = "vulkan", feature = "cubecl"))]
+        #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
         {
             let handle = gpu.as_ref().expect("GPU context failed to initialize");
             let range: FieldSize = claim_data.into();
 
             let gpu_results = match &**handle {
-                #[cfg(feature = "gpu")]
+                #[cfg(feature = "cuda")]
                 GpuHandle::Cuda(ctx) => match mode {
                     SearchMode::Detailed => {
-                        process_range_detailed_gpu(ctx, &range, claim_data.base)
+                        process_range_detailed_cuda(ctx, &range, claim_data.base)
                     }
                     SearchMode::Niceonly => {
-                        process_range_niceonly_gpu(ctx, &range, claim_data.base)
+                        process_range_niceonly_cuda(ctx, &range, claim_data.base)
                     }
                 },
                 #[cfg(feature = "vulkan")]
@@ -483,7 +493,7 @@ fn process_field_sync(
                 }
             }
         }
-        #[cfg(not(any(feature = "gpu", feature = "vulkan", feature = "cubecl")))]
+        #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
         {
             let _ = gpu; // there is no context to look at in this build
             error!("GPU support not compiled in");
@@ -986,7 +996,7 @@ async fn main() -> Result<()> {
     builder.init();
 
     // Check for GPU support
-    if cli.gpu && !(cfg!(feature = "gpu") || cfg!(feature = "vulkan") || cfg!(feature = "cubecl")) {
+    if cli.gpu && !(cfg!(feature = "cuda") || cfg!(feature = "vulkan") || cfg!(feature = "cubecl")) {
         error!(
             "Error: GPU support not enabled. Rebuild with --features gpu (CUDA) \
              and/or --features vulkan"
@@ -1002,7 +1012,7 @@ async fn main() -> Result<()> {
     #[allow(unused_mut)]
     let mut cpu_or_gpu = format!("CPU with {} threads", cli.threads);
 
-    #[cfg(any(feature = "gpu", feature = "vulkan", feature = "cubecl"))]
+    #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
     if cli.gpu {
         cpu_or_gpu = format!("GPU device {}", cli.gpu_device);
     };
@@ -1171,7 +1181,7 @@ mod tests {
     /// could fall through to Vulkan. Whatever this machine has installed,
     /// initialization must *return* — Ok on a CUDA box, Err on one without —
     /// and never unwind past here.
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
     #[test]
     fn cuda_init_returns_instead_of_panicking() {
         // The result depends on the host; only the absence of a panic matters.

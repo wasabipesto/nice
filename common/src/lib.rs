@@ -7,7 +7,7 @@ pub mod base_range;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
 pub mod client_api_async;
 pub mod client_process;
-pub mod client_process_gpu;
+pub mod client_process_cuda;
 pub mod client_process_vulkan;
 pub mod cubecl_backend;
 pub mod consensus;

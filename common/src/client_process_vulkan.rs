@@ -1,6 +1,6 @@
 //! Field processing on the Vulkan backend.
 //!
-//! Mirrors [`crate::client_process_gpu`] exactly — same batching, same
+//! Mirrors [`crate::client_process_cuda`] exactly — same batching, same
 //! fallback behaviour, same `FieldResults` — over the Vulkan compute backend in
 //! [`crate::vulkan`] instead of CUDA. The niceonly host pipeline is not merely
 //! mirrored but *shared*: both backends drive [`crate::gpu_niceonly`], which
@@ -99,7 +99,7 @@ pub fn process_range_detailed_vulkan(
 /// (`stride_filter::first_valid_at_or_after` indexes `valid_residues[idx]`).
 /// So this has to be checked before any stride table is built.
 ///
-/// The CUDA path has the same guard inside `process_range_niceonly_gpu`; here
+/// The CUDA path has the same guard inside `process_range_niceonly_cuda`; here
 /// it sits ahead of the CPU fallback rather than after it, so it also covers
 /// bases the GPU itself cannot take.
 fn residue_empty_result(base: u32) -> Option<FieldResults> {

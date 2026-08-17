@@ -31,7 +31,7 @@
 //! above 64 use a two-word digit mask. Bases with no u128 range fall back to
 //! the CPU implementation with a logged warning.
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "cuda")]
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
@@ -46,7 +46,7 @@ use crate::gpu_niceonly::{RangeSink, report_field, run_range_pipeline};
 use crate::{base_range, number_stats, residue_filter, stride_filter};
 use anyhow::{Context as _, Result, bail, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext as DriverContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use log::{debug, warn};
@@ -62,7 +62,7 @@ pub use crate::gpu_niceonly::{GPU_LSD_K, PROCESSING_CHUNK_SIZE};
 /// Numbers processed per detailed-mode kernel launch. Larger batches amortize
 /// launch overhead; since the detailed kernel takes no input arrays, batch
 /// size costs no memory or transfer bandwidth.
-pub const GPU_BATCH_SIZE: usize = 50_000_000;
+pub const CUDA_BATCH_SIZE: usize = 50_000_000;
 
 /// Threads per block. Must match `BLOCK_THREADS` in `nice_kernels.cu` (the
 /// detailed kernel's shared-memory histogram is sized from it).
@@ -88,14 +88,14 @@ struct NiceonlyPlan {
 }
 
 /// GPU context: CUDA device handle plus caches of per-base compiled kernels.
-pub struct GpuContext {
-    device: Arc<CudaContext>,
+pub struct CudaContext {
+    device: Arc<DriverContext>,
     stream: Arc<CudaStream>,
     niceonly_plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
     detailed_kernels: Mutex<HashMap<u32, CudaFunction>>,
 }
 
-impl GpuContext {
+impl CudaContext {
     /// Initialize the GPU context and verify that NVRTC compilation works.
     ///
     /// Kernels themselves are compiled lazily, once per (base, mode), when
@@ -108,7 +108,7 @@ impl GpuContext {
     /// Returns an error if the CUDA context cannot be initialized or if a
     /// smoke-test NVRTC compilation fails (e.g. missing NVRTC library).
     pub fn new(device_ordinal: usize) -> Result<Self> {
-        let device = CudaContext::new(device_ordinal)
+        let device = DriverContext::new(device_ordinal)
             .with_context(|| format!("initializing CUDA device {device_ordinal}"))?;
         let stream = device.default_stream();
 
@@ -130,7 +130,7 @@ impl GpuContext {
             smoke_start.elapsed().as_secs_f64()
         );
 
-        Ok(GpuContext {
+        Ok(CudaContext {
             device,
             stream,
             niceonly_plans: Mutex::new(HashMap::new()),
@@ -307,8 +307,8 @@ fn combine_u64(lo: u64, hi: u64) -> u128 {
 ///
 /// # Errors
 /// Returns an error on any CUDA failure or if the output buffer overflows.
-pub fn process_range_niceonly_gpu(
-    ctx: &GpuContext,
+pub fn process_range_niceonly_cuda(
+    ctx: &CudaContext,
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
@@ -351,7 +351,7 @@ pub fn process_range_niceonly_gpu(
 /// Holds the per-field output buffers and issues asynchronous niceonly
 /// kernel launches over batches of range descriptors.
 struct NiceonlyLauncher<'a> {
-    ctx: &'a GpuContext,
+    ctx: &'a CudaContext,
     plan: &'a NiceonlyPlan,
     field_start_lo: u64,
     field_start_hi: u64,
@@ -360,7 +360,7 @@ struct NiceonlyLauncher<'a> {
 }
 
 impl<'a> NiceonlyLauncher<'a> {
-    fn new(ctx: &'a GpuContext, plan: &'a NiceonlyPlan, range: &FieldSize) -> Result<Self> {
+    fn new(ctx: &'a CudaContext, plan: &'a NiceonlyPlan, range: &FieldSize) -> Result<Self> {
         let (field_start_lo, field_start_hi) = split_u128(range.start());
         Ok(NiceonlyLauncher {
             ctx,
@@ -458,8 +458,8 @@ impl RangeSink for NiceonlyLauncher<'_> {
 ///
 /// # Errors
 /// Returns an error on any CUDA failure or if the near-miss buffer overflows.
-pub fn process_range_detailed_gpu(
-    ctx: &GpuContext,
+pub fn process_range_detailed_cuda(
+    ctx: &CudaContext,
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
@@ -478,7 +478,7 @@ pub fn process_range_detailed_gpu(
     let mut d_miss_count = ctx.stream.alloc_zeros::<u32>(1)?;
     let miss_capacity = NEAR_MISS_CAPACITY as u32;
 
-    for batch in range.chunks(GPU_BATCH_SIZE as u128) {
+    for batch in range.chunks(CUDA_BATCH_SIZE as u128) {
         let (start_lo, start_hi) = split_u128(batch.start());
         let count = batch.size() as u64;
 
@@ -553,12 +553,12 @@ pub fn process_range_detailed_gpu(
 ///
 /// # Errors
 /// Returns an error on any CUDA failure.
-pub fn process_detailed_gpu(
-    ctx: &GpuContext,
+pub fn process_detailed_cuda(
+    ctx: &CudaContext,
     claim_data: &DataToClient,
     username: &String,
 ) -> Result<DataToServer> {
-    let results = process_range_detailed_gpu(ctx, &claim_data.into(), claim_data.base)?;
+    let results = process_range_detailed_cuda(ctx, &claim_data.into(), claim_data.base)?;
 
     Ok(DataToServer {
         claim_id: claim_data.claim_id,
@@ -574,12 +574,12 @@ pub fn process_detailed_gpu(
 ///
 /// # Errors
 /// Returns an error on any CUDA failure.
-pub fn process_niceonly_gpu(
-    ctx: &GpuContext,
+pub fn process_niceonly_cuda(
+    ctx: &CudaContext,
     claim_data: &DataToClient,
     username: &String,
 ) -> Result<DataToServer> {
-    let results = process_range_niceonly_gpu(ctx, &claim_data.into(), claim_data.base)?;
+    let results = process_range_niceonly_cuda(ctx, &claim_data.into(), claim_data.base)?;
 
     Ok(DataToServer {
         claim_id: claim_data.claim_id,
@@ -618,8 +618,8 @@ mod tests {
     /// u128-range, two-mask (>64), and beyond-U256 (>68) regimes.
     const MIRROR_TEST_BASES: [u32; 8] = [10, 40, 45, 57, 62, 68, 70, 94];
 
-    fn try_init_gpu() -> Option<GpuContext> {
-        GpuContext::new(0).ok()
+    fn try_init_cuda() -> Option<CudaContext> {
+        CudaContext::new(0).ok()
     }
 
     // ------------------------------------------------------------------
@@ -1096,7 +1096,7 @@ mod tests {
     #[test_log::test]
     #[ignore = "requires GPU"]
     fn gpu_kernels_compile_for_all_supported_bases() {
-        let Some(ctx) = try_init_gpu() else {
+        let Some(ctx) = try_init_cuda() else {
             println!("GPU not available, skipping test");
             return;
         };
@@ -1116,7 +1116,7 @@ mod tests {
     #[test_log::test]
     #[ignore = "requires GPU"]
     fn gpu_matches_cpu_detailed_small() {
-        let Some(ctx) = try_init_gpu() else {
+        let Some(ctx) = try_init_cuda() else {
             println!("GPU not available, skipping test");
             return;
         };
@@ -1127,7 +1127,7 @@ mod tests {
         ] {
             let range = FieldSize::new(start, start + size);
             let cpu = process_range_detailed(&range, base);
-            let gpu = process_range_detailed_gpu(&ctx, &range, base).expect("GPU failed");
+            let gpu = process_range_detailed_cuda(&ctx, &range, base).expect("GPU failed");
 
             assert_eq!(
                 cpu.distribution, gpu.distribution,
@@ -1143,7 +1143,7 @@ mod tests {
     #[test_log::test]
     #[ignore = "requires GPU"]
     fn gpu_matches_cpu_niceonly() {
-        let Some(ctx) = try_init_gpu() else {
+        let Some(ctx) = try_init_cuda() else {
             println!("GPU not available, skipping test");
             return;
         };
@@ -1161,7 +1161,7 @@ mod tests {
 
             let stride_table = StrideTable::new(base, GPU_LSD_K);
             let cpu = process_range_niceonly(&range, base, &stride_table);
-            let gpu = process_range_niceonly_gpu(&ctx, &range, base).expect("GPU failed");
+            let gpu = process_range_niceonly_cuda(&ctx, &range, base).expect("GPU failed");
 
             let mut cpu_nice = cpu.nice_numbers;
             cpu_nice.sort_by_key(|n| n.number);
