@@ -641,141 +641,216 @@ fn niceonly_kernel(
 
                 // Scan n² first; n³ is only multiplied out if n² had no
                 // duplicate (the same ordering worth 20-27% in the CUDA
-                // kernel — the cube multiply is usually dead work).
-                let mut pass: u32 = 0u32;
-                while pass < 2u32 && ok {
-                    if pass == 0u32 {
-                        #[unroll]
-                        for i in 0..sq_limbs {
-                            sv[i as usize] = sq[i as usize];
+                // kernel — the cube multiply is usually dead work). Straight-line
+                // like the hand kernels: the sq scan reads a sq_limbs window, and
+                // the cube is built directly in the scratch and destroyed by its
+                // scan — no cu array, no extra copies, no runtime pass branch.
+                // (The pass-loop version cost ~30% whole-kernel at bases without a
+                // prefilter, where every candidate takes this path.)
+                #[unroll]
+                for i in 0..sq_limbs {
+                    sv[i as usize] = sq[i as usize];
+                }
+                let mut top: i32 = comptime!(sq_limbs as i32 - 1).runtime();
+                while top >= 0 {
+                    if sv[top as usize] != 0u32 {
+                        break;
+                    }
+                    top -= 1;
+                }
+                while top >= 0 && ok {
+                    let mut rem = 0u32;
+                    if wide_chunk {
+                        let mut rem64 = 0u64;
+                        let mut i: i32 = top;
+                        while i >= 0 {
+                            let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
+                            sv[i as usize] = u32::cast_from(cur / u64::cast_from(chunk_div));
+                            rem64 = cur % u64::cast_from(chunk_div);
+                            i -= 1;
                         }
-                        #[unroll]
-                        for i in sq_limbs..cu_limbs {
-                            sv[i as usize] = 0u32;
-                        }
+                        rem = u32::cast_from(rem64); // rem < chunk_div < 2^31
                     } else {
-                        // cu = sq * n, computed only now.
-                        let mut cu = Array::<u32>::new(cu_limbs as usize);
-                        #[unroll]
-                        for i in 0..cu_limbs {
-                            cu[i as usize] = 0u32;
-                        }
-                        #[unroll]
-                        for i in 0..sq_limbs {
-                            let mut carry = 0u64;
-                            #[unroll]
-                            for jj in 0..limbs {
-                                let k = comptime!(i + jj);
-                                let t = u64::cast_from(sq[i as usize])
-                                    * u64::cast_from(nl[jj as usize])
-                                    + u64::cast_from(cu[k as usize])
-                                    + carry;
-                                cu[k as usize] = u32::cast_from(t);
-                                carry = t >> 32u64;
-                            }
-                            cu[comptime!(i + limbs) as usize] = u32::cast_from(carry);
-                        }
-                        #[unroll]
-                        for i in 0..cu_limbs {
-                            sv[i as usize] = cu[i as usize];
+                        let mut i: i32 = top;
+                        while i >= 0 {
+                            let vi = sv[i as usize];
+                            let c1 = (rem << 16u32) | (vi >> 16u32);
+                            let q1 = c1 / chunk_div;
+                            let c2 = ((c1 % chunk_div) << 16u32) | (vi & 0xFFFFu32);
+                            let q2 = c2 / chunk_div;
+                            rem = c2 % chunk_div;
+                            sv[i as usize] = (q1 << 16u32) | q2;
+                            i -= 1;
                         }
                     }
-
-                    let mut top: i32 = comptime!(cu_limbs as i32 - 1).runtime();
                     while top >= 0 {
                         if sv[top as usize] != 0u32 {
                             break;
                         }
                         top -= 1;
                     }
-
-                    // Chunked radix scan, destroying sv; same two comptime
-                    // flavors as the detailed kernel. After each chunk's
-                    // digits, a set duplicate bit ends the candidate.
-                    while top >= 0 && ok {
-                        let mut rem = 0u32;
-                        if wide_chunk {
-                            let mut rem64 = 0u64;
-                            let mut i: i32 = top;
-                            while i >= 0 {
-                                let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
-                                sv[i as usize] = u32::cast_from(cur / u64::cast_from(chunk_div));
-                                rem64 = cur % u64::cast_from(chunk_div);
-                                i -= 1;
-                            }
-                            rem = u32::cast_from(rem64); // rem < chunk_div < 2^31
-                        } else {
-                            let mut i: i32 = top;
-                            while i >= 0 {
-                                let vi = sv[i as usize];
-                                let c1 = (rem << 16u32) | (vi >> 16u32);
-                                let q1 = c1 / chunk_div;
-                                let c2 = ((c1 % chunk_div) << 16u32) | (vi & 0xFFFFu32);
-                                let q2 = c2 / chunk_div;
-                                rem = c2 % chunk_div;
-                                sv[i as usize] = (q1 << 16u32) | q2;
-                                i -= 1;
-                            }
-                        }
-                        while top >= 0 {
-                            if sv[top as usize] != 0u32 {
-                                break;
-                            }
-                            top -= 1;
-                        }
-
-                        let mut chunk = rem;
-                        let mut dup = 0u64;
-                        if top >= 0 {
-                            // Interior chunk: all chunk_digits digits, zeros
-                            // included.
-                            #[unroll]
-                            for _k in 0..chunk_digits {
-                                let d = chunk % base;
-                                chunk /= base;
-                                if two_masks {
-                                    if d < 64u32 {
-                                        let bit = 1u64 << u64::cast_from(d);
-                                        dup |= m0 & bit;
-                                        m0 |= bit;
-                                    } else {
-                                        let bit = 1u64 << u64::cast_from(d - 64u32);
-                                        dup |= m1 & bit;
-                                        m1 |= bit;
-                                    }
-                                } else {
+                
+                    let mut chunk = rem;
+                    let mut dup = 0u64;
+                    if top >= 0 {
+                        // Interior chunk: all chunk_digits digits, zeros included.
+                        #[unroll]
+                        for _k in 0..chunk_digits {
+                            let d = chunk % base;
+                            chunk /= base;
+                            if two_masks {
+                                if d < 64u32 {
                                     let bit = 1u64 << u64::cast_from(d);
                                     dup |= m0 & bit;
                                     m0 |= bit;
-                                }
-                            }
-                        } else {
-                            // Most significant chunk: digits until zero.
-                            while chunk != 0u32 {
-                                let d = chunk % base;
-                                chunk /= base;
-                                if two_masks {
-                                    if d < 64u32 {
-                                        let bit = 1u64 << u64::cast_from(d);
-                                        dup |= m0 & bit;
-                                        m0 |= bit;
-                                    } else {
-                                        let bit = 1u64 << u64::cast_from(d - 64u32);
-                                        dup |= m1 & bit;
-                                        m1 |= bit;
-                                    }
                                 } else {
+                                    let bit = 1u64 << u64::cast_from(d - 64u32);
+                                    dup |= m1 & bit;
+                                    m1 |= bit;
+                                }
+                            } else {
+                                let bit = 1u64 << u64::cast_from(d);
+                                dup |= m0 & bit;
+                                m0 |= bit;
+                            }
+                        }
+                    } else {
+                        // Most significant chunk: digits until zero.
+                        while chunk != 0u32 {
+                            let d = chunk % base;
+                            chunk /= base;
+                            if two_masks {
+                                if d < 64u32 {
                                     let bit = 1u64 << u64::cast_from(d);
                                     dup |= m0 & bit;
                                     m0 |= bit;
+                                } else {
+                                    let bit = 1u64 << u64::cast_from(d - 64u32);
+                                    dup |= m1 & bit;
+                                    m1 |= bit;
                                 }
+                            } else {
+                                let bit = 1u64 << u64::cast_from(d);
+                                dup |= m0 & bit;
+                                m0 |= bit;
                             }
-                        }
-                        if dup != 0u64 {
-                            ok = false;
                         }
                     }
-                    pass += 1u32;
+                    if dup != 0u64 {
+                        ok = false;
+                    }
+                }
+
+                if ok {
+                    // cu = sq * n, built directly in the scratch and consumed there.
+                    #[unroll]
+                    for i in 0..cu_limbs {
+                        sv[i as usize] = 0u32;
+                    }
+                    #[unroll]
+                    for i in 0..sq_limbs {
+                        let mut carry = 0u64;
+                        #[unroll]
+                        for jj in 0..limbs {
+                            let k = comptime!(i + jj);
+                            let t = u64::cast_from(sq[i as usize])
+                                * u64::cast_from(nl[jj as usize])
+                                + u64::cast_from(sv[k as usize])
+                                + carry;
+                            sv[k as usize] = u32::cast_from(t);
+                            carry = t >> 32u64;
+                        }
+                        sv[comptime!(i + limbs) as usize] = u32::cast_from(carry);
+                    }
+                    let mut topc: i32 = comptime!(cu_limbs as i32 - 1).runtime();
+                    while topc >= 0 {
+                        if sv[topc as usize] != 0u32 {
+                            break;
+                        }
+                        topc -= 1;
+                    }
+                while topc >= 0 && ok {
+                    let mut rem = 0u32;
+                    if wide_chunk {
+                        let mut rem64 = 0u64;
+                        let mut i: i32 = topc;
+                        while i >= 0 {
+                            let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
+                            sv[i as usize] = u32::cast_from(cur / u64::cast_from(chunk_div));
+                            rem64 = cur % u64::cast_from(chunk_div);
+                            i -= 1;
+                        }
+                        rem = u32::cast_from(rem64); // rem < chunk_div < 2^31
+                    } else {
+                        let mut i: i32 = topc;
+                        while i >= 0 {
+                            let vi = sv[i as usize];
+                            let c1 = (rem << 16u32) | (vi >> 16u32);
+                            let q1 = c1 / chunk_div;
+                            let c2 = ((c1 % chunk_div) << 16u32) | (vi & 0xFFFFu32);
+                            let q2 = c2 / chunk_div;
+                            rem = c2 % chunk_div;
+                            sv[i as usize] = (q1 << 16u32) | q2;
+                            i -= 1;
+                        }
+                    }
+                    while topc >= 0 {
+                        if sv[topc as usize] != 0u32 {
+                            break;
+                        }
+                        topc -= 1;
+                    }
+                
+                    let mut chunk = rem;
+                    let mut dup = 0u64;
+                    if topc >= 0 {
+                        // Interior chunk: all chunk_digits digits, zeros included.
+                        #[unroll]
+                        for _k in 0..chunk_digits {
+                            let d = chunk % base;
+                            chunk /= base;
+                            if two_masks {
+                                if d < 64u32 {
+                                    let bit = 1u64 << u64::cast_from(d);
+                                    dup |= m0 & bit;
+                                    m0 |= bit;
+                                } else {
+                                    let bit = 1u64 << u64::cast_from(d - 64u32);
+                                    dup |= m1 & bit;
+                                    m1 |= bit;
+                                }
+                            } else {
+                                let bit = 1u64 << u64::cast_from(d);
+                                dup |= m0 & bit;
+                                m0 |= bit;
+                            }
+                        }
+                    } else {
+                        // Most significant chunk: digits until zero.
+                        while chunk != 0u32 {
+                            let d = chunk % base;
+                            chunk /= base;
+                            if two_masks {
+                                if d < 64u32 {
+                                    let bit = 1u64 << u64::cast_from(d);
+                                    dup |= m0 & bit;
+                                    m0 |= bit;
+                                } else {
+                                    let bit = 1u64 << u64::cast_from(d - 64u32);
+                                    dup |= m1 & bit;
+                                    m1 |= bit;
+                                }
+                            } else {
+                                let bit = 1u64 << u64::cast_from(d);
+                                dup |= m0 & bit;
+                                m0 |= bit;
+                            }
+                        }
+                    }
+                    if dup != 0u64 {
+                        ok = false;
+                    }
+                }
                 }
             }
 
