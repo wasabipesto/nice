@@ -41,7 +41,8 @@ use crate::{FieldResults, FieldSize, NiceNumberSimple, UniquesDistributionSimple
 use anyhow::{Context as _, Result, ensure};
 use cubecl::prelude::*;
 use log::{debug, warn};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 /// Threads per cube (workgroup); matches the Vulkan backend.
@@ -814,11 +815,15 @@ pub enum CubeclContext {
     Wgpu {
         client: cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime>,
         device_name: String,
+        /// Per-base niceonly plans, cached across fields — see [`NiceonlyPlan`].
+        niceonly_plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
     },
     #[cfg(feature = "cubecl-cuda")]
     Cuda {
         client: cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
         device_name: String,
+        /// Per-base niceonly plans, cached across fields — see [`NiceonlyPlan`].
+        niceonly_plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
     },
 }
 
@@ -850,6 +855,7 @@ impl CubeclContext {
         Ok(Self::Wgpu {
             client: client.clone(),
             device_name: device_name.clone(),
+            niceonly_plans: Mutex::new(HashMap::new()),
         })
     }
 
@@ -864,6 +870,7 @@ impl CubeclContext {
         Ok(Self::Cuda {
             client,
             device_name: format!("cubecl-cuda device {device_index}"),
+            niceonly_plans: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1061,28 +1068,61 @@ pub fn process_range_niceonly_cubecl(
     }
 
     match ctx {
-        CubeclContext::Wgpu { client, .. } => niceonly_impl(client, range, base, false),
+        CubeclContext::Wgpu {
+            client,
+            niceonly_plans,
+            ..
+        } => niceonly_impl(client, cached_plan(niceonly_plans, client, base)?, range, base, false),
         #[cfg(feature = "cubecl-cuda")]
-        CubeclContext::Cuda { client, .. } => niceonly_impl(client, range, base, true),
+        CubeclContext::Cuda {
+            client,
+            niceonly_plans,
+            ..
+        } => niceonly_impl(client, cached_plan(niceonly_plans, client, base)?, range, base, true),
     }
+}
+
+/// Fetch the base's plan from the context cache, building it on first use.
+///
+/// # Panics
+/// Panics if the cache mutex was poisoned by an earlier panic.
+fn cached_plan<R: cubecl::prelude::Runtime>(
+    plans: &Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
+    client: &cubecl::prelude::ComputeClient<R>,
+    base: u32,
+) -> Result<Arc<NiceonlyPlan>> {
+    if let Some(plan) = plans.lock().unwrap().get(&base) {
+        return Ok(plan.clone());
+    }
+    // Built outside the lock: seconds of CPU work for a large modulus, and
+    // another thread asking for a *different* base should not wait on it.
+    // A racing build of the same base wastes one table walk, harmlessly.
+    let plan = Arc::new(NiceonlyPlan::build(client, base)?);
+    Ok(plans
+        .lock()
+        .unwrap()
+        .entry(base)
+        .or_insert(plan)
+        .clone())
 }
 
 /// Runtime-generic body of [`process_range_niceonly_cubecl`].
 fn niceonly_impl<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
+    plan: Arc<NiceonlyPlan>,
     range: &FieldSize,
     base: u32,
     wide_chunk: bool,
 ) -> Result<FieldResults> {
-    let mut run = CubeclNiceonlyRun::new(client, base, range.start(), wide_chunk)?;
+    let mut run = CubeclNiceonlyRun::from_plan(client, plan, base, range.start(), wide_chunk)?;
     let stats = run_range_pipeline(&mut run, range, base)?;
     let nice_numbers = run.finish()?;
     debug!(
         "CubeCL niceonly pipeline: {} ranges in {} dispatches, M={}, R={}, found {}",
         stats.num_ranges,
         stats.launches,
-        run.stride_m,
-        run.stride_r,
+        run.plan.stride_m,
+        run.plan.stride_r,
         nice_numbers.len()
     );
     report_field("CubeCL", base, range, &stats);
@@ -1093,47 +1133,32 @@ fn niceonly_impl<R: cubecl::prelude::Runtime>(
     })
 }
 
-/// The `CubeCL` end of the niceonly range pipeline: per-base constants, the
-/// device residue table, and the output buffers, kept across every dispatch of
-/// a field.
-struct CubeclNiceonlyRun<'a, R: cubecl::prelude::Runtime> {
-    client: &'a cubecl::prelude::ComputeClient<R>,
-    residues: cubecl::server::Handle,
-    nice_out: cubecl::server::Handle,
-    nice_count: cubecl::server::Handle,
-    field_start: u128,
-    /// `field_start mod M`, so the kernel only reduces the 64-bit offset.
-    fs_mod_m: u32,
-    base: u32,
-    limbs: u32,
-    chunk_digits: u32,
-    chunk_div: u32,
-    wide_chunk: bool,
+/// Per-base niceonly state that survives across fields: the stride-table
+/// constants and the residue table already on the device. The analog of the
+/// CUDA backend's cached `NiceonlyPlan` and the Vulkan pipeline cache.
+///
+/// Building this is *expensive*: `StrideTable::new` walks the whole modulus
+/// on one CPU thread (8.6e6 steps at base 52). Rebuilt per field, that walk
+/// dominated the pipeline at benchmark-window field sizes — measured on an
+/// RTX 4060, half of every b50 scenario's wall time was table rebuilds the
+/// hand backends never do.
+// Public because it names a field type of the public context enum; its own
+// fields stay private, so nothing outside this module can touch it.
+pub struct NiceonlyPlan {
     stride_m: u32,
     stride_r: u32,
+    residues: cubecl::server::Handle,
     prefilter: Option<VulkanPrefilterParams>,
-    /// Report prefilter survivors instead of nice numbers (device tests only).
-    probe: bool,
-    /// Pin the lane tiling instead of sizing it per dispatch (device tests).
-    lane_shift_override: Option<u32>,
 }
 
-impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
+impl NiceonlyPlan {
     /// # Errors
     /// Returns an error for an unconfigurable base. Residue-empty bases must
     /// be short-circuited by the caller before any stride table is built.
-    fn new(
-        client: &'a cubecl::prelude::ComputeClient<R>,
+    fn build<R: cubecl::prelude::Runtime>(
+        client: &cubecl::prelude::ComputeClient<R>,
         base: u32,
-        field_start: u128,
-        wide_chunk: bool,
     ) -> Result<Self> {
-        let limbs = n_limbs(base).with_context(|| format!("base {base} has no u128 range"))?;
-        let (chunk_digits, chunk_div) = if wide_chunk {
-            crate::gpu_config::chunk_constants(base)
-        } else {
-            chunk_constants_u16(base)
-        };
         let table = StrideTable::new(base, GPU_LSD_K);
         ensure!(
             !table.valid_residues.is_empty(),
@@ -1148,8 +1173,67 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
         let stride_m = table.modulus as u32;
         let stride_r = u32::try_from(table.valid_residues.len())
             .with_context(|| format!("residue count overflows u32 for base {base}"))?;
-
         let residues = client.create(cubecl::bytes::Bytes::from_elems(table.valid_residues));
+        Ok(Self {
+            stride_m,
+            stride_r,
+            residues,
+            prefilter: vulkan_prefilter_params(base),
+        })
+    }
+}
+
+/// The `CubeCL` end of the niceonly range pipeline: the base's cached plan
+/// plus this field's output buffers, kept across every dispatch of a field.
+struct CubeclNiceonlyRun<'a, R: cubecl::prelude::Runtime> {
+    client: &'a cubecl::prelude::ComputeClient<R>,
+    plan: Arc<NiceonlyPlan>,
+    nice_out: cubecl::server::Handle,
+    nice_count: cubecl::server::Handle,
+    field_start: u128,
+    /// `field_start mod M`, so the kernel only reduces the 64-bit offset.
+    fs_mod_m: u32,
+    base: u32,
+    limbs: u32,
+    chunk_digits: u32,
+    chunk_div: u32,
+    wide_chunk: bool,
+    /// Report prefilter survivors instead of nice numbers (device tests only).
+    probe: bool,
+    /// Pin the lane tiling instead of sizing it per dispatch (device tests).
+    lane_shift_override: Option<u32>,
+}
+
+impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
+    /// Build a fresh, uncached plan and wrap a run around it (device tests).
+    #[cfg(test)]
+    fn new(
+        client: &'a cubecl::prelude::ComputeClient<R>,
+        base: u32,
+        field_start: u128,
+        wide_chunk: bool,
+    ) -> Result<Self> {
+        let plan = Arc::new(NiceonlyPlan::build(client, base)?);
+        Self::from_plan(client, plan, base, field_start, wide_chunk)
+    }
+
+    /// Per-field setup over a cached plan: cheap — two buffer creations.
+    ///
+    /// # Errors
+    /// Returns an error for a base with no u128 range.
+    fn from_plan(
+        client: &'a cubecl::prelude::ComputeClient<R>,
+        plan: Arc<NiceonlyPlan>,
+        base: u32,
+        field_start: u128,
+        wide_chunk: bool,
+    ) -> Result<Self> {
+        let limbs = n_limbs(base).with_context(|| format!("base {base} has no u128 range"))?;
+        let (chunk_digits, chunk_div) = if wide_chunk {
+            crate::gpu_config::chunk_constants(base)
+        } else {
+            chunk_constants_u16(base)
+        };
         let nice_out = client.create(cubecl::bytes::Bytes::from_elems(vec![
             0u32;
             NICEONLY_OUT_CAPACITY
@@ -1158,10 +1242,10 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
         let nice_count = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
 
         #[allow(clippy::cast_possible_truncation)]
-        let fs_mod_m = (field_start % u128::from(stride_m)) as u32;
+        let fs_mod_m = (field_start % u128::from(plan.stride_m)) as u32;
         Ok(Self {
             client,
-            residues,
+            plan,
             nice_out,
             nice_count,
             field_start,
@@ -1171,9 +1255,6 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
             chunk_digits,
             chunk_div,
             wide_chunk,
-            stride_m,
-            stride_r,
-            prefilter: vulkan_prefilter_params(base),
             probe: false,
             lane_shift_override: None,
         })
@@ -1245,8 +1326,8 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
             lane_shift_for(
                 offsets.len() as u64,
                 mean_len,
-                self.stride_m,
-                self.stride_r,
+                self.plan.stride_m,
+                self.plan.stride_r,
             )
         });
         let num_ranges = u32::try_from(offsets.len()).unwrap_or(u32::MAX);
@@ -1257,6 +1338,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
             .clamp(1, u64::from(MAX_CUBES)) as u32;
 
         let (pre_limbs, pre_chunk_digits, pre_chunk_div) = self
+            .plan
             .prefilter
             .map_or((0, 0, 0), |p| (p.limbs, p.chunk_digits, p.chunk_div));
 
@@ -1266,7 +1348,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
                 self.client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(WORKGROUP_SIZE),
-                ArrayArg::from_raw_parts(self.residues.clone(), self.stride_r as usize),
+                ArrayArg::from_raw_parts(self.plan.residues.clone(), self.plan.stride_r as usize),
                 ArrayArg::from_raw_parts(offsets_handle, offsets.len() * 2),
                 ArrayArg::from_raw_parts(lens_handle, lens.len()),
                 ArrayArg::from_raw_parts(
@@ -1287,9 +1369,9 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
                 self.chunk_digits,
                 self.chunk_div,
                 self.wide_chunk,
-                self.stride_m,
-                self.stride_r,
-                stride_chunk_bits(self.stride_m),
+                self.plan.stride_m,
+                self.plan.stride_r,
+                stride_chunk_bits(self.plan.stride_m),
                 pre_limbs,
                 pre_chunk_digits,
                 pre_chunk_div,
@@ -1504,7 +1586,7 @@ mod tests {
             for shift in 0..=MAX_LANES_PER_RANGE.ilog2() {
                 let mut run =
                     CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
-                assert!(run.prefilter.is_some(), "base {base}: no prefilter params");
+                assert!(run.plan.prefilter.is_some(), "base {base}: no prefilter params");
                 run.probe = true;
                 run.lane_shift_override = Some(shift);
                 run.launch(&[0], &[len]).expect("dispatch");
