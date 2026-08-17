@@ -114,6 +114,15 @@ CREATE INDEX IF NOT EXISTS idx_fields_base_range ON fields(base_id, range_start,
 CREATE INDEX IF NOT EXISTS idx_fields_check_level_range_size_last_claim_time_id ON fields(check_level, range_size, last_claim_time, id);
 CREATE INDEX IF NOT EXISTS idx_fields_canon_submission ON fields(canon_submission_id) WHERE canon_submission_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_fields_cl0_id ON fields(id) WHERE check_level = 0;
+-- Detailed claims ask for `check_level <= 1` ordered by id. The composite index above
+-- cannot deliver that ordering across two check_level values, so without this partial
+-- index the planner walks fields_pkey and filters out every completed row before the
+-- frontier (93ms vs 21ms on a 1.2M row fixture; the gap scales with table size).
+CREATE INDEX IF NOT EXISTS idx_fields_cl1_id ON fields(id) WHERE check_level <= 1;
+-- Frontier chunk selection probes "does this chunk still hold a claimable field?" per
+-- candidate chunk. Covering all four predicate columns makes that probe an index-only
+-- scan; without it the probe reads every field of every exhausted chunk it skips.
+CREATE INDEX IF NOT EXISTS idx_fields_chunk_claim_cover ON fields(chunk_id, last_claim_time, range_size, check_level);
 CREATE INDEX IF NOT EXISTS idx_submissions_search_mode_field_id ON submissions(search_mode, field_id);
 CREATE INDEX IF NOT EXISTS idx_submissions_field_mode_disq ON submissions(field_id, search_mode, disqualified);
 CREATE INDEX IF NOT EXISTS idx_submissions_id_field ON submissions(id, field_id);

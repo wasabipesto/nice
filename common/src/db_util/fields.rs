@@ -198,6 +198,94 @@ pub fn get_fields_in_base_with_detailed_subs(
         .collect::<Result<Vec<FieldRecord>>>()
 }
 
+/// The `check_level` predicate for a claim query.
+///
+/// IMPORTANT: the two common bounds are emitted as *literals* rather than
+/// `check_level <= $2`, because Postgres can only prove that a query predicate implies a
+/// partial index's predicate when the bound is a constant — against a bound parameter it
+/// gives up and walks the primary key, filtering as it goes. `check_level = 0` matches
+/// `idx_fields_cl0_id` (nice-only claims) and `check_level <= 1` matches
+/// `idx_fields_cl1_id` (detailed claims); without them a claim scans through millions of
+/// already-completed rows to reach the frontier.
+fn check_level_predicate(maximum_check_level: i32) -> &'static str {
+    match maximum_check_level {
+        0 => "check_level = 0",
+        1 => "check_level <= 1",
+        _ => "check_level <= $2",
+    }
+}
+
+/// Predicate matching fields that are free to claim: never claimed, or claimed longer
+/// ago than `$1`.
+///
+/// Spelled as an explicit `IS NULL` disjunction rather than
+/// `COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1`. The two are equivalent for
+/// any `$1` after the epoch, which every caller passes, but `COALESCE` over the column
+/// is an expression no btree index can answer, so it can only ever be a filter applied
+/// after the fact — never an index condition.
+///
+/// `prefix` is the table qualifier, e.g. `""` or `"f."`.
+fn claimable_predicate(prefix: &str) -> String {
+    format!("({prefix}last_claim_time IS NULL OR {prefix}last_claim_time <= $1)")
+}
+
+/// CTE selecting the frontier chunk: the lowest-id chunk that is both under-explored
+/// *and* still has at least one claimable field.
+///
+/// The `EXISTS` clause is the load-bearing half. Without it this picks the first
+/// under-explored chunk whether or not anything in it can be claimed, so once every
+/// field in that chunk carries a live claim the whole `Thin` strategy returns nothing
+/// and the frontier never advances. That is the steady state under fleet load rather
+/// than an edge case: a chunk is 1% of a base, so holding one saturated needs only a
+/// few claims per second against the `CLAIM_DURATION_HOURS` expiry. Nor does the chunk
+/// exit the under-explored state on its own while that lasts — `checked_detailed` counts
+/// *completed* work (`check_level >= 2`) and is written only by the `jobs` binary on a
+/// schedule, never by `/submit`.
+///
+/// The claimability test is spelled as two `EXISTS` rather than one containing
+/// `claimable_predicate`'s disjunction. `EXISTS(A OR B)` is equivalent to
+/// `EXISTS(A) OR EXISTS(B)`, but Postgres can only turn the second form into index
+/// conditions: with one `EXISTS` the `OR` becomes a post-hoc filter, so the probe walks
+/// every field of every exhausted chunk it skips over (measured 13.9ms against a 1.2M
+/// row fixture, and it grows with the number of chunks skipped). Split, both halves
+/// become index conditions against `idx_fields_chunk_claim_cover` and the whole probe is
+/// an index-only scan (0.36ms on the same fixture).
+///
+/// Parameters: `$1` = maximum claim timestamp, `$2` = maximum check level,
+/// `$3` = maximum range size, `$4` = chunk completion cutoff percent.
+fn eligible_chunk_cte(check_level_predicate: &str) -> String {
+    format!(
+        "eligible_chunk AS (
+            SELECT c.id
+            FROM chunks c
+            WHERE CASE
+                WHEN $2 = 0 THEN c.checked_niceonly / NULLIF(c.range_size, 0) < $4
+                ELSE c.checked_detailed / NULLIF(c.range_size, 0) < $4
+            END
+              AND (
+                  EXISTS (
+                      SELECT 1
+                      FROM fields f
+                      WHERE f.chunk_id = c.id
+                        AND f.last_claim_time IS NULL
+                        AND f.{check_level_predicate}
+                        AND f.range_size <= $3
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM fields f
+                      WHERE f.chunk_id = c.id
+                        AND f.last_claim_time <= $1
+                        AND f.{check_level_predicate}
+                        AND f.range_size <= $3
+                  )
+              )
+            ORDER BY c.id ASC
+            LIMIT 1
+        )"
+    )
+}
+
 /// Finds the next field that matches the criteria, updates `last_claim_time`, and returns it.
 /// Returns Ok(None) if no matching fields are found.
 #[allow(clippy::too_many_lines)]
@@ -217,16 +305,8 @@ pub fn try_claim_field(
 
     // Use a single-statement "claim" with row locking to avoid thundering herd / lock contention.
     // `FOR UPDATE SKIP LOCKED` ensures concurrent claimers don't block on the same "next" row.
-    //
-    // IMPORTANT: Special-case `maximum_check_level == 0` to use `check_level = 0` rather than
-    // `check_level <= $2`. This helps Postgres match/choose the partial index
-    // `... ON fields(id) WHERE check_level = 0` for nice-only claims where otherwise it would
-    // have to scan through the first ~8 million rows.
-    let check_level_predicate = if maximum_check_level == 0 {
-        "check_level = 0"
-    } else {
-        "check_level <= $2"
-    };
+    let check_level_predicate = check_level_predicate(maximum_check_level);
+    let claimable = claimable_predicate("");
 
     match claim_strategy {
         FieldClaimStrategy::Next => {
@@ -235,7 +315,7 @@ pub fn try_claim_field(
                 "WITH candidate AS (
                     SELECT id
                     FROM fields
-                    WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                    WHERE {claimable}
                       AND {check_level_predicate}
                       AND range_size <= $3
                     ORDER BY id ASC
@@ -276,7 +356,7 @@ pub fn try_claim_field(
                     SELECT id
                     FROM fields
                     WHERE id >= $4
-                      AND COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                      AND {claimable}
                       AND {check_level_predicate}
                       AND range_size <= $3
                     ORDER BY id ASC
@@ -294,7 +374,7 @@ pub fn try_claim_field(
                 "WITH candidate AS (
                     SELECT id
                     FROM fields
-                    WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                    WHERE {claimable}
                       AND {check_level_predicate}
                       AND range_size <= $3
                     ORDER BY id ASC
@@ -347,7 +427,8 @@ pub fn try_claim_field(
             }
         }
         FieldClaimStrategy::Thin => {
-            // First, finds the first chunk with less than X% of the chunk checked:
+            // First, finds the frontier chunk: the first chunk with less than X% of it
+            // checked that still holds a claimable field (see `eligible_chunk_cte`):
             //   When maximum_check_level == 0, use chunk.checked_niceonly
             //   When maximum_check_level >= 1, use chunk.checked_detailed
             // Then find and return a pseudorandom field within that chunk using pivot strategy
@@ -355,26 +436,21 @@ pub fn try_claim_field(
             let chunk_completion_cutoff_pct =
                 conversions::f32_to_bigdec(DOWNSAMPLE_CUTOFF_PERCENT)?;
 
-            // Single query to get eligible chunk and field ID range within it
-            let chunk_info_query = "
-                WITH eligible_chunk AS (
-                    SELECT id
-                    FROM chunks
-                    WHERE CASE
-                        WHEN $1 = 0 THEN checked_niceonly / NULLIF(range_size, 0) < $2
-                        ELSE checked_detailed / NULLIF(range_size, 0) < $2
-                    END
-                    ORDER BY id ASC
-                    LIMIT 1
-                )
+            // Single query to get eligible chunk and field ID range within it. The range
+            // spans every field in the chunk, not just the claimable ones, so it is only
+            // a pivot hint — the wraparound below still finds a claimable field below the
+            // pivot when the chunk is nearly exhausted.
+            let eligible_chunk = eligible_chunk_cte(check_level_predicate);
+            let chunk_info_query = format!(
+                "WITH {eligible_chunk}
                 SELECT
                     ec.id as chunk_id,
                     MIN(f.id) as min_field_id,
                     MAX(f.id) as max_field_id
                 FROM eligible_chunk ec
                 JOIN fields f ON f.chunk_id = ec.id
-                GROUP BY ec.id
-            ";
+                GROUP BY ec.id"
+            );
 
             #[derive(QueryableByName)]
             #[allow(clippy::items_after_statements, clippy::struct_field_names)]
@@ -388,7 +464,9 @@ pub fn try_claim_field(
             }
 
             let chunk_info_result: Option<ChunkInfo> = sql_query(chunk_info_query)
+                .bind::<Timestamptz, _>(maximum_timestamp)
                 .bind::<Integer, _>(maximum_check_level)
+                .bind::<Numeric, _>(maximum_size.clone())
                 .bind::<Numeric, _>(chunk_completion_cutoff_pct)
                 .get_result(conn)
                 .optional()
@@ -418,7 +496,7 @@ pub fn try_claim_field(
                     FROM fields
                     WHERE chunk_id = $4
                       AND id >= $5
-                      AND COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                      AND {claimable}
                       AND {check_level_predicate}
                       AND range_size <= $3
                     ORDER BY id ASC
@@ -452,7 +530,7 @@ pub fn try_claim_field(
                     SELECT id
                     FROM fields
                     WHERE chunk_id = $4
-                      AND COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+                      AND {claimable}
                       AND {check_level_predicate}
                       AND range_size <= $3
                     ORDER BY id ASC
@@ -499,18 +577,14 @@ pub fn bulk_claim_fields(
     let maximum_size = conversions::u128_to_bigdec(maximum_size)?;
     let count_i64 = i64::try_from(count).map_err(|e| anyhow!("{e}"))?;
 
-    // Use the same optimization for check_level = 0 to match the partial index
-    let check_level_predicate = if maximum_check_level == 0 {
-        "check_level = 0"
-    } else {
-        "check_level <= $2"
-    };
+    let check_level_predicate = check_level_predicate(maximum_check_level);
+    let claimable = claimable_predicate("");
 
     let query = format!(
         "WITH candidates AS (
             SELECT id
             FROM fields
-            WHERE COALESCE(last_claim_time, 'epoch'::timestamptz) <= $1
+            WHERE {claimable}
               AND {check_level_predicate}
               AND range_size <= $3
             ORDER BY id ASC
@@ -535,7 +609,7 @@ pub fn bulk_claim_fields(
     results.into_iter().map(private_to_public).collect()
 }
 
-/// Bulk claim multiple fields at once from the first under-explored chunk, using the
+/// Bulk claim multiple fields at once from the frontier chunk, using the
 /// `Thin` strategy. Mirrors `try_claim_field`'s `Thin` branch but claims up to `count`
 /// fields from the chosen chunk in a single statement.
 ///
@@ -556,36 +630,24 @@ pub fn bulk_claim_thin_fields(
     let count_i64 = i64::try_from(count).map_err(|e| anyhow!("{e}"))?;
     let chunk_completion_cutoff_pct = conversions::f32_to_bigdec(DOWNSAMPLE_CUTOFF_PERCENT)?;
 
-    // Same check_level predicate logic as try_claim_field / bulk_claim_fields.
-    let check_level_predicate = if maximum_check_level == 0 {
-        "check_level = 0"
-    } else {
-        "check_level <= $2"
-    };
+    let check_level_predicate = check_level_predicate(maximum_check_level);
+    let claimable = claimable_predicate("f.");
 
-    // Find the first eligible (under-explored) chunk, then bulk-claim up to `count`
-    // fields within it. We do this in a single statement by joining the eligible
-    // chunk back to fields and limiting the candidate set.
+    // Find the frontier chunk, then bulk-claim up to `count` fields within it. We do
+    // this in a single statement by joining the eligible chunk back to fields and
+    // limiting the candidate set.
+    let eligible_chunk = eligible_chunk_cte(check_level_predicate);
     let query = format!(
-        "WITH eligible_chunk AS (
-            SELECT id
-            FROM chunks
-            WHERE CASE
-                WHEN $2 = 0 THEN checked_niceonly / NULLIF(range_size, 0) < $5
-                ELSE checked_detailed / NULLIF(range_size, 0) < $5
-            END
-            ORDER BY id ASC
-            LIMIT 1
-        ), candidates AS (
+        "WITH {eligible_chunk}, candidates AS (
             SELECT f.id
             FROM fields f
             JOIN eligible_chunk ec ON f.chunk_id = ec.id
-            WHERE COALESCE(f.last_claim_time, 'epoch'::timestamptz) <= $1
+            WHERE {claimable}
               AND f.{check_level_predicate}
               AND f.range_size <= $3
             ORDER BY f.id ASC
             FOR UPDATE SKIP LOCKED
-            LIMIT $4
+            LIMIT $5
         )
         UPDATE fields f
         SET last_claim_time = NOW()
@@ -595,13 +657,13 @@ pub fn bulk_claim_thin_fields(
     );
 
     // Note: bind order is $1=maximum_timestamp, $2=maximum_check_level, $3=maximum_size,
-    // $4=count, $5=chunk_completion_cutoff_pct.
+    // $4=chunk_completion_cutoff_pct, $5=count. $1-$4 are fixed by `eligible_chunk_cte`.
     let results = sql_query(query)
         .bind::<Timestamptz, _>(maximum_timestamp)
         .bind::<Integer, _>(maximum_check_level)
         .bind::<Numeric, _>(maximum_size)
-        .bind::<BigInt, _>(count_i64)
         .bind::<Numeric, _>(chunk_completion_cutoff_pct)
+        .bind::<BigInt, _>(count_i64)
         .load::<FieldPrivate>(conn)
         .map_err(|e| anyhow!("{e}"))?;
 

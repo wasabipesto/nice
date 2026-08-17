@@ -77,6 +77,22 @@ fn db_conn(
         .map_err(|e| service_unavailable_error(format!("Database connection unavailable: {e}")))
 }
 
+/// Every field matching the request is currently claimed by someone else — a transient
+/// capacity condition, so 503 and let the client retry.
+///
+/// This replaces a second claim pass that ran with `maximum_timestamp = Utc::now()`,
+/// which matches every row regardless of who holds it; its own log line read "falling
+/// back to one that may have been claimed recently". Against a saturated frontier chunk
+/// that handed the same few fields to every client that asked, burning client compute on
+/// duplicate work, inflating throughput accounting, and restamping `last_claim_time` on
+/// each re-issue so the original holder's claim never aged out. Returning nothing is
+/// strictly better than returning work someone else is already doing.
+fn no_claimable_field() -> rocket::response::status::Custom<Json<ApiErrorBody>> {
+    service_unavailable_error(
+        "No claimable field is available right now: every candidate is held by another client. Retry shortly.",
+    )
+}
+
 #[get("/claim/validate")]
 fn validate(pool: &State<PgPool>) -> ApiResult<ValidationData> {
     // Get database connection from the shared pool
@@ -185,57 +201,6 @@ fn claim_helper(
         } else {
             tracing::warn!("Detailed-thin queue exhausted, falling back to direct database claim");
             let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
-            if let Some(claimed_field) = try_claim_field(
-                &mut conn,
-                claim_strategy,
-                maximum_timestamp,
-                max_check_level,
-                max_range_size,
-            )
-            .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
-            {
-                claimed_field
-            } else {
-                tracing::info!(
-                    "Unable to find an unclaimed or expired field, falling back to one that may have been claimed recently."
-                );
-                let maximum_timestamp = Utc::now();
-                let claim_strategy = FieldClaimStrategy::Next;
-                try_claim_field(
-                    &mut conn,
-                    claim_strategy,
-                    maximum_timestamp,
-                    max_check_level,
-                    max_range_size,
-                )
-                .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
-                .ok_or_else(|| {
-                    internal_error(format!(
-                        "Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!"
-                    ))
-                })?
-            }
-        }
-    } else {
-        // For the remaining detailed strategies (Next / Random / cl=2), use the original
-        // database claim logic with the two-step fallback.
-        let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
-        if let Some(claimed_field) = try_claim_field(
-            &mut conn,
-            claim_strategy,
-            maximum_timestamp,
-            max_check_level,
-            max_range_size,
-        )
-        .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
-        {
-            claimed_field
-        } else {
-            tracing::info!(
-                "Unable to find an unclaimed or expired field, falling back to one that may have been claimed recently."
-            );
-            let maximum_timestamp = Utc::now();
-            let claim_strategy = FieldClaimStrategy::Next;
             try_claim_field(
                 &mut conn,
                 claim_strategy,
@@ -244,12 +209,21 @@ fn claim_helper(
                 max_range_size,
             )
             .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
-            .ok_or_else(|| {
-                internal_error(format!(
-                    "Could not find any field with maximum check level {max_check_level} and maximum size {max_range_size}!"
-                ))
-            })?
+            .ok_or_else(no_claimable_field)?
         }
+    } else {
+        // For the remaining detailed strategies (Next / Random / cl=2), claim directly
+        // from the database.
+        let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
+        try_claim_field(
+            &mut conn,
+            claim_strategy,
+            maximum_timestamp,
+            max_check_level,
+            max_range_size,
+        )
+        .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
+        .ok_or_else(no_claimable_field)?
     };
 
     // Save the claim and get the record
