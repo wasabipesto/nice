@@ -1322,14 +1322,26 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
         // bounds range length by the floor.
         let mean_len =
             lens.iter().map(|&l| u64::from(l)).sum::<u64>() / lens.len().max(1) as u64;
-        let lane_shift = self.lane_shift_override.unwrap_or_else(|| {
-            lane_shift_for(
-                offsets.len() as u64,
-                mean_len,
-                self.plan.stride_m,
-                self.plan.stride_r,
-            )
-        });
+        // NICE_CUBECL_LANES pins the tiling for A/B measurement, the same
+        // shape of knob as NICE_VULKAN_LANES on the hand backend.
+        let lane_shift = self
+            .lane_shift_override
+            .or_else(|| {
+                std::env::var("NICE_CUBECL_LANES")
+                    .ok()?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| n.is_power_of_two() && *n <= 32)
+                    .map(u32::trailing_zeros)
+            })
+            .unwrap_or_else(|| {
+                lane_shift_for(
+                    offsets.len() as u64,
+                    mean_len,
+                    self.plan.stride_m,
+                    self.plan.stride_r,
+                )
+            });
         let num_ranges = u32::try_from(offsets.len()).unwrap_or(u32::MAX);
         let threads = u64::from(num_ranges) << lane_shift;
         #[allow(clippy::cast_possible_truncation)]
