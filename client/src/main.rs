@@ -47,7 +47,9 @@ use nice_common::client_process_vulkan::{
 #[cfg(feature = "vulkan")]
 use nice_common::vulkan::VulkanContext;
 #[cfg(feature = "cubecl")]
-use nice_common::cubecl_backend::{CUBECL_BATCH_SIZE, CubeclContext, process_range_detailed_cubecl};
+use nice_common::cubecl_backend::{
+    CUBECL_BATCH_SIZE, CubeclContext, process_range_detailed_cubecl, process_range_niceonly_cubecl,
+};
 
 /// Which GPU backend to drive.
 ///
@@ -56,13 +58,13 @@ use nice_common::cubecl_backend::{CUBECL_BATCH_SIZE, CubeclContext, process_rang
 /// leaving behaviour on an NVIDIA machine exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
-    /// CUDA if available, then `CubeCL` (detailed mode), then Vulkan.
+    /// CUDA if available, then `CubeCL`, then Vulkan.
     Auto,
     /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC.
     Cuda,
     /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe).
     Vulkan,
-    /// `CubeCL` over wgpu (detailed mode only; benchmark-grade evaluation port).
+    /// `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base.
     Cubecl,
     /// `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature).
     CubeclCuda,
@@ -311,21 +313,16 @@ fn try_init_cuda(device: usize) -> Result<CudaContext> {
 ///
 /// `Auto` prefers CUDA (fastest measured everywhere it exists), then `CubeCL`,
 /// then Vulkan — `CubeCL` measured 1.4x the hand-WGSL backend on RDNA4/RADV and
-/// 2.5x on NVIDIA, so it outranks Vulkan wherever both could run. The one
-/// exception is niceonly mode, where `CubeCL` has no kernel yet: there `Auto`
-/// skips it and falls through to Vulkan. An **explicitly named** backend that
-/// fails to initialize is fatal rather than falling back: for a distributed
-/// compute client, silently dropping to a much slower path is a worse outcome
-/// than stopping and saying so.
+/// 2.5x on NVIDIA, so it outranks Vulkan wherever both could run. An
+/// **explicitly named** backend that fails to initialize is fatal rather than
+/// falling back: for a distributed compute client, silently dropping to a much
+/// slower path is a worse outcome than stopping and saying so.
 #[allow(unused_variables)]
 fn init_gpu(cli: &Cli) -> GpuCtx {
     if !cli.gpu {
         return None;
     }
     let want = cli.gpu_backend;
-    // CubeCL is detailed-only until its niceonly port lands; `Auto` must not
-    // select a backend that will refuse half the field types at claim time.
-    let cubecl_in_auto = cli.mode == SearchMode::Detailed;
 
     #[cfg(feature = "cuda")]
     if matches!(want, GpuBackend::Auto | GpuBackend::Cuda) {
@@ -365,7 +362,7 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
     }
 
     #[cfg(feature = "cubecl")]
-    if want == GpuBackend::Cubecl || (want == GpuBackend::Auto && cubecl_in_auto) {
+    if matches!(want, GpuBackend::Auto | GpuBackend::Cubecl) {
         match CubeclContext::new_default() {
             Ok(ctx) => {
                 info!(
@@ -479,9 +476,9 @@ fn process_field_sync(
                     SearchMode::Detailed => {
                         process_range_detailed_cubecl(ctx, &range, claim_data.base)
                     }
-                    SearchMode::Niceonly => Err(anyhow::anyhow!(
-                        "the CubeCL backend is detailed-only for now; use --mode detailed"
-                    )),
+                    SearchMode::Niceonly => {
+                        process_range_niceonly_cubecl(ctx, &range, claim_data.base)
+                    }
                 },
             };
 

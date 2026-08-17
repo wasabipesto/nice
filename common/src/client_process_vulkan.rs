@@ -11,8 +11,7 @@
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::gpu_config::gpu_supports_base;
-use crate::gpu_niceonly::{GPU_LSD_K, report_field, run_range_pipeline};
-use crate::residue_filter;
+use crate::gpu_niceonly::{GPU_LSD_K, report_field, residue_empty_result, run_range_pipeline};
 use crate::stride_filter::StrideTable;
 use crate::vulkan::{DetailedRun, NiceonlyRun, VulkanContext};
 use crate::{
@@ -89,28 +88,6 @@ pub fn process_range_detailed_vulkan(
         distribution,
         nice_numbers,
     })
-}
-
-/// The answer for a residue-empty base, if this is one.
-///
-/// For `b ≡ 3 mod 4` the residue set `R_b` is empty, which means there are
-/// provably no solutions — but it also means the stride table does not return
-/// so much as panic when indexed
-/// (`stride_filter::first_valid_at_or_after` indexes `valid_residues[idx]`).
-/// So this has to be checked before any stride table is built.
-///
-/// The CUDA path has the same guard inside `process_range_niceonly_cuda`; here
-/// it sits ahead of the CPU fallback rather than after it, so it also covers
-/// bases the GPU itself cannot take.
-fn residue_empty_result(base: u32) -> Option<FieldResults> {
-    if residue_filter::get_residue_filter_u128(&base).is_empty() {
-        debug!("base {base} is residue-empty; no candidates to check");
-        return Some(FieldResults {
-            distribution: Vec::new(),
-            nice_numbers: Vec::new(),
-        });
-    }
-    None
 }
 
 /// Vulkan implementation of `process_range_niceonly`.
@@ -203,6 +180,7 @@ pub fn process_niceonly_vulkan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::residue_filter;
 
     /// The GPU histogram bins are u32; a batch must not be able to overflow one.
     #[test]

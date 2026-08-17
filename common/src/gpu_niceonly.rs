@@ -15,10 +15,10 @@
 //! [`crate::client_process_cuda`] is `#![cfg(feature = "cuda")]` and unreachable
 //! from a Vulkan-only build.
 
-#![cfg(any(feature = "cuda", feature = "vulkan"))]
+#![cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use crate::{FieldSize, msd_prefix_filter};
+use crate::{FieldResults, FieldSize, msd_prefix_filter, residue_filter};
 use anyhow::Result;
 use log::{debug, info, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -414,6 +414,123 @@ pub fn report_field(backend: &str, base: u32, range: &FieldSize, stats: &Niceonl
         .lock()
         .unwrap()
         .update(stats.msd_secs, stats.total_secs);
+}
+
+/// The answer for a residue-empty base, if this is one.
+///
+/// For `b ≡ 3 mod 4` the residue set `R_b` is empty, which means there are
+/// provably no solutions — but it also means the stride table does not return
+/// so much as panic when indexed
+/// (`stride_filter::first_valid_at_or_after` indexes `valid_residues[idx]`).
+/// So this has to be checked before any stride table is built.
+///
+/// The CUDA path has the same guard inside `process_range_niceonly_cuda`; the
+/// Vulkan and `CubeCL` paths call this ahead of their CPU fallbacks, so it
+/// also covers bases the GPU itself cannot take.
+#[must_use]
+pub fn residue_empty_result(base: u32) -> Option<FieldResults> {
+    if residue_filter::get_residue_filter_u128(&base).is_empty() {
+        debug!("base {base} is residue-empty; no candidates to check");
+        return Some(FieldResults {
+            distribution: Vec::new(),
+            nice_numbers: Vec::new(),
+        });
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Kernel-shape constants shared by the range-descriptor backends (Vulkan and
+// CubeCL). CUDA predates the descriptor pipeline's tiling and keeps its fixed
+// one-warp-per-range shape, so only the newer backends read these.
+// ---------------------------------------------------------------------------
+
+/// Most threads that may cooperate on one MSD-valid range — CUDA's
+/// one-warp-per-range tiling, and the ceiling for [`lane_shift_for`].
+///
+/// Nothing here is a hardware property: the lanes stride through the range's
+/// candidates by index and never communicate, so this is a tiling constant, not
+/// a subgroup width. Which is exactly why it does not have to be a constant at
+/// all — the kernels take `log2(lanes)` as a launch parameter and the host
+/// picks it per dispatch.
+pub const MAX_LANES_PER_RANGE: u32 = 32;
+
+/// Candidates each lane should have to work on, which is what
+/// [`lane_shift_for`] sizes the tiling to deliver.
+///
+/// Every lane assigned to a range redundantly repeats that range's setup — the
+/// residue reduction and a ~12-iteration binary search over the residue table —
+/// before its first candidate. At CUDA's fixed 32 lanes and an MSD floor of 250,
+/// a base-40 range holds ~39 candidates, so the tiling buys 32 copies of that
+/// setup to share out **1.2 candidates per lane**.
+///
+/// Measured (b40, 1e12, floor 250, device time): 32 lanes 30.0 s, 16 24.6 s,
+/// 8 22.8 s, 4 21.6 s, 2 21.1 s, 1 21.1 s. Monotone, and 32 candidates per lane
+/// is what puts a ~39-candidate range on a single lane. Where ranges are long
+/// the same sweep is flat inside run-to-run variance (floor 4000: 21.1-21.6 s
+/// across every width; floor 32000: 24.9-25.9 s), so this only has to be right
+/// at the short-range end.
+const TARGET_CANDIDATES_PER_LANE: u64 = 32;
+
+/// Threads a dispatch should have before the tiling starts economizing on them.
+///
+/// The floor is for small batches — the last of a field, or a field whose whole
+/// MSD output is a few thousand ranges. 65536 is measured to saturate this
+/// device (at floor 250 a 65536-range batch at one lane apiece is the fastest
+/// setting there is), so it is a lower bound rather than a target; on a device
+/// with 30x the ALUs the [`MAX_LANES_PER_RANGE`] cap binds first anyway.
+const MIN_DISPATCH_THREADS: u64 = 1 << 16;
+
+/// `log2` of the lanes to assign per range, for a dispatch of `num_ranges`
+/// ranges averaging `mean_len` numbers, of which `stride_r / stride_m` are
+/// candidates.
+///
+/// Clamped to `[1, MAX_LANES_PER_RANGE]` lanes. Returning a shift rather than a
+/// count keeps the kernel's `gid >> shift` / `gid & (lanes - 1)` split exact,
+/// so the tiling stays pure index arithmetic at any width.
+#[must_use]
+pub fn lane_shift_for(num_ranges: u64, mean_len: u64, stride_m: u32, stride_r: u32) -> u32 {
+    let candidates = mean_len * u64::from(stride_r) / u64::from(stride_m);
+    // Round down to a power of two: 63 candidates' worth of lanes is 4, not 8,
+    // because the last lane would otherwise idle through most of the range.
+    let by_work =
+        (candidates / TARGET_CANDIDATES_PER_LANE).clamp(1, u64::from(MAX_LANES_PER_RANGE));
+    // ...but never leave the device short of threads to hide latency behind.
+    let by_occupancy = MIN_DISPATCH_THREADS
+        .div_ceil(num_ranges.max(1))
+        .next_power_of_two()
+        .min(u64::from(MAX_LANES_PER_RANGE));
+    by_work.max(by_occupancy).ilog2()
+}
+
+/// Largest stride modulus the descriptor kernels' residue reduction accepts.
+///
+/// `n mod M` cannot be computed as a 64-bit division by a constant — that is
+/// the one construct RADV/ACO does not strength-reduce (see the Vulkan module
+/// docs). Instead the kernel reduces the range's 64-bit *offset* one chunk at
+/// a time, `acc = (acc << c | chunk) % M`, with `M` a 32-bit compile-time
+/// constant. The running remainder satisfies `acc < M`, so the shift stays
+/// inside a u32 exactly while `M <= 2^(32-c)`.
+///
+/// `c` is picked per base by [`stride_chunk_bits`]. It used to be a fixed 8,
+/// on the premise that `M = (b-1)·b^k` with `k = 2` put even base 128 at
+/// 127·16384 ≈ 2^21. Upstream #88 raised `k` to 3, which multiplies every
+/// modulus by `b`: base 65 reaches 17 576 000 and base 128 reaches
+/// 266 338 304, so the fixed byte chunk would have refused every base ≥ 65 —
+/// base 80 among them. A 4-bit chunk covers the whole supported range with
+/// room to spare, and costs nothing measurable because this reduction runs
+/// once per *range descriptor*, not per candidate.
+pub const MAX_STRIDE_MODULUS: u128 = 1 << 28;
+
+/// Width in bits of one Horner chunk in the kernels' offset reduction.
+///
+/// The largest `c` with `M << c` still inside a u32, restricted to widths that
+/// divide 64 evenly so the unrolled loop covers the offset exactly. Both the
+/// device kernels and the host mirror derive `c` from the same modulus, so
+/// they cannot disagree.
+#[must_use]
+pub fn stride_chunk_bits(stride_m: u32) -> u32 {
+    if u128::from(stride_m) <= 1 << 24 { 8 } else { 4 }
 }
 
 #[cfg(test)]
