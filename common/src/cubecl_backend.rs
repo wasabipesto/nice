@@ -996,12 +996,18 @@ pub fn process_range_detailed_cubecl(
 }
 
 /// Runtime-generic body of [`process_range_detailed_cubecl`].
+#[allow(clippy::too_many_lines)]
 fn detailed_impl<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     range: &FieldSize,
     base: u32,
     wide_chunk: bool,
 ) -> Result<FieldResults> {
+    /// Batches launched between blocking histogram drains; the overflow
+    /// bound is checked below.
+    const DRAIN_INTERVAL: usize = 64;
+    const _: () = assert!((DRAIN_INTERVAL as u128) * CUBECL_BATCH_SIZE < u32::MAX as u128);
+
     let start_time = Instant::now();
     let limbs = n_limbs(base).with_context(|| format!("base {base} has no u128 range"))?;
     let (chunk_digits, chunk_div) = if wide_chunk {
@@ -1018,10 +1024,28 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
 
     let mut histogram = vec![0u128; hist_bins];
 
+    // Batches launch back-to-back asynchronously — the blocking histogram
+    // read is the only stream sync, so doing it per batch put a GPU-idle
+    // bubble after every ~12ms of work (~25% whole-field on an RTX 4060,
+    // the hand-CUDA backend's entire lead). Each candidate increments
+    // exactly one u32 bin, so a bin grows by at most CUBECL_BATCH_SIZE per
+    // batch and one drain per DRAIN_INTERVAL batches stays overflow-safe:
+    // 64 * 50e6 < u32::MAX. (The hand-CUDA kernel sidesteps this with u64
+    // bins; WGSL has no u64 atomics, and this host loop serves both.)
+    let mut hist_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; hist_bins]));
+    let mut undrained = 0usize;
+    let drain = |handle: cubecl::server::Handle, histogram: &mut Vec<u128>| -> Result<()> {
+        let bytes = client
+            .read_one(handle)
+            .map_err(|e| anyhow::anyhow!("histogram read failed: {e:?}"))?;
+        let bins = u32::from_bytes(&bytes);
+        for (acc, &bin) in histogram.iter_mut().zip(bins.iter()) {
+            *acc += u128::from(bin);
+        }
+        Ok(())
+    };
+
     for batch in range.chunks(CUBECL_BATCH_SIZE) {
-        // A fresh zeroed histogram per batch; drained below so a u32 bin
-        // cannot overflow (mirrors DetailedRun::drain_histogram).
-        let hist_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; hist_bins]));
         let start = batch.start();
         let count = batch.size() as u64;
         let cubes = u32::try_from(count.div_ceil(u64::from(WORKGROUP_SIZE)))
@@ -1055,14 +1079,14 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
             );
         }
 
-        let bytes = client
-            .read_one(hist_handle)
-            .map_err(|e| anyhow::anyhow!("histogram read failed: {e:?}"))?;
-        let bins = u32::from_bytes(&bytes);
-        for (acc, &bin) in histogram.iter_mut().zip(bins.iter()) {
-            *acc += u128::from(bin);
+        undrained += 1;
+        if undrained == DRAIN_INTERVAL {
+            drain(hist_handle, &mut histogram)?;
+            hist_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; hist_bins]));
+            undrained = 0;
         }
     }
+    drain(hist_handle, &mut histogram)?;
 
     // Near misses.
     let bytes = client
