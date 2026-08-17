@@ -74,6 +74,7 @@ pub enum ApiErrorKind {
     Conflict,
     UnprocessableEntity,
     Internal,
+    ServiceUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,4 +123,16 @@ pub fn unprocessable_entity_error(
 
 pub fn internal_error(message: impl Into<String>) -> rocket_status::Custom<Json<ApiErrorBody>> {
     api_error(Status::InternalServerError, ApiErrorKind::Internal, message)
+}
+
+/// 503 for transient capacity problems (connection pool exhausted, database
+/// unreachable) — a retryable condition, distinct from a 500 bug.
+pub fn service_unavailable_error(
+    message: impl Into<String>,
+) -> rocket_status::Custom<Json<ApiErrorBody>> {
+    api_error(
+        Status::ServiceUnavailable,
+        ApiErrorKind::ServiceUnavailable,
+        message,
+    )
 }
