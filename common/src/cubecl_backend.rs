@@ -1163,20 +1163,33 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
             );
         }
 
+        // Submit this batch on its own, because a GPU driver kills a
+        // submission that runs too long. CubeCL aggregates dispatches into one
+        // command buffer and submits only at `CUBECL_WGPU_MAX_TASKS` tasks (32
+        // by default) or at the next read — a bound tuned for ML kernels that
+        // run in microseconds. This one is a persistent grid-stride kernel over
+        // a whole `CUBECL_BATCH_SIZE`, ~0.12 s per dispatch at base 50 on an
+        // AMD 860M, so without this flush a single submission holds the *whole
+        // field*: `DETAILED_SEARCH_MAX_FIELD_SIZE` is 20 batches, which is
+        // 2.4 s at base 50 and 6.3 s at base 80. Measured on Linux/RADV,
+        // amdgpu resets a gfx job at ~2 s ("ring gfx_0.0.0 timeout ... device
+        // wedged") and the device is lost for the rest of the process; Windows
+        // has the same 2 s TDR, and only survives because the GPUs it was
+        // tested on run a field inside it. So the task cap is not the bound
+        // that matters — the field is — and raising or lowering it does not
+        // help.
+        //
+        // Flushing per batch is the granularity the hand Vulkan backend has
+        // always used, and it is free: `flush` submits without waiting, and one
+        // batch already saturates the device (measured interleaved, 80 batches
+        // at base 50: 9.76 s median against 10.00 s for the aggregated form).
+        client
+            .flush()
+            .map_err(|e| anyhow::anyhow!("stream flush failed: {e:?}"))?;
+
         undrained += 1;
         if undrained == DRAIN_INTERVAL {
             drain(hist_handle, &mut histogram)?;
-
-    // Every candidate lands in exactly one bin, so a mismatch means the
-    // device silently did nothing for some batch (the observed failure mode
-    // of a CUDA runtime without NVRTC) — refuse to report fabricated zeros.
-    let counted: u128 = histogram.iter().sum();
-    ensure!(
-        counted == range.size(),
-        "GPU histogram counted {counted} of {} candidates; \
-         the device dropped work (is the CUDA toolkit, including NVRTC, installed?)",
-        range.size()
-    );
             hist_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; hist_bins]));
             undrained = 0;
         }
@@ -1184,13 +1197,20 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
     drain(hist_handle, &mut histogram)?;
 
     // Every candidate lands in exactly one bin, so a mismatch means the
-    // device silently did nothing for some batch (the observed failure mode
-    // of a CUDA runtime without NVRTC) — refuse to report fabricated zeros.
+    // device silently did nothing for some batch — refuse to report
+    // fabricated zeros. Observed failure modes differ per runtime, so the
+    // hint does too: a CUDA runtime without NVRTC, or a wgpu device the
+    // driver's watchdog reset.
     let counted: u128 = histogram.iter().sum();
+    let hint = if wide_chunk {
+        "is the CUDA toolkit, including NVRTC, installed?"
+    } else {
+        "was the device reset by the driver's watchdog? check the kernel log"
+    };
     ensure!(
         counted == range.size(),
         "GPU histogram counted {counted} of {} candidates; \
-         the device dropped work (is the CUDA toolkit, including NVRTC, installed?)",
+         the device dropped work ({hint})",
         range.size()
     );
 
@@ -1511,7 +1531,11 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
 impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
     fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()> {
         // Pack offsets as lo/hi u32 pairs; buffers are created per dispatch
-        // and sized to the batch (CubeCL pools the allocations).
+        // and sized to the batch (CubeCL pools the allocations). These
+        // per-dispatch writes also flush the stream, so each dispatch is
+        // submitted on its own — the same watchdog protection detailed mode
+        // gets from its explicit `flush`. If these buffers are ever hoisted
+        // or pooled to save the allocation, add that flush here.
         #[allow(clippy::cast_possible_truncation)]
         let pairs: Vec<u32> = offsets
             .iter()
@@ -1855,6 +1879,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Many batches in one field must not lose the device. Without the
+    /// per-batch flush in `detailed_impl`, `CubeCL` packs persistent
+    /// grid-stride dispatches into one submission until it reaches
+    /// `CUBECL_WGPU_MAX_TASKS` (32), and the driver's watchdog resets the GPU
+    /// long before that — ~2 s on Linux/RADV, the same 2 s TDR on Windows.
+    ///
+    /// 40 batches is deliberately over that cap so the test also covers the
+    /// aggregated path, but it is not the interesting size: a real field is
+    /// `DETAILED_SEARCH_MAX_FIELD_SIZE` = 20 batches, under the cap and still
+    /// over the watchdog at every base past ~46.
+    ///
+    /// Skipped on software rasterizers: CI runs the ignored tests on lavapipe,
+    /// where 2e9 candidates would take hours and no watchdog is involved.
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn cubecl_detailed_survives_more_batches_than_the_task_cap() {
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        let device = ctx.device_name();
+        let squashed = device.to_lowercase().replace(' ', "");
+        let software = ["llvmpipe", "lavapipe", "swiftshader", "softwarerasterizer"];
+        if software.iter().any(|s| squashed.contains(s)) {
+            println!("skipping on software rasterizer: {device}");
+            return;
+        }
+
+        let base = 40u32;
+        let batches = 40u128;
+        let count = batches * CUBECL_BATCH_SIZE;
+        let start = crate::base_range::get_base_range_u128(base)
+            .unwrap()
+            .unwrap()
+            .range_start;
+        let range = FieldSize::new(start, start + count);
+        let results = process_range_detailed_cubecl(&ctx, &range, base).expect("cubecl run");
+
+        // Non-vacuous: every candidate lands in exactly one bin, so the
+        // histogram must account for the whole field. A submission the driver
+        // killed would take its batch's counts with it.
+        let counted: u128 = results.distribution.iter().map(|d| d.count).sum();
+        assert_eq!(
+            counted, count,
+            "{batches} batches on {device}: histogram covers {counted} of {count} candidates"
+        );
+        println!("{batches} batches ({count} candidates) survived on {device}");
     }
 
     /// CPU/CubeCL niceonly parity through the native CUDA runtime, on real
