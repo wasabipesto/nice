@@ -235,8 +235,12 @@ fn detailed_kernel(
                     let mut i: i32 = top;
                     while i >= 0 {
                         let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
-                        sv[i as usize] = u32::cast_from(cur / u64::cast_from(chunk_div));
-                        rem64 = cur % u64::cast_from(chunk_div);
+                        // Quotient once, remainder by mul-sub — see the
+                        // niceonly scan; `%` would cost a second multiply-high
+                        // sequence per word.
+                        let q = cur / u64::cast_from(chunk_div);
+                        sv[i as usize] = u32::cast_from(q);
+                        rem64 = cur - q * u64::cast_from(chunk_div);
                         i -= 1;
                     }
                     rem = u32::cast_from(rem64); // rem < chunk_div < 2^31
@@ -246,9 +250,10 @@ fn detailed_kernel(
                         let vi = sv[i as usize];
                         let c1 = (rem << 16u32) | (vi >> 16u32);
                         let q1 = c1 / chunk_div;
-                        let c2 = ((c1 % chunk_div) << 16u32) | (vi & 0xFFFFu32);
+                        let r1 = c1 - q1 * chunk_div;
+                        let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
                         let q2 = c2 / chunk_div;
-                        rem = c2 % chunk_div;
+                        rem = c2 - q2 * chunk_div;
                         sv[i as usize] = (q1 << 16u32) | q2;
                         i -= 1;
                     }
@@ -265,8 +270,9 @@ fn detailed_kernel(
                     // Interior chunk: all chunk_digits digits, zeros included.
                     #[unroll]
                     for _k in 0..chunk_digits {
-                        let d = chunk % base;
-                        chunk /= base;
+                        let cq = chunk / base;
+                        let d = chunk - cq * base;
+                        chunk = cq;
                         if two_masks {
                             if d < 64u32 {
                                 m0 |= 1u64 << u64::cast_from(d);
@@ -280,8 +286,9 @@ fn detailed_kernel(
                 } else {
                     // Most significant chunk: digits until zero.
                     while chunk != 0u32 {
-                        let d = chunk % base;
-                        chunk /= base;
+                        let cq = chunk / base;
+                        let d = chunk - cq * base;
+                        chunk = cq;
                         if two_masks {
                             if d < 64u32 {
                                 m0 |= 1u64 << u64::cast_from(d);
@@ -512,9 +519,11 @@ fn niceonly_kernel(
                         let vi = v[idx as usize];
                         let c1 = (rem << 16u32) | (vi >> 16u32);
                         let q1 = c1 / pre_chunk_div;
-                        let c2 = ((c1 % pre_chunk_div) << 16u32) | (vi & 0xFFFFu32);
-                        rem = c2 % pre_chunk_div;
-                        v[idx as usize] = (q1 << 16u32) | (c2 / pre_chunk_div);
+                        let r1 = c1 - q1 * pre_chunk_div;
+                        let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
+                        let q2 = c2 / pre_chunk_div;
+                        rem = c2 - q2 * pre_chunk_div;
+                        v[idx as usize] = (q1 << 16u32) | q2;
                     }
                     a[rr as usize] = rem;
                 }
@@ -534,8 +543,8 @@ fn niceonly_kernel(
                     for j in 0..comptime!(pre_limbs - i) {
                         let k = comptime!(i + j);
                         let t = a[i as usize] * a[j as usize] + psq[k as usize] + carry;
-                        psq[k as usize] = t % pre_chunk_div;
                         carry = t / pre_chunk_div;
+                        psq[k as usize] = t - carry * pre_chunk_div;
                     }
                 }
                 let mut pcu = Array::<u32>::new(pre_limbs as usize);
@@ -550,8 +559,8 @@ fn niceonly_kernel(
                     for j in 0..comptime!(pre_limbs - i) {
                         let k = comptime!(i + j);
                         let t = psq[i as usize] * a[j as usize] + pcu[k as usize] + carry;
-                        pcu[k as usize] = t % pre_chunk_div;
                         carry = t / pre_chunk_div;
+                        pcu[k as usize] = t - carry * pre_chunk_div;
                     }
                 }
 
@@ -572,8 +581,9 @@ fn niceonly_kernel(
                         };
                         #[unroll]
                         for _k in 0..pre_chunk_digits {
-                            let d = c % base;
-                            c /= base;
+                            let cq = c / base;
+                            let d = c - cq * base;
+                            c = cq;
                             if two_masks {
                                 if d < 64u32 {
                                     let bit = 1u64 << u64::cast_from(d);
@@ -665,8 +675,13 @@ fn niceonly_kernel(
                         let mut i: i32 = top;
                         while i >= 0 {
                             let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
-                            sv[i as usize] = u32::cast_from(cur / u64::cast_from(chunk_div));
-                            rem64 = cur % u64::cast_from(chunk_div);
+                            // Quotient once, remainder by mul-sub: `%` would
+                            // lower as a second independent multiply-high
+                            // correction sequence (the hand kernels avoid it
+                            // the same way).
+                            let q = cur / u64::cast_from(chunk_div);
+                            sv[i as usize] = u32::cast_from(q);
+                            rem64 = cur - q * u64::cast_from(chunk_div);
                             i -= 1;
                         }
                         rem = u32::cast_from(rem64); // rem < chunk_div < 2^31
@@ -676,9 +691,10 @@ fn niceonly_kernel(
                             let vi = sv[i as usize];
                             let c1 = (rem << 16u32) | (vi >> 16u32);
                             let q1 = c1 / chunk_div;
-                            let c2 = ((c1 % chunk_div) << 16u32) | (vi & 0xFFFFu32);
+                            let r1 = c1 - q1 * chunk_div;
+                            let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
                             let q2 = c2 / chunk_div;
-                            rem = c2 % chunk_div;
+                            rem = c2 - q2 * chunk_div;
                             sv[i as usize] = (q1 << 16u32) | q2;
                             i -= 1;
                         }
@@ -696,8 +712,9 @@ fn niceonly_kernel(
                         // Interior chunk: all chunk_digits digits, zeros included.
                         #[unroll]
                         for _k in 0..chunk_digits {
-                            let d = chunk % base;
-                            chunk /= base;
+                            let cq = chunk / base;
+                            let d = chunk - cq * base;
+                            chunk = cq;
                             if two_masks {
                                 if d < 64u32 {
                                     let bit = 1u64 << u64::cast_from(d);
@@ -717,8 +734,9 @@ fn niceonly_kernel(
                     } else {
                         // Most significant chunk: digits until zero.
                         while chunk != 0u32 {
-                            let d = chunk % base;
-                            chunk /= base;
+                            let cq = chunk / base;
+                            let d = chunk - cq * base;
+                            chunk = cq;
                             if two_masks {
                                 if d < 64u32 {
                                     let bit = 1u64 << u64::cast_from(d);
@@ -776,8 +794,13 @@ fn niceonly_kernel(
                         let mut i: i32 = topc;
                         while i >= 0 {
                             let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
-                            sv[i as usize] = u32::cast_from(cur / u64::cast_from(chunk_div));
-                            rem64 = cur % u64::cast_from(chunk_div);
+                            // Quotient once, remainder by mul-sub: `%` would
+                            // lower as a second independent multiply-high
+                            // correction sequence (the hand kernels avoid it
+                            // the same way).
+                            let q = cur / u64::cast_from(chunk_div);
+                            sv[i as usize] = u32::cast_from(q);
+                            rem64 = cur - q * u64::cast_from(chunk_div);
                             i -= 1;
                         }
                         rem = u32::cast_from(rem64); // rem < chunk_div < 2^31
@@ -787,9 +810,10 @@ fn niceonly_kernel(
                             let vi = sv[i as usize];
                             let c1 = (rem << 16u32) | (vi >> 16u32);
                             let q1 = c1 / chunk_div;
-                            let c2 = ((c1 % chunk_div) << 16u32) | (vi & 0xFFFFu32);
+                            let r1 = c1 - q1 * chunk_div;
+                            let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
                             let q2 = c2 / chunk_div;
-                            rem = c2 % chunk_div;
+                            rem = c2 - q2 * chunk_div;
                             sv[i as usize] = (q1 << 16u32) | q2;
                             i -= 1;
                         }
@@ -807,8 +831,9 @@ fn niceonly_kernel(
                         // Interior chunk: all chunk_digits digits, zeros included.
                         #[unroll]
                         for _k in 0..chunk_digits {
-                            let d = chunk % base;
-                            chunk /= base;
+                            let cq = chunk / base;
+                            let d = chunk - cq * base;
+                            chunk = cq;
                             if two_masks {
                                 if d < 64u32 {
                                     let bit = 1u64 << u64::cast_from(d);
@@ -828,8 +853,9 @@ fn niceonly_kernel(
                     } else {
                         // Most significant chunk: digits until zero.
                         while chunk != 0u32 {
-                            let d = chunk % base;
-                            chunk /= base;
+                            let cq = chunk / base;
+                            let d = chunk - cq * base;
+                            chunk = cq;
                             if two_masks {
                                 if d < 64u32 {
                                     let bit = 1u64 << u64::cast_from(d);
