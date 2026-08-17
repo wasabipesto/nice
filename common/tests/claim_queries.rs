@@ -226,9 +226,106 @@ fn try_claim_thin_returns_none_when_everything_is_claimed(conn: &mut PgConnectio
     assert!(claimed.is_none());
 }
 
-/// The non-`Thin` strategies are unscoped by chunk. They share the `check_level` and
-/// claimable predicates, so this is mostly a binding smoke test: `check_level <= 1` is
-/// now emitted as a literal, which changes how many parameters the statement references.
+/// Mark every field in `chunk_id` completed (`check_level = 2`) and update the chunk's
+/// `minimum_cl` to match, the way the `jobs` binary would after processing submissions.
+fn complete_chunk(conn: &mut PgConnection, chunk_id: i64) {
+    sql_query(format!(
+        "UPDATE fields SET check_level = 2 WHERE chunk_id = {chunk_id}"
+    ))
+    .execute(conn)
+    .expect("complete chunk fields");
+    sql_query(format!(
+        "UPDATE chunks SET minimum_cl = 2 WHERE id = {chunk_id}"
+    ))
+    .execute(conn)
+    .expect("update chunk minimum_cl");
+}
+
+/// The detailed `Next` claim is scoped to the frontier chunk via `minimum_cl`, so it
+/// must skip chunks whose fields are all completed without reading them.
+fn next_advances_past_completed_chunks(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    complete_chunk(conn, 1);
+
+    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("next claim should execute")
+        .expect("chunk 2 has claimable fields");
+
+    assert_eq!(
+        claimed.field_id, 11,
+        "the frontier is the first field of the first non-completed chunk"
+    );
+}
+
+/// A completed chunk followed by a fully-claimed one: the frontier CTE must step past
+/// both, for different reasons (`minimum_cl` excludes the first, the `EXISTS` the
+/// second).
+fn next_skips_completed_then_saturated_chunks(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    complete_chunk(conn, 1);
+    saturate_chunk(conn, 2);
+
+    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("next claim should execute")
+        .expect("chunk 3 has claimable fields");
+
+    assert_eq!(claimed.field_id, 21, "chunk 3's first field is the frontier");
+}
+
+/// `minimum_cl` is maintained by the `jobs` binary, so it can lag the fields within a
+/// run's window. A stale value errs low, and the claim must treat that as "advance",
+/// not "return the completed work" and not "give up".
+fn next_tolerates_stale_minimum_cl(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    // Fields completed, but the chunk's minimum_cl still says 0 — jobs hasn't run yet.
+    sql_query("UPDATE fields SET check_level = 2 WHERE chunk_id = 1")
+        .execute(conn)
+        .expect("complete chunk 1 fields only");
+
+    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("next claim should execute")
+        .expect("chunk 2 has claimable fields");
+
+    assert_eq!(
+        claimed.field_id, 11,
+        "a stale minimum_cl must not stall the frontier or resurface completed work"
+    );
+}
+
+/// The recheck strategy (`Next` with `max_check_level = 2`) exists to revisit completed
+/// fields, so a completed chunk is exactly what it should claim from.
+fn next_recheck_claims_completed_work(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    complete_chunk(conn, 1);
+
+    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 2, FIELD_SIZE)
+        .expect("recheck claim should execute")
+        .expect("chunk 1's completed fields are claimable at cl<=2");
+
+    assert_eq!(
+        claimed.field_id, 1,
+        "recheck starts from the lowest completed field, not the cl<=1 frontier"
+    );
+}
+
+fn next_returns_none_when_everything_is_claimed(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    for chunk in 1..=3 {
+        saturate_chunk(conn, chunk);
+    }
+
+    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("next claim should execute");
+
+    assert!(
+        claimed.is_none(),
+        "no frontier chunk has a claimable field, so Next must return nothing"
+    );
+}
+
+/// The non-`Thin` strategies share the `check_level` and claimable predicates, so this
+/// is mostly a binding smoke test across the literal (`cl<=1`) and parameterized
+/// (`cl<=2`) predicate branches and both `Next` query shapes.
 fn unscoped_strategies_execute(conn: &mut PgConnection) {
     reset_fixture(conn);
 
@@ -247,7 +344,9 @@ fn unscoped_strategies_execute(conn: &mut PgConnection) {
         .expect("recheck claim should execute");
     assert!(recheck.is_some());
 
-    // And the nice-only bulk path, which uses the `check_level = 0` literal.
+    // And the nice-only paths, which use the `check_level = 0` literal: the bulk refill
+    // and the unscoped `Next` fallback (cl = 0 keeps the partial-index query shape
+    // rather than the chunk-scoped one).
     reset_fixture(conn);
     sql_query("UPDATE fields SET check_level = 0")
         .execute(conn)
@@ -255,6 +354,13 @@ fn unscoped_strategies_execute(conn: &mut PgConnection) {
     let niceonly =
         bulk_claim_fields(conn, 7, claim_cutoff(), 0, u128::MAX).expect("bulk claim should execute");
     assert_eq!(niceonly.len(), 7);
+    let niceonly_next = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 0, u128::MAX)
+        .expect("niceonly next claim should execute")
+        .expect("unclaimed cl=0 fields remain");
+    assert_eq!(
+        niceonly_next.field_id, 8,
+        "the unscoped cl=0 Next continues where the bulk claim left off"
+    );
 }
 
 /// A claim must not be handed to two clients at once — the property the removed
@@ -302,6 +408,11 @@ fn claim_queries_against_postgres() {
     try_claim_thin_advances_past_saturated_chunk(&mut conn);
     try_claim_thin_finds_the_last_free_field(&mut conn);
     try_claim_thin_returns_none_when_everything_is_claimed(&mut conn);
+    next_advances_past_completed_chunks(&mut conn);
+    next_skips_completed_then_saturated_chunks(&mut conn);
+    next_tolerates_stale_minimum_cl(&mut conn);
+    next_recheck_claims_completed_work(&mut conn);
+    next_returns_none_when_everything_is_claimed(&mut conn);
     unscoped_strategies_execute(&mut conn);
     claims_are_not_duplicated(&mut conn);
 }
