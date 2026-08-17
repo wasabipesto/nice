@@ -18,7 +18,7 @@ cuda = ["dep:cudarc"]
 # at runtime.
 gpu = ["cuda", "vulkan", "cubecl", "cubecl-cuda"]
 vulkan = ["dep:ash", "dep:naga"]
-cubecl = ["dep:cubecl"]
+cubecl = ["dep:cubecl", "dep:getrandom", "dep:cubecl-common"]
 cubecl-cuda = ["cubecl", "cubecl/cuda"]
 
 [dependencies]
@@ -50,6 +50,14 @@ rand = { version = "0.10.1", optional = true }
 cudarc = { version = "0.19", features = ["cuda-12080"], optional = true }
 ash = { version = "0.38", optional = true }
 naga = { version = "30.0", features = ["wgsl-in", "spv-out"], optional = true }
+
+# wasm32 feature unification for the cubecl/wgpu dependency graph: getrandom
+# needs its JS entropy backend named explicitly on the browser target, serde
+# and cubecl-common need std/serde enabled where a wasm-side consumer would
+# otherwise leave them off. No effect on native builds.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
+cubecl-common = { version = "0.10", features = ["serde"], optional = true }
 
 [build-dependencies]
 cc = { version = "1.2", optional = true }
