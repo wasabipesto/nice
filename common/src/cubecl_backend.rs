@@ -122,8 +122,14 @@ fn detailed_kernel(
     let copy = (UNIT_POS_X >> 5u32) % HIST_COPIES;
     let stride = u64::cast_from(CUBE_COUNT_X) * u64::cast_from(CUBE_DIM_X);
 
-    // Scratch for the digit scan: cu_limbs u32 words.
-    let mut sv = Array::<u32>::new(cu_limbs as usize);
+    // Scratch for the digit scan, in shared memory: the split loop indexes
+    // it at runtime, and a register-promoted array makes every such access a
+    // compare/select chain over all words (~100 extra SASS compares at b50),
+    // while local memory costs a round trip. One shared word per thread per
+    // limb, padded to an odd stride so a warp's accesses spread across banks.
+    let sv_pad = comptime!(cu_limbs | 1);
+    let mut sv_s = SharedMemory::<u32>::new(comptime!((WORKGROUP_SIZE * (cu_limbs | 1)) as usize));
+    let svb = UNIT_POS_X * sv_pad;
 
     let mut idx = u64::cast_from(ABSOLUTE_POS_X);
     while idx < count {
@@ -200,23 +206,23 @@ fn detailed_kernel(
             if pass == 0u32 {
                 #[unroll]
                 for i in 0..sq_limbs {
-                    sv[i as usize] = sq[i as usize];
+                    sv_s[(svb + u32::cast_from(i)) as usize] = sq[i as usize];
                 }
                 #[unroll]
                 for i in sq_limbs..cu_limbs {
-                    sv[i as usize] = 0u32;
+                    sv_s[(svb + u32::cast_from(i)) as usize] = 0u32;
                 }
             } else {
                 #[unroll]
                 for i in 0..cu_limbs {
-                    sv[i as usize] = cu[i as usize];
+                    sv_s[(svb + u32::cast_from(i)) as usize] = cu[i as usize];
                 }
             }
 
             // top_limb
             let mut top: i32 = comptime!(cu_limbs as i32 - 1).runtime();
             while top >= 0 {
-                if sv[top as usize] != 0u32 {
+                if sv_s[(svb + u32::cast_from(top)) as usize] != 0u32 {
                     break;
                 }
                 top -= 1;
@@ -234,12 +240,12 @@ fn detailed_kernel(
                     let mut rem64 = 0u64;
                     let mut i: i32 = top;
                     while i >= 0 {
-                        let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
+                        let cur = (rem64 << 32u64) | u64::cast_from(sv_s[(svb + u32::cast_from(i)) as usize]);
                         // Quotient once, remainder by mul-sub — see the
                         // niceonly scan; `%` would cost a second multiply-high
                         // sequence per word.
                         let q = cur / u64::cast_from(chunk_div);
-                        sv[i as usize] = u32::cast_from(q);
+                        sv_s[(svb + u32::cast_from(i)) as usize] = u32::cast_from(q);
                         rem64 = cur - q * u64::cast_from(chunk_div);
                         i -= 1;
                     }
@@ -247,19 +253,19 @@ fn detailed_kernel(
                 } else {
                     let mut i: i32 = top;
                     while i >= 0 {
-                        let vi = sv[i as usize];
+                        let vi = sv_s[(svb + u32::cast_from(i)) as usize];
                         let c1 = (rem << 16u32) | (vi >> 16u32);
                         let q1 = c1 / chunk_div;
                         let r1 = c1 - q1 * chunk_div;
                         let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
                         let q2 = c2 / chunk_div;
                         rem = c2 - q2 * chunk_div;
-                        sv[i as usize] = (q1 << 16u32) | q2;
+                        sv_s[(svb + u32::cast_from(i)) as usize] = (q1 << 16u32) | q2;
                         i -= 1;
                     }
                 }
                 while top >= 0 {
-                    if sv[top as usize] != 0u32 {
+                    if sv_s[(svb + u32::cast_from(top)) as usize] != 0u32 {
                         break;
                     }
                     top -= 1;
@@ -419,8 +425,14 @@ fn niceonly_kernel(
     let fs_lo = (u64::cast_from(fs1) << 32u64) | u64::cast_from(fs0);
     let fs_hi = (u64::cast_from(fs3) << 32u64) | u64::cast_from(fs2);
 
-    // Scratch for the digit scan: cu_limbs u32 words.
-    let mut sv = Array::<u32>::new(cu_limbs as usize);
+    // Scratch for the digit scan, in shared memory: the split loop indexes
+    // it at runtime, and a register-promoted array makes every such access a
+    // compare/select chain over all words (~100 extra SASS compares at b50),
+    // while local memory costs a round trip. One shared word per thread per
+    // limb, padded to an odd stride so a warp's accesses spread across banks.
+    let sv_pad = comptime!(cu_limbs | 1);
+    let mut sv_s = SharedMemory::<u32>::new(comptime!((WORKGROUP_SIZE * (cu_limbs | 1)) as usize));
+    let svb = UNIT_POS_X * sv_pad;
 
     let mut r = ABSOLUTE_POS_X >> lane_shift;
     while r < num_ranges {
@@ -659,11 +671,11 @@ fn niceonly_kernel(
                 // prefilter, where every candidate takes this path.)
                 #[unroll]
                 for i in 0..sq_limbs {
-                    sv[i as usize] = sq[i as usize];
+                    sv_s[(svb + u32::cast_from(i)) as usize] = sq[i as usize];
                 }
                 let mut top: i32 = comptime!(sq_limbs as i32 - 1).runtime();
                 while top >= 0 {
-                    if sv[top as usize] != 0u32 {
+                    if sv_s[(svb + u32::cast_from(top)) as usize] != 0u32 {
                         break;
                     }
                     top -= 1;
@@ -674,13 +686,13 @@ fn niceonly_kernel(
                         let mut rem64 = 0u64;
                         let mut i: i32 = top;
                         while i >= 0 {
-                            let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
+                            let cur = (rem64 << 32u64) | u64::cast_from(sv_s[(svb + u32::cast_from(i)) as usize]);
                             // Quotient once, remainder by mul-sub: `%` would
                             // lower as a second independent multiply-high
                             // correction sequence (the hand kernels avoid it
                             // the same way).
                             let q = cur / u64::cast_from(chunk_div);
-                            sv[i as usize] = u32::cast_from(q);
+                            sv_s[(svb + u32::cast_from(i)) as usize] = u32::cast_from(q);
                             rem64 = cur - q * u64::cast_from(chunk_div);
                             i -= 1;
                         }
@@ -688,19 +700,19 @@ fn niceonly_kernel(
                     } else {
                         let mut i: i32 = top;
                         while i >= 0 {
-                            let vi = sv[i as usize];
+                            let vi = sv_s[(svb + u32::cast_from(i)) as usize];
                             let c1 = (rem << 16u32) | (vi >> 16u32);
                             let q1 = c1 / chunk_div;
                             let r1 = c1 - q1 * chunk_div;
                             let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
                             let q2 = c2 / chunk_div;
                             rem = c2 - q2 * chunk_div;
-                            sv[i as usize] = (q1 << 16u32) | q2;
+                            sv_s[(svb + u32::cast_from(i)) as usize] = (q1 << 16u32) | q2;
                             i -= 1;
                         }
                     }
                     while top >= 0 {
-                        if sv[top as usize] != 0u32 {
+                        if sv_s[(svb + u32::cast_from(top)) as usize] != 0u32 {
                             break;
                         }
                         top -= 1;
@@ -763,7 +775,7 @@ fn niceonly_kernel(
                     // cu = sq * n, built directly in the scratch and consumed there.
                     #[unroll]
                     for i in 0..cu_limbs {
-                        sv[i as usize] = 0u32;
+                        sv_s[(svb + u32::cast_from(i)) as usize] = 0u32;
                     }
                     #[unroll]
                     for i in 0..sq_limbs {
@@ -773,16 +785,16 @@ fn niceonly_kernel(
                             let k = comptime!(i + jj);
                             let t = u64::cast_from(sq[i as usize])
                                 * u64::cast_from(nl[jj as usize])
-                                + u64::cast_from(sv[k as usize])
+                                + u64::cast_from(sv_s[(svb + k) as usize])
                                 + carry;
-                            sv[k as usize] = u32::cast_from(t);
+                            sv_s[(svb + k) as usize] = u32::cast_from(t);
                             carry = t >> 32u64;
                         }
-                        sv[comptime!(i + limbs) as usize] = u32::cast_from(carry);
+                        sv_s[(svb + comptime!(i + limbs)) as usize] = u32::cast_from(carry);
                     }
                     let mut topc: i32 = comptime!(cu_limbs as i32 - 1).runtime();
                     while topc >= 0 {
-                        if sv[topc as usize] != 0u32 {
+                        if sv_s[(svb + u32::cast_from(topc)) as usize] != 0u32 {
                             break;
                         }
                         topc -= 1;
@@ -793,13 +805,13 @@ fn niceonly_kernel(
                         let mut rem64 = 0u64;
                         let mut i: i32 = topc;
                         while i >= 0 {
-                            let cur = (rem64 << 32u64) | u64::cast_from(sv[i as usize]);
+                            let cur = (rem64 << 32u64) | u64::cast_from(sv_s[(svb + u32::cast_from(i)) as usize]);
                             // Quotient once, remainder by mul-sub: `%` would
                             // lower as a second independent multiply-high
                             // correction sequence (the hand kernels avoid it
                             // the same way).
                             let q = cur / u64::cast_from(chunk_div);
-                            sv[i as usize] = u32::cast_from(q);
+                            sv_s[(svb + u32::cast_from(i)) as usize] = u32::cast_from(q);
                             rem64 = cur - q * u64::cast_from(chunk_div);
                             i -= 1;
                         }
@@ -807,19 +819,19 @@ fn niceonly_kernel(
                     } else {
                         let mut i: i32 = topc;
                         while i >= 0 {
-                            let vi = sv[i as usize];
+                            let vi = sv_s[(svb + u32::cast_from(i)) as usize];
                             let c1 = (rem << 16u32) | (vi >> 16u32);
                             let q1 = c1 / chunk_div;
                             let r1 = c1 - q1 * chunk_div;
                             let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
                             let q2 = c2 / chunk_div;
                             rem = c2 - q2 * chunk_div;
-                            sv[i as usize] = (q1 << 16u32) | q2;
+                            sv_s[(svb + u32::cast_from(i)) as usize] = (q1 << 16u32) | q2;
                             i -= 1;
                         }
                     }
                     while topc >= 0 {
-                        if sv[topc as usize] != 0u32 {
+                        if sv_s[(svb + u32::cast_from(topc)) as usize] != 0u32 {
                             break;
                         }
                         topc -= 1;
