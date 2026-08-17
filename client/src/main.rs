@@ -58,10 +58,9 @@ use nice_common::cubecl_backend::{
 /// leaving behaviour on an NVIDIA machine exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
-    /// CUDA if available, then `CubeCL` over wgpu, then Vulkan.
-    /// `cubecl-cuda` is never picked automatically: it needs the same
-    /// toolkit as CUDA and only leads it in detailed mode, so choosing it
-    /// is deliberately explicit until the backend lineup settles.
+    /// Fastest measured order for the mode: detailed tries `cubecl-cuda`,
+    /// `cubecl`, CUDA, then Vulkan; niceonly tries CUDA, `cubecl`, then
+    /// Vulkan. See `init_gpu` for the numbers behind the ordering.
     Auto,
     /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC.
     Cuda,
@@ -339,21 +338,57 @@ fn try_init_cuda(device: usize) -> Result<CudaContext> {
 
 /// Bring up the GPU backend the user asked for.
 ///
-/// `Auto` prefers CUDA (fastest measured everywhere it exists), then `CubeCL`,
-/// then Vulkan — `CubeCL` measured 1.4x the hand-WGSL backend on RDNA4/RADV and
-/// 2.5x on NVIDIA, so it outranks Vulkan wherever both could run. An
-/// **explicitly named** backend that fails to initialize is fatal rather than
-/// falling back: for a distributed compute client, silently dropping to a much
-/// slower path is a worse outcome than stopping and saying so.
+/// `Auto`'s order is per mode, from the measured tables in the `CubeCL`
+/// evaluation (RTX 4060, RX 9070 XT, Apple M4, plus review runs on Intel
+/// iGPU and an RTX A1000):
+///
+/// - **Detailed**: `cubecl-cuda` → `cubecl` → `cuda` → `vulkan`. The
+///   `CubeCL` family wins detailed on every vendor tested (1.03-1.07x over hand-CUDA
+///   on NVIDIA, 1.2-2.6x over hand-Vulkan elsewhere), and a failed
+///   `cubecl-cuda` init (no CUDA toolkit) falls through to `cubecl`, which
+///   needs only a driver — so NVIDIA-without-toolkit gets wgpu speed instead
+///   of the hand-WGSL fallback.
+/// - **Niceonly**: `cuda` → `cubecl` → `vulkan`. Hand-CUDA keeps a slim edge
+///   at the b50+ bases where long-run wall time concentrates; everywhere
+///   without a toolkit, `CubeCL` is the best available (wins RADV b50+ and
+///   NVIDIA-over-wgpu outright, runs out of the box on Apple).
+///
+/// An **explicitly named** backend that fails to initialize is fatal rather
+/// than falling back: for a distributed compute client, silently dropping to
+/// a much slower path is a worse outcome than stopping and saying so.
 #[allow(unused_variables)]
 fn init_gpu(cli: &Cli) -> GpuCtx {
     if !cli.gpu {
         return None;
     }
     let want = cli.gpu_backend;
+    let detailed = cli.mode == SearchMode::Detailed;
+
+    // Detailed auto leads with the CubeCL CUDA runtime; a clean init failure
+    // (validated by its smoke kernel) falls through to the wgpu runtime.
+    #[cfg(feature = "cubecl-cuda")]
+    if want == GpuBackend::CubeclCuda || (want == GpuBackend::Auto && detailed) {
+        match CubeclContext::new_cuda(cli.gpu_device) {
+            Ok(ctx) => {
+                info!(
+                    "GPU initialized: CubeCL CUDA device {}, batch size {}",
+                    cli.gpu_device, CUBECL_BATCH_SIZE
+                );
+                return Some(Arc::new(GpuHandle::Cubecl(ctx)));
+            }
+            Err(e) if want == GpuBackend::CubeclCuda => {
+                error!("Failed to initialize CubeCL CUDA runtime: {e:?}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                info!("CubeCL CUDA unavailable; trying the next backend");
+                debug!("  CubeCL CUDA init failed: {e:#}");
+            }
+        }
+    }
 
     #[cfg(feature = "cuda")]
-    if matches!(want, GpuBackend::Auto | GpuBackend::Cuda) {
+    if want == GpuBackend::Cuda || (want == GpuBackend::Auto && !detailed) {
         match try_init_cuda(cli.gpu_device) {
             Ok(ctx) => {
                 info!(
@@ -411,6 +446,21 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
         }
     }
 
+    // Detailed auto's third stop: hand-CUDA, for the corner where both
+    // CubeCL runtimes failed but NVRTC works (e.g. a CUDA container with no
+    // Vulkan ICD and a CubeCL regression).
+    #[cfg(feature = "cuda")]
+    if want == GpuBackend::Auto && detailed {
+        if let Ok(ctx) = try_init_cuda(cli.gpu_device) {
+            info!(
+                "GPU initialized: CUDA device {}, batch size {}",
+                cli.gpu_device, CUDA_BATCH_SIZE
+            );
+            return Some(Arc::new(GpuHandle::Cuda(ctx)));
+        }
+        info!("CUDA unavailable; trying Vulkan");
+    }
+
     #[cfg(feature = "vulkan")]
     if matches!(want, GpuBackend::Auto | GpuBackend::Vulkan) {
         match VulkanContext::new(cli.gpu_device) {
@@ -430,23 +480,6 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 eprintln!("1. Ensure a Vulkan driver is installed (try vulkaninfo)");
                 eprintln!("2. The device must support shaderInt64");
                 eprintln!("3. Try a different device with --gpu-device <N>");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    #[cfg(feature = "cubecl-cuda")]
-    if want == GpuBackend::CubeclCuda {
-        match CubeclContext::new_cuda(cli.gpu_device) {
-            Ok(ctx) => {
-                info!(
-                    "GPU initialized: CubeCL CUDA device {} , batch size {}",
-                    cli.gpu_device, CUBECL_BATCH_SIZE
-                );
-                return Some(Arc::new(GpuHandle::Cubecl(ctx)));
-            }
-            Err(e) => {
-                error!("Failed to initialize CubeCL CUDA runtime: {e:?}");
                 std::process::exit(1);
             }
         }
