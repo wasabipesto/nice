@@ -43,8 +43,12 @@ jobs:
             - name: Run device parity tests
               # Point the loader at lavapipe explicitly so a future runner
               # image with a real ICD cannot change what this job tests.
+              # (Ubuntu ships the ICD as `lvp_icd.json`, upstream Mesa as
+              # `lvp_icd.<arch>.json` — glob both, and fail loudly if neither
+              # exists rather than exporting an empty loader list.)
               run: |
-                  export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd.*.json | head -n1)"
+                  export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)"
+                  test -n "$VK_ICD_FILENAMES" || { echo "no lavapipe ICD found"; exit 1; }
                   vulkaninfo --summary | grep -A3 deviceName || true
                   cargo test --release --features vulkan,cubecl -p nice_common -- --ignored --nocapture
 
