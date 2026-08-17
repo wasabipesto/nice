@@ -233,6 +233,30 @@ pub struct VulkanContext {
 unsafe impl Send for VulkanContext {}
 unsafe impl Sync for VulkanContext {}
 
+/// Create the Vulkan instance, opting into portability enumeration when the
+/// loader offers it.
+///
+/// Portability drivers (`MoltenVK` on macOS) are hidden by loaders ≥ 1.3.207
+/// unless the instance enables `VK_KHR_portability_enumeration`; a no-op on
+/// conformant Linux/Windows stacks where the extension is absent.
+fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
+    let app = vk::ApplicationInfo::default()
+        .application_name(c"nice")
+        .api_version(vk::make_api_version(0, 1, 2, 0));
+    let portability = unsafe { entry.enumerate_instance_extension_properties(None) }
+        .unwrap_or_default()
+        .iter()
+        .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::portability_enumeration::NAME));
+    let instance_exts = [ash::khr::portability_enumeration::NAME.as_ptr()];
+    let mut instance_info = vk::InstanceCreateInfo::default().application_info(&app);
+    if portability {
+        instance_info = instance_info
+            .enabled_extension_names(&instance_exts)
+            .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
+    }
+    unsafe { entry.create_instance(&instance_info, None) }.context("creating the Vulkan instance")
+}
+
 impl VulkanContext {
     /// Initialize Vulkan and verify that shader generation and pipeline
     /// creation work.
@@ -248,13 +272,7 @@ impl VulkanContext {
         // Safety: loads libvulkan; no other thread is using the loader yet.
         let entry = unsafe { ash::Entry::load() }
             .context("loading the Vulkan loader (is libvulkan installed?)")?;
-        let app = vk::ApplicationInfo::default()
-            .application_name(c"nice")
-            .api_version(vk::make_api_version(0, 1, 2, 0));
-        let instance = unsafe {
-            entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)
-        }
-        .context("creating the Vulkan instance")?;
+        let instance = create_instance(&entry)?;
 
         let selected = compute_devices(&instance).and_then(|candidates| {
             candidates.get(device_ordinal).cloned().with_context(|| {
@@ -278,16 +296,23 @@ impl VulkanContext {
             .queue_family_index(queue_family)
             .queue_priorities(&prios)];
         let feats = vk::PhysicalDeviceFeatures::default().shader_int64(true);
-        let device = unsafe {
-            instance.create_device(
-                physical,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&qci)
-                    .enabled_features(&feats),
-                None,
-            )
+        // The spec requires VK_KHR_portability_subset to be enabled whenever
+        // the physical device advertises it (again: MoltenVK).
+        let portability_subset = unsafe {
+            instance.enumerate_device_extension_properties(physical)
         }
-        .context("creating the Vulkan logical device")?;
+        .unwrap_or_default()
+        .iter()
+        .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::portability_subset::NAME));
+        let device_exts = [ash::khr::portability_subset::NAME.as_ptr()];
+        let mut device_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&qci)
+            .enabled_features(&feats);
+        if portability_subset {
+            device_info = device_info.enabled_extension_names(&device_exts);
+        }
+        let device = unsafe { instance.create_device(physical, &device_info, None) }
+            .context("creating the Vulkan logical device")?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical) };
 
