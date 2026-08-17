@@ -529,13 +529,17 @@ fn niceonly_kernel(
                     for i in 0..limbs {
                         let idx = comptime!(limbs - 1 - i);
                         let vi = v[idx as usize];
+                        // Plain paired `%` here, unlike the digit scan: the
+                        // mul-sub form of these four prefilter sites
+                        // miscompiles under naga's MSL backend (survivors
+                        // diverge from the host mirror on Apple GPUs, caught
+                        // by the probe test), and the prefilter runs once per
+                        // candidate so the pairing costs nothing measurable.
                         let c1 = (rem << 16u32) | (vi >> 16u32);
                         let q1 = c1 / pre_chunk_div;
-                        let r1 = c1 - q1 * pre_chunk_div;
-                        let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
-                        let q2 = c2 / pre_chunk_div;
-                        rem = c2 - q2 * pre_chunk_div;
-                        v[idx as usize] = (q1 << 16u32) | q2;
+                        let c2 = ((c1 % pre_chunk_div) << 16u32) | (vi & 0xFFFFu32);
+                        rem = c2 % pre_chunk_div;
+                        v[idx as usize] = (q1 << 16u32) | (c2 / pre_chunk_div);
                     }
                     a[rr as usize] = rem;
                 }
@@ -555,8 +559,8 @@ fn niceonly_kernel(
                     for j in 0..comptime!(pre_limbs - i) {
                         let k = comptime!(i + j);
                         let t = a[i as usize] * a[j as usize] + psq[k as usize] + carry;
+                        psq[k as usize] = t % pre_chunk_div;
                         carry = t / pre_chunk_div;
-                        psq[k as usize] = t - carry * pre_chunk_div;
                     }
                 }
                 let mut pcu = Array::<u32>::new(pre_limbs as usize);
@@ -571,8 +575,8 @@ fn niceonly_kernel(
                     for j in 0..comptime!(pre_limbs - i) {
                         let k = comptime!(i + j);
                         let t = psq[i as usize] * a[j as usize] + pcu[k as usize] + carry;
+                        pcu[k as usize] = t % pre_chunk_div;
                         carry = t / pre_chunk_div;
-                        pcu[k as usize] = t - carry * pre_chunk_div;
                     }
                 }
 
@@ -593,9 +597,8 @@ fn niceonly_kernel(
                         };
                         #[unroll]
                         for _k in 0..pre_chunk_digits {
-                            let cq = c / base;
-                            let d = c - cq * base;
-                            c = cq;
+                            let d = c % base;
+                            c /= base;
                             if two_masks {
                                 if d < 64u32 {
                                     let bit = 1u64 << u64::cast_from(d);
