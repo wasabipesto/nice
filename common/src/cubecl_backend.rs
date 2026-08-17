@@ -917,6 +917,16 @@ fn niceonly_kernel(
     }
 }
 
+/// One-thread smoke kernel for [`CubeclContext::new_cuda`]: proves the
+/// runtime can actually compile and run something before init reports
+/// success.
+#[cube(launch_unchecked)]
+fn smoke_kernel(out: &mut Array<u32>) {
+    if ABSOLUTE_POS_X == 0 {
+        out[0] = 42u32;
+    }
+}
+
 // ============================================================================
 // Host side
 // ============================================================================
@@ -961,7 +971,11 @@ impl CubeclContext {
                 &device,
                 cubecl::wgpu::RuntimeOptions::default(),
             );
-            let device_name = setup.adapter.get_info().name;
+            // Include the resolved graphics API: AutoGraphicsApi may pick
+            // DX12 on Windows, and reports comparing this backend against
+            // the hand-Vulkan one need to know which API actually ran.
+            let info = setup.adapter.get_info();
+            let device_name = format!("{} ({:?})", info.name, info.backend);
             let client = cubecl::wgpu::WgpuRuntime::client(&device);
             (client, device_name)
         });
@@ -976,10 +990,39 @@ impl CubeclContext {
     ///
     /// # Errors
     /// Returns an error if CUDA is unavailable.
+    /// A working NVIDIA *driver* is not enough: kernel compilation needs
+    /// NVRTC from the CUDA toolkit, `CubeCL` compiles lazily at first
+    /// launch, and a missing NVRTC panics `CubeCL`'s server thread while
+    /// launches keep reporting success — a completed run whose results are
+    /// silently zero. So init proves the runtime end-to-end with a smoke
+    /// kernel before reporting success, the same contract as the hand
+    /// backends' init-time compile checks.
     #[cfg(feature = "cubecl-cuda")]
     pub fn new_cuda(device_index: usize) -> Result<Self> {
         let device = cubecl::cuda::CudaDevice::new(device_index);
         let client = cubecl::cuda::CudaRuntime::client(&device);
+
+        let out = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
+        unsafe {
+            smoke_kernel::launch_unchecked::<cubecl::cuda::CudaRuntime>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(out.clone(), 1),
+            );
+        }
+        let bytes = client.read_one(out).map_err(|e| {
+            anyhow::anyhow!(
+                "CubeCL CUDA smoke test failed to read back: {e:?} \
+                 (is the CUDA toolkit, including NVRTC, installed?)"
+            )
+        })?;
+        ensure!(
+            u32::from_bytes(&bytes)[0] == 42,
+            "CubeCL CUDA smoke kernel did not run \
+             (is the CUDA toolkit, including NVRTC, installed?)"
+        );
+
         Ok(Self::Cuda {
             client,
             device_name: format!("cubecl-cuda device {device_index}"),
@@ -1120,11 +1163,33 @@ fn detailed_impl<R: cubecl::prelude::Runtime>(
         undrained += 1;
         if undrained == DRAIN_INTERVAL {
             drain(hist_handle, &mut histogram)?;
+
+    // Every candidate lands in exactly one bin, so a mismatch means the
+    // device silently did nothing for some batch (the observed failure mode
+    // of a CUDA runtime without NVRTC) — refuse to report fabricated zeros.
+    let counted: u128 = histogram.iter().sum();
+    ensure!(
+        counted == range.size(),
+        "GPU histogram counted {counted} of {} candidates; \
+         the device dropped work (is the CUDA toolkit, including NVRTC, installed?)",
+        range.size()
+    );
             hist_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; hist_bins]));
             undrained = 0;
         }
     }
     drain(hist_handle, &mut histogram)?;
+
+    // Every candidate lands in exactly one bin, so a mismatch means the
+    // device silently did nothing for some batch (the observed failure mode
+    // of a CUDA runtime without NVRTC) — refuse to report fabricated zeros.
+    let counted: u128 = histogram.iter().sum();
+    ensure!(
+        counted == range.size(),
+        "GPU histogram counted {counted} of {} candidates; \
+         the device dropped work (is the CUDA toolkit, including NVRTC, installed?)",
+        range.size()
+    );
 
     // Near misses.
     let bytes = client

@@ -58,7 +58,10 @@ use nice_common::cubecl_backend::{
 /// leaving behaviour on an NVIDIA machine exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
-    /// CUDA if available, then `CubeCL`, then Vulkan.
+    /// CUDA if available, then `CubeCL` over wgpu, then Vulkan.
+    /// `cubecl-cuda` is never picked automatically: it needs the same
+    /// toolkit as CUDA and only leads it in detailed mode, so choosing it
+    /// is deliberately explicit until the backend lineup settles.
     Auto,
     /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC.
     Cuda,
