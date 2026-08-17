@@ -209,9 +209,9 @@ pub fn get_fields_in_base_with_detailed_subs(
 /// There is deliberately no matching index for `check_level <= 1`: in production that
 /// covers 95.6% of `fields`, so the index would be nearly as large as the primary key
 /// (~7GB) while excluding almost nothing. The literal is kept anyway because it costs
-/// nothing and gives the planner strictly more to work with. The unscoped detailed claim
-/// it would accelerate is slow for a separate reason — see `try_claim_field`'s `Next`
-/// branch.
+/// nothing and gives the planner strictly more to work with. Detailed claims avoid
+/// needing such an index by scoping to a single chunk instead — `Thin` via
+/// `eligible_chunk_cte`, `Next` via `frontier_chunk_cte`.
 fn check_level_predicate(maximum_check_level: i32) -> &'static str {
     match maximum_check_level {
         0 => "check_level = 0",
@@ -284,6 +284,50 @@ fn eligible_chunk_cte(check_level_predicate: &str) -> String {
     )
 }
 
+/// CTE selecting the frontier chunk for the `Next` strategy: the lowest-id chunk that
+/// still contains a field at or below the requested check level *and* has one free to
+/// claim.
+///
+/// This differs from `eligible_chunk_cte` in its chunk filter, and the difference is the
+/// two strategies' semantics. `Thin` explores under-explored chunks, so it filters on
+/// the `checked_*` ratio and honors the downsample cutoff. `Next`'s job is the global
+/// frontier — the lowest-id claimable field anywhere, including leftovers in chunks the
+/// cutoff has retired — so it filters on `minimum_cl`, which is simply "does this chunk
+/// contain any field at `check_level <= N`". Chunks partition fields in id order, so the
+/// first such chunk with a claimable field contains the globally-first claimable field:
+/// scoping to it changes nothing about which field `Next` returns, only what the planner
+/// has to read to find it (measured in production: 1,547ms → 32ms, generic plan).
+///
+/// Trusting `minimum_cl` is sound because it shares a writer with the thing it
+/// summarizes: field `check_level`s are advanced only by the `jobs` binary, which
+/// recomputes chunk `minimum_cl` in the same run. Between runs the frontier cannot move.
+/// Within a run's window a stale `minimum_cl` errs low, which is the safe direction —
+/// the `EXISTS` finds nothing in a finished chunk and the CTE steps past it, same as a
+/// saturated chunk.
+///
+/// Parameters: `$1` = maximum claim timestamp, `$2` = maximum check level,
+/// `$3` = maximum range size.
+fn frontier_chunk_cte(check_level_predicate: &str) -> String {
+    let claimable = claimable_predicate("f.");
+    format!(
+        "frontier_chunk AS (
+            SELECT c.id
+            FROM chunks c
+            WHERE c.minimum_cl <= $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM fields f
+                  WHERE f.chunk_id = c.id
+                    AND {claimable}
+                    AND f.{check_level_predicate}
+                    AND f.range_size <= $3
+              )
+            ORDER BY c.id ASC
+            LIMIT 1
+        )"
+    )
+}
+
 /// Finds the next field that matches the criteria, updates `last_claim_time`, and returns it.
 /// Returns Ok(None) if no matching fields are found.
 #[allow(clippy::too_many_lines)]
@@ -308,32 +352,70 @@ pub fn try_claim_field(
 
     match claim_strategy {
         FieldClaimStrategy::Next => {
-            // Simply get the next available field.
+            // Get the next available field: the lowest-id claimable one at or below the
+            // requested check level.
             //
-            // KNOWN COST: unscoped by chunk, so this walks the primary key from id 1
-            // until it reaches the frontier. Measured at 1.55s in production, filtering
-            // 1.43M rows — every field below the lowest `check_level <= 1` id, which are
-            // all completed work. A partial index on `check_level <= 1` would skip them
-            // but would cover 95.6% of the table to do it. This is 20% of detailed claims
-            // (the non-`Thin` strategies); fixing it properly means giving the detailed
-            // frontier a cursor rather than rediscovering it by scan on every request.
-            let query = format!(
-                "WITH candidate AS (
-                    SELECT id
-                    FROM fields
-                    WHERE {claimable}
-                      AND {check_level_predicate}
-                      AND range_size <= $3
-                    ORDER BY id ASC
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT 1
+            // For nice-only claims (cl = 0) the unscoped form is already fast — the
+            // `check_level = 0` literal matches the partial index `idx_fields_cl0_id`,
+            // which skips completed rows by construction. Keep it.
+            //
+            // For detailed claims (cl >= 1) no such index exists or is worth having
+            // (`check_level <= 1` covers 95.6% of the table in production), so the
+            // unscoped form walks the primary key from id 1 and filters every completed
+            // field below the frontier — measured at 1.55s and ~1.6GB of buffer reads
+            // per claim in production. Scope it to the frontier chunk instead via
+            // `frontier_chunk_cte`, which reads only that chunk's fields: 32ms measured,
+            // same row returned.
+            let query = if maximum_check_level == 0 {
+                format!(
+                    "WITH candidate AS (
+                        SELECT id
+                        FROM fields
+                        WHERE {claimable}
+                          AND {check_level_predicate}
+                          AND range_size <= $3
+                        ORDER BY id ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    UPDATE fields f
+                    SET last_claim_time = NOW()
+                    FROM candidate
+                    WHERE f.id = candidate.id
+                    RETURNING f.*;"
                 )
-                UPDATE fields f
-                SET last_claim_time = NOW()
-                FROM candidate
-                WHERE f.id = candidate.id
-                RETURNING f.*;"
-            );
+            } else {
+                // `ORDER BY f.chunk_id, f.id` rather than `ORDER BY f.id` is
+                // load-bearing, not cosmetic: the two orderings are identical here (the
+                // CTE yields exactly one chunk), but a bare `ORDER BY id` lets the
+                // planner satisfy the sort by walking the primary key from id 1 with the
+                // chunk join as a filter — reintroducing the full 1.3s scan this scoping
+                // exists to avoid. Leading with `chunk_id` makes the primary key unable
+                // to produce the ordering, so the planner reads the chunk via
+                // `idx_fields_chunk_id` and top-1 sorts its ~30k rows. Verified against
+                // production under `force_generic_plan`, which is what diesel's prepared
+                // statements get.
+                let frontier_chunk = frontier_chunk_cte(check_level_predicate);
+                let claimable_f = claimable_predicate("f.");
+                format!(
+                    "WITH {frontier_chunk}, candidate AS (
+                        SELECT f.id
+                        FROM fields f
+                        JOIN frontier_chunk fc ON f.chunk_id = fc.id
+                        WHERE {claimable_f}
+                          AND f.{check_level_predicate}
+                          AND f.range_size <= $3
+                        ORDER BY f.chunk_id, f.id ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    UPDATE fields f
+                    SET last_claim_time = NOW()
+                    FROM candidate
+                    WHERE f.id = candidate.id
+                    RETURNING f.*;"
+                )
+            };
 
             let result = sql_query(query)
                 .bind::<Timestamptz, _>(maximum_timestamp)
