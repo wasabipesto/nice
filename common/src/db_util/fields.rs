@@ -204,9 +204,14 @@ pub fn get_fields_in_base_with_detailed_subs(
 /// `check_level <= $2`, because Postgres can only prove that a query predicate implies a
 /// partial index's predicate when the bound is a constant — against a bound parameter it
 /// gives up and walks the primary key, filtering as it goes. `check_level = 0` matches
-/// `idx_fields_cl0_id` (nice-only claims) and `check_level <= 1` matches
-/// `idx_fields_cl1_id` (detailed claims); without them a claim scans through millions of
-/// already-completed rows to reach the frontier.
+/// the partial index `idx_fields_cl0_id`, which is what makes nice-only claims fast.
+///
+/// There is deliberately no matching index for `check_level <= 1`: in production that
+/// covers 95.6% of `fields`, so the index would be nearly as large as the primary key
+/// (~7GB) while excluding almost nothing. The literal is kept anyway because it costs
+/// nothing and gives the planner strictly more to work with. The unscoped detailed claim
+/// it would accelerate is slow for a separate reason — see `try_claim_field`'s `Next`
+/// branch.
 fn check_level_predicate(maximum_check_level: i32) -> &'static str {
     match maximum_check_level {
         0 => "check_level = 0",
@@ -242,18 +247,21 @@ fn claimable_predicate(prefix: &str) -> String {
 /// *completed* work (`check_level >= 2`) and is written only by the `jobs` binary on a
 /// schedule, never by `/submit`.
 ///
-/// The claimability test is spelled as two `EXISTS` rather than one containing
-/// `claimable_predicate`'s disjunction. `EXISTS(A OR B)` is equivalent to
-/// `EXISTS(A) OR EXISTS(B)`, but Postgres can only turn the second form into index
-/// conditions: with one `EXISTS` the `OR` becomes a post-hoc filter, so the probe walks
-/// every field of every exhausted chunk it skips over (measured 13.9ms against a 1.2M
-/// row fixture, and it grows with the number of chunks skipped). Split, both halves
-/// become index conditions against `idx_fields_chunk_claim_cover` and the whole probe is
-/// an index-only scan (0.36ms on the same fixture).
+/// The claimability test is one `EXISTS` over `claimable_predicate`'s disjunction, not
+/// two `EXISTS` split on it. `EXISTS(A OR B)` and `EXISTS(A) OR EXISTS(B)` are
+/// equivalent, and the split form is faster *if* an index covers all four predicate
+/// columns, because then each half becomes an index condition. Without such an index the
+/// split form is a pessimization, because Postgres evaluates the two in order: on a chunk
+/// that has been picked over — every field claimed at least once, some claims now expired
+/// — the `IS NULL` half scans the whole chunk to conclude nothing, and only then does the
+/// expired half find its row immediately. Measured against production (130M fields):
+/// split 78.0ms with the field probe at 48ms, single 35.2ms with the field probe at
+/// 0.24ms. The single form short-circuits on the first row matching either branch.
 ///
 /// Parameters: `$1` = maximum claim timestamp, `$2` = maximum check level,
 /// `$3` = maximum range size, `$4` = chunk completion cutoff percent.
 fn eligible_chunk_cte(check_level_predicate: &str) -> String {
+    let claimable = claimable_predicate("f.");
     format!(
         "eligible_chunk AS (
             SELECT c.id
@@ -262,23 +270,13 @@ fn eligible_chunk_cte(check_level_predicate: &str) -> String {
                 WHEN $2 = 0 THEN c.checked_niceonly / NULLIF(c.range_size, 0) < $4
                 ELSE c.checked_detailed / NULLIF(c.range_size, 0) < $4
             END
-              AND (
-                  EXISTS (
-                      SELECT 1
-                      FROM fields f
-                      WHERE f.chunk_id = c.id
-                        AND f.last_claim_time IS NULL
-                        AND f.{check_level_predicate}
-                        AND f.range_size <= $3
-                  )
-                  OR EXISTS (
-                      SELECT 1
-                      FROM fields f
-                      WHERE f.chunk_id = c.id
-                        AND f.last_claim_time <= $1
-                        AND f.{check_level_predicate}
-                        AND f.range_size <= $3
-                  )
+              AND EXISTS (
+                  SELECT 1
+                  FROM fields f
+                  WHERE f.chunk_id = c.id
+                    AND {claimable}
+                    AND f.{check_level_predicate}
+                    AND f.range_size <= $3
               )
             ORDER BY c.id ASC
             LIMIT 1
@@ -310,7 +308,15 @@ pub fn try_claim_field(
 
     match claim_strategy {
         FieldClaimStrategy::Next => {
-            // Simply get the next available field
+            // Simply get the next available field.
+            //
+            // KNOWN COST: unscoped by chunk, so this walks the primary key from id 1
+            // until it reaches the frontier. Measured at 1.55s in production, filtering
+            // 1.43M rows — every field below the lowest `check_level <= 1` id, which are
+            // all completed work. A partial index on `check_level <= 1` would skip them
+            // but would cover 95.6% of the table to do it. This is 20% of detailed claims
+            // (the non-`Thin` strategies); fixing it properly means giving the detailed
+            // frontier a cursor rather than rediscovering it by scan on every request.
             let query = format!(
                 "WITH candidate AS (
                     SELECT id
