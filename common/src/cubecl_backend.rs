@@ -1139,7 +1139,7 @@ pub async fn process_range_detailed_cubecl_async(
 /// An async fn rather than a closure (async closures aren't stable), and
 /// `read_async` rather than `read_one` so [`detailed_impl`] stays runnable
 /// on wasm, where a future cannot block.
-async fn drain<R: cubecl::prelude::Runtime>(
+pub(crate) async fn drain<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     handle: cubecl::server::Handle,
     histogram: &mut [u128],
