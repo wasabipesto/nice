@@ -79,8 +79,9 @@ function processDetailedWithProgress(claimDataJson, username) {
         // Merge nice numbers
         allNiceNumbers.push(...chunkResult.nice_numbers);
 
-        // Update distribution
-        for (const entry of chunkResult.distribution_updates) {
+        // Update distribution ("distribution" in FieldResults; the old
+        // "distribution_updates" name predates a serialization rename)
+        for (const entry of chunkResult.distribution) {
             const currentCount = uniqueDistribution.get(entry.num_uniques) || 0;
             uniqueDistribution.set(
                 entry.num_uniques,
@@ -142,6 +143,107 @@ function processDetailedWithProgress(claimDataJson, username) {
     return JSON.stringify(result);
 }
 
+// Process numbers on the GPU (WebGPU via CubeCL) with progress updates.
+// Slices the claim so progress ticks and stop signals stay responsive; each
+// slice is one async wasm call that runs entirely on the GPU.
+async function processDetailedGpu(claimDataJson, username) {
+    const claimData = JSON.parse(claimDataJson);
+    const base = claimData.base;
+    const rangeStart = BigInt(claimData.range_start);
+    const rangeEnd = BigInt(claimData.range_end);
+    const rangeSize = rangeEnd - rangeStart;
+
+    self.postMessage({
+        type: "progress",
+        percent: 0,
+        message: "Starting GPU processing...",
+        processedCount: 0,
+        uniqueDistribution: new Map(),
+        niceNumbers: [],
+    });
+
+    const allNiceNumbers = [];
+    const uniqueDistribution = new Map();
+    for (let i = 1; i <= base; i++) {
+        uniqueDistribution.set(i, 0);
+    }
+
+    // ~32 progress ticks per field, in whole millions so slice boundaries
+    // stay friendly to the GPU's internal batching.
+    let sliceSize = rangeSize / BigInt(32);
+    const megaBig = BigInt(1000000);
+    if (sliceSize > megaBig) {
+        sliceSize = (sliceSize / megaBig) * megaBig;
+    }
+    if (sliceSize < BigInt(1)) {
+        sliceSize = rangeSize;
+    }
+
+    let processed = BigInt(0);
+    for (
+        let current = rangeStart;
+        current < rangeEnd && !shouldStop;
+        current += sliceSize
+    ) {
+        const sliceEnd =
+            current + sliceSize > rangeEnd ? rangeEnd : current + sliceSize;
+
+        const sliceResultJson = await wasm.process_chunk_gpu(
+            current.toString(),
+            sliceEnd.toString(),
+            base,
+        );
+        const sliceResult = JSON.parse(sliceResultJson);
+
+        allNiceNumbers.push(...sliceResult.nice_numbers);
+        for (const entry of sliceResult.distribution) {
+            const currentCount = uniqueDistribution.get(entry.num_uniques) || 0;
+            uniqueDistribution.set(
+                entry.num_uniques,
+                currentCount + entry.count,
+            );
+        }
+
+        processed += sliceEnd - current;
+        const percent = Number((processed * BigInt(100)) / rangeSize);
+        self.postMessage({
+            type: "progress",
+            percent: percent,
+            message: `GPU processed ${Number(processed).toLocaleString()} / ${Number(rangeSize).toLocaleString()} numbers`,
+            processedCount: Number(processed),
+            uniqueDistribution: uniqueDistribution,
+            niceNumbers: allNiceNumbers,
+        });
+    }
+
+    if (shouldStop) {
+        self.postMessage({
+            type: "stopped",
+            message: "Processing stopped by user",
+        });
+        return null;
+    }
+
+    const serverNiceNumbers = allNiceNumbers.map((nn) => ({
+        number: nn.number,
+        num_uniques: nn.num_uniques,
+    }));
+    const serverDistribution = Array.from(uniqueDistribution.entries())
+        .map(([num_uniques, count]) => ({
+            num_uniques: num_uniques,
+            count: count,
+        }))
+        .sort((a, b) => a.num_uniques - b.num_uniques);
+
+    return JSON.stringify({
+        claim_id: claimData.claim_id,
+        username: username,
+        client_version: "3.0.0-wasm-webgpu",
+        unique_distribution: serverDistribution,
+        nice_numbers: serverNiceNumbers,
+    });
+}
+
 // Handle messages from main thread
 self.onmessage = async function (e) {
     const { type, data } = e.data;
@@ -184,6 +286,61 @@ self.onmessage = async function (e) {
                 self.postMessage({
                     type: "error",
                     error: error.message,
+                });
+            }
+            break;
+
+        case "init_gpu":
+            if (!isInitialized) {
+                self.postMessage({
+                    type: "gpu_initialized",
+                    success: false,
+                    error: "WASM not initialized",
+                });
+                return;
+            }
+            try {
+                const adapterName = await wasm.gpu_init();
+                self.postMessage({
+                    type: "gpu_initialized",
+                    success: true,
+                    adapterName: adapterName,
+                });
+            } catch (error) {
+                self.postMessage({
+                    type: "gpu_initialized",
+                    success: false,
+                    error: String(error),
+                });
+            }
+            break;
+
+        case "process_gpu":
+            if (!isInitialized) {
+                self.postMessage({
+                    type: "error",
+                    error: "WASM not initialized",
+                });
+                return;
+            }
+            shouldStop = false;
+            try {
+                const gpuStart = Date.now();
+                const gpuResultJson = await processDetailedGpu(
+                    JSON.stringify(e.data.data.claimData),
+                    e.data.data.username,
+                );
+                if (!shouldStop && gpuResultJson) {
+                    self.postMessage({
+                        type: "complete",
+                        result: JSON.parse(gpuResultJson),
+                        elapsedSeconds: (Date.now() - gpuStart) / 1000,
+                    });
+                }
+            } catch (error) {
+                self.postMessage({
+                    type: "error",
+                    error: String(error),
                 });
             }
             break;

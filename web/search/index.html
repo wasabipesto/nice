@@ -175,6 +175,24 @@
                             </div>
 
                             <div class="field">
+                                <label class="label" for="backendSelect"
+                                    >Compute Backend:</label
+                                >
+                                <div class="control">
+                                    <div class="select is-fullwidth">
+                                        <select id="backendSelect">
+                                            <option value="cpu" selected>
+                                                CPU
+                                            </option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="help" id="backendHelp">
+                                    Checking for WebGPU support...
+                                </div>
+                            </div>
+
+                            <div class="field">
                                 <label class="label" for="threadCount">
                                     Thread Count:
                                     <span id="threadCountValue">1</span>
@@ -714,6 +732,10 @@
                 const claimData = getCurrentClaimData();
                 if (!claimData) return;
 
+                // Final distribution, exposed for the e2e harness to compare
+                // across backends.
+                window.lastDistribution = result.unique_distribution;
+
                 const rangeSize = parseInt(claimData.range_size);
                 const numbersPerSecond = rangeSize / elapsedSeconds;
 
@@ -840,12 +862,128 @@
                 }
             }
 
+            // The GPU path runs in one dedicated worker: the device supplies
+            // the parallelism, so there is nothing for a pool to do.
+            let gpuWorker = null;
+            let gpuAdapterName = null;
+
+            function selectedBackend() {
+                return document.getElementById("backendSelect").value;
+            }
+
+            function initGpuWorker() {
+                return new Promise((resolve) => {
+                    const worker = new Worker("worker.js");
+                    const timeout = setTimeout(() => {
+                        worker.terminate();
+                        resolve(null);
+                    }, 15000);
+                    worker.onmessage = (e) => {
+                        if (e.data.type === "initialized") {
+                            if (e.data.success) {
+                                worker.postMessage({ type: "init_gpu" });
+                            } else {
+                                clearTimeout(timeout);
+                                worker.terminate();
+                                resolve(null);
+                            }
+                        } else if (e.data.type === "gpu_initialized") {
+                            clearTimeout(timeout);
+                            if (e.data.success) {
+                                resolve({
+                                    worker,
+                                    adapterName: e.data.adapterName,
+                                });
+                            } else {
+                                console.log(
+                                    "No WebGPU:",
+                                    e.data.error,
+                                );
+                                worker.terminate();
+                                resolve(null);
+                            }
+                        }
+                    };
+                    worker.onerror = () => {
+                        clearTimeout(timeout);
+                        worker.terminate();
+                        resolve(null);
+                    };
+                    worker.postMessage({ type: "init" });
+                });
+            }
+
+            async function detectGpu() {
+                const help = document.getElementById("backendHelp");
+                const gpu = await initGpuWorker();
+                if (gpu) {
+                    gpuWorker = gpu.worker;
+                    gpuAdapterName = gpu.adapterName;
+                    const select =
+                        document.getElementById("backendSelect");
+                    const option = document.createElement("option");
+                    option.value = "gpu";
+                    option.textContent = `GPU — ${gpuAdapterName}`;
+                    select.appendChild(option);
+                    help.textContent =
+                        "WebGPU available; the GPU runs whole fields while the CPU option uses the thread pool.";
+                    gpuWorker.onmessage = handleGpuWorkerMessage;
+                } else {
+                    help.textContent =
+                        "No WebGPU on this browser; using the CPU thread pool.";
+                }
+            }
+
+            function handleGpuWorkerMessage(e) {
+                const { type, ...rest } = e.data;
+                switch (type) {
+                    case "progress":
+                        handleWorkerPoolProgress({
+                            percent: rest.percent,
+                            message: rest.message,
+                            processedCount: rest.processedCount,
+                            uniqueDistribution: rest.uniqueDistribution,
+                            niceNumbers: rest.niceNumbers,
+                        });
+                        break;
+                    case "complete":
+                        handleWorkerPoolComplete({
+                            result: rest.result,
+                            elapsedSeconds: rest.elapsedSeconds,
+                        });
+                        break;
+                    case "stopped":
+                        handleProcessingStopped(rest.message);
+                        break;
+                    case "error":
+                        handleWorkerPoolError(new Error(rest.error));
+                        break;
+                }
+            }
+
             function processCurrentField() {
-                if (!currentClaimData || !workerPool) return;
+                if (!currentClaimData) return;
 
                 const username =
                     document.getElementById("username").value || "anonymous";
 
+                if (selectedBackend() === "gpu" && gpuWorker) {
+                    updateStatus(
+                        `Processing field on ${gpuAdapterName}...`,
+                        "is-warning",
+                    );
+                    updateProgress(0, "Starting GPU processing...");
+                    gpuWorker.postMessage({
+                        type: "process_gpu",
+                        data: {
+                            claimData: currentClaimData,
+                            username: username,
+                        },
+                    });
+                    return;
+                }
+
+                if (!workerPool) return;
                 updateStatus(
                     `Processing field with ${workerPool.getWorkerCount()} workers in parallel...`,
                     "is-warning",
@@ -903,6 +1041,9 @@
             window.stopProcessing = function () {
                 shouldStop = true;
                 isProcessing = false;
+                if (gpuWorker) {
+                    gpuWorker.postMessage({ type: "stop" });
+                }
 
                 if (workerPool) {
                     workerPool.stopProcessing();
@@ -969,6 +1110,7 @@
 
             // Initialize when page loads
             document.addEventListener("DOMContentLoaded", () => {
+                detectGpu();
                 if (checkBrowserSupport()) {
                     setupCpuControls();
                     init();
