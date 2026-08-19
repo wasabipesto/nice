@@ -16,3 +16,6 @@ rocket = { version = "0.5.1", features = ["json"] }
 rocket_prometheus = { version = "0.10.1" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+diesel = { version = "2.3", features = ["postgres", "r2d2"] }
