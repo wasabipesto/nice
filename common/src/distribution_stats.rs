@@ -26,6 +26,66 @@ pub fn expand_distribution(
         .collect()
 }
 
+/// Incrementally aggregates distribution counts over batches of submissions.
+///
+/// Folding batch-by-batch produces the same result as one pass over the
+/// concatenation, which is what lets the jobs binary stream a base's canon
+/// submissions chunk-by-chunk instead of holding them all in memory.
+pub struct DistributionAccumulator {
+    base: u32,
+    // Counter vec indexed by `num_uniques`.
+    // Note: Array size is (base + 1) to allow indexing from 0..=base
+    // We use indices [1..=base] (inclusive range) since `num_uniques` ranges from 1 to base
+    counter: Vec<UniquesDistributionSimple>,
+}
+
+impl DistributionAccumulator {
+    #[must_use]
+    pub fn new(base: u32) -> Self {
+        let mut counter = vec![
+            UniquesDistributionSimple {
+                num_uniques: 0,
+                count: 0
+            };
+            base as usize + 1
+        ];
+        // Initialize entries for `num_uniques` in [1, base] (inclusive on both ends)
+        for n in 1..=base {
+            counter[n as usize].num_uniques = n;
+        }
+        Self { base, counter }
+    }
+
+    /// Add a batch of submissions' distribution counts.
+    pub fn fold(&mut self, submissions: &[SubmissionRecord]) {
+        for sub in submissions.iter().filter_map(|s| s.distribution.as_deref()) {
+            for dist in sub {
+                if let Some(counter_dist) = self.counter.get_mut(dist.num_uniques as usize) {
+                    counter_dist.count += dist.count;
+                }
+            }
+        }
+    }
+
+    /// Total count folded so far. Zero means no data: `finalize` would panic
+    /// (via `expand_distribution`'s empty assertion), so check this first.
+    #[must_use]
+    pub fn total_count(&self) -> u128 {
+        self.counter.iter().map(|c| c.count).sum()
+    }
+
+    /// Expand the accumulated counts into a full distribution.
+    ///
+    /// # Panics
+    /// Panics if nothing was folded in (see `total_count`).
+    #[must_use]
+    pub fn finalize(&self) -> Vec<UniquesDistribution> {
+        // Note: counter[1..] is a half-open range slice that includes indices [1, base],
+        // effectively skipping counter[0] which was just a placeholder
+        expand_distribution(&self.counter[1..], self.base)
+    }
+}
+
 /// Take a bunch of `SubmissionRecords`, which each have their own `UniquesDistributions`,
 /// and aggregate the total count per `um_uniques`.
 #[must_use]
@@ -33,37 +93,9 @@ pub fn downsample_distributions(
     submissions: &[SubmissionRecord],
     base: u32,
 ) -> Vec<UniquesDistribution> {
-    // Set up counter vec indexed by `num_uniques`
-    // Note: Array size is (base + 1) to allow indexing from 0..=base
-    // We use indices [1..=base] (inclusive range) since `num_uniques` ranges from 1 to base
-    let mut counter = vec![
-        UniquesDistributionSimple {
-            num_uniques: 0,
-            count: 0
-        };
-        base as usize + 1
-    ];
-    // Initialize entries for `num_uniques` in [1, base] (inclusive on both ends)
-    for n in 1..=base {
-        counter[n as usize] = UniquesDistributionSimple {
-            num_uniques: n,
-            count: 0,
-        };
-    }
-
-    // Count all submissions
-    for sub in submissions.iter().filter_map(|s| s.distribution.as_deref()) {
-        for dist in sub {
-            if let Some(counter_dist) = counter.get_mut(dist.num_uniques as usize) {
-                counter_dist.count += dist.count;
-            }
-        }
-    }
-
-    // Expand out & return
-    // Note: counter[1..] is a half-open range slice that includes indices [1, base],
-    // effectively skipping counter[0] which was just a placeholder
-    expand_distribution(&counter[1..], base)
+    let mut acc = DistributionAccumulator::new(base);
+    acc.fold(submissions);
+    acc.finalize()
 }
 
 /// Convert a set of `UniquesDistributions` to a mean and standard deviation.
@@ -106,6 +138,66 @@ mod tests {
     use super::*;
     use crate::SearchMode;
     use chrono::Utc;
+
+    /// Build a submission whose distribution has the given counts for
+    /// num_uniques 1..=counts.len().
+    fn sub_with_counts(counts: &[u128]) -> SubmissionRecord {
+        let base = counts.len() as u32;
+        let dist: Vec<UniquesDistributionSimple> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, &count)| UniquesDistributionSimple {
+                num_uniques: i as u32 + 1,
+                count,
+            })
+            .collect();
+        SubmissionRecord {
+            submission_id: 1,
+            claim_id: 1,
+            field_id: 1,
+            search_mode: SearchMode::Detailed,
+            submit_time: Utc::now(),
+            elapsed_secs: 1.0,
+            username: "test".to_string(),
+            user_ip: "test".to_string(),
+            client_version: "test".to_string(),
+            disqualified: false,
+            distribution: Some(expand_distribution(&dist, base)),
+            numbers: Vec::new(),
+        }
+    }
+
+    /// Folding batches through the accumulator must equal one pass over the
+    /// concatenation - the property that lets the jobs binary stream a base's
+    /// submissions chunk-by-chunk.
+    #[test]
+    fn accumulator_matches_single_pass() {
+        let base = 4;
+        let subs: Vec<SubmissionRecord> = vec![
+            sub_with_counts(&[5, 10, 100, 3]),
+            sub_with_counts(&[1, 2, 3, 4]),
+            sub_with_counts(&[0, 7, 70, 1]),
+            sub_with_counts(&[9, 0, 50, 2]),
+            sub_with_counts(&[4, 4, 4, 4]),
+        ];
+
+        let single = downsample_distributions(&subs, base);
+
+        let mut acc = DistributionAccumulator::new(base);
+        acc.fold(&subs[..2]);
+        acc.fold(&subs[2..3]);
+        acc.fold(&subs[3..]);
+        let folded = acc.finalize();
+
+        assert_eq!(single, folded);
+        assert_eq!(
+            acc.total_count(),
+            subs.iter()
+                .flat_map(|s| s.distribution.as_deref().unwrap())
+                .map(|d| d.count)
+                .sum::<u128>()
+        );
+    }
 
     fn create_test_distribution_simple() -> Vec<UniquesDistributionSimple> {
         vec![

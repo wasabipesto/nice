@@ -105,9 +105,14 @@ run-sql file:
     --dbname=nice \
     < {{ file }}
 
-# Run scheduled jobs
+# Run scheduled jobs (incremental: only fields/chunks with new submissions)
 jobs:
     cargo run -r -p nice_jobs
+
+# Run scheduled jobs as a full sweep. Required after manual changes that
+# create no submission (e.g. disqualifying one) so every stat recomputes.
+jobs-full:
+    cargo run -r -p nice_jobs -- --full
 
 # Deploy the website and bundled assets
 deploy-site:
