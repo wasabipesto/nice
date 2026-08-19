@@ -178,7 +178,7 @@ fn claim_helper(
     // are inherently per-request stateful and not worth bulk-pre-claiming.
     let search_field = if search_mode == SearchMode::Niceonly {
         // Try to get from queue first
-        if let Some(queued_field) = queue.claim_niceonly() {
+        if let Some(queued_field) = queue.claim_niceonly(&mut conn) {
             queued_field
         } else {
             // Queue is empty, fall back to direct database claim
@@ -196,7 +196,7 @@ fn claim_helper(
         }
     } else if claim_strategy == FieldClaimStrategy::Thin {
         // Try the detailed-thin queue first; fall back to a direct claim if it's empty.
-        if let Some(queued_field) = queue.claim_detailed_thin() {
+        if let Some(queued_field) = queue.claim_detailed_thin(&mut conn) {
             queued_field
         } else {
             tracing::warn!("Detailed-thin queue exhausted, falling back to direct database claim");

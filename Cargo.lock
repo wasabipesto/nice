@@ -1489,6 +1489,7 @@ name = "nice_api"
 version = "3.3.0"
 dependencies = [
  "chrono",
+ "diesel",
  "nice_common",
  "rand 0.10.1",
  "rocket",
