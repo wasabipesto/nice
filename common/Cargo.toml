@@ -16,7 +16,8 @@ cuda = ["dep:cudarc"]
 # Umbrella: every GPU backend this crate knows how to build. Building any of
 # them needs no GPU libraries at compile time; each backend dlopens its driver
 # at runtime.
-gpu = ["cuda", "vulkan", "cubecl", "cubecl-cuda"]
+gpu = ["cuda", "cubecl", "cubecl-cuda"]
+# Experimental; see the client manifest's note.
 vulkan = ["dep:ash", "dep:naga"]
 cubecl = ["dep:cubecl", "dep:getrandom", "dep:cubecl-common", "dep:web-time"]
 cubecl-cuda = ["cubecl", "cubecl/cuda"]

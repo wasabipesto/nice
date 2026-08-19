@@ -170,7 +170,7 @@ Options:
           Possible values:
           - auto:        Fastest measured order for the mode: detailed tries `cubecl-cuda`, `cubecl`, CUDA, then Vulkan; niceonly tries CUDA, `cubecl`, then Vulkan. See `init_gpu` for the numbers behind the ordering
           - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC
-          - vulkan:      Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe)
+          - vulkan:      Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe). Experimental: only present in builds with the `vulkan` feature, which the `gpu` umbrella no longer includes
           - cubecl:      `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base
           - cubecl-cuda: `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature)
           
@@ -207,15 +207,16 @@ base at first use, so the first field on a new base takes a few extra seconds.
 | `cubecl` | any GPU via wgpu — Vulkan on Linux/Windows, Metal on macOS | a graphics driver; nothing else |
 | `cubecl-cuda` | NVIDIA | CUDA toolkit (NVRTC) |
 | `cuda` | NVIDIA | CUDA toolkit (NVRTC) |
-| `vulkan` | any Vulkan 1.2 device with `shaderInt64` | a Vulkan driver; on macOS also MoltenVK + the Vulkan loader (`brew install molten-vk vulkan-loader`) |
+| `vulkan` (experimental, opt-in build) | any Vulkan 1.2 device with `shaderInt64` | a Vulkan driver; on macOS also MoltenVK + the Vulkan loader (`brew install molten-vk vulkan-loader`) |
 
 Nothing needs GPU libraries at *build* time — every backend loads its driver
 dynamically, so one binary built anywhere runs anywhere.
 
 **Backend selection.** `--gpu-backend auto` (the default) tries backends in
 the measured-fastest order for the mode: detailed tries `cubecl-cuda`,
-`cubecl`, `cuda`, then `vulkan`; niceonly tries `cuda`, `cubecl`, then
-`vulkan`. A backend that fails to initialize falls through to the next; a
+`cubecl`, then `cuda`; niceonly tries `cuda`, then `cubecl` (each list ends
+with `vulkan` in the opt-in builds that include it). A backend that fails to
+initialize falls through to the next; a
 backend you name explicitly is fatal if it fails, so a distributed client
 never silently drops to a slower path. The init log always prints which
 backend and device won, and benchmark/telemetry reports carry both.
@@ -238,7 +239,7 @@ Unset, it picks the highest-powered adapter.
   wgpu this usually means the driver's watchdog reset the GPU (check `dmesg`
   for `ring gfx ... timeout`); please report it, since batches are sized to
   stay under watchdogs.
-- *"Unable to find a Vulkan driver"* on macOS — the `vulkan` backend needs
+- *"Unable to find a Vulkan driver"* on macOS — the experimental `vulkan` backend needs
   `brew install molten-vk vulkan-loader` and
   `VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`. The
   `cubecl` backend needs none of that (it talks to Metal directly) and is
@@ -259,7 +260,7 @@ There are some feature flags that enable specific dependencies:
 - `nice_client/rustls-tls` is enabled by default and uses rustls for TLS connections, which doesn't require any external dependencies. Disable it and enable `nice_client/openssl-tls` to use `openssl`.
 - In order to build the client with GPU acceleration, enable the `nice_client/gpu` feature. It is an umbrella over every backend below, so the release recipe is two builds: default features for a lightweight CPU-only binary, `--features gpu` for one binary that runs on the CPU or any supported GPU. No backend needs its GPU libraries at *build* time — each one `dlopen`s its driver at runtime — and the backend is selected at runtime with `--gpu-backend` (`auto` picks the measured-fastest order per mode: detailed tries `cubecl-cuda`, `cubecl`, `cuda`, then `vulkan`; niceonly tries `cuda`, `cubecl`, then `vulkan`).
 - `nice_client/cuda` is the hand-written CUDA backend (NVIDIA only). It requires the CUDA toolkit at runtime for NVRTC kernel compilation.
-- `nice_client/vulkan` is the hand-written WGSL backend; it runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe, and MoltenVK on macOS). At runtime it needs only a Vulkan driver, since shaders are generated per base and compiled with `naga`.
+- `nice_client/vulkan` is the hand-written WGSL backend (**experimental — not part of the `gpu` umbrella**); it runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe, and MoltenVK on macOS). Every platform it serves is also covered by `cubecl`, which beats it in detailed mode on all vendors measured, so standard builds omit it; build with `--features gpu,vulkan` to include it while its fate (promote or remove) is decided.
 - `nice_client/cubecl` is the [CubeCL](https://github.com/tracel-ai/cubecl) backend (kernels written in Rust), running over wgpu: Vulkan on Linux/Windows, Metal on macOS. `nice_client/cubecl-cuda` adds its native CUDA runtime. Both modes run on the GPU.
 
 Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack/).

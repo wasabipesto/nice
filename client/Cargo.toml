@@ -17,7 +17,11 @@ cuda = ["nice_common/cuda", "dep:cudarc"]
 # release recipe is two builds: default features = lightweight CPU-only,
 # `--features gpu` = CPU + every backend, selected at runtime by
 # `--gpu-backend` (auto picks the fastest available).
-gpu = ["cuda", "vulkan", "cubecl", "cubecl-cuda"]
+gpu = ["cuda", "cubecl", "cubecl-cuda"]
+# Experimental: the hand-written WGSL backend. Not part of the `gpu`
+# umbrella — every platform it serves is covered by `cubecl`, which beats it
+# in detailed mode on all vendors measured. Kept for opt-in builds while its
+# fate (promote or remove) is decided.
 vulkan = ["nice_common/vulkan"]
 cubecl = ["nice_common/cubecl"]
 # Must also enable this crate's own cubecl gate: feature cfgs do not

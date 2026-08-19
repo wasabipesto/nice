@@ -64,7 +64,9 @@ enum GpuBackend {
     Auto,
     /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC.
     Cuda,
-    /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe).
+    /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA,
+    /// llvmpipe). Experimental: only present in builds with the `vulkan`
+    /// feature, which the `gpu` umbrella no longer includes.
     Vulkan,
     /// `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base.
     Cubecl,
