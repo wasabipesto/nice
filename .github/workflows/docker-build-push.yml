@@ -107,6 +107,9 @@ jobs:
 
             - name: Build nice_client (release, GPU-enabled)
               run: |
+                  # `gpu` is the umbrella feature: this image's binary carries every
+                  # backend (cuda, vulkan, cubecl, cubecl-cuda), selected at runtime
+                  # by --gpu-backend.
                   cargo build --release --locked -p nice_client --features gpu
 
             - name: Stage Docker build context

@@ -4,7 +4,7 @@
 //! The CUDA kernels are embedded in the binary and compiled at runtime via NVRTC.
 
 fn main() {
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
     {
         // The CUDA kernels are embedded in the binary via include_str!()
         // and compiled at runtime using NVRTC, so we don't need to compile
@@ -25,7 +25,7 @@ fn main() {
         );
     }
 
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(not(feature = "cuda"))]
     {
         // Nothing to do when GPU feature is disabled
     }

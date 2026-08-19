@@ -31,7 +31,7 @@
 //! above 64 use a two-word digit mask. Bases with no u128 range fall back to
 //! the CPU implementation with a logged warning.
 
-#![cfg(feature = "gpu")]
+#![cfg(feature = "cuda")]
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
@@ -39,28 +39,30 @@ use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
 };
-use crate::{base_range, msd_prefix_filter, number_stats, residue_filter, stride_filter};
+use crate::gpu_config::{
+    MAX_GPU_DIGIT_MASK_BASE, chunk_constants, gpu_supports_base, prefilter_params,
+};
+use crate::gpu_niceonly::{RangeSink, report_field, run_range_pipeline};
+use crate::{base_range, number_stats, residue_filter, stride_filter};
 use anyhow::{Context as _, Result, bail, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext as DriverContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
-use log::{debug, info, warn};
+use log::{debug, warn};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
+/// The MSD/descriptor pipeline these two constants belong to now lives in
+/// [`crate::gpu_niceonly`], which the Vulkan backend shares. Re-exported so the
+/// CUDA path's public surface is unchanged.
+pub use crate::gpu_niceonly::{GPU_LSD_K, PROCESSING_CHUNK_SIZE};
 
 /// Numbers processed per detailed-mode kernel launch. Larger batches amortize
 /// launch overhead; since the detailed kernel takes no input arrays, batch
 /// size costs no memory or transfer bandwidth.
-pub const GPU_BATCH_SIZE: usize = 50_000_000;
-
-/// LSD filter depth for the stride table, matching the CPU client's
-/// `DEFAULT_LSD_K_VALUE` so GPU and CPU check the identical candidate set.
-const GPU_LSD_K: u32 = 3;
+pub const CUDA_BATCH_SIZE: usize = 50_000_000;
 
 /// Threads per block. Must match `BLOCK_THREADS` in `nice_kernels.cu` (the
 /// detailed kernel's shared-memory histogram is sized from it).
@@ -76,113 +78,6 @@ const NEAR_MISS_CAPACITY: usize = 1 << 20;
 /// Maximum MSD-valid ranges per niceonly kernel launch.
 const RANGES_PER_LAUNCH: usize = 1 << 22;
 
-/// Minimum MSD recursion floor for the adaptive controller.
-/// Below this the GPU receives virtually the same candidates as the CPU would
-/// check itself, so there is no point going lower.
-const MSD_FLOOR_MIN: f64 = 250.0;
-
-/// Maximum useful MSD recursion floor. Beyond ~64 000 the survival rate
-/// saturates around 23 % (b52 measurement), so larger values buy nothing.
-/// Measured on a real b52 production field (per 1e12 numbers, single core):
-///
-/// | floor  | CPU time | surviving |
-/// |--------|----------|-----------|
-/// | 250    | 350 s    | 2.3 %     |
-/// | 4 000  | 50 s     | 15.2 %    |
-/// | 16 000 | 15 s     | 19.0 %    |
-/// | 64 000 | 4.8 s    | 22.6 %    |
-const MSD_FLOOR_MAX: f64 = 256_000.0;
-
-/// Adaptive MSD recursion floor for the niceonly GPU pipeline.
-///
-/// Goal: keep `msd_time ≈ gpu_tail_time` so the overlapped pipeline is
-/// balanced.  The floor is seeded from the CPU count (fewer cores → coarser
-/// floor, because MSD is the bottleneck) and then nudged ≤ 1.5× per field
-/// toward that balance.  Setting `NICE_GPU_MSD_FLOOR` in the environment
-/// pins the floor and disables adaptation.
-struct AdaptiveFloor {
-    floor: f64,
-    /// Fields remaining in warmup (skip adaptation); `u32::MAX` = permanently
-    /// fixed via env-var override.
-    warmup: u32,
-}
-
-/// Fields to observe before adapting, so NVRTC and JIT one-time costs don't
-/// skew the first measurement.
-const ADAPT_WARMUP: u32 = 3;
-
-/// Maximum multiplicative step per field in either direction.
-const ADAPT_MAX_STEP: f64 = 1.5;
-
-/// Ignore a phase if it took less than this many seconds — the measurement
-/// noise would dominate the ratio.
-const ADAPT_MIN_SECS: f64 = 0.002;
-
-/// Floor value calibrated for 32 cores. Derived value for N cores:
-/// `ADAPT_BASE_CORE_PRODUCT / N`, clamped to `[MSD_FLOOR_MIN, MSD_FLOOR_MAX]`.
-const ADAPT_BASE_CORE_PRODUCT: f64 = 512_000.0;
-
-impl AdaptiveFloor {
-    fn current(&self) -> u128 {
-        self.floor as u128
-    }
-
-    fn update(&mut self, msd_secs: f64, total_secs: f64) {
-        if self.warmup == u32::MAX {
-            return;
-        }
-        if self.warmup > 0 {
-            self.warmup -= 1;
-            return;
-        }
-        let gpu_tail = (total_secs - msd_secs).max(0.0);
-        let ratio = if gpu_tail < ADAPT_MIN_SECS {
-            ADAPT_MAX_STEP
-        } else if msd_secs < ADAPT_MIN_SECS {
-            1.0 / ADAPT_MAX_STEP
-        } else {
-            msd_secs / gpu_tail
-        };
-        let factor = ratio.clamp(1.0 / ADAPT_MAX_STEP, ADAPT_MAX_STEP);
-        let new_floor = (self.floor * factor).clamp(MSD_FLOOR_MIN, MSD_FLOOR_MAX);
-        if (new_floor - self.floor).abs() > self.floor * 0.05 {
-            info!(
-                "GPU MSD floor: {:.0} → {:.0} (msd {:.3}s, gpu_tail {:.3}s)",
-                self.floor, new_floor, msd_secs, gpu_tail,
-            );
-        }
-        self.floor = new_floor;
-    }
-}
-
-static ADAPTIVE_FLOOR: std::sync::OnceLock<Mutex<AdaptiveFloor>> = std::sync::OnceLock::new();
-
-fn adaptive_floor() -> &'static Mutex<AdaptiveFloor> {
-    ADAPTIVE_FLOOR.get_or_init(|| {
-        if let Ok(v) = std::env::var("NICE_GPU_MSD_FLOOR") {
-            match v.parse::<f64>() {
-                Ok(f) if f >= 1.0 => {
-                    info!("GPU MSD floor fixed at {f:.0} via NICE_GPU_MSD_FLOOR");
-                    return Mutex::new(AdaptiveFloor {
-                        floor: f,
-                        warmup: u32::MAX,
-                    });
-                }
-                _ => warn!("ignoring invalid NICE_GPU_MSD_FLOOR '{v}'; using adaptive floor"),
-            }
-        }
-        let cpu_count = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(32) as f64;
-        let seed = (ADAPT_BASE_CORE_PRODUCT / cpu_count).clamp(MSD_FLOOR_MIN, MSD_FLOOR_MAX);
-        info!("GPU MSD floor: adaptive, seed {seed:.0} ({cpu_count:.0} logical cores)");
-        Mutex::new(AdaptiveFloor {
-            floor: seed,
-            warmup: ADAPT_WARMUP,
-        })
-    })
-}
-
 /// Compiled niceonly kernel plus the per-base stride data living on-device.
 struct NiceonlyPlan {
     base: u32,
@@ -193,14 +88,14 @@ struct NiceonlyPlan {
 }
 
 /// GPU context: CUDA device handle plus caches of per-base compiled kernels.
-pub struct GpuContext {
-    device: Arc<CudaContext>,
+pub struct CudaContext {
+    device: Arc<DriverContext>,
     stream: Arc<CudaStream>,
     niceonly_plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
     detailed_kernels: Mutex<HashMap<u32, CudaFunction>>,
 }
 
-impl GpuContext {
+impl CudaContext {
     /// Initialize the GPU context and verify that NVRTC compilation works.
     ///
     /// Kernels themselves are compiled lazily, once per (base, mode), when
@@ -213,7 +108,7 @@ impl GpuContext {
     /// Returns an error if the CUDA context cannot be initialized or if a
     /// smoke-test NVRTC compilation fails (e.g. missing NVRTC library).
     pub fn new(device_ordinal: usize) -> Result<Self> {
-        let device = CudaContext::new(device_ordinal)
+        let device = DriverContext::new(device_ordinal)
             .with_context(|| format!("initializing CUDA device {device_ordinal}"))?;
         let stream = device.default_stream();
 
@@ -235,7 +130,7 @@ impl GpuContext {
             smoke_start.elapsed().as_secs_f64()
         );
 
-        Ok(GpuContext {
+        Ok(CudaContext {
             device,
             stream,
             niceonly_plans: Mutex::new(HashMap::new()),
@@ -305,12 +200,6 @@ impl GpuContext {
     }
 }
 
-/// Highest base the GPU digit mask can represent (two u64 words). The
-/// kernel's u32-limb arithmetic is width-generic (buffers are sized from
-/// `N_LIMBS` at JIT time), so unlike the CPU's `U256` path there is no
-/// 256-bit ceiling; in practice the u128 candidate representation caps
-/// usable bases around 97 via `get_base_range_u128`.
-const MAX_GPU_DIGIT_MASK_BASE: u32 = 128;
 
 /// Defines shared by both kernels for a base: `BASE`, `N_LIMBS`,
 /// `CHUNK_DIGITS`, `CHUNK_DIV`. Fails for bases the GPU cannot handle
@@ -380,100 +269,6 @@ fn niceonly_defines(base: u32) -> Result<(Vec<String>, stride_filter::StrideTabl
     Ok((defines, table))
 }
 
-/// Parameters for the niceonly kernel's modular prefilter.
-struct PrefilterParams {
-    /// Digits checked per value (the lowest `digits` of n² and of n³).
-    digits: u32,
-    /// `base^digits`, at most 2^48.
-    modulus: u64,
-    /// `2^64 mod modulus`.
-    pow64_mod: u64,
-}
-
-/// Compute the prefilter parameters for a base, or None when the prefilter
-/// must stay disabled.
-///
-/// The prefilter checks the lowest p digits of n² and n³ using
-/// `x mod b^p` arithmetic in u64. Constraints:
-/// - `b^p <= 2^48` keeps every intermediate product reducible with a couple
-///   of multiply-high steps;
-/// - n² and n³ must each be guaranteed at least p digits across the base's
-///   whole range, or the digit loop would extract phantom leading zeros and
-///   could falsely reject a nice number. Verified with a conservative
-///   log-based lower bound on the digit counts at the range start.
-/// Highest base where the niceonly kernel's fused prefilter still pays for
-/// itself. Above this the prefilter is compiled out even though it would be
-/// sound: warp divergence means the whole warp runs the full check whenever
-/// any lane survives, so the prefilter only pays while per-lane survival is
-/// very low (at 4% survival ~74% of warp iterations already hold a
-/// survivor). Measured (G1 2026-07-12 + crossover sweep,
-/// scratchpad/2026-07-gpu-compaction/g1-verdict.md): fused wins at b40
-/// (1.1% survival, 16-30% faster on 3090/4090), loses at every live base
-/// from b42 up (4%+ survival, 4-27% slower). b41 has no live range.
-const GPU_PREFILTER_MAX_BASE: u32 = 40;
-
-fn prefilter_params(base: u32) -> Option<PrefilterParams> {
-    // Profitability gate (see GPU_PREFILTER_MAX_BASE). Every consumer —
-    // define injection, the CPU diagnostics mirror, the G0/G1 harnesses —
-    // takes the on/off decision from this single function, so the kernel
-    // and its mirrors always agree.
-    if base > GPU_PREFILTER_MAX_BASE {
-        return None;
-    }
-
-    let mut digits = 0u32;
-    let mut modulus = 1u64;
-    while modulus <= (1u64 << 48) / u64::from(base) {
-        modulus *= u64::from(base);
-        digits += 1;
-    }
-
-    let range = base_range::get_base_range_u128(base).ok()??;
-    #[allow(clippy::cast_precision_loss)]
-    let ln_n_min = (range.range_start as f64).ln();
-    let ln_base = f64::from(base).ln();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let digit_lower_bound =
-        |power: f64| ((power * ln_n_min / ln_base).floor() - 1.0).max(0.0) as u32;
-    let sq_digits_min = digit_lower_bound(2.0);
-    let cu_digits_min = digit_lower_bound(3.0);
-    if digits < 4 || sq_digits_min < digits || cu_digits_min < digits {
-        return None;
-    }
-
-    let pow64_mod = ((1u128 << 64) % u128::from(modulus)) as u64;
-    Some(PrefilterParams {
-        digits,
-        modulus,
-        pow64_mod,
-    })
-}
-
-/// Largest (e, base^e) with base^e < 2^31. The kernel splits n² and n³ into
-/// chunks of `e` digits by dividing by `base^e`, then peels single digits
-/// from each u32 chunk — all divisions by compile-time constants.
-fn chunk_constants(base: u32) -> (u32, u32) {
-    let mut e = 0u32;
-    let mut div = 1u64;
-    while div * u64::from(base) < (1 << 31) {
-        div *= u64::from(base);
-        e += 1;
-    }
-    (e, div as u32)
-}
-
-/// Whether the GPU path can process this base natively. Bases outside this
-/// fall back to the CPU implementation. Unlike the CPU fast path (capped at
-/// `MAX_BASE_FOR_FIXED_WIDTH_U256` = 68 by its 256-bit type), the GPU's
-/// limb-generic arithmetic handles every base with a valid u128 range.
-///
-/// Bases below 10 are excluded: their search ranges are trivially small
-/// (b5's is two numbers), and `get_base_range_u128` panics outright on
-/// degenerate ones like b4 — not worth guarding for on the GPU path.
-fn gpu_supports_base(base: u32) -> bool {
-    (10..=MAX_GPU_DIGIT_MASK_BASE).contains(&base)
-        && matches!(base_range::get_base_range_u128(base), Ok(Some(_)))
-}
 
 /// Compile the embedded CUDA source with the given `-D` defines via NVRTC.
 fn compile_kernel_ptx(defines: &[String]) -> Result<Ptx> {
@@ -512,8 +307,8 @@ fn combine_u64(lo: u64, hi: u64) -> u128 {
 ///
 /// # Errors
 /// Returns an error on any CUDA failure or if the output buffer overflows.
-pub fn process_range_niceonly_gpu(
-    ctx: &GpuContext,
+pub fn process_range_niceonly_cuda(
+    ctx: &CudaContext,
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
@@ -534,169 +329,9 @@ pub fn process_range_niceonly_gpu(
     // front, so the timings below reflect per-field work only.
     let plan = ctx.niceonly_plan(base)?;
 
-    let (nice_numbers, stats) = run_niceonly_pipeline(ctx, &plan, range, base)?;
-
-    #[allow(clippy::cast_precision_loss)]
-    {
-        info!(
-            "GPU niceonly b{base}: msd {:.3}s -> {} ranges ({:.2}% of field), gpu tail {:.3}s, total {:.3}s, {:.2e} n/s overall",
-            stats.msd_secs,
-            stats.num_ranges,
-            100.0 * stats.valid_numbers as f64 / range.size() as f64,
-            (stats.total_secs - stats.msd_secs).max(0.0),
-            stats.total_secs,
-            range.size() as f64 / stats.total_secs,
-        );
-    }
-    update_msd_floor(stats.msd_secs, stats.total_secs);
-
-    Ok(FieldResults {
-        distribution: Vec::new(),
-        nice_numbers,
-    })
-}
-
-fn gpu_msd_floor() -> u128 {
-    adaptive_floor().lock().unwrap().current()
-}
-
-fn update_msd_floor(msd_secs: f64, total_secs: f64) {
-    adaptive_floor()
-        .lock()
-        .unwrap()
-        .update(msd_secs, total_secs);
-}
-
-/// Per-field statistics from the overlapped niceonly pipeline.
-struct NiceonlyStats {
-    /// Wall time until the MSD workers finished (launches overlap with this).
-    msd_secs: f64,
-    total_secs: f64,
-    num_ranges: usize,
-    valid_numbers: u64,
-    launches: u32,
-}
-
-/// Ranges buffered before each kernel launch. Big enough to amortize launch
-/// and upload overhead, small enough that launches start while the MSD
-/// workers are still producing.
-const LAUNCH_BATCH_RANGES: usize = 1 << 16;
-
-/// Run the niceonly field: MSD workers stream surviving-range descriptors
-/// through a channel while the main thread batches them into asynchronous
-/// kernel launches, so the CPU filter and the GPU checks overlap instead of
-/// running as sequential phases.
-fn run_niceonly_pipeline(
-    ctx: &GpuContext,
-    plan: &NiceonlyPlan,
-    range: &FieldSize,
-    base: u32,
-) -> Result<(Vec<NiceNumberSimple>, NiceonlyStats)> {
-    let start_time = Instant::now();
-    let chunks = range.chunks(PROCESSING_CHUNK_SIZE);
-    let floor = gpu_msd_floor();
-    let num_threads = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(4)
-        .min(chunks.len().max(1));
-
-    let mut launcher = NiceonlyLauncher::new(ctx, plan, range)?;
-
-    let next_chunk = AtomicUsize::new(0);
-    let worker_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u64>, Vec<u32>)>();
-
-    let mut stats = NiceonlyStats {
-        msd_secs: 0.0,
-        total_secs: 0.0,
-        num_ranges: 0,
-        valid_numbers: 0,
-        launches: 0,
-    };
-    let mut buf_offsets: Vec<u64> = Vec::new();
-    let mut buf_lens: Vec<u32> = Vec::new();
-    let mut launch_error: Option<anyhow::Error> = None;
-
-    std::thread::scope(|scope| {
-        let chunks = &chunks;
-        let next_chunk = &next_chunk;
-        let worker_error = &worker_error;
-        for _ in 0..num_threads {
-            let tx = tx.clone();
-            scope.spawn(move || {
-                loop {
-                    let i = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks.get(i) else { break };
-                    let mut offsets: Vec<u64> = Vec::new();
-                    let mut lens: Vec<u32> = Vec::new();
-                    for sub in msd_prefix_filter::get_valid_ranges_recursive(
-                        *chunk,
-                        base,
-                        0,
-                        msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH,
-                        floor,
-                        msd_prefix_filter::MSD_RECURSIVE_SUBDIVISION_FACTOR,
-                    ) {
-                        let offset = u64::try_from(sub.start() - range.start());
-                        let len = u32::try_from(sub.size());
-                        if let (Ok(offset), Ok(len)) = (offset, len) {
-                            offsets.push(offset);
-                            lens.push(len);
-                        } else {
-                            *worker_error.lock().unwrap() = Some(anyhow::anyhow!(
-                                "valid range doesn't fit descriptor: start {} size {}",
-                                sub.start(),
-                                sub.size()
-                            ));
-                            return;
-                        }
-                    }
-                    if !offsets.is_empty() {
-                        // The receiver may be gone if a launch failed; the
-                        // remaining chunks are then discarded.
-                        let _ = tx.send((offsets, lens));
-                    }
-                }
-            });
-        }
-        // The consumer runs on this thread while the workers produce. The
-        // clone of `tx` held by each worker keeps the channel open; dropping
-        // ours lets `recv` disconnect once they all finish.
-        drop(tx);
-
-        while let Ok((offsets, lens)) = rx.recv() {
-            stats.num_ranges += offsets.len();
-            stats.valid_numbers += lens.iter().map(|&l| u64::from(l)).sum::<u64>();
-            buf_offsets.extend_from_slice(&offsets);
-            buf_lens.extend_from_slice(&lens);
-            if buf_offsets.len() >= LAUNCH_BATCH_RANGES {
-                if let Err(e) = launcher.launch(&buf_offsets, &buf_lens) {
-                    launch_error = Some(e);
-                    break;
-                }
-                stats.launches += 1;
-                buf_offsets.clear();
-                buf_lens.clear();
-            }
-        }
-        // Workers are done (or the launch failed); either way this marks the
-        // end of the CPU-side phase.
-        stats.msd_secs = start_time.elapsed().as_secs_f64();
-    });
-
-    if let Some(e) = launch_error {
-        return Err(e);
-    }
-    if let Some(e) = worker_error.into_inner().unwrap() {
-        return Err(e);
-    }
-    if !buf_offsets.is_empty() {
-        launcher.launch(&buf_offsets, &buf_lens)?;
-        stats.launches += 1;
-    }
-
+    let mut launcher = NiceonlyLauncher::new(ctx, &plan, range)?;
+    let stats = run_range_pipeline(&mut launcher, range, base)?;
     let nice_numbers = launcher.finish()?;
-    stats.total_secs = start_time.elapsed().as_secs_f64();
     debug!(
         "GPU niceonly pipeline: {} ranges in {} launches, M={}, R={}, found {}",
         stats.num_ranges,
@@ -705,13 +340,18 @@ fn run_niceonly_pipeline(
         plan.num_residues,
         nice_numbers.len()
     );
-    Ok((nice_numbers, stats))
+    report_field("GPU", base, range, &stats);
+
+    Ok(FieldResults {
+        distribution: Vec::new(),
+        nice_numbers,
+    })
 }
 
 /// Holds the per-field output buffers and issues asynchronous niceonly
 /// kernel launches over batches of range descriptors.
 struct NiceonlyLauncher<'a> {
-    ctx: &'a GpuContext,
+    ctx: &'a CudaContext,
     plan: &'a NiceonlyPlan,
     field_start_lo: u64,
     field_start_hi: u64,
@@ -720,7 +360,7 @@ struct NiceonlyLauncher<'a> {
 }
 
 impl<'a> NiceonlyLauncher<'a> {
-    fn new(ctx: &'a GpuContext, plan: &'a NiceonlyPlan, range: &FieldSize) -> Result<Self> {
+    fn new(ctx: &'a CudaContext, plan: &'a NiceonlyPlan, range: &FieldSize) -> Result<Self> {
         let (field_start_lo, field_start_hi) = split_u128(range.start());
         Ok(NiceonlyLauncher {
             ctx,
@@ -732,9 +372,34 @@ impl<'a> NiceonlyLauncher<'a> {
         })
     }
 
+    /// Synchronize and collect the found nice numbers.
+    fn finish(self) -> Result<Vec<NiceNumberSimple>> {
+        let nice_count = self.ctx.stream.clone_dtoh(&self.d_nice_count)?[0] as usize;
+        if nice_count > NICE_OUT_CAPACITY {
+            bail!(
+                "niceonly output buffer overflow: {nice_count} > {NICE_OUT_CAPACITY} \
+                 (this strongly suggests a kernel bug)"
+            );
+        }
+        let mut nice_numbers = Vec::with_capacity(nice_count);
+        if nice_count > 0 {
+            let out = self.ctx.stream.clone_dtoh(&self.d_nice_out)?;
+            for i in 0..nice_count {
+                nice_numbers.push(NiceNumberSimple {
+                    number: combine_u64(out[2 * i], out[2 * i + 1]),
+                    num_uniques: self.plan.base,
+                });
+            }
+            nice_numbers.sort_by_key(|n| n.number);
+        }
+        Ok(nice_numbers)
+    }
+}
+
+impl RangeSink for NiceonlyLauncher<'_> {
     /// Upload a batch of range descriptors and launch the kernel on them.
     /// Launches are asynchronous on the stream; results accumulate in the
-    /// shared output buffers until [`Self::finish`].
+    /// shared output buffers until [`NiceonlyLauncher::finish`].
     fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()> {
         let nice_capacity = NICE_OUT_CAPACITY as u32;
         for (batch_offsets, batch_lens) in offsets
@@ -771,27 +436,11 @@ impl<'a> NiceonlyLauncher<'a> {
         Ok(())
     }
 
-    /// Synchronize and collect the found nice numbers.
-    fn finish(self) -> Result<Vec<NiceNumberSimple>> {
-        let nice_count = self.ctx.stream.clone_dtoh(&self.d_nice_count)?[0] as usize;
-        if nice_count > NICE_OUT_CAPACITY {
-            bail!(
-                "niceonly output buffer overflow: {nice_count} > {NICE_OUT_CAPACITY} \
-                 (this strongly suggests a kernel bug)"
-            );
-        }
-        let mut nice_numbers = Vec::with_capacity(nice_count);
-        if nice_count > 0 {
-            let out = self.ctx.stream.clone_dtoh(&self.d_nice_out)?;
-            for i in 0..nice_count {
-                nice_numbers.push(NiceNumberSimple {
-                    number: combine_u64(out[2 * i], out[2 * i + 1]),
-                    num_uniques: self.plan.base,
-                });
-            }
-            nice_numbers.sort_by_key(|n| n.number);
-        }
-        Ok(nice_numbers)
+    /// Launches are asynchronous, so the pipeline's `total_secs` would
+    /// otherwise stop before the device had done the work.
+    fn sync(&mut self) -> Result<()> {
+        self.ctx.stream.synchronize()?;
+        Ok(())
     }
 }
 
@@ -809,8 +458,8 @@ impl<'a> NiceonlyLauncher<'a> {
 ///
 /// # Errors
 /// Returns an error on any CUDA failure or if the near-miss buffer overflows.
-pub fn process_range_detailed_gpu(
-    ctx: &GpuContext,
+pub fn process_range_detailed_cuda(
+    ctx: &CudaContext,
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
@@ -829,7 +478,7 @@ pub fn process_range_detailed_gpu(
     let mut d_miss_count = ctx.stream.alloc_zeros::<u32>(1)?;
     let miss_capacity = NEAR_MISS_CAPACITY as u32;
 
-    for batch in range.chunks(GPU_BATCH_SIZE as u128) {
+    for batch in range.chunks(CUDA_BATCH_SIZE as u128) {
         let (start_lo, start_hi) = split_u128(batch.start());
         let count = batch.size() as u64;
 
@@ -904,12 +553,12 @@ pub fn process_range_detailed_gpu(
 ///
 /// # Errors
 /// Returns an error on any CUDA failure.
-pub fn process_detailed_gpu(
-    ctx: &GpuContext,
+pub fn process_detailed_cuda(
+    ctx: &CudaContext,
     claim_data: &DataToClient,
     username: &String,
 ) -> Result<DataToServer> {
-    let results = process_range_detailed_gpu(ctx, &claim_data.into(), claim_data.base)?;
+    let results = process_range_detailed_cuda(ctx, &claim_data.into(), claim_data.base)?;
 
     Ok(DataToServer {
         claim_id: claim_data.claim_id,
@@ -925,12 +574,12 @@ pub fn process_detailed_gpu(
 ///
 /// # Errors
 /// Returns an error on any CUDA failure.
-pub fn process_niceonly_gpu(
-    ctx: &GpuContext,
+pub fn process_niceonly_cuda(
+    ctx: &CudaContext,
     claim_data: &DataToClient,
     username: &String,
 ) -> Result<DataToServer> {
-    let results = process_range_niceonly_gpu(ctx, &claim_data.into(), claim_data.base)?;
+    let results = process_range_niceonly_cuda(ctx, &claim_data.into(), claim_data.base)?;
 
     Ok(DataToServer {
         claim_id: claim_data.claim_id,
@@ -961,6 +610,7 @@ pub fn process_niceonly_gpu(
 )]
 mod tests {
     use super::*;
+    use crate::gpu_config::PrefilterParams;
     use crate::client_process;
     use crate::stride_filter::StrideTable;
 
@@ -968,8 +618,8 @@ mod tests {
     /// u128-range, two-mask (>64), and beyond-U256 (>68) regimes.
     const MIRROR_TEST_BASES: [u32; 8] = [10, 40, 45, 57, 62, 68, 70, 94];
 
-    fn try_init_gpu() -> Option<GpuContext> {
-        GpuContext::new(0).ok()
+    fn try_init_cuda() -> Option<CudaContext> {
+        CudaContext::new(0).ok()
     }
 
     // ------------------------------------------------------------------
@@ -1371,19 +1021,6 @@ mod tests {
         }
     }
 
-    #[test_log::test]
-    fn chunk_constants_are_maximal() {
-        for base in 2..=MAX_GPU_DIGIT_MASK_BASE {
-            let (e, div) = chunk_constants(base);
-            assert!(e >= 1);
-            assert_eq!(u64::from(div), u64::from(base).pow(e));
-            assert!(u64::from(div) < (1 << 31), "base {base}: div too large");
-            assert!(
-                u64::from(div) * u64::from(base) >= (1 << 31),
-                "base {base}: e not maximal"
-            );
-        }
-    }
 
     #[test_log::test]
     fn mirror_digit_extraction_matches_cpu() {
@@ -1459,7 +1096,7 @@ mod tests {
     #[test_log::test]
     #[ignore = "requires GPU"]
     fn gpu_kernels_compile_for_all_supported_bases() {
-        let Some(ctx) = try_init_gpu() else {
+        let Some(ctx) = try_init_cuda() else {
             println!("GPU not available, skipping test");
             return;
         };
@@ -1479,7 +1116,7 @@ mod tests {
     #[test_log::test]
     #[ignore = "requires GPU"]
     fn gpu_matches_cpu_detailed_small() {
-        let Some(ctx) = try_init_gpu() else {
+        let Some(ctx) = try_init_cuda() else {
             println!("GPU not available, skipping test");
             return;
         };
@@ -1490,7 +1127,7 @@ mod tests {
         ] {
             let range = FieldSize::new(start, start + size);
             let cpu = process_range_detailed(&range, base);
-            let gpu = process_range_detailed_gpu(&ctx, &range, base).expect("GPU failed");
+            let gpu = process_range_detailed_cuda(&ctx, &range, base).expect("GPU failed");
 
             assert_eq!(
                 cpu.distribution, gpu.distribution,
@@ -1506,7 +1143,7 @@ mod tests {
     #[test_log::test]
     #[ignore = "requires GPU"]
     fn gpu_matches_cpu_niceonly() {
-        let Some(ctx) = try_init_gpu() else {
+        let Some(ctx) = try_init_cuda() else {
             println!("GPU not available, skipping test");
             return;
         };
@@ -1524,7 +1161,7 @@ mod tests {
 
             let stride_table = StrideTable::new(base, GPU_LSD_K);
             let cpu = process_range_niceonly(&range, base, &stride_table);
-            let gpu = process_range_niceonly_gpu(&ctx, &range, base).expect("GPU failed");
+            let gpu = process_range_niceonly_cuda(&ctx, &range, base).expect("GPU failed");
 
             let mut cpu_nice = cpu.nice_numbers;
             cpu_nice.sort_by_key(|n| n.number);

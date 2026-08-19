@@ -1,0 +1,72 @@
+# Device parity tests for the GPU backends, on the devices hosted runners have.
+#
+# CI coverage by backend:
+#   vulkan (hand-WGSL)   — lavapipe (Mesa software Vulkan) on Linux, and
+#                          MoltenVK on the macOS arm64 runner
+#   cubecl (wgpu)        — lavapipe via wgpu-Vulkan on Linux, and Metal on the
+#                          macOS arm64 runner (Apple paravirtualized GPU)
+#   cuda (hand-CUDA)     — NOT CI-testable: needs NVIDIA silicon. NVRTC
+#                          compile-tests of every base's kernel do run in the
+#                          normal suite when libnvrtc is present (see README
+#                          "GPU development"); result parity is validated
+#                          manually on real hardware.
+#   cubecl-cuda          — NOT CI-testable: needs NVIDIA silicon, same as cuda.
+name: GPU Device Parity
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+
+concurrency:
+    group: gpu-parity-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    lavapipe:
+        name: vulkan + cubecl on lavapipe (Linux)
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Install lavapipe
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 vulkan-tools
+
+            - name: Run device parity tests
+              # Point the loader at lavapipe explicitly so a future runner
+              # image with a real ICD cannot change what this job tests.
+              # (Ubuntu ships the ICD as `lvp_icd.json`, upstream Mesa as
+              # `lvp_icd.<arch>.json` — glob both, and fail loudly if neither
+              # exists rather than exporting an empty loader list.)
+              run: |
+                  export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)"
+                  test -n "$VK_ICD_FILENAMES" || { echo "no lavapipe ICD found"; exit 1; }
+                  vulkaninfo --summary | grep -A3 deviceName || true
+                  cargo test --release --features vulkan,cubecl -p nice_common -- --ignored --nocapture
+
+    metal:
+        name: vulkan (MoltenVK) + cubecl (Metal) on macOS
+        runs-on: macos-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Install MoltenVK
+              run: brew install --quiet molten-vk vulkan-loader
+
+            - name: Run device parity tests
+              # cubecl goes through wgpu -> Metal on the runner's
+              # paravirtualized Apple GPU; the hand-WGSL backend goes through
+              # the Vulkan loader -> MoltenVK -> Metal (it opts into
+              # VK_KHR_portability_enumeration at runtime).
+              run: |
+                  export VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+                  export DYLD_LIBRARY_PATH=/opt/homebrew/lib
+                  cargo test --release --features vulkan,cubecl -p nice_common -- --ignored --nocapture

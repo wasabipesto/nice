@@ -68,6 +68,9 @@ test:
     cargo clippy -p "*"
     cargo build -p "*"
     cargo build -p "*" --features nice_client/gpu
+    cargo build -p "*" --features nice_client/vulkan
+    # One binary carrying both backends; neither library is needed to build.
+    cargo build -p "*" --features nice_client/gpu,nice_client/vulkan
     # cargo build -p "*" -r
     # just wasm-build
     RUST_LOG="trace" cargo test -p "*" --no-fail-fast

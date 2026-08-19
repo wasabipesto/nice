@@ -246,7 +246,7 @@ pub async fn run_benchmark_sweep(cli: &Arc<Cli>, gpu: &GpuCtx, client: &Client) 
 
     let ping_after = ping_samples(client, &cli.api_base, 5).await;
 
-    let hardware = collect_hardware(cli);
+    let hardware = collect_hardware(cli, gpu);
     let environment = collect_environment();
     let score = compute_score(&results, cli.gpu);
 
@@ -584,10 +584,10 @@ fn build_report_json(
 
 /// The constant part of a submission telemetry payload: hardware, scheduler
 /// environment, and client configuration. Collected once per process.
-pub fn telemetry_base(cli: &Cli) -> Value {
+pub fn telemetry_base(cli: &Cli, gpu: &GpuCtx) -> Value {
     json!({
         "schema_version": TELEMETRY_SCHEMA_VERSION,
-        "hardware": collect_hardware(cli),
+        "hardware": collect_hardware(cli, gpu),
         "environment": collect_environment(),
         "config": {
             "gpu": cli.gpu,
@@ -663,7 +663,7 @@ async fn upload_report(client: &Client, cli: &Cli, report: &Value) {
 
 /// Collect hardware info. Linux-oriented (`/proc`), with graceful absence
 /// elsewhere; every field is optional downstream.
-fn collect_hardware(cli: &Cli) -> Value {
+fn collect_hardware(cli: &Cli, gpu: &GpuCtx) -> Value {
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
@@ -675,7 +675,8 @@ fn collect_hardware(cli: &Cli) -> Value {
         "arch": std::env::consts::ARCH,
         "os": std::env::consts::OS,
         "os_pretty": parse_os_pretty(&os_release),
-        "gpu_model": gpu_name(cli),
+        "gpu_model": gpu_name(cli, gpu),
+        "gpu_backend": gpu_backend(cli, gpu),
     })
 }
 
@@ -715,19 +716,24 @@ fn parse_os_pretty(os_release: &str) -> Option<String> {
         .map(|l| l["PRETTY_NAME=".len()..].trim_matches('"').to_string())
 }
 
-#[cfg(feature = "gpu")]
-fn gpu_name(cli: &Cli) -> Option<String> {
+/// The active GPU's model name, from the initialized backend rather than from
+/// the CLI flags — see `GpuHandle::device_name`. `None` on a CPU run, and on a
+/// GPU run only if the backend cannot name its device.
+fn gpu_name(cli: &Cli, gpu: &GpuCtx) -> Option<String> {
     if !cli.gpu {
         return None;
     }
-    cudarc::driver::CudaContext::new(cli.gpu_device)
-        .ok()
-        .and_then(|d| d.name().ok())
+    gpu.as_ref()
+        .and_then(|handle| handle.device_name(cli.gpu_device))
 }
 
-#[cfg(not(feature = "gpu"))]
-fn gpu_name(_cli: &Cli) -> Option<String> {
-    None
+/// The backend processing fields, as its `--gpu-backend` value — from the
+/// live handle, since `auto` decides at init which compiled backend wins.
+fn gpu_backend(cli: &Cli, gpu: &GpuCtx) -> Option<&'static str> {
+    if !cli.gpu {
+        return None;
+    }
+    gpu.as_ref().and_then(|handle| handle.backend_name())
 }
 
 /// Scheduler/instance identifiers from the environment allowlist, for
