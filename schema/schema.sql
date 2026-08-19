@@ -122,6 +122,16 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_submissions_field_id ON submissions 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_submissions_claim_id ON submissions (claim_id);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_base_range ON chunks(base_id, range_start, range_end);
 
+-- JOB STATE: watermark for incremental scheduled jobs
+CREATE TABLE IF NOT EXISTS job_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_processed_submission_id BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO job_state (id, last_processed_submission_id)
+SELECT 1, COALESCE(MAX(id), 0) FROM submissions
+ON CONFLICT (id) DO NOTHING;
+
 -- CACHE: Daily search totals per user/mode
 CREATE TABLE IF NOT EXISTS cache_search_rate_daily (
     date DATE NOT NULL,

@@ -23,6 +23,7 @@ pub mod chunks;
 pub mod claims;
 pub mod conversions;
 pub mod fields;
+pub mod job_state;
 pub mod submissions;
 
 /// A Diesel Postgres connection pool type.
