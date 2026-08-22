@@ -410,6 +410,85 @@ class MultiModeTests(unittest.TestCase):
         self.assertEqual(modes_used, {"niceonly", "detailed"})
 
 
+class InsufficientCreditTests(unittest.TestCase):
+    """An empty account is account-level: the first create that fails on it
+    aborts the whole buy phase instead of grinding through every offer."""
+
+    class _Resp:
+        text = '{"success": false, "error": "insufficient_credit", "msg": "Your account lacks credit; see the billing page."}'
+
+    class _HttpBoom(Exception):
+        def __init__(self, text):
+            super().__init__("402 Client Error")
+            self.response = type("R", (), {"text": text})()
+
+    def _stub_client(self, text):
+        test = self
+
+        class Stub:
+            def create_instance(self, **kw):
+                raise test._HttpBoom(text)
+
+        return Stub()
+
+    def test_create_raises_on_empty_account(self):
+        db = memory_db()
+        orig = controller.vast_client
+        controller.vast_client = lambda cfg: self._stub_client(self._Resp.text)
+        try:
+            with self.assertRaises(controller.InsufficientCredit):
+                controller.create_instance(
+                    cfg(dry_run=False), db,
+                    {"id": 1, "gpu_name": "RTX A4000", "cpu_name": "EPYC"},
+                    "exploit", 0.05, 1.0, 1.0e12, False, False, mode="niceonly",
+                )
+        finally:
+            controller.vast_client = orig
+
+    def test_stale_offer_failure_still_just_skips(self):
+        db = memory_db()
+        orig = controller.vast_client
+        controller.vast_client = lambda cfg: self._stub_client(
+            '{"success": false, "error": "no_such_ask", "msg": "Instance type 1 is no longer available."}'
+        )
+        try:  # per-offer failures stay per-offer: log and move on, no raise
+            controller.create_instance(
+                cfg(dry_run=False), db,
+                {"id": 1, "gpu_name": "RTX A4000", "cpu_name": "EPYC"},
+                "exploit", 0.05, 1.0, 1.0e12, False, False, mode="niceonly",
+            )
+        finally:
+            controller.vast_client = orig
+
+    def test_buy_phase_stops_at_first_credit_failure(self):
+        db = memory_db()
+        now = time.time()
+        c = cfg(exploit_modes={"niceonly": {}, "detailed": {}}, dry_run=False)
+        for m in ("niceonly", "detailed"):
+            db.execute(
+                "INSERT INTO buckets (mode, balance, updated_at) VALUES (?, 9.0, ?)", (m, now)
+            )
+        est = {"prediction_stage": "exact", "confidence": 85, "blended_rate_p25": 5.0e10}
+        offers = [({"id": i, "min_bid": 0.05, "gpu_name": "RTX A4000",
+                    "cpu_name": "EPYC"}, est, 1.0e12 * (10 - i)) for i in range(3)]
+        by_mode = {"niceonly": list(offers), "detailed": list(offers)}
+        attempts = []
+        orig = controller.create_instance
+
+        def broke(cfg_, db_, offer, *a, **kw):
+            attempts.append(offer["id"])
+            raise controller.InsufficientCredit("insufficient_credit")
+
+        controller.create_instance = broke
+        try:
+            with self.assertRaises(controller.InsufficientCredit):
+                controller.plan_exploit(c, db, by_mode, dry=False)
+        finally:
+            controller.create_instance = orig
+        # One attempt total — not one per offer, not one per mode.
+        self.assertEqual(len(attempts), 1)
+
+
 class OnstartTemplateTests(unittest.TestCase):
     def test_explore_benchmarks_all_four_configs(self):
         # create_instance formats with these kwargs; the explore template no

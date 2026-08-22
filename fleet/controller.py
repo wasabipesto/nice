@@ -501,6 +501,13 @@ class VastError(Exception):
     """A Vast operation failed; the message carries the full response."""
 
 
+class InsufficientCredit(Exception):
+    """The account is out of credit. This is account-level, not per-offer:
+    once one create fails on it, every later create this tick fails the same
+    way (an empty account once burned 72 straight ticks x ~17 offers of
+    futile creates), so the buy phase aborts for the tick."""
+
+
 def search_offers(cfg):
     return vast_client(cfg).search_offers(
         query=cfg["offer_query"], type=cfg["offer_type"], limit=200
@@ -603,6 +610,8 @@ def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry, mo
             db, "ERROR",
             f"create failed for offer {offer['id']}: {e!r} {body[:200]}",
         )
+        if "insufficient_credit" in body:
+            raise InsufficientCredit(body[:200])
         return
     if not isinstance(result, dict) or not result.get("success"):
         log_event(db, "ERROR", f"create rejected for offer {offer['id']}: {result!r}")
@@ -1056,8 +1065,15 @@ def tick(cfg):
         log_event(db, "MARKET", f"[{m}] {len(by_mode[m])} offers; {confidence_spread(by_mode[m], cfg)}")
 
     # 5. Explore (all modes at once), then exploit (per mode).
-    plan_explore(cfg, db, by_mode, dry)
-    plan_exploit(cfg, db, by_mode, dry)
+    try:
+        plan_explore(cfg, db, by_mode, dry)
+        plan_exploit(cfg, db, by_mode, dry)
+    except InsufficientCredit:
+        # Commit first: creates that succeeded earlier this tick are already
+        # on Vast, and an uncommitted ledger row would get them reaped as
+        # orphans next tick.
+        db.commit()
+        log_event(db, "CREDIT", "account out of credit; buys aborted for this tick")
 
     # Tick summary.
     active = db.execute(
