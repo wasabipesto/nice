@@ -40,6 +40,11 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const url = `http://127.0.0.1:${server.address().port}/`;
 console.log(`serving ${root} at ${url}`);
 
+// --enable-unsafe-webgpu is load-bearing, not belt-and-braces: measured on
+// Linux Chromium, plain defaults and --enable-features=Vulkan alone both
+// expose navigator.gpu while returning null from every requestAdapter call,
+// including forceFallbackAdapter. The swiftshader override then pins the
+// software adapter so the run does not depend on host GPU drivers.
 const browser = await chromium.launch({
     headless: true,
     args: [
