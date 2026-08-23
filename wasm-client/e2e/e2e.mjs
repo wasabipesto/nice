@@ -40,11 +40,13 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const url = `http://127.0.0.1:${server.address().port}/`;
 console.log(`serving ${root} at ${url}`);
 
-// --enable-unsafe-webgpu is load-bearing, not belt-and-braces: measured on
-// Linux Chromium, plain defaults and --enable-features=Vulkan alone both
-// expose navigator.gpu while returning null from every requestAdapter call,
-// including forceFallbackAdapter. The swiftshader override then pins the
-// software adapter so the run does not depend on host GPU drivers.
+// These flags are for *this harness's* environment and say nothing about
+// what real users need. Headless Chromium in a container brings up no GPU
+// by default: measured here, plain defaults and --enable-features=Vulkan
+// both expose navigator.gpu while every requestAdapter returns null, and
+// --enable-unsafe-webgpu is what makes an adapter appear. The swiftshader
+// override then pins the software adapter so the run never depends on host
+// GPU drivers.
 const browser = await chromium.launch({
     headless: true,
     args: [

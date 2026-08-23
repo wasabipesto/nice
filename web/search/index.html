@@ -922,7 +922,7 @@
                     return {
                         ok: false,
                         why: window.isSecureContext
-                            ? "This browser exposes no WebGPU. Chrome/Edge 113+ and Safari 18+ have it on by default; Firefox-family browsers on Linux still need dom.webgpu.enabled (and dom.webgpu.workers.enabled, if present) set in about:config."
+                            ? "This browser does not expose WebGPU. Chrome and Edge 113+ and Safari 18+ support it; Firefox has not enabled it on every platform yet."
                             : "WebGPU needs a secure context — open this page over HTTPS (or localhost) to enable the GPU option.",
                     };
                 }
@@ -948,7 +948,7 @@
                 if (!adapter) {
                     return {
                         ok: false,
-                        why: "This browser has WebGPU but offered no adapter. On Chrome/Chromium this is usually the GPU being blocklisted or WebGPU being gated: check chrome://gpu, and try enabling chrome://flags/#enable-unsafe-webgpu (equivalently, launch with --enable-unsafe-webgpu), which is what unblocks it on many Linux builds.",
+                        why: "This browser has WebGPU but offered no adapter, usually because graphics acceleration is off or the GPU is not usable by the browser. Chrome and Chromium explain the reason on chrome://gpu.",
                     };
                 }
                 const info = adapter.info ?? {};
