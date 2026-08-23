@@ -946,9 +946,24 @@
                     };
                 }
                 if (!adapter) {
+                    // A machine can have working WebGPU and still refuse a
+                    // standard adapter: Chrome hands out compatibility-mode
+                    // adapters only when a page asks for them by name, and
+                    // the engine behind this client cannot drive one yet.
+                    // Distinguish that from having no GPU at all.
+                    let compat = null;
+                    try {
+                        compat = await navigator.gpu.requestAdapter({
+                            featureLevel: "compatibility",
+                        });
+                    } catch {
+                        compat = null;
+                    }
                     return {
                         ok: false,
-                        why: "This browser has WebGPU but offered no adapter, usually because graphics acceleration is off or the GPU is not usable by the browser. Chrome and Chromium explain the reason on chrome://gpu.",
+                        why: compat
+                            ? "This browser only offers a WebGPU compatibility-mode adapter, which this client cannot use yet."
+                            : "This browser has WebGPU but offered no adapter, usually because graphics acceleration is off or the GPU is not usable by the browser. Chrome and Chromium explain the reason on chrome://gpu.",
                     };
                 }
                 const info = adapter.info ?? {};
