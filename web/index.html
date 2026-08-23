@@ -22,13 +22,21 @@
                 height: 0.75em;
                 width: 0.75em;
             }
-            /* Reserve roughly the height each chart will occupy so the page
-               doesn't jump around as charts arrive one at a time. */
-            .chart-slot {
-                min-height: 300px;
+            /* Reserve the shape each chart will take so the column doesn't
+               jump as charts arrive one at a time. Plot's SVG scales to the
+               column width, so the reservation has to be a ratio rather than a
+               fixed height. It sits on the placeholder rather than the slot so
+               that it can never constrain the chart that replaces it. */
+            .chart-placeholder {
+                display: flex;
+                align-items: center;
+                aspect-ratio: 3 / 1;
             }
-            .chart-slot-sm {
-                min-height: 250px;
+            .chart-placeholder.is-tall {
+                aspect-ratio: 9 / 4;
+            }
+            .chart-placeholder.is-short {
+                aspect-ratio: 18 / 5;
             }
         </style>
 
@@ -195,11 +203,13 @@
                                 Notably Nice Numbers
                             </h1>
                             <p>Which numbers are closest to being 100% nice?</p>
-                            <div id="numbers" class="chart-slot">
-                                <progress
-                                    class="progress is-small is-primary"
-                                    max="100"
-                                ></progress>
+                            <div id="numbers">
+                                <div class="chart-placeholder">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
                             </div>
                         </div>
                         <div class="box content">
@@ -208,11 +218,13 @@
                                 On average, how nice is each chunk we've
                                 searched?
                             </p>
-                            <div id="niceness" class="chart-slot">
-                                <progress
-                                    class="progress is-small is-primary"
-                                    max="100"
-                                ></progress>
+                            <div id="niceness">
+                                <div class="chart-placeholder">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
                             </div>
                         </div>
                         <div class="box content">
@@ -224,29 +236,35 @@
                                 quintillions of numbers and take many months of
                                 CPU time.
                             </p>
-                            <div id="completion" class="chart-slot">
-                                <progress
-                                    class="progress is-small is-primary"
-                                    max="100"
-                                ></progress>
+                            <div id="completion">
+                                <div class="chart-placeholder is-tall">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
                             </div>
                         </div>
                         <div class="box content">
                             <h1 class="title is-4 mb-1">Search Rate</h1>
                             <p>How much progress have we made recently?</p>
                             <h3 class="title is-5 mb-1">Detailed</h3>
-                            <div id="rate-detailed" class="chart-slot">
-                                <progress
-                                    class="progress is-small is-primary"
-                                    max="100"
-                                ></progress>
+                            <div id="rate-detailed">
+                                <div class="chart-placeholder">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
                             </div>
                             <h3 class="title is-5 mb-1">Nice Only</h3>
-                            <div id="rate-niceonly" class="chart-slot">
-                                <progress
-                                    class="progress is-small is-primary"
-                                    max="100"
-                                ></progress>
+                            <div id="rate-niceonly">
+                                <div class="chart-placeholder">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
                             </div>
                         </div>
                         <div class="box content">
@@ -255,24 +273,22 @@
                                 Total range searched all time, by contributor.
                             </p>
                             <h3 class="title is-5 mb-1">Detailed</h3>
-                            <div
-                                id="leaderboard-detailed"
-                                class="chart-slot-sm"
-                            >
-                                <progress
-                                    class="progress is-small is-primary"
-                                    max="100"
-                                ></progress>
+                            <div id="leaderboard-detailed">
+                                <div class="chart-placeholder is-short">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
                             </div>
                             <h3 class="title is-5 mb-1">Nice Only</h3>
-                            <div
-                                id="leaderboard-niceonly"
-                                class="chart-slot-sm"
-                            >
-                                <progress
-                                    class="progress is-small is-primary"
-                                    max="100"
-                                ></progress>
+                            <div id="leaderboard-niceonly">
+                                <div class="chart-placeholder is-short">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
                             </div>
                         </div>
                     </div>
