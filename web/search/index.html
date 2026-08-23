@@ -913,25 +913,83 @@
                 });
             }
 
+            // Ask the browser directly before involving wasm. Three
+            // distinguishable failures hide behind "no GPU", and each wants a
+            // different message; going through wasm first turns all of them
+            // into one opaque panic inside CubeCL's adapter request.
+            async function probeWebGpu() {
+                if (!navigator.gpu) {
+                    return {
+                        ok: false,
+                        why: window.isSecureContext
+                            ? "This browser does not support WebGPU. Chrome 113+, Edge 113+, Safari 18+ or Firefox 141+ (on supported platforms) can use the GPU option."
+                            : "WebGPU needs a secure context — open this page over HTTPS (or localhost) to enable the GPU option.",
+                    };
+                }
+                // Fallback adapters are allowed as a last resort: a software
+                // adapter is still much faster than nothing on a weak CPU,
+                // and the kernel is identical either way.
+                let adapter = null;
+                try {
+                    adapter =
+                        (await navigator.gpu.requestAdapter({
+                            powerPreference: "high-performance",
+                        })) ??
+                        (await navigator.gpu.requestAdapter()) ??
+                        (await navigator.gpu.requestAdapter({
+                            forceFallbackAdapter: true,
+                        }));
+                } catch (error) {
+                    return {
+                        ok: false,
+                        why: `WebGPU adapter request failed: ${error}`,
+                    };
+                }
+                if (!adapter) {
+                    return {
+                        ok: false,
+                        why: "This browser has WebGPU but offered no adapter — usually a blocklisted or missing GPU driver. Chrome users can check chrome://gpu for the reason.",
+                    };
+                }
+                const info = adapter.info ?? {};
+                const described = [info.vendor, info.architecture, info.device]
+                    .filter(Boolean)
+                    .join(" ");
+                return {
+                    ok: true,
+                    name: described || info.description || "WebGPU device",
+                };
+            }
+
             async function detectGpu() {
                 const help = document.getElementById("backendHelp");
-                const gpu = await initGpuWorker();
-                if (gpu) {
-                    gpuWorker = gpu.worker;
-                    gpuAdapterName = gpu.adapterName;
-                    const select =
-                        document.getElementById("backendSelect");
-                    const option = document.createElement("option");
-                    option.value = "gpu";
-                    option.textContent = `GPU — ${gpuAdapterName}`;
-                    select.appendChild(option);
-                    help.textContent =
-                        "WebGPU available; the GPU runs whole fields while the CPU option uses the thread pool.";
-                    gpuWorker.onmessage = handleGpuWorkerMessage;
-                } else {
-                    help.textContent =
-                        "No WebGPU on this browser; using the CPU thread pool.";
+                const probe = await probeWebGpu();
+                if (!probe.ok) {
+                    help.textContent = `${probe.why} Using the CPU thread pool.`;
+                    return;
                 }
+
+                help.textContent = `Starting ${probe.name}...`;
+                const gpu = await initGpuWorker();
+                if (!gpu) {
+                    help.textContent = `WebGPU adapter found (${probe.name}) but the GPU worker failed to start; using the CPU thread pool. See the console for details.`;
+                    return;
+                }
+
+                gpuWorker = gpu.worker;
+                // Prefer the browser's adapter description: CubeCL reports an
+                // empty name on some adapters (software ones especially).
+                gpuAdapterName = gpu.adapterName?.trim()
+                    ? gpu.adapterName
+                    : probe.name;
+                const select = document.getElementById("backendSelect");
+                const option = document.createElement("option");
+                option.value = "gpu";
+                option.textContent = `GPU — ${gpuAdapterName}`;
+                select.appendChild(option);
+                help.textContent =
+                    "WebGPU available; the GPU runs whole fields while the CPU option uses the thread pool.";
+                gpuWorker.onmessage = handleGpuWorkerMessage;
             }
 
             function handleGpuWorkerMessage(e) {
