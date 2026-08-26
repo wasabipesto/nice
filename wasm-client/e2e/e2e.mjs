@@ -9,7 +9,7 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
-import { chromium } from "playwright";
+import { chromium, firefox } from "playwright";
 
 // Defaults to the repo's page; NICE_E2E_ROOT points it at a copy, which is
 // how the hardware runs work — the harness ships to a machine with a GPU
@@ -62,18 +62,37 @@ const hardware = process.argv.includes("--hw");
 // headless binary is chrome-headless-shell, which ships without GPU support
 // at all, so it reports no adapter on a perfectly good GPU. The full
 // Chromium in new-headless mode is what a user's browser actually is.
-const browser = await chromium.launch({
-    headless: true,
-    ...(hardware ? { channel: "chromium" } : {}),
-    args: hardware
-        ? []
-        : [
-              "--enable-unsafe-webgpu",
-              "--use-webgpu-adapter=swiftshader",
-              "--enable-features=Vulkan",
-          ],
-});
-console.log(hardware ? "mode: real hardware adapter" : "mode: pinned software adapter");
+//
+// `--firefox` runs the same page in Firefox instead. Firefox gates WebGPU
+// behind two prefs on Linux — the feature, and WebGPU inside workers, which
+// is where this client runs it — so both are set here. Neither is on by
+// default in a release channel yet, so this mode is for checking the stack
+// works there, not for CI.
+const useFirefox = process.argv.includes("--firefox");
+const browser = useFirefox
+    ? await firefox.launch({
+          headless: true,
+          firefoxUserPrefs: {
+              "dom.webgpu.enabled": true,
+              "dom.webgpu.workers.enabled": true,
+          },
+      })
+    : await chromium.launch({
+          headless: true,
+          ...(hardware ? { channel: "chromium" } : {}),
+          args: hardware
+              ? []
+              : [
+                    "--enable-unsafe-webgpu",
+                    "--use-webgpu-adapter=swiftshader",
+                    "--enable-features=Vulkan",
+                ],
+      });
+console.log(
+    `browser: ${useFirefox ? "firefox" : "chromium"}, adapter: ${
+        hardware || useFirefox ? "real" : "pinned software"
+    }`,
+);
 
 // Drive one full offline-benchmark run on the given backend and return the
 // page's final state (status text, processed count, histogram rows).

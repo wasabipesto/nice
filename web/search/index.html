@@ -963,7 +963,7 @@
                         ok: false,
                         why: compat
                             ? "This browser only offers a WebGPU compatibility-mode adapter, which this client cannot use yet."
-                            : "This browser has WebGPU but offered no adapter, usually because graphics acceleration is off or the GPU is not usable by the browser. Chrome and Chromium explain the reason on chrome://gpu.",
+                            : "This browser has WebGPU but offered no adapter, usually because graphics acceleration is off or the GPU is not usable by the browser. Chromium reports the reason on chrome://gpu, Firefox under Graphics on about:support.",
                     };
                 }
                 const info = adapter.info ?? {};
