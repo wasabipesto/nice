@@ -490,6 +490,184 @@ class InsufficientCreditTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
 
 
+class FinalIntervalTests(unittest.TestCase):
+    """The stretch between the last tick and death was never billed, so
+    instances that lived and died inside one tick recorded $0."""
+
+    def _live_instance(self, db, vast_id, bid, charged_ago_h, mode="niceonly", now=None):
+        now = now or time.time()
+        db.execute(
+            "INSERT INTO instances (vast_id, label, purpose, gpu_name, bid, created_at, "
+            "ttl_at, last_charged_at, mode) VALUES (?, 'x', 'exploit', 'RTX 3080', ?, ?, ?, ?, ?)",
+            (vast_id, bid, now - charged_ago_h * 3600, now + 3600,
+             now - charged_ago_h * 3600, mode))
+        db.execute("INSERT OR REPLACE INTO buckets (mode, balance, updated_at) VALUES (?, 5.0, ?)",
+                   (mode, now))
+        return db.execute("SELECT * FROM instances WHERE vast_id = ?", (vast_id,)).fetchone()
+
+    def test_charges_half_the_unbilled_interval(self):
+        db = memory_db()
+        now = time.time()
+        row = self._live_instance(db, 1, bid=0.10, charged_ago_h=0.5, now=now)
+        cost = controller.charge_final_interval(db, cfg(), row, now)
+        # 0.5h at $0.10/hr, halved for the unknown stop time.
+        self.assertAlmostEqual(cost, 0.025, places=4)
+        self.assertAlmostEqual(
+            db.execute("SELECT spend FROM instances WHERE vast_id=1").fetchone()[0],
+            0.025, places=4)
+        self.assertAlmostEqual(
+            db.execute("SELECT balance FROM buckets WHERE mode='niceonly'").fetchone()[0],
+            5.0 - 0.025, places=4)
+
+    def test_no_double_charge_when_already_current(self):
+        # A deliberate destroy of an instance seen alive this tick: reconcile
+        # already advanced last_charged_at, so there is nothing left to bill.
+        db = memory_db()
+        now = time.time()   # reconcile threads one `now` through the whole tick
+        row = self._live_instance(db, 2, bid=0.10, charged_ago_h=0.0, now=now)
+        self.assertEqual(controller.charge_final_interval(db, cfg(), row, now), 0.0)
+        self.assertEqual(
+            db.execute("SELECT spend FROM instances WHERE vast_id=2").fetchone()[0], 0.0)
+
+    def test_sub_tick_instance_is_no_longer_free(self):
+        # The 44% case: created and dead inside one tick, never observed running.
+        db = memory_db()
+        now = time.time()
+        row = self._live_instance(db, 3, bid=0.06, charged_ago_h=10.0 / 60.0, now=now)
+        cost = controller.charge_final_interval(db, cfg(), row, now)
+        self.assertGreater(cost, 0.0, "an instance that lived a whole tick must not be free")
+
+
+class EHoldStatisticTests(unittest.TestCase):
+    def test_uses_mean_not_median(self):
+        # Right-skewed holds: the long tail carries nearly all delivered work,
+        # and amortisation is a mean operation, so the median under-values it.
+        db = memory_db()
+        now = time.time()
+        holds = [0.4, 0.4, 0.5, 0.5, 20.0]      # median 0.5, mean 4.36
+        for i, h in enumerate(holds):
+            db.execute(
+                "INSERT INTO instances (vast_id, label, purpose, gpu_name, bid, created_at, "
+                "ttl_at, last_charged_at, destroyed_at, destroy_reason) "
+                "VALUES (?, 'x', 'exploit', 'RTX 3080', 0.05, ?, ?, ?, ?, 'preempted')",
+                (i, now - h * 3600, now, now, now))
+        self.assertAlmostEqual(e_hold_hours(db, cfg(), "RTX 3080"), 4.36, places=2)
+
+
+class CpuFamilyKeyTests(unittest.TestCase):
+    def test_bridges_vast_and_cpuinfo_strings(self):
+        # Vast's listing string and the client's /proc/cpuinfo string for the
+        # same chip must land on one key, or coverage is never detected.
+        for vast, cpuinfo in [
+            ("Xeon\u00ae E5-2680 v4", "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz"),
+            ("AMD EPYC 7763 64-Core Processor", "AMD EPYC 7763 64-Core Processor"),
+            ("Core\u2122 i7-6700", "Intel(R) Core(TM) i7-6700 CPU @ 3.40GHz"),
+        ]:
+            self.assertEqual(controller.cpu_family_key(vast),
+                             controller.cpu_family_key(cpuinfo),
+                             f"{vast!r} and {cpuinfo!r} are the same chip")
+
+    def test_distinct_chips_stay_distinct(self):
+        self.assertNotEqual(controller.cpu_family_key("Xeon E5-2680 v4"),
+                            controller.cpu_family_key("Xeon E5-2690 v3"))
+        self.assertNotEqual(controller.cpu_family_key("AMD EPYC 7763"),
+                            controller.cpu_family_key("AMD EPYC 7402"))
+
+    def test_missing_cpu_is_safe(self):
+        self.assertEqual(controller.cpu_family_key(None), "?")
+        self.assertEqual(controller.cpu_family_key(""), "?")
+
+
+class ExploreTargetingTests(unittest.TestCase):
+    """Explore should buy the coverage it lacks, not the cheapest thing on
+    the market. The old rule spent a third of the budget re-measuring two
+    already well-known cards."""
+
+    def _seed_corpus(self, db, rows):
+        """rows: (gpu_model, cpu_model, count) already normalized."""
+        i = 0
+        for gpu_model, cpu_model, n in rows:
+            for _ in range(n):
+                i += 1
+                db.execute(
+                    "INSERT INTO corpus (id, client_version, gpu, mode, threads, cpu_model, "
+                    "gpu_model, scenarios) VALUES (?, '3.3.0', 1, 'Nice-only', 8, ?, ?, '[]')",
+                    (i, cpu_model, gpu_model))
+        db.commit()
+
+    def _offers(self, specs):
+        return {"niceonly": [({"id": i, "gpu_name": g, "cpu_name": c, "min_bid": b}, {}, 1.0)
+                             for i, (g, c, b) in enumerate(specs)]}
+
+    def _run(self, db, c, by_mode):
+        created = []
+        orig = controller.create_instance
+        controller.create_instance = (
+            lambda cfg, db_, offer, purpose, bid, ttl, ev, pounce, dry, mode=None:
+            created.append(offer["gpu_name"]))
+        try:
+            controller.plan_explore(c, db, by_mode, dry=False)
+        finally:
+            controller.create_instance = orig
+        return created
+
+    def test_prefers_the_thinnest_cell_over_the_cheapest_offer(self):
+        db = memory_db()
+        now = time.time()
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                   (now,))
+        self._seed_corpus(db, [("rtx 3060", "amd epyc 7763", 20)])   # well covered
+        c = cfg(explore_per_tick=1, explore_target_samples=8)
+        # The 3060 is far cheaper, but we already have 20 reports for it.
+        created = self._run(db, c, self._offers([
+            ("RTX 3060", "AMD EPYC 7763 64-Core", 0.01),
+            ("RTX 4090", "AMD EPYC 7763 64-Core", 0.90),
+        ]))
+        self.assertEqual(created, ["RTX 4090"])
+
+    def test_skips_cells_that_are_already_deep_enough(self):
+        db = memory_db()
+        now = time.time()
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                   (now,))
+        self._seed_corpus(db, [("rtx 3060", "amd epyc 7763", 20)])
+        c = cfg(explore_per_tick=2, explore_target_samples=8)
+        created = self._run(db, c, self._offers([("RTX 3060", "AMD EPYC 7763 64-Core", 0.01)]))
+        self.assertEqual(created, [], "a covered cell is not worth paying to re-measure")
+
+    def test_one_buy_per_cell_per_tick(self):
+        # Many offers share a cell; buying several would waste the whole slot
+        # budget on one gap.
+        db = memory_db()
+        now = time.time()
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                   (now,))
+        c = cfg(explore_per_tick=3, explore_target_samples=8)
+        created = self._run(db, c, self._offers([
+            ("RTX 4090", "AMD EPYC 7763 64-Core Processor", 0.10),
+            # Same chip as above, as /proc/cpuinfo spells it: one cell, one buy.
+            ("NVIDIA GeForce RTX 4090", "AMD EPYC 7763 64-Core Processor", 0.11),
+            ("RTX 4080", "Intel(R) Xeon(R) Gold 6230", 0.12),
+        ]))
+        self.assertEqual(sorted(created), ["RTX 4080", "RTX 4090"])
+
+    def test_cooldown_is_by_cell_not_exact_pair(self):
+        # The old cooldown keyed on the raw (gpu, cpu) strings, so one popular
+        # GPU across many CPU models never cooled down.
+        db = memory_db()
+        now = time.time()
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                   (now,))
+        db.execute("INSERT INTO explored (gpu_name, cpu_name, explored_at) VALUES "
+                   "('RTX 3090', 'Xeon\u00ae E5-2680 v4', ?)", (now,))
+        c = cfg(explore_per_tick=2, explore_target_samples=8, explore_cooldown_days=14)
+        created = self._run(db, c, self._offers([
+            # Same GPU and chip, spelled the way the other source spells them.
+            ("NVIDIA GeForce RTX 3090", "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz", 0.05),
+        ]))
+        self.assertEqual(created, [], "the same chip under two spellings is one cell")
+
+
 class CorpusSyncTests(unittest.TestCase):
     """The corpus mirror: idempotent upsert, watermark advances past junk,
     a failed pull leaves what we already had."""

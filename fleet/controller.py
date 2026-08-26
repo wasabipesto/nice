@@ -13,8 +13,8 @@ One tick per cron invocation:
   2. accrue budget into the token bucket (sustained rate, capped)
   3. search bid offers and estimate each locally, against a corpus of
      benchmark reports mirrored from the API's database
-  4. explore slice: benchmark hardware the estimator can't price
-     (low confidence / cold-start stages), rate-limited and cooled down
+  4. explore slice: benchmark the hardware the estimator can't price yet,
+     ranked by how thin that GPU/CPU-family cell is, rate-limited and cooled
   5. exploit slice: rank offers by hold-amortized P25 EV, buy under the
      reserve rules; exceptional deals may dip into the reserve ("pounce")
      with a probe TTL until realized data confirms the estimate
@@ -155,8 +155,11 @@ DEFAULT_CONFIG = {
         "sleep infinity"
     ),
     # --- explore slice ---
-    "explore_confidence_threshold": 80,
-    "explore_stages": ["floor", "none", "gpu-family-scaled", "cpu-family-scaled"],
+    # A coverage cell (GPU model x CPU family) at or above this many benchmark
+    # reports is considered priceable and no longer worth exploring. Replaces
+    # the old confidence/stage thresholds: with the corpus local, depth is
+    # measurable directly rather than inferred from an estimate's self-report.
+    "explore_target_samples": 8,
     "explore_per_tick": 2,
     "explore_max_concurrent": 3,
     "explore_per_day": 10,
@@ -198,6 +201,8 @@ CREATE TABLE IF NOT EXISTS instances (
     destroy_reason TEXT,
     spend REAL NOT NULL DEFAULT 0,   -- charged to the bucket so far (estimate,
                                      -- trued-up to invoiced once billing posts)
+    ever_ran INTEGER NOT NULL DEFAULT 0,  -- seen `running` at least once, so a
+                                     -- $0 invoice is a fact, not an unsettled bill
     invoiced REAL,                   -- actual Vast charge (GPU+storage+net),
                                      -- NULL until the instance is invoiced
     mode TEXT                        -- exploit mode (which bucket it charges);
@@ -258,6 +263,8 @@ def open_db(path):
         db.execute("ALTER TABLE instances ADD COLUMN invoiced REAL")
     if "mode" not in icols:
         db.execute("ALTER TABLE instances ADD COLUMN mode TEXT")
+    if "ever_ran" not in icols:
+        db.execute("ALTER TABLE instances ADD COLUMN ever_ran INTEGER NOT NULL DEFAULT 0")
     ecols = {r["name"] for r in db.execute("PRAGMA table_info(ev_seen)").fetchall()}
     if "mode" not in ecols:
         db.execute("ALTER TABLE ev_seen ADD COLUMN mode TEXT")
@@ -458,16 +465,31 @@ def e_hold_hours(db, cfg, gpu_name):
     """Expected hold for a GPU type: our own realized holds when we have
     them (ground truth), else the market-study seed table. Only exploit
     instances count — explore instances retire themselves after their
-    benchmark, which reconcile can't distinguish from a preemption."""
+    benchmark, which reconcile can't distinguish from a preemption.
+
+    The MEAN, not the median. `effective_rate` amortizes a fixed setup cost
+    over this, and across many instances the true ratio is
+    sum(hold) / sum(hold + setup + lost) — a mean operation. Hold
+    distributions are violently right-skewed (RTX 3080: median 0.97h, mean
+    4.63h), and the long tail is where nearly all delivered work lives, so
+    the median charged a 72% amortization haircut where the truth was ~7%
+    and systematically undervalued any type that usually dies young but
+    occasionally holds for a day.
+
+    Known residual bias: sampling the most recent N *deaths* under-represents
+    long holds, which die less often per unit time. Correcting that properly
+    is survival analysis; the window is widened instead, which trades some
+    responsiveness for stability.
+    """
     rows = db.execute(
         "SELECT (destroyed_at - created_at) / 3600.0 AS h FROM instances "
         "WHERE gpu_name = ? AND destroyed_at IS NOT NULL "
         "AND destroy_reason = 'preempted' AND purpose = 'exploit' "
-        "ORDER BY destroyed_at DESC LIMIT 20",
+        "ORDER BY destroyed_at DESC LIMIT 40",
         (gpu_name,),
     ).fetchall()
     if len(rows) >= 3:
-        return statistics.median(r["h"] for r in rows)
+        return statistics.mean(r["h"] for r in rows)
     seeds = cfg["e_hold_seed_hours"]
     return seeds.get(gpu_name, seeds["default"])
 
@@ -782,6 +804,32 @@ def estimate_offer(cfg, db, offer, mode=None):
 # Tick phases
 
 
+def charge_final_interval(db, cfg, row, now, fraction=0.5):
+    """Bill the stretch between the last tick and an instance's death.
+
+    Per-tick charging only accrues while an instance is observed `running`,
+    so the interval between the last observation and the moment we notice it
+    gone was never billed. Instances that lived and died entirely between two
+    ticks — 44% of the fleet's history — were therefore recorded at $0.
+
+    We don't know when in that interval it actually stopped, so charge the
+    expected value: half, for a uniformly distributed stop time. That is
+    unbiased rather than conservative, which is what a budget gate wants.
+    Deliberate destroys of an instance seen alive this tick need no call —
+    reconcile has already advanced last_charged_at to now.
+    """
+    dt_h = (now - row["last_charged_at"]) / 3600.0
+    if dt_h <= 0:
+        return 0.0
+    cost = dt_h * row["bid"] * fraction
+    db.execute(
+        "UPDATE instances SET spend = spend + ?, last_charged_at = ? WHERE vast_id = ?",
+        (cost, now, row["vast_id"]),
+    )
+    charge_bucket(db, bucket_mode(row["mode"], cfg), cost)
+    return cost
+
+
 def reconcile(cfg, db, dry):
     """Diff ledger vs live instances. Runs first, unconditionally."""
     now = time.time()
@@ -806,6 +854,7 @@ def reconcile(cfg, db, dry):
         if vast_id not in ours_live:
             # Gone without us destroying it: preempted (or finished).
             hold_h = (now - row["created_at"]) / 3600.0
+            charge_final_interval(db, cfg, row, now)
             db.execute(
                 "UPDATE instances SET destroyed_at = ?, destroy_reason = 'preempted' "
                 "WHERE vast_id = ?",
@@ -818,6 +867,7 @@ def reconcile(cfg, db, dry):
             # Outbid or dead: the instance is stopped, not gone, and pays
             # storage until destroyed. Reap it and record the hold.
             hold_h = (now - row["created_at"]) / 3600.0
+            charge_final_interval(db, cfg, row, now)
             destroy_instance(cfg, db, vast_id, "preempted", dry)
             log_event(db, "OUTBID", f"instance {vast_id} stopped after {hold_h:.2f}h; reaped")
             continue
@@ -827,8 +877,12 @@ def reconcile(cfg, db, dry):
         if ours_live[vast_id].get("actual_status") == "running":
             dt_h = (now - row["last_charged_at"]) / 3600.0
             cost = dt_h * row["bid"]
+            # ever_ran distinguishes "billed $0 because it never ran" from
+            # "billed $0 because the invoice hasn't settled" — the invoice
+            # true-up needs that to know when a zero charge is trustworthy.
             db.execute(
-                "UPDATE instances SET spend = spend + ?, last_charged_at = ? WHERE vast_id = ?",
+                "UPDATE instances SET spend = spend + ?, last_charged_at = ?, ever_ran = 1 "
+                "WHERE vast_id = ?",
                 (cost, now, vast_id),
             )
             charge_bucket(db, bucket_mode(row["mode"], cfg), cost)
@@ -970,9 +1024,68 @@ def record_ev_seen(db, mode, mode_offers):
     db.commit()
 
 
+# Vendor and marketing tokens that appear on one side of a CPU name but not
+# the other. Vast lists "Xeon(R) E5-2680 v4" while /proc/cpuinfo reports
+# "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz", so a naive first-two-tokens
+# family key reads "xeon e5-2680" from one and "intel xeon" from the other and
+# the two never meet.
+_CPU_NOISE = frozenset(
+    ["intel", "amd", "genuine", "authentic", "cpu", "processor", "core", "with",
+     "radeon", "graphics", "ryzen", "th", "gen"]
+)
+
+
+def cpu_family_key(raw):
+    """A CPU grouping that survives the gap between Vast's listing strings and
+    the client's /proc/cpuinfo strings.
+
+    Drops the clock suffix and the vendor/marketing tokens either side may or
+    may not carry, then keeps the first two remaining tokens: "xeon e5-2680",
+    "epyc 7763", "i5-11400". Deliberately separate from the estimator's own
+    `family_key`, which is part of a matching chain validated against the Rust
+    implementation and must not drift with it."""
+    text = estimator.normalize_model(raw or "?")
+    text = text.split("@")[0]
+    tokens = [t for t in text.replace("(", " ").replace(")", " ").split()
+              if t not in _CPU_NOISE and not t.endswith("ghz")]
+    return " ".join(tokens[:2]) if tokens else "?"
+
+
+def corpus_cell_key(gpu_model, cpu_model):
+    """The unit of estimator coverage: a GPU model paired with a CPU family.
+
+    Matching keys on the GPU model and, one rung down, on CPU similarity, so
+    coverage is really a property of that pair rather than of either alone.
+    CPU family (not model) because that is the granularity the corpus can
+    actually fill — there are hundreds of CPU models on the market and we buy
+    a few hundred instances a month."""
+    return (estimator.normalize_gpu_model(gpu_model or "?"), cpu_family_key(cpu_model))
+
+
+def corpus_cell_counts(db):
+    """Reports per coverage cell, from the local mirror. GPU reports only:
+    an explore's value is the hardware pairing it prices, and the CPU-only
+    runs in its sweep are priced by the CPU chain regardless of GPU."""
+    counts = {}
+    for r in db.execute("SELECT gpu_model, cpu_model FROM corpus WHERE gpu = 1").fetchall():
+        key = (r["gpu_model"] or "?", cpu_family_key(r["cpu_model"]))
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def plan_explore(cfg, db, by_mode, dry):
-    """One explore instance benchmarks every mode, so a (gpu,cpu) pair is worth
-    exploring if it's uncertain in ANY mode. Funded from the primary bucket."""
+    """Buy benchmarks for the hardware the estimator cannot price yet.
+
+    Explore used to take the cheapest uncertain offer and cool down on the
+    exact (gpu, cpu) string pair. Both parts misfired: cheapest-first kept
+    landing on the same few budget cards, and because a popular GPU appears
+    with hundreds of different CPUs the pair-level cooldown never bit — 143 of
+    850 explores were RTX 3060 and 141 were RTX 3090, a third of the budget
+    spent re-measuring two already well-known cards.
+
+    Now that the whole corpus is local the controller can see its own coverage
+    directly, so it ranks by how thin a cell is and skips cells already deep
+    enough to price confidently. Cheapness only breaks ties."""
     now = time.time()
     balance = bucket_balance(db, primary_mode(cfg))
     if balance <= 0:
@@ -993,33 +1106,49 @@ def plan_explore(cfg, db, by_mode, dry):
     )
     if slots == 0:
         return
-    # Per offer id: the estimates across every mode, plus the offer object.
-    ests = {}
-    for m, mode_offers in by_mode.items():
-        for offer, est, _ev in mode_offers:
-            ests.setdefault(offer["id"], (offer, []))[1].append(est)
-    def uncertain(est):
-        return (
-            est.get("confidence", 0) < cfg["explore_confidence_threshold"]
-            or est.get("prediction_stage") in cfg["explore_stages"]
-        )
+    offers = {o["id"]: o for mode_offers in by_mode.values() for o, _e, _v in mode_offers}
+    counts = corpus_cell_counts(db)
+    target = cfg["explore_target_samples"]
+
+    # Cells explored recently, whether or not their reports have landed yet:
+    # without this the same thin cell is bought every tick until its benchmarks
+    # upload, and a cell whose uploads keep failing would be bought forever.
     cooldown = now - cfg["explore_cooldown_days"] * 86400
-    for offer, mode_ests in sorted(ests.values(), key=lambda t: float(t[0].get("min_bid", 9e9))):
+    recent = {
+        corpus_cell_key(r["gpu_name"], r["cpu_name"])
+        for r in db.execute("SELECT gpu_name, cpu_name FROM explored WHERE explored_at > ?",
+                            (cooldown,)).fetchall()
+    }
+
+    candidates = []
+    for offer in offers.values():
+        key = corpus_cell_key(offer.get("gpu_name"), offer.get("cpu_name"))
+        have = counts.get(key, 0)
+        if have >= target or key in recent:
+            continue
+        # offer id before the dict: it breaks exact (count, bid) ties so the
+        # sort never has to compare two offer dicts.
+        candidates.append((have, float(offer.get("min_bid", 9e9)), offer["id"], offer, key))
+    if not candidates:
+        log_event(db, "EXPLORE-SKIP", f"every priceable cell has >= {target} reports")
+        return
+
+    # Thinnest cell first; cheapest offer breaks the tie.
+    for have, _bid, _id, offer, key in sorted(candidates, key=lambda c: (c[0], c[1], c[2])):
         if slots == 0:
             break
-        if not any(uncertain(e) for e in mode_ests):
-            continue
-        seen = db.execute(
-            "SELECT COUNT(*) FROM explored WHERE gpu_name = ? AND cpu_name = ? AND explored_at > ?",
-            (offer.get("gpu_name") or "?", offer.get("cpu_name") or "?", cooldown),
-        ).fetchone()[0]
-        if seen:
-            continue
+        if key in recent:
+            continue   # a cheaper offer for this cell was already taken above
         bid = suggested_bid(offer, cfg, primary_mode(cfg))
+        log_event(
+            db, "EXPLORE-TARGET",
+            f"{key[0]} / {key[1]}: {have} report(s), target {target}",
+        )
         create_instance(
             cfg, db, offer, "explore", bid,
             cfg["explore_ttl_minutes"] / 60.0, 0.0, pounce=False, dry=dry, mode=None,
         )
+        recent.add(key)   # one buy per cell per tick, not one per matching offer
         slots -= 1
     db.commit()
 
