@@ -47,7 +47,19 @@ pub const MAX_CUBES_WEB: u32 = 4096;
 pub const CUBECL_WEB_BATCH_SIZE: u128 = 4_000_000;
 
 /// Near-miss records held on the device per field.
-const NEAR_MISS_CAPACITY_WEB: usize = 1 << 20;
+///
+/// Deliberately far smaller than the native backend's: this buffer is the
+/// client's largest GPU allocation, and a browser tab is given a small
+/// fraction of the card's memory. 131072 records is 2.6 MB.
+///
+/// Sizing it is about *low* bases, not production ones. Near misses are
+/// candidates above 0.9 x base unique digits, which at base 40 and up is
+/// almost nothing (a real field yields a handful), but at base 10 is over
+/// half of all candidates. The browser only ever receives fields for the
+/// bases actually being searched, so the small buffer is right for the
+/// workload; the parity tests keep their low-base ranges short to match,
+/// and an overflow is reported rather than silently truncated.
+const NEAR_MISS_CAPACITY_WEB: usize = 1 << 17;
 
 /// The u32-only detailed kernel. See the module docs for how it differs from
 /// the native one; the structure (grid-stride, shared histogram copies,
@@ -587,8 +599,11 @@ mod tests {
     #[ignore = "requires a wgpu device"]
     fn web_kernel_matches_cpu_detailed() {
         let ctx = CubeclContext::new_default().expect("CubeCL init");
+        // Base 10's range is short because over half its candidates are
+        // near misses: 1e6 candidates there would overflow the device
+        // buffer, which is sized for real browser fields (base 40+).
         for (base, count) in [
-            (10u32, 1_000_000u128),
+            (10u32, 100_000u128),
             (40, 2_000_000),
             (62, 200_000),
             (80, 100_000),

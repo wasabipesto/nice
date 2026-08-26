@@ -1189,7 +1189,26 @@
             }
 
             // Initialize when page loads
+            // Log which wasm build is actually loaded. The page is small and
+            // revalidates, but the 2 MB wasm is exactly the kind of thing a
+            // browser keeps, so "did my fix reach you" is otherwise
+            // unanswerable from a console paste.
+            async function logBuild() {
+                try {
+                    const r = await fetch("./pkg/nice_wasm_client_bg.wasm", {
+                        method: "HEAD",
+                        cache: "no-cache",
+                    });
+                    console.log(
+                        `wasm build: ${r.headers.get("content-length")} bytes, modified ${r.headers.get("last-modified")}`,
+                    );
+                } catch {
+                    /* diagnostics only */
+                }
+            }
+
             document.addEventListener("DOMContentLoaded", () => {
+                logBuild();
                 detectGpu();
                 if (checkBrowserSupport()) {
                     setupCpuControls();
