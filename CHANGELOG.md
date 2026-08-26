@@ -29,6 +29,10 @@ Backend:
   - Thanks to [Janzert](https://github.com/Janzert) for the report and diagnoses
 - Add `common/tests/claim_queries.rs`: the claim path is hand-written SQL with positional bindings that the compiler cannot check, so it is now exercised against a real PostgreSQL. Skipped unless `NICE_TEST_DATABASE_URL` is set.
 
+Website:
+
+- Speed up the index page: start the data fetches while the plot library is still downloading, draw each chart as its own data arrives instead of waiting for all five requests, and load d3/Plot as two vendored files rather than 48 CDN modules spread over six dependency levels. `just vendor-fetch` downloads them; `just deploy-site` and `just dev` do it automatically.
+
 ## Nice v3.3.0
 
 - Fix an off-by-one error in get_base_range_natural which dropped one trailing candidate per base where base % 5 ∈ {2,3,4}. Thanks to [Janzert](https://github.com/Janzert) for reporting this!
