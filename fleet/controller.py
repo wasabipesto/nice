@@ -84,6 +84,19 @@ DEFAULT_CONFIG = {
     # ledger + bucket to ground truth. <= 0 disables (estimate-only). Invoices
     # finalize at day boundaries, so this is a lagging correction, not a meter.
     "invoice_reconcile_hours": 1.0,
+    # A single pull that would cut recorded spend by more than this fraction of
+    # the total is refused outright and logged. A true-up corrects drift; a mass
+    # reduction means the invoice feed changed shape, which is a thing to look
+    # at rather than to act on — the original bug wrote off 2372 GPU-hours.
+    # Whether an invoice pull may actually change the ledger. False = observe
+    # only: pull, log the shape, report what would have moved, change nothing.
+    "invoice_apply_trueup": True,
+    "invoice_max_drop_fraction": 0.25,
+    # Log (never act on) a thin match that disagrees with its wider pool by more
+    # than this factor. Diagnostics only: overriding thin matches was measured
+    # and made predictions worse.
+    "divergence_warn_factor": 2.0,
+    "divergence_warn_below_samples": 5,
     # --- economics ---
     "bid_multiplier": 1.2,
     "setup_hours": 0.12,
@@ -385,21 +398,96 @@ def parse_invoice_charges(invoices, owned_ids):
     return actual
 
 
-def plan_invoice_trueup(spend_by_id, actual_by_id, eps=1e-6):
+def plan_invoice_trueup(spend_by_id, actual_by_id, eps=1e-6, alive_ids=frozenset(),
+                        max_drop_fraction=None):
     """Pure planner for the invoice true-up. Given each instance's charged-so-far
-    `spend` and its actual invoiced total, return (updates, net) where updates is
-    [(vast_id, new_spend, delta)] for instances whose charge drifted from actual
-    and net is the total to subtract from the bucket (positive = we under-charged
-    and owe more). Idempotent: once spend == actual, nothing is returned."""
+    `spend` and its actual invoiced total, return (updates, net, refusals) where
+    updates is [(vast_id, new_spend, delta)] for instances whose charge drifted
+    from actual and net is the total to subtract from the bucket (positive = we
+    under-charged and owe more). Idempotent: once spend == actual, nothing is
+    returned.
+
+    Three guards, all learned from the true-up that silently zeroed 1465
+    instances and 2372 GPU-hours of real spend:
+
+    * A live instance is never reduced. Its bill is still accruing, so a
+      partial invoice always looks like an over-charge.
+    * Spend never goes negative, whatever the invoice claims.
+    * If the pull would cut recorded spend by more than `max_drop_fraction` of
+      the total, the whole batch is refused rather than applied. A true-up is a
+      correction; a mass reduction means the invoice feed changed shape under
+      us, and that is a thing to look at, not to act on.
+    """
     updates = []
     net = 0.0
+    refusals = []
     for iid, actual in actual_by_id.items():
-        delta = actual - spend_by_id.get(iid, 0.0)
+        current = spend_by_id.get(iid, 0.0)
+        delta = actual - current
         if abs(delta) < eps:
             continue
-        updates.append((iid, actual, delta))
+        if delta < 0 and iid in alive_ids:
+            refusals.append((iid, "still running; bill not final"))
+            continue
+        new_spend = max(0.0, actual)
+        delta = new_spend - current
+        if abs(delta) < eps:
+            continue
+        updates.append((iid, new_spend, delta))
         net += delta
-    return updates, net
+    if max_drop_fraction is not None:
+        total = sum(spend_by_id.values())
+        drop = -net
+        if total > 0 and drop > total * max_drop_fraction:
+            return [], 0.0, [(None, f"batch would cut recorded spend by "
+                                    f"${drop:.2f} of ${total:.2f} "
+                                    f"(> {max_drop_fraction:.0%}); refusing")]
+    return updates, net, refusals
+
+
+def log_invoice_shape(db, invoices, spend_by_id, owned):
+    """Record what an invoice pull actually contained, without acting on it.
+
+    Per-instance charges live in a ~2-day sliding window and each instance is
+    only ever seen once, so the conditions governing when a zero is trustworthy
+    have to be written against observed shapes rather than guessed. This logs
+    those shapes so a week of them accumulates before any rule is written."""
+    from collections import Counter
+    days = Counter()
+    kinds = Counter()
+    zero_rows = 0
+    per_instance = {}
+    for r in invoices:
+        if r.get("type") != "charge":
+            continue
+        ts = r.get("timestamp")
+        day = time.strftime("%Y-%m-%d", time.gmtime(ts)) if ts else "?"
+        days[day] += 1
+        try:
+            amt = float(r.get("amount") or 0.0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        try:
+            qty = float(r.get("quantity") or 0.0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty == 0.0 or amt == 0.0:
+            zero_rows += 1
+        desc = (r.get("description") or "").split(":")[0]
+        kinds[desc.split()[-1] if desc.split() else "?"] += 1
+        iid = r.get("instance_id")
+        if iid in owned:
+            per_instance[iid] = per_instance.get(iid, 0.0) + amt
+    nonzero = {i: a for i, a in per_instance.items() if a > 0}
+    ratios = [nonzero[i] / spend_by_id[i] for i in nonzero
+              if spend_by_id.get(i, 0.0) > 0]
+    ratio_note = (f"invoiced/estimated median {statistics.median(ratios):.2f} "
+                  f"over {len(ratios)}") if ratios else "no comparable pairs"
+    log_event(
+        db, "INVOICE-SHAPE",
+        f"days={dict(days)} kinds={dict(kinds)} zero_rows={zero_rows} "
+        f"ours={len(per_instance)} of_which_nonzero={len(nonzero)}; {ratio_note}",
+    )
 
 
 def effective_rate(p25_rate, e_hold_hours, setup_hours, lost_hours):
@@ -583,6 +671,11 @@ def reconcile_invoices(cfg, db, dry):
     every_h = cfg.get("invoice_reconcile_hours", 1.0)
     if not every_h or every_h <= 0:
         return
+    # Pulling and applying are separate switches. The window holds ~2 days and
+    # each instance appears in it once, so the observations needed to write the
+    # true-up's conditions have to be collected while the true-up itself stays
+    # off; `invoice_apply_trueup: false` is that observation mode.
+    apply_trueup = cfg.get("invoice_apply_trueup", True)
     now = time.time()
     if now - (meta_get(db, "last_invoice_reconcile_at", 0.0) or 0.0) < every_h * 3600.0:
         return
@@ -597,13 +690,35 @@ def reconcile_invoices(cfg, db, dry):
     mode_by_id = {r["vast_id"]: r["mode"] for r in rows}
     actual = parse_invoice_charges(invoices, owned)
     spend_by_id = {r["vast_id"]: r["spend"] for r in rows}
-    updates, net = plan_invoice_trueup(spend_by_id, actual)
+    # Always record the pull's shape, even when the true-up itself is disabled:
+    # the conditions governing when a zero charge is trustworthy have to be
+    # written against observed data, and the window only holds ~2 days.
+    log_invoice_shape(db, invoices, spend_by_id, owned)
+    alive_ids = {
+        r["vast_id"] for r in db.execute(
+            "SELECT vast_id FROM instances WHERE destroyed_at IS NULL").fetchall()
+    }
+    updates, net, refusals = plan_invoice_trueup(
+        spend_by_id, actual, alive_ids=alive_ids,
+        max_drop_fraction=cfg.get("invoice_max_drop_fraction", 0.25),
+    )
+    for iid, why in refusals:
+        log_event(db, "INVOICE-REFUSED", f"{iid if iid else 'batch'}: {why}")
     total = sum(actual.values())
     # Route each instance's drift to the bucket that funds its mode.
     net_by_bucket = {}
     for iid, _new_spend, delta in updates:
         bm = bucket_mode(mode_by_id.get(iid), cfg)
         net_by_bucket[bm] = net_by_bucket.get(bm, 0.0) + delta
+    if not apply_trueup:
+        log_event(
+            db, "INVOICE",
+            f"observe-only: {len(updates)} instance(s) would move, "
+            f"bucket adj ${-net:+.3f}; not applied",
+        )
+        meta_set(db, "last_invoice_reconcile_at", now)
+        db.commit()
+        return
     if not dry:
         for iid, amt in actual.items():
             db.execute("UPDATE instances SET invoiced = ? WHERE vast_id = ?", (amt, iid))
@@ -788,16 +903,49 @@ def estimate_offer(cfg, db, offer, mode=None):
     mode_display = estimator.mode_string(mode or cfg["mode"])
     if mode_display is None:
         raise ValueError(f"unknown mode {mode or cfg['mode']!r}")
-    return estimator.estimate(
-        load_corpus(db),
-        {
-            "mode": mode_display,
-            "gpu": cfg["gpu"],
-            "threads": int(offer.get("cpu_cores_effective") or 0) or None,
-            "cpu_model": offer.get("cpu_name"),
-            "gpu_model": offer.get("gpu_name"),
-        },
-    )
+    corpus = load_corpus(db)
+    query = {
+        "mode": mode_display,
+        "gpu": cfg["gpu"],
+        "threads": int(offer.get("cpu_cores_effective") or 0) or None,
+        "cpu_model": offer.get("cpu_name"),
+        "gpu_model": offer.get("gpu_name"),
+    }
+    out = estimator.estimate(corpus, query)
+    warn_if_divergent(db, cfg, corpus, query, out)
+    return out
+
+
+def warn_if_divergent(db, cfg, corpus, query, out):
+    """Flag a thin match that disagrees badly with the wider pool behind it.
+
+    Held-out testing says the narrow stages are usually right and that error
+    does not track sample count, so this deliberately does not change what gets
+    bought — a rule that overrode them made predictions worse. But a handful of
+    cells are genuinely poisoned: RTX 4090 on one EPYC pairing reads 222 G/s
+    from three samples, two of them off contended hosts, against 482 G/s from
+    the other 75. Those are worth a human look, not an automatic override."""
+    factor = cfg.get("divergence_warn_factor", 2.0)
+    if not factor or out["prediction_stage"] not in ("exact", "same-gpu-similar-cpu"):
+        return
+    if out["samples_used"] >= cfg.get("divergence_warn_below_samples", 5):
+        return
+    narrow = out.get("blended_rate_p50")
+    if not narrow:
+        return
+    # Same GPU, no CPU or thread constraint: the pool the thin match stepped over.
+    broad = estimator.estimate(corpus, {**query, "cpu_model": None, "threads": None})
+    wide = broad.get("blended_rate_p50")
+    if not wide or broad["prediction_stage"] != "same-gpu" or broad["samples_used"] < 5:
+        return
+    ratio = narrow / wide
+    if ratio > factor or ratio < 1.0 / factor:
+        log_event(
+            db, "DIVERGENT",
+            f"{query['gpu_model']} [{query['mode']}]: {out['prediction_stage']} "
+            f"n={out['samples_used']} says {narrow/1e9:.0f} G/s but same-gpu "
+            f"n={broad['samples_used']} says {wide/1e9:.0f} G/s ({ratio:.2f}x)",
+        )
 
 
 # ---------------------------------------------------------------------------

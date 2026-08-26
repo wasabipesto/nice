@@ -198,12 +198,12 @@ class InvoiceReconcileTests(unittest.TestCase):
         # id 1 under-charged (bug: $0 estimate, $0.05 real); id 2 over-charged.
         spend = {1: 0.0, 2: 0.10}
         actual = {1: 0.05, 2: 0.06}
-        updates, net = plan_invoice_trueup(spend, actual)
+        updates, net, _refused = plan_invoice_trueup(spend, actual)
         self.assertEqual({u[0] for u in updates}, {1, 2})
         # net owed = (0.05-0) + (0.06-0.10) = +0.01
         self.assertAlmostEqual(net, 0.01, places=6)
         # Re-running once spend == actual yields nothing.
-        updates2, net2 = plan_invoice_trueup(actual, actual)
+        updates2, net2, _r2 = plan_invoice_trueup(actual, actual)
         self.assertEqual(updates2, [])
         self.assertEqual(net2, 0.0)
 
@@ -553,6 +553,46 @@ class EHoldStatisticTests(unittest.TestCase):
                 "VALUES (?, 'x', 'exploit', 'RTX 3080', 0.05, ?, ?, ?, ?, 'preempted')",
                 (i, now - h * 3600, now, now, now))
         self.assertAlmostEqual(e_hold_hours(db, cfg(), "RTX 3080"), 4.36, places=2)
+
+
+class InvoiceGuardTests(unittest.TestCase):
+    """Guards learned from the true-up that zeroed 1465 instances."""
+
+    def test_live_instance_is_never_reduced(self):
+        # A running instance's bill is still accruing, so a partial invoice
+        # always looks like an over-charge.
+        updates, net, refused = plan_invoice_trueup(
+            {1: 0.50}, {1: 0.10}, alive_ids={1})
+        self.assertEqual(updates, [])
+        self.assertEqual(net, 0.0)
+        self.assertEqual(refused[0][0], 1)
+        # Destroyed, same numbers: the correction applies.
+        updates, _net, _r = plan_invoice_trueup({1: 0.50}, {1: 0.10})
+        self.assertEqual(updates, [(1, 0.10, -0.40)])
+
+    def test_spend_never_goes_negative(self):
+        updates, _net, _r = plan_invoice_trueup({1: 0.10}, {1: -5.0})
+        self.assertEqual(updates, [(1, 0.0, -0.10)])
+
+    def test_mass_reduction_is_refused_whole(self):
+        # The original failure: a pull that writes off most of the ledger.
+        spend = {i: 1.0 for i in range(10)}
+        actual = {i: 0.0 for i in range(10)}
+        updates, net, refused = plan_invoice_trueup(spend, actual, max_drop_fraction=0.25)
+        self.assertEqual(updates, [], "a batch this destructive must not apply")
+        self.assertEqual(net, 0.0)
+        self.assertIn("refusing", refused[0][1])
+        # A correction within the threshold still applies.
+        updates, _net, _r = plan_invoice_trueup(
+            spend, {0: 0.0, 1: 0.0}, max_drop_fraction=0.25)
+        self.assertEqual(len(updates), 2)
+
+    def test_under_charge_is_always_applied(self):
+        # Guards are one-directional: owing more is never refused.
+        updates, net, _r = plan_invoice_trueup(
+            {1: 0.10}, {1: 5.0}, alive_ids={1}, max_drop_fraction=0.25)
+        self.assertEqual(updates, [(1, 5.0, 4.9)])
+        self.assertAlmostEqual(net, 4.9)
 
 
 class CpuMatchKeyTests(unittest.TestCase):
