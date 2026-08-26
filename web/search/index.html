@@ -994,9 +994,16 @@
                 gpuWorker = gpu.worker;
                 // Prefer the browser's adapter description: CubeCL reports an
                 // empty name on some adapters (software ones especially).
-                gpuAdapterName = gpu.adapterName?.trim()
-                    ? gpu.adapterName
-                    : probe.name;
+                // Browsers deliberately redact adapter identity, so both
+                // names are often empty or a bare backend tag like
+                // "(BrowserWebGpu)". Prefer whichever actually names a
+                // device, and never render a label that starts with the
+                // backend in parentheses.
+                const cubeclName = gpu.adapterName?.trim() ?? "";
+                const named = cubeclName && !cubeclName.startsWith("(");
+                gpuAdapterName = named
+                    ? cubeclName
+                    : probe.name || "WebGPU device";
                 const select = document.getElementById("backendSelect");
                 const option = document.createElement("option");
                 option.value = "gpu";

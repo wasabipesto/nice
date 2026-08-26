@@ -11,7 +11,12 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
-const root = normalize(join(fileURLToPath(import.meta.url), "../../../web/search"));
+// Defaults to the repo's page; NICE_E2E_ROOT points it at a copy, which is
+// how the hardware runs work — the harness ships to a machine with a GPU
+// without dragging the whole repo along.
+const root = process.env.NICE_E2E_ROOT
+    ? normalize(process.env.NICE_E2E_ROOT)
+    : normalize(join(fileURLToPath(import.meta.url), "../../../web/search"));
 const MIME = {
     ".html": "text/html",
     ".js": "text/javascript",
@@ -40,21 +45,35 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const url = `http://127.0.0.1:${server.address().port}/`;
 console.log(`serving ${root} at ${url}`);
 
-// These flags are for *this harness's* environment and say nothing about
-// what real users need. Headless Chromium in a container brings up no GPU
-// by default: measured here, plain defaults and --enable-features=Vulkan
-// both expose navigator.gpu while every requestAdapter returns null, and
-// --enable-unsafe-webgpu is what makes an adapter appear. The swiftshader
-// override then pins the software adapter so the run never depends on host
-// GPU drivers.
+// Default (CI) mode pins a software adapter so the run never depends on
+// host GPU drivers. These flags are for *this harness's* environment and
+// say nothing about what real users need: headless Chromium in a container
+// brings up no GPU by default — measured here, plain defaults and
+// --enable-features=Vulkan both expose navigator.gpu while every
+// requestAdapter returns null, and --enable-unsafe-webgpu is what makes an
+// adapter appear at all.
+//
+// `--hw` instead launches the browser exactly as a user's would be, with no
+// GPU flags whatsoever, so the run exercises the platform's real adapter.
+// That is the only mode that can report a meaningful rate, and the only one
+// that proves the stack works on hardware someone actually has.
+const hardware = process.argv.includes("--hw");
+// `channel: "chromium"` matters in hardware mode: Playwright's default
+// headless binary is chrome-headless-shell, which ships without GPU support
+// at all, so it reports no adapter on a perfectly good GPU. The full
+// Chromium in new-headless mode is what a user's browser actually is.
 const browser = await chromium.launch({
     headless: true,
-    args: [
-        "--enable-unsafe-webgpu",
-        "--use-webgpu-adapter=swiftshader",
-        "--enable-features=Vulkan",
-    ],
+    ...(hardware ? { channel: "chromium" } : {}),
+    args: hardware
+        ? []
+        : [
+              "--enable-unsafe-webgpu",
+              "--use-webgpu-adapter=swiftshader",
+              "--enable-features=Vulkan",
+          ],
 });
+console.log(hardware ? "mode: real hardware adapter" : "mode: pinned software adapter");
 
 // Drive one full offline-benchmark run on the given backend and return the
 // page's final state (status text, processed count, histogram rows).
@@ -81,8 +100,9 @@ async function runBackend(backend) {
         () => document.querySelectorAll("#backendSelect option").length > 1,
     );
     if (backend === "gpu" && !gpuOffered) {
+        const why = await page.textContent("#backendHelp");
         await page.close();
-        return { skipped: "no WebGPU adapter offered" };
+        return { skipped: `no WebGPU adapter offered — page says: ${why?.trim()}` };
     }
 
     await page.selectOption("#testMode", "true"); // offline benchmark
@@ -103,7 +123,18 @@ async function runBackend(backend) {
         status: document.getElementById("status").textContent.trim(),
         results: document.getElementById("results").textContent.trim(),
         histogram: window.lastDistribution ?? null,
+        adapter:
+            [...document.querySelectorAll("#backendSelect option")]
+                .find((o) => o.value === "gpu")
+                ?.textContent.trim() ?? null,
     }));
+    const rate = /Rate: [\d.]+ \(([\d.e+]+)\) numbers\/second/.exec(
+        state.results,
+    )?.[1];
+    if (rate) console.log(`[${backend}] rate: ${rate} numbers/second`);
+    if (backend === "gpu" && state.adapter) {
+        console.log(`[gpu] adapter: ${state.adapter}`);
+    }
     await page.close();
     return state;
 }
