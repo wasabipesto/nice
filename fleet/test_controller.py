@@ -289,8 +289,8 @@ class RenewExploitTests(unittest.TestCase):
         db.commit()
 
     def _patch_estimate(self, est):
-        orig = controller.api_estimate
-        controller.api_estimate = lambda cfg, offer, mode=None: est
+        orig = controller.estimate_offer
+        controller.estimate_offer = lambda cfg, db, offer, mode=None: est
         return orig
 
     def test_healthy_winner_is_renewed_not_reaped(self):
@@ -302,7 +302,7 @@ class RenewExploitTests(unittest.TestCase):
         try:
             renew_exploits(cfg(bid_multiplier=1.2, exploit_ttl_hours=24.0), db, dry=False)
         finally:
-            controller.api_estimate = orig
+            controller.estimate_offer = orig
         row = db.execute("SELECT ttl_at, destroyed_at FROM instances WHERE vast_id = 1").fetchone()
         self.assertIsNone(row["destroyed_at"], "a healthy winner must not be reaped")
         self.assertGreater(row["ttl_at"], time.time() + 20 * 3600, "TTL should be pushed ~24h out")
@@ -319,7 +319,7 @@ class RenewExploitTests(unittest.TestCase):
         try:
             renew_exploits(cfg(bid_multiplier=1.2, exploit_ttl_hours=24.0), db, dry=False)
         finally:
-            controller.api_estimate = orig_est
+            controller.estimate_offer = orig_est
             controller.destroy_instance = orig_destroy
         self.assertEqual(reaped, [(1, "ttl")], "a faded instance out of time must be reaped")
         # TTL was not extended.
@@ -330,12 +330,13 @@ class RenewExploitTests(unittest.TestCase):
         db = memory_db()
         self._seed_expired_exploit(db)
         called = {"n": 0}
-        orig = controller.api_estimate
-        controller.api_estimate = lambda cfg, offer: called.__setitem__("n", called["n"] + 1)
+        orig = controller.estimate_offer
+        controller.estimate_offer = (
+            lambda cfg, db, offer, mode=None: called.__setitem__("n", called["n"] + 1))
         try:
             renew_exploits(cfg(exploit_renew_window_hours=0), db, dry=False)
         finally:
-            controller.api_estimate = orig
+            controller.estimate_offer = orig
         self.assertEqual(called["n"], 0, "disabled renewal must not estimate or touch instances")
         row = db.execute("SELECT ttl_at, destroyed_at FROM instances WHERE vast_id = 1").fetchone()
         self.assertIsNone(row["destroyed_at"])
@@ -487,6 +488,104 @@ class InsufficientCreditTests(unittest.TestCase):
             controller.create_instance = orig
         # One attempt total — not one per offer, not one per mode.
         self.assertEqual(len(attempts), 1)
+
+
+class CorpusSyncTests(unittest.TestCase):
+    """The corpus mirror: idempotent upsert, watermark advances past junk,
+    a failed pull leaves what we already had."""
+
+    def _report(self, i, gpu=True, mode="Nice-only", threads=8, cpu="AMD EPYC 7763",
+                gpu_model="RTX 3080", rate=2.0e9):
+        return {"id": i, "client_version": "3.3.0", "data": {
+            "schema_version": 1,
+            "config": {"gpu": gpu, "mode": mode, "threads": threads},
+            "hardware": {"cpu_model": cpu, "gpu_model": gpu_model},
+            "scenarios": [
+                {"key": "b50_msd_weak", "base": 50, "threads": threads, "rate": rate},
+                {"key": "b50_msd_weak_1t", "base": 50, "threads": 1, "rate": 3.0e8},
+            ]}}
+
+    def _patch_fetch(self, pages):
+        """pages: list of responses, or an Exception to raise."""
+        orig = controller._fetch_json
+        calls = []
+
+        def fake(cfg, url):
+            calls.append(url)
+            nxt = pages.pop(0) if pages else []
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+        controller._fetch_json = fake
+        return orig, calls
+
+    def test_sync_stores_and_is_idempotent(self):
+        db = memory_db()
+        c = cfg(corpus_page_size=5000)
+        rows = [self._report(i) for i in (1, 2, 3)]
+        orig, _ = self._patch_fetch([list(rows)])
+        try:
+            self.assertEqual(controller.sync_corpus(c, db), 3)
+            # Re-syncing re-reads the overlap window; the upsert must not duplicate.
+            controller._fetch_json = lambda cfg_, url: list(rows)
+            self.assertEqual(controller.sync_corpus(c, db), 3)
+        finally:
+            controller._fetch_json = orig
+        self.assertEqual(controller.meta_get(db, "corpus_watermark"), 3)
+
+    def test_watermark_advances_past_undecodable_rows(self):
+        # A report we cannot decode must still move the watermark, or the sync
+        # re-fetches it forever and never reaches newer reports.
+        db = memory_db()
+        junk = {"id": 7, "client_version": "3.3.0", "data": {"schema_version": 2}}
+        orig, _ = self._patch_fetch([[junk]])
+        try:
+            controller.sync_corpus(cfg(), db)
+        finally:
+            controller._fetch_json = orig
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM corpus").fetchone()[0], 0)
+        self.assertEqual(controller.meta_get(db, "corpus_watermark"), 7)
+
+    def test_failed_pull_keeps_existing_corpus(self):
+        db = memory_db()
+        orig, _ = self._patch_fetch([[self._report(1)], OSError("boom")])
+        try:
+            controller.sync_corpus(cfg(), db)          # seeds one report
+            controller._fetch_json = lambda cfg_, url: (_ for _ in ()).throw(OSError("boom"))
+            self.assertEqual(controller.sync_corpus(cfg(), db), 1)   # survives, keeps it
+        finally:
+            controller._fetch_json = orig
+
+    def test_paginates_until_short_page(self):
+        db = memory_db()
+        c = cfg(corpus_page_size=2)
+        pages = [[self._report(1), self._report(2)], [self._report(3)]]
+        orig, calls = self._patch_fetch(pages)
+        try:
+            self.assertEqual(controller.sync_corpus(c, db), 3)
+        finally:
+            controller._fetch_json = orig
+        self.assertEqual(len(calls), 2, "should stop on the short page")
+        self.assertIn("id=gt.0", calls[0])
+        self.assertIn("id=gt.2", calls[1])
+
+    def test_estimate_offer_uses_local_corpus(self):
+        db = memory_db()
+        orig, _ = self._patch_fetch([[self._report(i) for i in (1, 2, 3)]])
+        try:
+            controller.sync_corpus(cfg(), db)
+        finally:
+            controller._fetch_json = orig
+        controller._corpus = None
+        out = controller.estimate_offer(
+            cfg(gpu=True, mode="niceonly"), db,
+            {"gpu_name": "NVIDIA GeForce RTX 3080", "cpu_name": "AMD EPYC 7763",
+             "cpu_cores_effective": 8})
+        controller._corpus = None
+        self.assertEqual(out["prediction_stage"], "exact")
+        self.assertEqual(out["samples_used"], 3)
+        self.assertLess(abs(out["blended_rate_p50"] - 2.0e9), 1.0)
 
 
 class OnstartTemplateTests(unittest.TestCase):

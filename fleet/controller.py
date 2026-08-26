@@ -11,7 +11,8 @@ One tick per cron invocation:
      the #1 cost risk) — diff our ledger against live Vast instances,
      destroy anything expired or unknown, charge runtime spend to the bucket
   2. accrue budget into the token bucket (sustained rate, capped)
-  3. search bid offers, estimate each via the API's POST /estimate
+  3. search bid offers and estimate each locally, against a corpus of
+     benchmark reports mirrored from the API's database
   4. explore slice: benchmark hardware the estimator can't price
      (low confidence / cold-start stages), rate-limited and cooled down
   5. exploit slice: rank offers by hold-amortized P25 EV, buy under the
@@ -33,6 +34,8 @@ import statistics
 import sys
 import time
 import urllib.request
+
+import estimator
 
 # ---------------------------------------------------------------------------
 # Config and state
@@ -58,6 +61,13 @@ _BENCH_SWEEP = (
 DEFAULT_CONFIG = {
     "dry_run": True,
     "api_base": "https://api.nicenumbers.net",
+    # PostgREST host serving the benchmark corpus. Estimation is local, so the
+    # controller mirrors `benchmarks` rather than calling POST /estimate per
+    # offer; this is the only place it is read from.
+    "data_base": "https://data.nicenumbers.net",
+    "corpus_overlap": 50,
+    "corpus_page_size": 5000,
+    "corpus_timeout_secs": 120,
     "username": "wasabipesto-fleet",
     "user_agent": "nice-fleet-controller/1.0",
     "vast_api_key": None,
@@ -100,7 +110,7 @@ DEFAULT_CONFIG = {
         "L40S": 0.5,
     },
     # --- fleet shape ---
-    "mode": "niceonly",  # legacy single-mode default / api_estimate fallback
+    "mode": "niceonly",  # legacy single-mode default / estimate_offer fallback
     # Exploit tracks: one independent budget per mode. Each mode gets its own
     # token bucket (accrual/cap/reserve/pounce) and instance cap; explore
     # benchmarks all modes and is funded from the FIRST (primary) mode's bucket.
@@ -197,6 +207,17 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value REAL
 );
+CREATE TABLE IF NOT EXISTS corpus (   -- local mirror of the API's benchmarks table
+    id INTEGER PRIMARY KEY,           -- benchmarks.id upstream; the sync watermark
+    client_version TEXT NOT NULL,
+    gpu INTEGER NOT NULL,
+    mode TEXT NOT NULL,
+    threads INTEGER NOT NULL,
+    cpu_model TEXT,                   -- normalized at sync time
+    gpu_model TEXT,                   -- normalized at sync time
+    scenarios TEXT NOT NULL           -- JSON: [{key, base, threads, rate}, ...]
+);
+CREATE INDEX IF NOT EXISTS idx_corpus_pool ON corpus (gpu, mode);
 CREATE TABLE IF NOT EXISTS explored (
     gpu_name TEXT NOT NULL,
     cpu_name TEXT NOT NULL,
@@ -651,26 +672,110 @@ def destroy_instance(cfg, db, vast_id, reason, dry):
     log_event(db, "DESTROY", f"instance {vast_id} ({reason})")
 
 
-def api_estimate(cfg, offer, mode=None):
-    body = {
-        "mode": mode or cfg["mode"],
-        "gpu": cfg["gpu"],
-        "threads": int(offer.get("cpu_cores_effective") or 0) or None,
-        "cpu_model": offer.get("cpu_name"),
-        "gpu_model": offer.get("gpu_name"),
-    }
-    # A real User-Agent matters: the production API sits behind Cloudflare,
-    # which rejects urllib's default Python-urllib UA with a 403.
-    req = urllib.request.Request(
-        f"{cfg['api_base']}/estimate",
-        data=json.dumps(body).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": cfg["user_agent"],
+def _fetch_json(cfg, url):
+    """GET and decode. A real User-Agent matters: the hosts sit behind
+    Cloudflare, which rejects urllib's default Python-urllib UA with a 403."""
+    req = urllib.request.Request(url, headers={"User-Agent": cfg["user_agent"]})
+    with urllib.request.urlopen(req, timeout=cfg.get("corpus_timeout_secs", 120)) as resp:
+        return json.loads(resp.read())
+
+
+def sync_corpus(cfg, db):
+    """Pull new benchmark reports into the local corpus mirror.
+
+    The estimator used to live behind POST /estimate, which meant one HTTP
+    round trip per offer per mode (~400 a tick) against a corpus the API
+    truncated to its most recent N reports. Mirroring it locally removes both:
+    the whole corpus is available and a tick's estimates cost no network.
+
+    Rows are fetched by id ascending from a watermark, re-reading a small
+    overlap because a lower id can commit after a higher one; the upsert makes
+    that idempotent. Reports that fail to decode still advance the watermark,
+    or they would be re-fetched forever. A failed sync is not fatal: the tick
+    proceeds on whatever corpus is already stored.
+    """
+    overlap = cfg.get("corpus_overlap", 50)
+    page = cfg.get("corpus_page_size", 5000)
+    watermark = int(meta_get(db, "corpus_watermark", 0) or 0)
+    start = max(0, watermark - overlap)
+    added = 0
+    while True:
+        url = (
+            f"{cfg['data_base']}/benchmarks"
+            f"?id=gt.{start}&order=id.asc&limit={page}"
+            f"&select=id,client_version,data"
+        )
+        try:
+            rows = _fetch_json(cfg, url)
+        except Exception as e:
+            log_event(db, "WARN", f"corpus sync failed at id>{start}: {e!r}")
+            break
+        if not rows:
+            break
+        for r in rows:
+            sample = estimator.decode_sample(r.get("client_version") or "", r.get("data"))
+            if sample is not None:
+                db.execute(
+                    "INSERT OR REPLACE INTO corpus (id, client_version, gpu, mode, threads, "
+                    "cpu_model, gpu_model, scenarios) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (r["id"], sample.client_version, int(sample.gpu), sample.mode,
+                     sample.threads, sample.cpu_model, sample.gpu_model,
+                     json.dumps(sample.scenarios)),
+                )
+                added += 1
+            start = max(start, r["id"])
+        meta_set(db, "corpus_watermark", start)
+        db.commit()
+        if len(rows) < page:
+            break
+    total = db.execute("SELECT COUNT(*) FROM corpus").fetchone()[0]
+    log_event(db, "CORPUS", f"{total} reports (+{added} this tick, watermark {start})")
+    return total
+
+
+_corpus = None
+
+
+def load_corpus(db):
+    """Decoded corpus for this process. Read once per tick; the controller is
+    a fresh process each run, so there is nothing longer-lived to invalidate."""
+    global _corpus
+    if _corpus is None:
+        _corpus = [
+            estimator.Sample(
+                client_version=r["client_version"],
+                gpu=bool(r["gpu"]),
+                mode=r["mode"],
+                threads=r["threads"],
+                cpu_model=r["cpu_model"],
+                gpu_model=r["gpu_model"],
+                scenarios=json.loads(r["scenarios"]),
+            )
+            for r in db.execute(
+                "SELECT client_version, gpu, mode, threads, cpu_model, gpu_model, scenarios "
+                "FROM corpus"
+            ).fetchall()
+        ]
+    return _corpus
+
+
+def estimate_offer(cfg, db, offer, mode=None):
+    """Predict what an offer will achieve. Same response shape the API's
+    /estimate returned, so callers are unchanged; the numbers now come from
+    the local corpus rather than a round trip."""
+    mode_display = estimator.mode_string(mode or cfg["mode"])
+    if mode_display is None:
+        raise ValueError(f"unknown mode {mode or cfg['mode']!r}")
+    return estimator.estimate(
+        load_corpus(db),
+        {
+            "mode": mode_display,
+            "gpu": cfg["gpu"],
+            "threads": int(offer.get("cpu_cores_effective") or 0) or None,
+            "cpu_model": offer.get("cpu_name"),
+            "gpu_model": offer.get("gpu_name"),
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
 
 
 # ---------------------------------------------------------------------------
@@ -756,9 +861,9 @@ def extend_or_probe_pounces(cfg, db, dry):
             "min_bid": row["bid"] / mcfg(cfg, m, "bid_multiplier"),
         }
         try:
-            est = api_estimate(cfg, offer_like, mode=m)
-        except OSError as e:
-            log_event(db, "WARN", f"estimate for pounce {row['vast_id']} failed: {e}")
+            est = estimate_offer(cfg, db, offer_like, mode=m)
+        except Exception as e:
+            log_event(db, "WARN", f"estimate for pounce {row['vast_id']} failed: {e!r}")
             continue
         ev = offer_ev(offer_like, est, e_hold_hours(db, cfg, row["gpu_name"]), cfg, mode=m)
         trailing = trailing_median_ev(db, mode=m)
@@ -807,9 +912,9 @@ def renew_exploits(cfg, db, dry):
             "min_bid": row["bid"] / mcfg(cfg, m, "bid_multiplier"),
         }
         try:
-            est = api_estimate(cfg, offer_like, mode=m)
-        except OSError as e:
-            log_event(db, "WARN", f"renew estimate for {row['vast_id']} failed: {e}")
+            est = estimate_offer(cfg, db, offer_like, mode=m)
+        except Exception as e:
+            log_event(db, "WARN", f"renew estimate for {row['vast_id']} failed: {e!r}")
             continue  # can't judge; leave TTL as-is, re-check next tick
         ev = offer_ev(offer_like, est, e_hold_hours(db, cfg, row["gpu_name"]), cfg, mode=m)
         trailing = trailing_median_ev(db, mode=m)
@@ -1023,7 +1128,14 @@ def tick(cfg):
     # correcting the drift the per-tick bid*hold estimate leaves behind.
     reconcile_invoices(cfg, db, dry)
 
-    # 1c. Renew proven winners before their TTL churns them.
+    # 1c. Mirror new benchmark reports before anything estimates. A failed pull
+    # is survivable (we keep the stored corpus); an empty one is not, so the
+    # tick stops rather than pricing every offer off no data at all.
+    if sync_corpus(cfg, db) == 0:
+        log_event(db, "ERROR", "benchmark corpus empty; skipping tick")
+        return
+
+    # 1d. Renew proven winners before their TTL churns them.
     renew_exploits(cfg, db, dry)
 
     # 2. Accrue each mode's bucket.
@@ -1054,9 +1166,9 @@ def tick(cfg):
         hold = e_hold_hours(db, cfg, gpu)
         for m in modes:
             try:
-                est = api_estimate(cfg, offer, mode=m)
-            except OSError as e:
-                log_event(db, "WARN", f"estimate [{m}] failed for offer {offer.get('id')}: {e}")
+                est = estimate_offer(cfg, db, offer, mode=m)
+            except Exception as e:
+                log_event(db, "WARN", f"estimate [{m}] failed for offer {offer.get('id')}: {e!r}")
                 continue
             by_mode[m].append((offer, est, offer_ev(offer, est, hold, cfg, mode=m)))
     record_type_floors(db, offers)
