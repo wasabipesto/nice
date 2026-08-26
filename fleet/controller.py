@@ -28,11 +28,14 @@ token bucket, ~$30/mo accrual, ~$7 cap, half-full reserve line, pounce at
 """
 
 import argparse
+import fcntl
 import json
+import os
 import sqlite3
 import statistics
 import sys
 import time
+import traceback
 import urllib.request
 
 import estimator
@@ -74,6 +77,11 @@ DEFAULT_CONFIG = {
     "label_prefix": "nice-fleet",
     "db_path": "fleet.sqlite3",
     "kill_switch_path": "KILL",
+    # Relative paths here resolve against the config file's own directory, so
+    # cron needs only one absolute path on its command line.
+    "tick_lock_path": ".tick.lock",
+    "log_path": None,          # None = write to stdout, for interactive runs
+    "log_max_bytes": 5242880,
     # --- budget (token bucket) ---
     "accrual_usd_per_month": 30.0,
     "bucket_cap_usd": 7.0,
@@ -260,10 +268,53 @@ CREATE TABLE IF NOT EXISTS events (
 
 
 def load_config(path):
+    """Load the config and resolve its relative paths against its own location.
+
+    Relative to the config file, not the working directory: cron invokes this
+    from an arbitrary cwd, and resolving against the config means one absolute
+    path on the crontab line is enough to locate everything else."""
     cfg = dict(DEFAULT_CONFIG)
     with open(path, encoding="utf-8") as f:
         cfg.update(json.load(f))
+    base = os.path.dirname(os.path.abspath(path))
+    for key in ("db_path", "kill_switch_path", "log_path"):
+        value = cfg.get(key)
+        if value and not os.path.isabs(value):
+            cfg[key] = os.path.join(base, value)
     return cfg
+
+
+def acquire_tick_lock(path):
+    """Take the single-tick lock, or return None if a tick is already running.
+
+    Ticks can outlast the cron cadence, and two of them racing corrupts the
+    ledger — reconcile crashed on sqlite's write lock 14 times before this
+    existed. Skipping is right rather than queueing: the next scheduled tick
+    picks up whatever this one would have done. The descriptor is deliberately
+    leaked, so the lock lives exactly as long as the process."""
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def redirect_output_to_log(path, max_bytes):
+    """Send this tick's output to the log file, rotating it first if oversized.
+
+    Takes over the real file descriptors rather than just `sys.stdout`, so an
+    uncaught traceback lands in the log with everything else instead of in
+    cron's mail. Rotation happens here, before the file is opened, because a
+    process holding the old descriptor would otherwise keep writing to the
+    rotated-away inode."""
+    if max_bytes and os.path.exists(path) and os.path.getsize(path) > max_bytes:
+        os.replace(path, path + ".1")
+    handle = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    os.dup2(handle.fileno(), sys.stdout.fileno())
+    os.dup2(handle.fileno(), sys.stderr.fileno())
+    return handle
 
 
 def open_db(path):
@@ -1455,14 +1506,47 @@ def tick(cfg):
 
 
 def main():
+    """One tick, self-contained: cron calls this directly.
+
+    Locking, log rotation and the run banner used to live in a shell wrapper
+    beside this file. None of it was shell-specific, and splitting them meant
+    the wrapper had to know where state lived in order to do its half."""
     parser = argparse.ArgumentParser(description="Nice fleet controller")
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--live", action="store_true", help="override config dry_run")
+    parser.add_argument(
+        "--log",
+        help="append output to this file instead of stdout, rotating it when "
+             "oversized (default: the config's log_path, if it sets one)",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.live:
         cfg["dry_run"] = False
-    tick(cfg)
+
+    log_path = args.log or cfg.get("log_path")
+    if log_path:
+        if not os.path.isabs(log_path):
+            log_path = os.path.join(os.path.dirname(os.path.abspath(args.config)), log_path)
+        redirect_output_to_log(log_path, cfg.get("log_max_bytes", 5 * 1024 * 1024))
+
+    started = time.strftime("%Y-%m-%d %H:%M:%S %z")
+    lock = acquire_tick_lock(cfg["tick_lock_path"] if os.path.isabs(cfg["tick_lock_path"])
+                             else os.path.join(os.path.dirname(os.path.abspath(args.config)),
+                                               cfg["tick_lock_path"]))
+    if lock is None:
+        print(f"===== tick {started} SKIPPED: previous tick still running =====")
+        return 0
+
+    print(f"===== tick {started} =====")
+    rc = 0
+    try:
+        tick(cfg)
+    except Exception:
+        traceback.print_exc()
+        rc = 1
+    print(f"----- exit {rc} at {time.strftime('%Y-%m-%d %H:%M:%S %z')} -----")
+    return rc
 
 
 if __name__ == "__main__":

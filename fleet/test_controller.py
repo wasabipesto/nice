@@ -555,6 +555,85 @@ class EHoldStatisticTests(unittest.TestCase):
         self.assertAlmostEqual(e_hold_hours(db, cfg(), "RTX 3080"), 4.36, places=2)
 
 
+class TickWrapperTests(unittest.TestCase):
+    """Locking, log rotation and path resolution, which used to live in a
+    shell wrapper beside the controller."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_lock_is_exclusive_across_processes(self):
+        import os, subprocess, sys as _sys
+        path = os.path.join(self.dir, ".tick.lock")
+        fd = controller.acquire_tick_lock(path)
+        self.assertIsNotNone(fd)
+        # A second process must be refused while we hold it. Same-process
+        # flock re-acquisition succeeds, so this has to be a real fork.
+        probe = subprocess.run(
+            [_sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import controller; "
+             "print(controller.acquire_tick_lock(%r) is not None)"
+             % (os.path.dirname(controller.__file__), path)],
+            capture_output=True, text=True)
+        self.assertEqual(probe.stdout.strip(), "False", probe.stderr)
+        os.close(fd)
+        # Released: the next tick gets it.
+        again = controller.acquire_tick_lock(path)
+        self.assertIsNotNone(again)
+        os.close(again)
+
+    def test_log_rotates_only_when_oversized(self):
+        import os
+        path = os.path.join(self.dir, "tick.log")
+        with open(path, "w") as f:
+            f.write("x" * 100)
+        # The call takes over the real descriptors, which for a one-shot CLI is
+        # the point and for a test runner would swallow its own report; save
+        # and restore them around it.
+        saved = (os.dup(1), os.dup(2))
+        try:
+            # Under the cap: left alone, no rotation file created.
+            controller.redirect_output_to_log(path, max_bytes=10_000).close()
+            under_cap = os.path.exists(path + ".1")
+            # Over the cap: previous generation preserved, fresh file started.
+            controller.redirect_output_to_log(path, max_bytes=50).close()
+            rotated = os.path.exists(path + ".1")
+            rotated_size = os.path.getsize(path + ".1") if rotated else None
+        finally:
+            os.dup2(saved[0], 1)
+            os.dup2(saved[1], 2)
+            os.close(saved[0])
+            os.close(saved[1])
+        self.assertFalse(under_cap)
+        self.assertTrue(rotated)
+        self.assertEqual(rotated_size, 100)
+
+    def test_config_paths_resolve_against_the_config_file(self):
+        import os, json as _json
+        cfgdir = os.path.join(self.dir, "state")
+        os.makedirs(cfgdir)
+        path = os.path.join(cfgdir, "config.json")
+        with open(path, "w") as f:
+            _json.dump({"db_path": "fleet.sqlite3", "kill_switch_path": "KILL"}, f)
+        loaded = controller.load_config(path)
+        # Resolved against the config, not the cwd cron happens to hand us.
+        self.assertEqual(loaded["db_path"], os.path.join(cfgdir, "fleet.sqlite3"))
+        self.assertEqual(loaded["kill_switch_path"], os.path.join(cfgdir, "KILL"))
+
+    def test_absolute_config_paths_are_left_alone(self):
+        import os, json as _json
+        path = os.path.join(self.dir, "config.json")
+        with open(path, "w") as f:
+            _json.dump({"db_path": "/var/lib/nice/fleet.sqlite3"}, f)
+        self.assertEqual(controller.load_config(path)["db_path"],
+                         "/var/lib/nice/fleet.sqlite3")
+
+
 class InvoiceGuardTests(unittest.TestCase):
     """Guards learned from the true-up that zeroed 1465 instances."""
 
