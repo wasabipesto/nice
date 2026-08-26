@@ -971,12 +971,37 @@ impl CubeclContext {
     ///
     /// # Errors
     /// Returns an error if no wgpu device is available.
+    /// Runtime options for the wgpu backend.
+    ///
+    /// In a browser this pins `ExclusivePages`, so every buffer is allocated
+    /// at exactly its own size. The default `SubSlices` pool instead builds a
+    /// ladder of page sizes down from `max_storage_buffer_binding_size` — the
+    /// *adapter's* maximum, since cubecl requests adapter limits — so on a
+    /// discrete card it will try to allocate pages of hundreds of megabytes
+    /// to satisfy a 21 MB request. A browser gives a tab far less GPU memory
+    /// than the card has, and refuses: observed on an RX 9070 XT under
+    /// LibreWolf 149 as "Not enough memory left", then an invalid buffer,
+    /// then a panic in CubeCL's buffer mapping. Native builds keep the
+    /// default pooling, which is measurably fine on the same card.
+    ///
+    /// This backend allocates a handful of long-lived buffers per field, so
+    /// exclusive pages cost nothing here.
+    fn runtime_options() -> cubecl::wgpu::RuntimeOptions {
+        #[allow(unused_mut)]
+        let mut options = cubecl::wgpu::RuntimeOptions::default();
+        #[cfg(target_family = "wasm")]
+        {
+            options.memory_config = cubecl::wgpu::MemoryConfiguration::ExclusivePages;
+        }
+        options
+    }
+
     pub fn new_default() -> Result<Self> {
         let (client, device_name) = WGPU_DEFAULT.get_or_init(|| {
             let device = cubecl::wgpu::WgpuDevice::default();
             let setup = cubecl::wgpu::init_setup::<cubecl::wgpu::AutoGraphicsApi>(
                 &device,
-                cubecl::wgpu::RuntimeOptions::default(),
+                Self::runtime_options(),
             );
             // Include the resolved graphics API: AutoGraphicsApi may pick
             // DX12 on Windows, and reports comparing this backend against
@@ -1008,7 +1033,7 @@ impl CubeclContext {
             let device = cubecl::wgpu::WgpuDevice::default();
             let setup = cubecl::wgpu::init_setup_async::<cubecl::wgpu::AutoGraphicsApi>(
                 &device,
-                cubecl::wgpu::RuntimeOptions::default(),
+                Self::runtime_options(),
             )
             .await;
             let info = setup.adapter.get_info();
