@@ -300,6 +300,12 @@ self.onmessage = async function (e) {
                 return;
             }
             try {
+                if (wasm.gpu_build_info) {
+                    self.postMessage({
+                        type: "gpu_build_info",
+                        info: wasm.gpu_build_info(),
+                    });
+                }
                 const adapterName = await wasm.gpu_init();
                 self.postMessage({
                     type: "gpu_initialized",

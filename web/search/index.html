@@ -887,6 +887,8 @@
                                 worker.terminate();
                                 resolve(null);
                             }
+                        } else if (e.data.type === "gpu_build_info") {
+                            console.log("gpu build info:", e.data.info);
                         } else if (e.data.type === "gpu_initialized") {
                             clearTimeout(timeout);
                             if (e.data.success) {

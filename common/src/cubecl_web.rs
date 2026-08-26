@@ -59,7 +59,25 @@ pub const CUBECL_WEB_BATCH_SIZE: u128 = 4_000_000;
 /// bases actually being searched, so the small buffer is right for the
 /// workload; the parity tests keep their low-base ranges short to match,
 /// and an overflow is reported rather than silently truncated.
+///
+/// A browser gets a far smaller figure than the native tests. LibreWolf 149
+/// on an RX 9070 XT — a card with 16 GB — refused a 4 MB buffer outright, so
+/// the browser's largest allocation is kept in the hundreds of kilobytes. At
+/// 8192 records that is 160 KB, still far more near misses than a real field
+/// produces at the bases the browser is given. The native value stays large
+/// enough for the parity tests' low-base ranges, which is the only place
+/// dense near misses occur.
+#[cfg(target_family = "wasm")]
+const NEAR_MISS_CAPACITY_WEB: usize = 1 << 13;
+#[cfg(not(target_family = "wasm"))]
 const NEAR_MISS_CAPACITY_WEB: usize = 1 << 17;
+
+/// The near-miss capacity this build compiled with, for the client's
+/// startup diagnostics.
+#[must_use]
+pub fn near_miss_capacity() -> usize {
+    NEAR_MISS_CAPACITY_WEB
+}
 
 /// The u32-only detailed kernel. See the module docs for how it differs from
 /// the native one; the structure (grid-stride, shared histogram copies,

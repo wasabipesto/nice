@@ -82,3 +82,16 @@ pub async fn process_chunk_gpu(
         .map_err(|e| JsValue::from_str(&format!("GPU processing failed: {e:#}")))?;
     serde_json::to_string(&result).map_err(|e| JsValue::from_str(&e.to_string()))
 }
+
+/// Sizes the GPU path actually compiled with, for field diagnosis. The page
+/// logs this at startup: a browser caches the wasm aggressively, and without
+/// it a console paste cannot tell a fixed build from a stale one.
+#[wasm_bindgen]
+pub fn gpu_build_info() -> String {
+    format!(
+        "{{\"near_miss_capacity\":{},\"batch_size\":{},\"miss_buffer_bytes\":{}}}",
+        nice_common::cubecl_web::near_miss_capacity(),
+        nice_common::cubecl_web::CUBECL_WEB_BATCH_SIZE,
+        nice_common::cubecl_web::near_miss_capacity() * 5 * 4,
+    )
+}
