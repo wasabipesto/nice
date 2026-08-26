@@ -60,7 +60,9 @@
                     return p;
                 };
                 return {
-                    bases: get("/bases?select=id,numbers&order=id.asc"),
+                    notable: get(
+                        "/cache_notable_numbers?select=number,niceness,base,num_uniques&order=off_by.desc",
+                    ),
                     niceness: get(
                         "/chunks?select=id,base_id,range_start,range_end,niceness_mean,niceness_stdev&niceness_mean=not.is.null&order=id.asc",
                     ),
@@ -381,8 +383,11 @@
             }
 
             // ── Notable Numbers ──────────────────────────────────────────────────
-            function buildNumbersChart(basesData) {
-                const numbers = basesData.flatMap((base) => base.numbers);
+            // The rows are already thinned to the points that are visually
+            // distinguishable at this chart's size; see the cache_notable_numbers
+            // migration. Plotting every number in every base's top-10k list was
+            // ~81k marks and about two seconds of blocking work.
+            function buildNumbersChart(numbers) {
                 return Plot.plot({
                     width: 900,
                     height: 300,
@@ -632,7 +637,7 @@
                     buildLeaderboardChart(rows, "niceonly"),
                 ),
             ]);
-            await draw("#numbers", data.bases, buildNumbersChart);
+            await draw("#numbers", data.notable, buildNumbersChart);
         </script>
     </body>
 </html>

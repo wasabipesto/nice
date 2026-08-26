@@ -1,4 +1,5 @@
 -- DROP TABLES IN REVERSE ORDER
+DROP TABLE IF EXISTS cache_notable_numbers;
 DROP TABLE IF EXISTS cache_search_rate_daily;
 DROP TABLE IF EXISTS cache_search_leaderboard;
 DROP TABLE IF EXISTS submissions;
@@ -150,8 +151,21 @@ CREATE TABLE IF NOT EXISTS cache_search_leaderboard (
     PRIMARY KEY (search_mode, username)
 );
 
+-- CACHE: Plot-ready points for the website's notable numbers chart. Only the
+-- visually distinguishable subset of every base's top-10k list; see
+-- migrations/2026-08-26_cache_notable_numbers.sql for how it is thinned.
+CREATE TABLE IF NOT EXISTS cache_notable_numbers (
+    base        INTEGER NOT NULL,
+    number      DECIMAL NOT NULL,
+    num_uniques INTEGER NOT NULL,
+    off_by      INTEGER NOT NULL,
+    niceness    REAL    NOT NULL,
+    PRIMARY KEY (base, number)
+);
+
 GRANT SELECT ON cache_search_rate_daily TO web_anon;
 GRANT SELECT ON cache_search_leaderboard TO web_anon;
+GRANT SELECT ON cache_notable_numbers TO web_anon;
 
 CREATE INDEX IF NOT EXISTS idx_cache_rate_daily_mode_date ON cache_search_rate_daily(search_mode, date);
 CREATE INDEX IF NOT EXISTS idx_cache_leaderboard_mode ON cache_search_leaderboard(search_mode, total_range DESC);

@@ -28,10 +28,12 @@ Backend:
   - Make queue refills single-flight and run them on the requesting handler's database connection
   - Thanks to [Janzert](https://github.com/Janzert) for the report and diagnoses
 - Add `common/tests/claim_queries.rs`: the claim path is hand-written SQL with positional bindings that the compiler cannot check, so it is now exercised against a real PostgreSQL. Skipped unless `NICE_TEST_DATABASE_URL` is set.
+- Add `cache_notable_numbers`, refreshed by the scheduled jobs alongside the other caches: the plot-ready subset of every base's top-10k number list, thinned to the points that are visually distinguishable on the website's chart. Covered by `common/tests/notable_numbers_cache.rs`.
 
 Website:
 
 - Speed up the index page: start the data fetches while the plot library is still downloading, draw each chart as its own data arrives instead of waiting for all five requests, and load d3/Plot as two vendored files rather than 48 CDN modules spread over six dependency levels. `just vendor-fetch` downloads them; `just deploy-site` and `just dev` do it automatically.
+- Draw the notable numbers chart from `cache_notable_numbers` instead of every base's full top-10k list. The chart is unchanged to the eye; it was drawing ~81k points into a space with room for a few hundred distinguishable ones, which cost 686 KB of payload and about two seconds of blocking work per page load.
 
 ## Nice v3.3.0
 
