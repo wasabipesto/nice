@@ -347,6 +347,38 @@ fn try_init_cuda(device: usize) -> Result<CudaContext> {
     }
 }
 
+/// Initialize the `CubeCL` wgpu runtime, surviving the case where it panics
+/// instead of returning an error.
+///
+/// cubecl-wgpu panics when no adapter serves the requested backend, which is
+/// the ordinary case inside a CUDA container with no Vulkan ICD. Unwinding out
+/// of the backend chain aborts the process, so `auto` never reaches the
+/// hand-CUDA stop that exists precisely for that corner — detailed mode died
+/// with exit 101 on hosts whose plain CUDA was working fine.
+///
+/// Same shape and same caveat as `try_init_cuda`: the hook is silenced so a
+/// routine fallback does not print a panic trace, and this relies on
+/// unwinding.
+#[cfg(feature = "cubecl")]
+fn try_init_cubecl_default() -> Result<CubeclContext> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let caught = std::panic::catch_unwind(CubeclContext::new_default);
+    std::panic::set_hook(previous);
+
+    match caught {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("no adapter available for the requested wgpu backend");
+            Err(anyhow!("{msg}"))
+        }
+    }
+}
+
 /// Bring up the GPU backend the user asked for.
 ///
 /// `Auto`'s order is per mode, from the measured tables in the `CubeCL`
@@ -448,7 +480,7 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
 
     #[cfg(feature = "cubecl")]
     if matches!(want, GpuBackend::Auto | GpuBackend::Cubecl) {
-        match CubeclContext::new_default() {
+        match try_init_cubecl_default() {
             Ok(ctx) => {
                 info!(
                     "GPU initialized: CubeCL wgpu device ({}), batch size {}",
@@ -462,7 +494,7 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 std::process::exit(1);
             }
             Err(e) => {
-                info!("CubeCL unavailable; trying Vulkan");
+                info!("CubeCL unavailable; trying the next backend");
                 debug!("  CubeCL init failed: {e:#}");
             }
         }
