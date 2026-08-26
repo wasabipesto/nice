@@ -10,12 +10,11 @@ Kept close to the Rust so the two can be diffed by eye: same stage names,
 same confidence numbers, same widening factors, same order of checks. Pure
 functions over decoded samples; the corpus sync lives in the controller.
 
-One deliberate divergence, in `cpu_match_key`: the Rust compares CPU model
-strings directly, which silently fails whenever Vast's listing string and the
-client's /proc/cpuinfo string spell the same chip differently — 55% of the
-instances we have ground truth for, essentially every Intel part. See that
-function for the measurement. If POST /estimate is ever revived the Rust needs
-the same fix before the two can be called equivalent again.
+The two must carry the same CPU identity rule: see `cpu_match_key` here and
+its counterpart in common/src/estimator.rs. Comparing the raw model strings
+instead silently fails whenever Vast's listing string and the client's
+/proc/cpuinfo string spell the same chip differently, which is essentially
+every Intel part; that function carries the measurement.
 """
 
 from __future__ import annotations
