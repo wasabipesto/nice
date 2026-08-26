@@ -8,6 +8,7 @@ import time
 import unittest
 
 import controller
+import estimator
 from controller import (
     DEFAULT_CONFIG,
     exploit_allowed,
@@ -554,7 +555,7 @@ class EHoldStatisticTests(unittest.TestCase):
         self.assertAlmostEqual(e_hold_hours(db, cfg(), "RTX 3080"), 4.36, places=2)
 
 
-class CpuFamilyKeyTests(unittest.TestCase):
+class CpuMatchKeyTests(unittest.TestCase):
     def test_bridges_vast_and_cpuinfo_strings(self):
         # Vast's listing string and the client's /proc/cpuinfo string for the
         # same chip must land on one key, or coverage is never detected.
@@ -563,19 +564,19 @@ class CpuFamilyKeyTests(unittest.TestCase):
             ("AMD EPYC 7763 64-Core Processor", "AMD EPYC 7763 64-Core Processor"),
             ("Core\u2122 i7-6700", "Intel(R) Core(TM) i7-6700 CPU @ 3.40GHz"),
         ]:
-            self.assertEqual(controller.cpu_family_key(vast),
-                             controller.cpu_family_key(cpuinfo),
+            self.assertEqual(estimator.cpu_match_key(vast),
+                             estimator.cpu_match_key(cpuinfo),
                              f"{vast!r} and {cpuinfo!r} are the same chip")
 
     def test_distinct_chips_stay_distinct(self):
-        self.assertNotEqual(controller.cpu_family_key("Xeon E5-2680 v4"),
-                            controller.cpu_family_key("Xeon E5-2690 v3"))
-        self.assertNotEqual(controller.cpu_family_key("AMD EPYC 7763"),
-                            controller.cpu_family_key("AMD EPYC 7402"))
+        self.assertNotEqual(estimator.cpu_match_key("Xeon E5-2680 v4"),
+                            estimator.cpu_match_key("Xeon E5-2690 v3"))
+        self.assertNotEqual(estimator.cpu_match_key("AMD EPYC 7763"),
+                            estimator.cpu_match_key("AMD EPYC 7402"))
 
     def test_missing_cpu_is_safe(self):
-        self.assertEqual(controller.cpu_family_key(None), "?")
-        self.assertEqual(controller.cpu_family_key(""), "?")
+        self.assertEqual(estimator.cpu_match_key(None), "?")
+        self.assertEqual(estimator.cpu_match_key(""), "?")
 
 
 class ExploreTargetingTests(unittest.TestCase):

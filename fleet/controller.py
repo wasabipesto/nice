@@ -1024,33 +1024,6 @@ def record_ev_seen(db, mode, mode_offers):
     db.commit()
 
 
-# Vendor and marketing tokens that appear on one side of a CPU name but not
-# the other. Vast lists "Xeon(R) E5-2680 v4" while /proc/cpuinfo reports
-# "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz", so a naive first-two-tokens
-# family key reads "xeon e5-2680" from one and "intel xeon" from the other and
-# the two never meet.
-_CPU_NOISE = frozenset(
-    ["intel", "amd", "genuine", "authentic", "cpu", "processor", "core", "with",
-     "radeon", "graphics", "ryzen", "th", "gen"]
-)
-
-
-def cpu_family_key(raw):
-    """A CPU grouping that survives the gap between Vast's listing strings and
-    the client's /proc/cpuinfo strings.
-
-    Drops the clock suffix and the vendor/marketing tokens either side may or
-    may not carry, then keeps the first two remaining tokens: "xeon e5-2680",
-    "epyc 7763", "i5-11400". Deliberately separate from the estimator's own
-    `family_key`, which is part of a matching chain validated against the Rust
-    implementation and must not drift with it."""
-    text = estimator.normalize_model(raw or "?")
-    text = text.split("@")[0]
-    tokens = [t for t in text.replace("(", " ").replace(")", " ").split()
-              if t not in _CPU_NOISE and not t.endswith("ghz")]
-    return " ".join(tokens[:2]) if tokens else "?"
-
-
 def corpus_cell_key(gpu_model, cpu_model):
     """The unit of estimator coverage: a GPU model paired with a CPU family.
 
@@ -1059,7 +1032,7 @@ def corpus_cell_key(gpu_model, cpu_model):
     CPU family (not model) because that is the granularity the corpus can
     actually fill — there are hundreds of CPU models on the market and we buy
     a few hundred instances a month."""
-    return (estimator.normalize_gpu_model(gpu_model or "?"), cpu_family_key(cpu_model))
+    return (estimator.normalize_gpu_model(gpu_model or "?"), estimator.cpu_match_key(cpu_model))
 
 
 def corpus_cell_counts(db):
@@ -1068,7 +1041,7 @@ def corpus_cell_counts(db):
     runs in its sweep are priced by the CPU chain regardless of GPU."""
     counts = {}
     for r in db.execute("SELECT gpu_model, cpu_model FROM corpus WHERE gpu = 1").fetchall():
-        key = (r["gpu_model"] or "?", cpu_family_key(r["cpu_model"]))
+        key = (r["gpu_model"] or "?", estimator.cpu_match_key(r["cpu_model"]))
         counts[key] = counts.get(key, 0) + 1
     return counts
 
