@@ -64,10 +64,13 @@ const hardware = process.argv.includes("--hw");
 // Chromium in new-headless mode is what a user's browser actually is.
 //
 // `--firefox` runs the same page in Firefox instead. Firefox gates WebGPU
-// behind two prefs on Linux — the feature, and WebGPU inside workers, which
-// is where this client runs it — so both are set here. Neither is on by
-// default in a release channel yet, so this mode is for checking the stack
-// works there, not for CI.
+// behind three prefs on Linux: the feature, WebGPU inside workers (which is
+// where this client runs it), and the driver blocklist — Firefox ships a
+// conservative adapter blocklist on Linux, and a blocklisted adapter makes
+// requestAdapter return null, which is indistinguishable from "no hardware"
+// unless the pref is cleared. None of the three is on by default in a
+// release channel yet, so this mode is for checking the stack works there,
+// not for CI.
 const useFirefox = process.argv.includes("--firefox");
 const browser = useFirefox
     ? await firefox.launch({
@@ -75,6 +78,7 @@ const browser = useFirefox
           firefoxUserPrefs: {
               "dom.webgpu.enabled": true,
               "dom.webgpu.workers.enabled": true,
+              "gfx.webgpu.ignore-blocklist": true,
           },
       })
     : await chromium.launch({
