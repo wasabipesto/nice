@@ -971,6 +971,76 @@ impl CubeclContext {
     ///
     /// # Errors
     /// Returns an error if no wgpu device is available.
+    /// The largest buffer a browser build lets `CubeCL` allocate, and by
+    /// extension the top of every memory pool it builds.
+    ///
+    /// `CubeCL` sets its pool page sizes from the *device's*
+    /// `max_storage_buffer_binding_size`, and asks the adapter for its
+    /// maximum — 128 MB on the machine below. Measured on LibreWolf 149 with
+    /// an RX 9070 XT: that device grants `maxBufferSize` of 256 MB and then
+    /// refuses any single allocation of 8 MB or more, while allowing 4 MB
+    /// and roughly 10 MB in aggregate. The advertised limits are therefore
+    /// not usable as a sizing input, and nothing the client does with its own
+    /// buffer sizes can constrain the pools cubecl builds behind it.
+    ///
+    /// Owning the device is the only lever: requesting this limit caps every
+    /// pool — main, staging and uniform alike — at a size that browser
+    /// accepts. The client's largest binding is the near-miss buffer at
+    /// 160 KB, so there is a wide margin.
+    #[cfg(target_family = "wasm")]
+    const BROWSER_MAX_BUFFER: u64 = 4 * 1024 * 1024;
+
+    /// Build a `CubeCL` setup around a device we requested ourselves.
+    ///
+    /// `init_setup_async` would ask for `adapter.limits()`, the maximum the
+    /// adapter advertises; see [`Self::BROWSER_MAX_BUFFER`] for why that is
+    /// unusable in a browser. Everything else mirrors what cubecl's own
+    /// `request_device` does.
+    #[cfg(target_family = "wasm")]
+    async fn browser_setup() -> Result<cubecl::wgpu::WgpuSetup> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("no WebGPU adapter: {e:?}"))?;
+
+        // Start from the defaults every WebGPU implementation must support,
+        // then bound the two that drive cubecl's pool sizing.
+        let mut limits = wgpu::Limits::default();
+        limits.max_buffer_size = Self::BROWSER_MAX_BUFFER;
+        limits.max_storage_buffer_binding_size = Self::BROWSER_MAX_BUFFER;
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("nice browser client"),
+                required_features: adapter
+                    .features()
+                    .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+                // Safety: mirrors cubecl's own device request.
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("WebGPU device request failed: {e:?}"))?;
+
+        Ok(cubecl::wgpu::WgpuSetup {
+            instance,
+            adapter,
+            device,
+            queue,
+            backend: wgpu::Backend::BrowserWebGpu,
+        })
+    }
+
     /// Runtime options for the wgpu backend.
     ///
     /// In a browser this pins `ExclusivePages`, so every buffer is allocated
@@ -1030,13 +1100,28 @@ impl CubeclContext {
     /// client is infallible once the set above has happened.
     pub async fn new_default_async() -> Result<Self> {
         if WGPU_DEFAULT.get().is_none() {
-            let device = cubecl::wgpu::WgpuDevice::default();
-            let setup = cubecl::wgpu::init_setup_async::<cubecl::wgpu::AutoGraphicsApi>(
-                &device,
-                Self::runtime_options(),
-            )
-            .await;
-            let info = setup.adapter.get_info();
+            // In a browser the device is ours, so its limits can be bounded;
+            // natively cubecl picks the device as usual.
+            #[cfg(target_family = "wasm")]
+            let (device, info) = {
+                let setup = Self::browser_setup().await?;
+                let info = setup.adapter.get_info();
+                (
+                    cubecl::wgpu::init_device(setup, Self::runtime_options()),
+                    info,
+                )
+            };
+            #[cfg(not(target_family = "wasm"))]
+            let (device, info) = {
+                let device = cubecl::wgpu::WgpuDevice::default();
+                let setup = cubecl::wgpu::init_setup_async::<cubecl::wgpu::AutoGraphicsApi>(
+                    &device,
+                    Self::runtime_options(),
+                )
+                .await;
+                let info = setup.adapter.get_info();
+                (device, info)
+            };
             let device_name = format!("{} ({:?})", info.name, info.backend);
             let client = cubecl::wgpu::WgpuRuntime::client(&device);
             // A racing initializer winning this set is fine: both describe
