@@ -239,6 +239,13 @@ Unset, it picks the highest-powered adapter.
   wgpu this usually means the driver's watchdog reset the GPU (check `dmesg`
   for `ring gfx ... timeout`); please report it, since batches are sized to
   stay under watchdogs.
+- *Browser client, Firefox on Linux* — WebGPU there is still pre-release
+  (two `about:config` prefs, worker support unfinished upstream). On at least
+  one AMD/RADV machine the browser grants roughly 10 MB of GPU memory in
+  total, refuses single allocations of 8 MB and up, and does not appear to
+  reclaim on release, which is not enough to run this client's GPU path. The
+  page falls back to the CPU worker pool automatically. Chromium on the same
+  machine offers no adapter at all yet (AMD is not in its Linux rollout).
 - *"Unable to find a Vulkan driver"* on macOS — the experimental `vulkan` backend needs
   `brew install molten-vk vulkan-loader` and
   `VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`. The
