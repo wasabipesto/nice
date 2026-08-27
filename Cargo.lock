@@ -2809,7 +2809,6 @@ dependencies = [
  "test-log",
  "tokio",
  "web-time",
- "wgpu",
 ]
 
 [[package]]
