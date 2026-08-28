@@ -927,7 +927,14 @@
                         worker.terminate();
                         resolve(null);
                     };
-                    worker.postMessage({ type: "init" });
+                    // Same compiled module the CPU pool uses (worker-pool.js);
+                    // the GPU worker should not re-download and re-compile it.
+                    niceWasmModule().then((sharedModule) =>
+                        worker.postMessage({
+                            type: "init",
+                            data: { module: sharedModule },
+                        }),
+                    );
                 });
             }
 

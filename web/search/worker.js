@@ -27,12 +27,19 @@ function stringifySubmission(payload) {
     return JSON.stringify(payload).replace(/"number":"(\d+)"/g, '"number":$1');
 }
 
-// Initialize WASM module in worker context
-async function initWasm() {
+// Initialize WASM module in worker context.
+//
+// `sharedModule` is a WebAssembly.Module the page compiled once and
+// structured-cloned to every worker. Without it each worker fetches and
+// compiles the same ~1.9 MB binary independently, which on a cold cache is
+// nine downloads and nine compiles of identical bytes. wasm-bindgen's init
+// takes a Module directly and goes straight to WebAssembly.instantiate;
+// passing undefined keeps the old fetch-by-URL behaviour.
+async function initWasm(sharedModule) {
     try {
         // Import the WASM module
         const wasmModule = await import("./pkg/nice_wasm_client.js");
-        await wasmModule.default();
+        await wasmModule.default(sharedModule);
         wasm = wasmModule;
         isInitialized = true;
 
@@ -272,7 +279,7 @@ self.onmessage = async function (e) {
 
     switch (type) {
         case "init":
-            await initWasm();
+            await initWasm(data?.module);
             break;
 
         case "process":

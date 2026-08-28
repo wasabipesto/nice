@@ -231,6 +231,15 @@ async function submitShape(backend) {
     const page = await browser.newPage();
     let captured = null;
     let raw = "";
+    // The page compiles the wasm once and structured-clones the Module to
+    // every worker; if that regresses, each of the ~9 workers fetches its own
+    // copy of the 1.9 MB binary and this count jumps with the thread count.
+    let wasmFetches = 0;
+    page.on("request", (r) => {
+        // GET only: logBuild() issues a deliberate HEAD probe for the build
+        // banner, which transfers no body.
+        if (r.url().endsWith(".wasm") && r.method() === "GET") wasmFetches += 1;
+    });
     page.on("pageerror", (e) => console.log(`[submit:${backend}] pageerror:`, e.message));
     await page.route("**/api.nicenumbers.net/**", async (route) => {
         const req = route.request();
@@ -287,13 +296,13 @@ async function submitShape(backend) {
     // The page loops into the next field after a submission; closing here
     // stops it, and an in-flight route can reject as it goes.
     await page.close().catch(() => {});
-    return { captured, raw };
+    return { captured, raw, wasmFetches };
 }
 
 if (!failed) {
     console.log("=== submit payload shape ===");
     for (const backend of skipGpu ? ["cpu"] : ["cpu", "gpu"]) {
-        const { captured, raw, skipped } = await submitShape(backend);
+        const { captured, raw, wasmFetches, skipped } = await submitShape(backend);
         if (skipped) {
             console.log(`[submit:${backend}] skipped: ${skipped}`);
             continue;
@@ -331,6 +340,12 @@ if (!failed) {
                     `${NEAR_MISS} (a double cannot hold it)`,
             );
         }
+        if (wasmFetches !== 1) {
+            problems.push(
+                `wasm binary fetched ${wasmFetches} times, expected 1 ` +
+                    `(the compiled module should be shared across workers)`,
+            );
+        }
         if (typeof captured.username !== "string") problems.push("username missing");
         if (typeof captured.client_version !== "string") {
             problems.push("client_version missing");
@@ -342,6 +357,7 @@ if (!failed) {
             console.log(
                 `[submit:${backend}] ok — claim_id ${captured.claim_id} (number), ` +
                     `${dist.length} bins, near miss ${NEAR_MISS} exact, ` +
+                    `1 wasm fetch, ` +
                     `client_version ${captured.client_version}`,
             );
         }
