@@ -44,7 +44,7 @@ pub const MAX_CUBES_WEB: u32 = 4096;
 /// deadlines), and the u32-only arithmetic is several times slower per
 /// candidate, so dispatches are sized for slow integrated GPUs. Each batch is
 /// flushed as its own submission, exactly like the native backend.
-pub const CUBECL_WEB_BATCH_SIZE: u128 = 4_000_000;
+pub const CUBECL_WEB_BATCH_SIZE: u128 = 32_000_000;
 
 /// Near-miss records held on the device per field.
 ///
@@ -438,7 +438,7 @@ pub async fn process_range_detailed_web_async(
 ) -> Result<FieldResults> {
     /// Batches between blocking histogram drains; bins are u32 and each
     /// candidate increments exactly one, so the bound is checked below.
-    const DRAIN_INTERVAL: usize = 512;
+    const DRAIN_INTERVAL: usize = 64;
     const _: () = assert!((DRAIN_INTERVAL as u128) * CUBECL_WEB_BATCH_SIZE < u32::MAX as u128);
 
     if !gpu_supports_base(base) {
@@ -510,7 +510,28 @@ pub async fn process_range_detailed_web_async(
             undrained = 0;
         }
     }
-    crate::cubecl_backend::drain(client, hist_handle, &mut histogram).await?;
+    // One round trip for the histogram and both near-miss buffers. Every
+    // GPU->CPU read costs a queue drain and, in a browser, a task tick before
+    // the mapped memory is readable; this tail runs once per slice, so three
+    // separate reads paid that latency three times over for data that is
+    // ready at the same moment.
+    let mut reads = client
+        .read_async(vec![
+            hist_handle,
+            miss_count_handle,
+            miss_data_handle,
+        ])
+        .await
+        .map_err(|e| anyhow::anyhow!("result read failed: {e:?}"))?;
+    let miss_bytes = reads.pop().expect("miss data read");
+    let count_bytes = reads.pop().expect("miss count read");
+    let hist_bytes = reads.pop().expect("histogram read");
+    for (acc, &bin) in histogram
+        .iter_mut()
+        .zip(u32::from_bytes(&hist_bytes).iter())
+    {
+        *acc += u128::from(bin);
+    }
 
     // Conservation: every candidate lands in exactly one bin.
     let counted: u128 = histogram.iter().sum();
@@ -521,23 +542,12 @@ pub async fn process_range_detailed_web_async(
         range.size()
     );
 
-    // Near misses.
-    let bytes = client
-        .read_async(vec![miss_count_handle.clone()])
-        .await
-        .map_err(|e| anyhow::anyhow!("miss count read failed: {e:?}"))?
-        .remove(0);
-    let miss_total = u32::from_bytes(&bytes)[0] as usize;
+    let miss_total = u32::from_bytes(&count_bytes)[0] as usize;
     ensure!(
         miss_total <= NEAR_MISS_CAPACITY_WEB,
         "near-miss buffer overflow: {miss_total} > {NEAR_MISS_CAPACITY_WEB}"
     );
-    let bytes = client
-        .read_async(vec![miss_data_handle])
-        .await
-        .map_err(|e| anyhow::anyhow!("miss data read failed: {e:?}"))?
-        .remove(0);
-    let words = u32::from_bytes(&bytes);
+    let words = u32::from_bytes(&miss_bytes);
     let mut nice_numbers: Vec<NiceNumberSimple> = (0..miss_total)
         .map(|i| {
             let o = i * MISS_STRIDE as usize;
@@ -601,10 +611,13 @@ mod tests {
         assert!(max * max + max + max <= u64::from(u32::MAX));
     }
 
-    /// A drain interval of web batches must not overflow a u32 bin.
+    /// A drain interval of web batches must not overflow a u32 bin. Must
+    /// track `DRAIN_INTERVAL` in `process_range_detailed_web`, which the
+    /// compile-time assert beside it pins; this is the readable statement of
+    /// the same bound.
     #[test]
     fn web_batch_drain_interval_cannot_overflow_a_bin() {
-        assert!(512 * CUBECL_WEB_BATCH_SIZE < u128::from(u32::MAX));
+        assert!(64 * CUBECL_WEB_BATCH_SIZE < u128::from(u32::MAX));
     }
 
     /// CPU/web-kernel parity across limb widths and both mask layouts —
