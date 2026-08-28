@@ -108,8 +108,7 @@ function processDetailedWithProgress(claimDataJson, username) {
         // Merge nice numbers
         allNiceNumbers.push(...chunkResult.nice_numbers);
 
-        // Update distribution ("distribution" in FieldResults; the old
-        // "distribution_updates" name predates a serialization rename)
+        // Update distribution
         for (const entry of chunkResult.distribution) {
             const currentCount = uniqueDistribution.get(entry.num_uniques) || 0;
             uniqueDistribution.set(

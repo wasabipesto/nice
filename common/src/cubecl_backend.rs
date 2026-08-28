@@ -962,15 +962,6 @@ pub enum CubeclContext {
 }
 
 impl CubeclContext {
-    /// Initialize on the runtime's default device (discrete first, then
-    /// integrated, then software rasterizers), recording the adapter's
-    /// marketing name for benchmark reports and the estimator.
-    ///
-    /// `init_setup` registers the device server and is not idempotent, so the
-    /// setup runs exactly once per process; later contexts clone the client.
-    ///
-    /// # Errors
-    /// Returns an error if no wgpu device is available.
     /// Runtime options for the wgpu backend.
     ///
     /// In a browser this pins `ExclusivePages`, so every buffer is allocated
@@ -995,6 +986,16 @@ impl CubeclContext {
         }
         options
     }
+
+    /// Initialize on the runtime's default device (discrete first, then
+    /// integrated, then software rasterizers), recording the adapter's
+    /// marketing name for benchmark reports and the estimator.
+    ///
+    /// `init_setup` registers the device server and is not idempotent, so the
+    /// setup runs exactly once per process; later contexts clone the client.
+    ///
+    /// # Errors
+    /// Returns an error if no wgpu device is available.
 
     pub fn new_default() -> Result<Self> {
         let (client, device_name) = WGPU_DEFAULT.get_or_init(|| {

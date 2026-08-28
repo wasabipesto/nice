@@ -225,19 +225,6 @@ The GPU-enabled client (`--features gpu`, or the `-gpu` docker tag) carries mult
 | `cuda` | NVIDIA | CUDA toolkit (NVRTC) |
 | `vulkan` (experimental, opt-in build) | any Vulkan 1.2 device with `shaderInt64` | a Vulkan driver; on macOS also MoltenVK + the Vulkan loader (`brew install molten-vk vulkan-loader`) |
 
-### Browser client
-
-The page in `web/search` runs the same detailed search in the browser, on a pool of CPU workers or, when the browser offers a WebGPU adapter, on the GPU. It feature-detects and falls back to the CPU pool on its own, so nothing needs configuring; the backend dropdown only offers the GPU when one is actually available.
-
-WebGPU is shipped on Windows and macOS but is still rolling out on Linux, where support depends on the browser and the vendor. Measured on an AMD RX 9070 XT (RADV, Wayland):
-
-| browser | result |
-|---|---|
-| Firefox Nightly | works, no flags — the recommended way to use the GPU path on Linux today |
-| Firefox 152+ | needs `dom.webgpu.enabled`; if the page still reports no adapter, also try `dom.webgpu.workers.enabled` (the client runs WebGPU inside a worker) and `gfx.webgpu.ignore-blocklist` (a blocklisted adapter is reported as no adapter) |
-| Chromium | no adapter on AMD yet — Chrome's Linux rollout is per-vendor, and AMD is not in it |
-| LibreWolf 149 | does not work: its hardening caps GPU memory at roughly 10 MB, well under what the GPU path needs. Stock Firefox on the same machine has no such ceiling |
-
 ## Why are you writing this from scratch for like the tenth time
 
 It's the sixth time. And no comment.
