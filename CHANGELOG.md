@@ -28,6 +28,7 @@ Backend:
   - Make queue refills single-flight and run them on the requesting handler's database connection
   - Thanks to [Janzert](https://github.com/Janzert) for the report and diagnoses
 - Add `common/tests/claim_queries.rs`: the claim path is hand-written SQL with positional bindings that the compiler cannot check, so it is now exercised against a real PostgreSQL. Skipped unless `NICE_TEST_DATABASE_URL` is set.
+- Exclude browser-suite benchmark reports (`config.platform: "browser"`) from the `/estimate` corpus, in both the API's estimator and the fleet controller's Python port: wasm rates are not native rates, and a browser cannot name its CPU, so these samples would pool into the coarse fallback buckets and drag native estimates down. The reports themselves are still stored.
 - Add `cache_notable_numbers`, refreshed by the scheduled jobs alongside the other caches: the plot-ready subset of every base's top-10k number list, thinned to the points that are visually distinguishable on the website's chart. Covered by `common/tests/notable_numbers_cache.rs`.
 
 Website:

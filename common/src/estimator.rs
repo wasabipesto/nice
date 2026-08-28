@@ -52,6 +52,14 @@ pub fn decode_sample(client_version: &str, data: &Value) -> Option<BenchmarkSamp
         return None;
     }
     let config = data.get("config")?;
+    // Browser-suite reports are stored for their own sake but stay out of
+    // the estimator corpus: wasm rates are not native rates, and a browser
+    // cannot name its CPU, so these samples would land in the coarse
+    // fallback buckets and drag native estimates down. Native reports
+    // carry no `platform` key at all.
+    if config.get("platform").and_then(Value::as_str) == Some("browser") {
+        return None;
+    }
     let hardware = data.get("hardware")?;
     let scenarios = data
         .get("scenarios")?
@@ -833,6 +841,32 @@ mod tests {
         let s = decode_sample("3.4.0", &good).unwrap();
         assert_eq!(s.scenarios.len(), 1);
         assert_eq!(s.cpu_model.as_deref(), Some("amd epyc 7763"));
+    }
+
+    #[test]
+    fn decode_excludes_browser_reports() {
+        // The browser suite uploads with config.platform = "browser"; those
+        // reports are stored but must never enter the native corpus (wasm
+        // rates with no cpu_model would pool into the fallback buckets).
+        let browser = json!({
+            "schema_version": 1,
+            "config": {"gpu": false, "mode": "Detailed", "threads": 8,
+                       "platform": "browser"},
+            "hardware": {"user_agent": "Mozilla/5.0"},
+            "scenarios": [
+                {"key": "b40_detailed", "base": 40, "threads": 8, "rate": 1.5e7}
+            ],
+        });
+        assert!(decode_sample("3.4.0-wasm-worker", &browser).is_none());
+
+        // The same report without the marker decodes, so the exclusion is
+        // the platform key and nothing else.
+        let mut native = browser.clone();
+        native["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("platform");
+        assert!(decode_sample("3.4.0", &native).is_some());
     }
 
     #[test]
