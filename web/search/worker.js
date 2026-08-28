@@ -419,6 +419,34 @@ self.onmessage = async function (e) {
             });
             break;
 
+        case "benchmark_plan":
+            // The shared scenario plan lives in the wasm build (it is the
+            // same table the native client sweeps); the page drives the
+            // suite, the worker just relays the definitions.
+            self.postMessage({
+                type: "benchmark_plan",
+                plan:
+                    isInitialized && wasm.benchmark_plan
+                        ? JSON.parse(wasm.benchmark_plan())
+                        : null,
+            });
+            break;
+
+        case "nicemark":
+            // data: { rates: [{key, rate}], gpu }. Scoring stays in Rust so
+            // the browser and native scores cannot drift.
+            let score = null;
+            try {
+                score = wasm.nicemark_score(
+                    JSON.stringify(data.rates),
+                    data.gpu,
+                );
+            } catch (error) {
+                console.warn("nicemark scoring failed:", error);
+            }
+            self.postMessage({ type: "nicemark", score: score ?? null });
+            break;
+
         case "benchmark":
             // Return benchmark data
             const benchmarkData = {
