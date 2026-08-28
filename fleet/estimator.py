@@ -140,6 +140,13 @@ def decode_sample(client_version, data):
     raw_scenarios = data.get("scenarios")
     if not isinstance(config, dict) or not isinstance(hardware, dict):
         return None
+    # Browser-suite reports are stored for their own sake but stay out of
+    # the estimator corpus: wasm rates are not native rates, and a browser
+    # cannot name its CPU, so these samples would land in the coarse
+    # fallback buckets and drag native estimates down. Native reports carry
+    # no `platform` key at all. Mirrors the Rust.
+    if config.get("platform") == "browser":
+        return None
     if not isinstance(raw_scenarios, list):
         return None
 

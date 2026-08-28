@@ -168,6 +168,26 @@ class VersionAndDecodeTests(unittest.TestCase):
         self.assertEqual(s.cpu_model, "amd epyc 7763")
         self.assertIsNone(s.gpu_model)
 
+    def test_decode_excludes_browser_reports(self):
+        # The browser suite uploads with config.platform = "browser"; those
+        # reports are stored but must never enter the native corpus (wasm
+        # rates with no cpu_model would pool into the fallback buckets).
+        report = {
+            "schema_version": 1,
+            "config": {"gpu": False, "mode": "Detailed", "threads": 8,
+                       "platform": "browser"},
+            "hardware": {"user_agent": "Mozilla/5.0"},
+            "scenarios": [
+                {"key": "b40_detailed", "base": 40, "threads": 8, "rate": 1.5e7},
+            ],
+        }
+        self.assertIsNone(decode_sample("3.4.0-wasm-worker", report))
+        # The same report without the marker decodes, so the exclusion is
+        # the platform key and nothing else.
+        native = {**report, "config": {k: v for k, v in report["config"].items()
+                                       if k != "platform"}}
+        self.assertIsNotNone(decode_sample("3.4.0", native))
+
     def test_decode_survives_malformed_reports(self):
         # A bad report must be skipped, never raise: the corpus is uploaded
         # by clients we don't control.
