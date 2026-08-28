@@ -11,9 +11,10 @@ One tick per cron invocation:
      the #1 cost risk) — diff our ledger against live Vast instances,
      destroy anything expired or unknown, charge runtime spend to the bucket
   2. accrue budget into the token bucket (sustained rate, capped)
-  3. search bid offers, estimate each via the API's POST /estimate
-  4. explore slice: benchmark hardware the estimator can't price
-     (low confidence / cold-start stages), rate-limited and cooled down
+  3. search bid offers and estimate each locally, against a corpus of
+     benchmark reports mirrored from the API's database
+  4. explore slice: benchmark the hardware the estimator can't price yet,
+     ranked by how thin that GPU/CPU-family cell is, rate-limited and cooled
   5. exploit slice: rank offers by hold-amortized P25 EV, buy under the
      reserve rules; exceptional deals may dip into the reserve ("pounce")
      with a probe TTL until realized data confirms the estimate
@@ -27,12 +28,17 @@ token bucket, ~$30/mo accrual, ~$7 cap, half-full reserve line, pounce at
 """
 
 import argparse
+import fcntl
 import json
+import os
 import sqlite3
 import statistics
 import sys
 import time
+import traceback
 import urllib.request
+
+import estimator
 
 # ---------------------------------------------------------------------------
 # Config and state
@@ -58,12 +64,24 @@ _BENCH_SWEEP = (
 DEFAULT_CONFIG = {
     "dry_run": True,
     "api_base": "https://api.nicenumbers.net",
+    # PostgREST host serving the benchmark corpus. Estimation is local, so the
+    # controller mirrors `benchmarks` rather than calling POST /estimate per
+    # offer; this is the only place it is read from.
+    "data_base": "https://data.nicenumbers.net",
+    "corpus_overlap": 50,
+    "corpus_page_size": 5000,
+    "corpus_timeout_secs": 120,
     "username": "wasabipesto-fleet",
     "user_agent": "nice-fleet-controller/1.0",
     "vast_api_key": None,
     "label_prefix": "nice-fleet",
     "db_path": "fleet.sqlite3",
     "kill_switch_path": "KILL",
+    # Relative paths here resolve against the config file's own directory, so
+    # cron needs only one absolute path on its command line.
+    "tick_lock_path": ".tick.lock",
+    "log_path": None,          # None = write to stdout, for interactive runs
+    "log_max_bytes": 5242880,
     # --- budget (token bucket) ---
     "accrual_usd_per_month": 30.0,
     "bucket_cap_usd": 7.0,
@@ -74,6 +92,19 @@ DEFAULT_CONFIG = {
     # ledger + bucket to ground truth. <= 0 disables (estimate-only). Invoices
     # finalize at day boundaries, so this is a lagging correction, not a meter.
     "invoice_reconcile_hours": 1.0,
+    # A single pull that would cut recorded spend by more than this fraction of
+    # the total is refused outright and logged. A true-up corrects drift; a mass
+    # reduction means the invoice feed changed shape, which is a thing to look
+    # at rather than to act on — the original bug wrote off 2372 GPU-hours.
+    # Whether an invoice pull may actually change the ledger. False = observe
+    # only: pull, log the shape, report what would have moved, change nothing.
+    "invoice_apply_trueup": True,
+    "invoice_max_drop_fraction": 0.25,
+    # Log (never act on) a thin match that disagrees with its wider pool by more
+    # than this factor. Diagnostics only: overriding thin matches was measured
+    # and made predictions worse.
+    "divergence_warn_factor": 2.0,
+    "divergence_warn_below_samples": 5,
     # --- economics ---
     "bid_multiplier": 1.2,
     "setup_hours": 0.12,
@@ -100,7 +131,7 @@ DEFAULT_CONFIG = {
         "L40S": 0.5,
     },
     # --- fleet shape ---
-    "mode": "niceonly",  # legacy single-mode default / api_estimate fallback
+    "mode": "niceonly",  # legacy single-mode default / estimate_offer fallback
     # Exploit tracks: one independent budget per mode. Each mode gets its own
     # token bucket (accrual/cap/reserve/pounce) and instance cap; explore
     # benchmarks all modes and is funded from the FIRST (primary) mode's bucket.
@@ -145,8 +176,11 @@ DEFAULT_CONFIG = {
         "sleep infinity"
     ),
     # --- explore slice ---
-    "explore_confidence_threshold": 80,
-    "explore_stages": ["floor", "none", "gpu-family-scaled", "cpu-family-scaled"],
+    # A coverage cell (GPU model x CPU family) at or above this many benchmark
+    # reports is considered priceable and no longer worth exploring. Replaces
+    # the old confidence/stage thresholds: with the corpus local, depth is
+    # measurable directly rather than inferred from an estimate's self-report.
+    "explore_target_samples": 8,
     "explore_per_tick": 2,
     "explore_max_concurrent": 3,
     "explore_per_day": 10,
@@ -188,6 +222,8 @@ CREATE TABLE IF NOT EXISTS instances (
     destroy_reason TEXT,
     spend REAL NOT NULL DEFAULT 0,   -- charged to the bucket so far (estimate,
                                      -- trued-up to invoiced once billing posts)
+    ever_ran INTEGER NOT NULL DEFAULT 0,  -- seen `running` at least once, so a
+                                     -- $0 invoice is a fact, not an unsettled bill
     invoiced REAL,                   -- actual Vast charge (GPU+storage+net),
                                      -- NULL until the instance is invoiced
     mode TEXT                        -- exploit mode (which bucket it charges);
@@ -197,6 +233,17 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value REAL
 );
+CREATE TABLE IF NOT EXISTS corpus (   -- local mirror of the API's benchmarks table
+    id INTEGER PRIMARY KEY,           -- benchmarks.id upstream; the sync watermark
+    client_version TEXT NOT NULL,
+    gpu INTEGER NOT NULL,
+    mode TEXT NOT NULL,
+    threads INTEGER NOT NULL,
+    cpu_model TEXT,                   -- normalized at sync time
+    gpu_model TEXT,                   -- normalized at sync time
+    scenarios TEXT NOT NULL           -- JSON: [{key, base, threads, rate}, ...]
+);
+CREATE INDEX IF NOT EXISTS idx_corpus_pool ON corpus (gpu, mode);
 CREATE TABLE IF NOT EXISTS explored (
     gpu_name TEXT NOT NULL,
     cpu_name TEXT NOT NULL,
@@ -221,10 +268,53 @@ CREATE TABLE IF NOT EXISTS events (
 
 
 def load_config(path):
+    """Load the config and resolve its relative paths against its own location.
+
+    Relative to the config file, not the working directory: cron invokes this
+    from an arbitrary cwd, and resolving against the config means one absolute
+    path on the crontab line is enough to locate everything else."""
     cfg = dict(DEFAULT_CONFIG)
     with open(path, encoding="utf-8") as f:
         cfg.update(json.load(f))
+    base = os.path.dirname(os.path.abspath(path))
+    for key in ("db_path", "kill_switch_path", "log_path"):
+        value = cfg.get(key)
+        if value and not os.path.isabs(value):
+            cfg[key] = os.path.join(base, value)
     return cfg
+
+
+def acquire_tick_lock(path):
+    """Take the single-tick lock, or return None if a tick is already running.
+
+    Ticks can outlast the cron cadence, and two of them racing corrupts the
+    ledger — reconcile crashed on sqlite's write lock 14 times before this
+    existed. Skipping is right rather than queueing: the next scheduled tick
+    picks up whatever this one would have done. The descriptor is deliberately
+    leaked, so the lock lives exactly as long as the process."""
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def redirect_output_to_log(path, max_bytes):
+    """Send this tick's output to the log file, rotating it first if oversized.
+
+    Takes over the real file descriptors rather than just `sys.stdout`, so an
+    uncaught traceback lands in the log with everything else instead of in
+    cron's mail. Rotation happens here, before the file is opened, because a
+    process holding the old descriptor would otherwise keep writing to the
+    rotated-away inode."""
+    if max_bytes and os.path.exists(path) and os.path.getsize(path) > max_bytes:
+        os.replace(path, path + ".1")
+    handle = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    os.dup2(handle.fileno(), sys.stdout.fileno())
+    os.dup2(handle.fileno(), sys.stderr.fileno())
+    return handle
 
 
 def open_db(path):
@@ -237,6 +327,8 @@ def open_db(path):
         db.execute("ALTER TABLE instances ADD COLUMN invoiced REAL")
     if "mode" not in icols:
         db.execute("ALTER TABLE instances ADD COLUMN mode TEXT")
+    if "ever_ran" not in icols:
+        db.execute("ALTER TABLE instances ADD COLUMN ever_ran INTEGER NOT NULL DEFAULT 0")
     ecols = {r["name"] for r in db.execute("PRAGMA table_info(ev_seen)").fetchall()}
     if "mode" not in ecols:
         db.execute("ALTER TABLE ev_seen ADD COLUMN mode TEXT")
@@ -357,21 +449,96 @@ def parse_invoice_charges(invoices, owned_ids):
     return actual
 
 
-def plan_invoice_trueup(spend_by_id, actual_by_id, eps=1e-6):
+def plan_invoice_trueup(spend_by_id, actual_by_id, eps=1e-6, alive_ids=frozenset(),
+                        max_drop_fraction=None):
     """Pure planner for the invoice true-up. Given each instance's charged-so-far
-    `spend` and its actual invoiced total, return (updates, net) where updates is
-    [(vast_id, new_spend, delta)] for instances whose charge drifted from actual
-    and net is the total to subtract from the bucket (positive = we under-charged
-    and owe more). Idempotent: once spend == actual, nothing is returned."""
+    `spend` and its actual invoiced total, return (updates, net, refusals) where
+    updates is [(vast_id, new_spend, delta)] for instances whose charge drifted
+    from actual and net is the total to subtract from the bucket (positive = we
+    under-charged and owe more). Idempotent: once spend == actual, nothing is
+    returned.
+
+    Three guards, all learned from the true-up that silently zeroed 1465
+    instances and 2372 GPU-hours of real spend:
+
+    * A live instance is never reduced. Its bill is still accruing, so a
+      partial invoice always looks like an over-charge.
+    * Spend never goes negative, whatever the invoice claims.
+    * If the pull would cut recorded spend by more than `max_drop_fraction` of
+      the total, the whole batch is refused rather than applied. A true-up is a
+      correction; a mass reduction means the invoice feed changed shape under
+      us, and that is a thing to look at, not to act on.
+    """
     updates = []
     net = 0.0
+    refusals = []
     for iid, actual in actual_by_id.items():
-        delta = actual - spend_by_id.get(iid, 0.0)
+        current = spend_by_id.get(iid, 0.0)
+        delta = actual - current
         if abs(delta) < eps:
             continue
-        updates.append((iid, actual, delta))
+        if delta < 0 and iid in alive_ids:
+            refusals.append((iid, "still running; bill not final"))
+            continue
+        new_spend = max(0.0, actual)
+        delta = new_spend - current
+        if abs(delta) < eps:
+            continue
+        updates.append((iid, new_spend, delta))
         net += delta
-    return updates, net
+    if max_drop_fraction is not None:
+        total = sum(spend_by_id.values())
+        drop = -net
+        if total > 0 and drop > total * max_drop_fraction:
+            return [], 0.0, [(None, f"batch would cut recorded spend by "
+                                    f"${drop:.2f} of ${total:.2f} "
+                                    f"(> {max_drop_fraction:.0%}); refusing")]
+    return updates, net, refusals
+
+
+def log_invoice_shape(db, invoices, spend_by_id, owned):
+    """Record what an invoice pull actually contained, without acting on it.
+
+    Per-instance charges live in a ~2-day sliding window and each instance is
+    only ever seen once, so the conditions governing when a zero is trustworthy
+    have to be written against observed shapes rather than guessed. This logs
+    those shapes so a week of them accumulates before any rule is written."""
+    from collections import Counter
+    days = Counter()
+    kinds = Counter()
+    zero_rows = 0
+    per_instance = {}
+    for r in invoices:
+        if r.get("type") != "charge":
+            continue
+        ts = r.get("timestamp")
+        day = time.strftime("%Y-%m-%d", time.gmtime(ts)) if ts else "?"
+        days[day] += 1
+        try:
+            amt = float(r.get("amount") or 0.0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        try:
+            qty = float(r.get("quantity") or 0.0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty == 0.0 or amt == 0.0:
+            zero_rows += 1
+        desc = (r.get("description") or "").split(":")[0]
+        kinds[desc.split()[-1] if desc.split() else "?"] += 1
+        iid = r.get("instance_id")
+        if iid in owned:
+            per_instance[iid] = per_instance.get(iid, 0.0) + amt
+    nonzero = {i: a for i, a in per_instance.items() if a > 0}
+    ratios = [nonzero[i] / spend_by_id[i] for i in nonzero
+              if spend_by_id.get(i, 0.0) > 0]
+    ratio_note = (f"invoiced/estimated median {statistics.median(ratios):.2f} "
+                  f"over {len(ratios)}") if ratios else "no comparable pairs"
+    log_event(
+        db, "INVOICE-SHAPE",
+        f"days={dict(days)} kinds={dict(kinds)} zero_rows={zero_rows} "
+        f"ours={len(per_instance)} of_which_nonzero={len(nonzero)}; {ratio_note}",
+    )
 
 
 def effective_rate(p25_rate, e_hold_hours, setup_hours, lost_hours):
@@ -437,16 +604,31 @@ def e_hold_hours(db, cfg, gpu_name):
     """Expected hold for a GPU type: our own realized holds when we have
     them (ground truth), else the market-study seed table. Only exploit
     instances count — explore instances retire themselves after their
-    benchmark, which reconcile can't distinguish from a preemption."""
+    benchmark, which reconcile can't distinguish from a preemption.
+
+    The MEAN, not the median. `effective_rate` amortizes a fixed setup cost
+    over this, and across many instances the true ratio is
+    sum(hold) / sum(hold + setup + lost) — a mean operation. Hold
+    distributions are violently right-skewed (RTX 3080: median 0.97h, mean
+    4.63h), and the long tail is where nearly all delivered work lives, so
+    the median charged a 72% amortization haircut where the truth was ~7%
+    and systematically undervalued any type that usually dies young but
+    occasionally holds for a day.
+
+    Known residual bias: sampling the most recent N *deaths* under-represents
+    long holds, which die less often per unit time. Correcting that properly
+    is survival analysis; the window is widened instead, which trades some
+    responsiveness for stability.
+    """
     rows = db.execute(
         "SELECT (destroyed_at - created_at) / 3600.0 AS h FROM instances "
         "WHERE gpu_name = ? AND destroyed_at IS NOT NULL "
         "AND destroy_reason = 'preempted' AND purpose = 'exploit' "
-        "ORDER BY destroyed_at DESC LIMIT 20",
+        "ORDER BY destroyed_at DESC LIMIT 40",
         (gpu_name,),
     ).fetchall()
     if len(rows) >= 3:
-        return statistics.median(r["h"] for r in rows)
+        return statistics.mean(r["h"] for r in rows)
     seeds = cfg["e_hold_seed_hours"]
     return seeds.get(gpu_name, seeds["default"])
 
@@ -501,6 +683,13 @@ class VastError(Exception):
     """A Vast operation failed; the message carries the full response."""
 
 
+class InsufficientCredit(Exception):
+    """The account is out of credit. This is account-level, not per-offer:
+    once one create fails on it, every later create this tick fails the same
+    way (an empty account once burned 72 straight ticks x ~17 offers of
+    futile creates), so the buy phase aborts for the tick."""
+
+
 def search_offers(cfg):
     return vast_client(cfg).search_offers(
         query=cfg["offer_query"], type=cfg["offer_type"], limit=200
@@ -533,6 +722,11 @@ def reconcile_invoices(cfg, db, dry):
     every_h = cfg.get("invoice_reconcile_hours", 1.0)
     if not every_h or every_h <= 0:
         return
+    # Pulling and applying are separate switches. The window holds ~2 days and
+    # each instance appears in it once, so the observations needed to write the
+    # true-up's conditions have to be collected while the true-up itself stays
+    # off; `invoice_apply_trueup: false` is that observation mode.
+    apply_trueup = cfg.get("invoice_apply_trueup", True)
     now = time.time()
     if now - (meta_get(db, "last_invoice_reconcile_at", 0.0) or 0.0) < every_h * 3600.0:
         return
@@ -547,13 +741,35 @@ def reconcile_invoices(cfg, db, dry):
     mode_by_id = {r["vast_id"]: r["mode"] for r in rows}
     actual = parse_invoice_charges(invoices, owned)
     spend_by_id = {r["vast_id"]: r["spend"] for r in rows}
-    updates, net = plan_invoice_trueup(spend_by_id, actual)
+    # Always record the pull's shape, even when the true-up itself is disabled:
+    # the conditions governing when a zero charge is trustworthy have to be
+    # written against observed data, and the window only holds ~2 days.
+    log_invoice_shape(db, invoices, spend_by_id, owned)
+    alive_ids = {
+        r["vast_id"] for r in db.execute(
+            "SELECT vast_id FROM instances WHERE destroyed_at IS NULL").fetchall()
+    }
+    updates, net, refusals = plan_invoice_trueup(
+        spend_by_id, actual, alive_ids=alive_ids,
+        max_drop_fraction=cfg.get("invoice_max_drop_fraction", 0.25),
+    )
+    for iid, why in refusals:
+        log_event(db, "INVOICE-REFUSED", f"{iid if iid else 'batch'}: {why}")
     total = sum(actual.values())
     # Route each instance's drift to the bucket that funds its mode.
     net_by_bucket = {}
     for iid, _new_spend, delta in updates:
         bm = bucket_mode(mode_by_id.get(iid), cfg)
         net_by_bucket[bm] = net_by_bucket.get(bm, 0.0) + delta
+    if not apply_trueup:
+        log_event(
+            db, "INVOICE",
+            f"observe-only: {len(updates)} instance(s) would move, "
+            f"bucket adj ${-net:+.3f}; not applied",
+        )
+        meta_set(db, "last_invoice_reconcile_at", now)
+        db.commit()
+        return
     if not dry:
         for iid, amt in actual.items():
             db.execute("UPDATE instances SET invoiced = ? WHERE vast_id = ?", (amt, iid))
@@ -603,6 +819,8 @@ def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry, mo
             db, "ERROR",
             f"create failed for offer {offer['id']}: {e!r} {body[:200]}",
         )
+        if "insufficient_credit" in body:
+            raise InsufficientCredit(body[:200])
         return
     if not isinstance(result, dict) or not result.get("success"):
         log_event(db, "ERROR", f"create rejected for offer {offer['id']}: {result!r}")
@@ -642,30 +860,173 @@ def destroy_instance(cfg, db, vast_id, reason, dry):
     log_event(db, "DESTROY", f"instance {vast_id} ({reason})")
 
 
-def api_estimate(cfg, offer, mode=None):
-    body = {
-        "mode": mode or cfg["mode"],
+def _fetch_json(cfg, url):
+    """GET and decode. A real User-Agent matters: the hosts sit behind
+    Cloudflare, which rejects urllib's default Python-urllib UA with a 403."""
+    req = urllib.request.Request(url, headers={"User-Agent": cfg["user_agent"]})
+    with urllib.request.urlopen(req, timeout=cfg.get("corpus_timeout_secs", 120)) as resp:
+        return json.loads(resp.read())
+
+
+def sync_corpus(cfg, db):
+    """Pull new benchmark reports into the local corpus mirror.
+
+    The estimator used to live behind POST /estimate, which meant one HTTP
+    round trip per offer per mode (~400 a tick) against a corpus the API
+    truncated to its most recent N reports. Mirroring it locally removes both:
+    the whole corpus is available and a tick's estimates cost no network.
+
+    Rows are fetched by id ascending from a watermark, re-reading a small
+    overlap because a lower id can commit after a higher one; the upsert makes
+    that idempotent. Reports that fail to decode still advance the watermark,
+    or they would be re-fetched forever. A failed sync is not fatal: the tick
+    proceeds on whatever corpus is already stored.
+    """
+    overlap = cfg.get("corpus_overlap", 50)
+    page = cfg.get("corpus_page_size", 5000)
+    watermark = int(meta_get(db, "corpus_watermark", 0) or 0)
+    start = max(0, watermark - overlap)
+    added = 0
+    while True:
+        url = (
+            f"{cfg['data_base']}/benchmarks"
+            f"?id=gt.{start}&order=id.asc&limit={page}"
+            f"&select=id,client_version,data"
+        )
+        try:
+            rows = _fetch_json(cfg, url)
+        except Exception as e:
+            log_event(db, "WARN", f"corpus sync failed at id>{start}: {e!r}")
+            break
+        if not rows:
+            break
+        for r in rows:
+            sample = estimator.decode_sample(r.get("client_version") or "", r.get("data"))
+            if sample is not None:
+                db.execute(
+                    "INSERT OR REPLACE INTO corpus (id, client_version, gpu, mode, threads, "
+                    "cpu_model, gpu_model, scenarios) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (r["id"], sample.client_version, int(sample.gpu), sample.mode,
+                     sample.threads, sample.cpu_model, sample.gpu_model,
+                     json.dumps(sample.scenarios)),
+                )
+                added += 1
+            start = max(start, r["id"])
+        meta_set(db, "corpus_watermark", start)
+        db.commit()
+        if len(rows) < page:
+            break
+    total = db.execute("SELECT COUNT(*) FROM corpus").fetchone()[0]
+    log_event(db, "CORPUS", f"{total} reports (+{added} this tick, watermark {start})")
+    return total
+
+
+_corpus = None
+
+
+def load_corpus(db):
+    """Decoded corpus for this process. Read once per tick; the controller is
+    a fresh process each run, so there is nothing longer-lived to invalidate."""
+    global _corpus
+    if _corpus is None:
+        _corpus = [
+            estimator.Sample(
+                client_version=r["client_version"],
+                gpu=bool(r["gpu"]),
+                mode=r["mode"],
+                threads=r["threads"],
+                cpu_model=r["cpu_model"],
+                gpu_model=r["gpu_model"],
+                scenarios=json.loads(r["scenarios"]),
+            )
+            for r in db.execute(
+                "SELECT client_version, gpu, mode, threads, cpu_model, gpu_model, scenarios "
+                "FROM corpus"
+            ).fetchall()
+        ]
+    return _corpus
+
+
+def estimate_offer(cfg, db, offer, mode=None):
+    """Predict what an offer will achieve. Same response shape the API's
+    /estimate returned, so callers are unchanged; the numbers now come from
+    the local corpus rather than a round trip."""
+    mode_display = estimator.mode_string(mode or cfg["mode"])
+    if mode_display is None:
+        raise ValueError(f"unknown mode {mode or cfg['mode']!r}")
+    corpus = load_corpus(db)
+    query = {
+        "mode": mode_display,
         "gpu": cfg["gpu"],
         "threads": int(offer.get("cpu_cores_effective") or 0) or None,
         "cpu_model": offer.get("cpu_name"),
         "gpu_model": offer.get("gpu_name"),
     }
-    # A real User-Agent matters: the production API sits behind Cloudflare,
-    # which rejects urllib's default Python-urllib UA with a 403.
-    req = urllib.request.Request(
-        f"{cfg['api_base']}/estimate",
-        data=json.dumps(body).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": cfg["user_agent"],
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    out = estimator.estimate(corpus, query)
+    warn_if_divergent(db, cfg, corpus, query, out)
+    return out
+
+
+def warn_if_divergent(db, cfg, corpus, query, out):
+    """Flag a thin match that disagrees badly with the wider pool behind it.
+
+    Held-out testing says the narrow stages are usually right and that error
+    does not track sample count, so this deliberately does not change what gets
+    bought — a rule that overrode them made predictions worse. But a handful of
+    cells are genuinely poisoned: RTX 4090 on one EPYC pairing reads 222 G/s
+    from three samples, two of them off contended hosts, against 482 G/s from
+    the other 75. Those are worth a human look, not an automatic override."""
+    factor = cfg.get("divergence_warn_factor", 2.0)
+    if not factor or out["prediction_stage"] not in ("exact", "same-gpu-similar-cpu"):
+        return
+    if out["samples_used"] >= cfg.get("divergence_warn_below_samples", 5):
+        return
+    narrow = out.get("blended_rate_p50")
+    if not narrow:
+        return
+    # Same GPU, no CPU or thread constraint: the pool the thin match stepped over.
+    broad = estimator.estimate(corpus, {**query, "cpu_model": None, "threads": None})
+    wide = broad.get("blended_rate_p50")
+    if not wide or broad["prediction_stage"] != "same-gpu" or broad["samples_used"] < 5:
+        return
+    ratio = narrow / wide
+    if ratio > factor or ratio < 1.0 / factor:
+        log_event(
+            db, "DIVERGENT",
+            f"{query['gpu_model']} [{query['mode']}]: {out['prediction_stage']} "
+            f"n={out['samples_used']} says {narrow/1e9:.0f} G/s but same-gpu "
+            f"n={broad['samples_used']} says {wide/1e9:.0f} G/s ({ratio:.2f}x)",
+        )
 
 
 # ---------------------------------------------------------------------------
 # Tick phases
+
+
+def charge_final_interval(db, cfg, row, now, fraction=0.5):
+    """Bill the stretch between the last tick and an instance's death.
+
+    Per-tick charging only accrues while an instance is observed `running`,
+    so the interval between the last observation and the moment we notice it
+    gone was never billed. Instances that lived and died entirely between two
+    ticks — 44% of the fleet's history — were therefore recorded at $0.
+
+    We don't know when in that interval it actually stopped, so charge the
+    expected value: half, for a uniformly distributed stop time. That is
+    unbiased rather than conservative, which is what a budget gate wants.
+    Deliberate destroys of an instance seen alive this tick need no call —
+    reconcile has already advanced last_charged_at to now.
+    """
+    dt_h = (now - row["last_charged_at"]) / 3600.0
+    if dt_h <= 0:
+        return 0.0
+    cost = dt_h * row["bid"] * fraction
+    db.execute(
+        "UPDATE instances SET spend = spend + ?, last_charged_at = ? WHERE vast_id = ?",
+        (cost, now, row["vast_id"]),
+    )
+    charge_bucket(db, bucket_mode(row["mode"], cfg), cost)
+    return cost
 
 
 def reconcile(cfg, db, dry):
@@ -692,6 +1053,7 @@ def reconcile(cfg, db, dry):
         if vast_id not in ours_live:
             # Gone without us destroying it: preempted (or finished).
             hold_h = (now - row["created_at"]) / 3600.0
+            charge_final_interval(db, cfg, row, now)
             db.execute(
                 "UPDATE instances SET destroyed_at = ?, destroy_reason = 'preempted' "
                 "WHERE vast_id = ?",
@@ -704,6 +1066,7 @@ def reconcile(cfg, db, dry):
             # Outbid or dead: the instance is stopped, not gone, and pays
             # storage until destroyed. Reap it and record the hold.
             hold_h = (now - row["created_at"]) / 3600.0
+            charge_final_interval(db, cfg, row, now)
             destroy_instance(cfg, db, vast_id, "preempted", dry)
             log_event(db, "OUTBID", f"instance {vast_id} stopped after {hold_h:.2f}h; reaped")
             continue
@@ -713,8 +1076,12 @@ def reconcile(cfg, db, dry):
         if ours_live[vast_id].get("actual_status") == "running":
             dt_h = (now - row["last_charged_at"]) / 3600.0
             cost = dt_h * row["bid"]
+            # ever_ran distinguishes "billed $0 because it never ran" from
+            # "billed $0 because the invoice hasn't settled" — the invoice
+            # true-up needs that to know when a zero charge is trustworthy.
             db.execute(
-                "UPDATE instances SET spend = spend + ?, last_charged_at = ? WHERE vast_id = ?",
+                "UPDATE instances SET spend = spend + ?, last_charged_at = ?, ever_ran = 1 "
+                "WHERE vast_id = ?",
                 (cost, now, vast_id),
             )
             charge_bucket(db, bucket_mode(row["mode"], cfg), cost)
@@ -747,9 +1114,9 @@ def extend_or_probe_pounces(cfg, db, dry):
             "min_bid": row["bid"] / mcfg(cfg, m, "bid_multiplier"),
         }
         try:
-            est = api_estimate(cfg, offer_like, mode=m)
-        except OSError as e:
-            log_event(db, "WARN", f"estimate for pounce {row['vast_id']} failed: {e}")
+            est = estimate_offer(cfg, db, offer_like, mode=m)
+        except Exception as e:
+            log_event(db, "WARN", f"estimate for pounce {row['vast_id']} failed: {e!r}")
             continue
         ev = offer_ev(offer_like, est, e_hold_hours(db, cfg, row["gpu_name"]), cfg, mode=m)
         trailing = trailing_median_ev(db, mode=m)
@@ -798,9 +1165,9 @@ def renew_exploits(cfg, db, dry):
             "min_bid": row["bid"] / mcfg(cfg, m, "bid_multiplier"),
         }
         try:
-            est = api_estimate(cfg, offer_like, mode=m)
-        except OSError as e:
-            log_event(db, "WARN", f"renew estimate for {row['vast_id']} failed: {e}")
+            est = estimate_offer(cfg, db, offer_like, mode=m)
+        except Exception as e:
+            log_event(db, "WARN", f"renew estimate for {row['vast_id']} failed: {e!r}")
             continue  # can't judge; leave TTL as-is, re-check next tick
         ev = offer_ev(offer_like, est, e_hold_hours(db, cfg, row["gpu_name"]), cfg, mode=m)
         trailing = trailing_median_ev(db, mode=m)
@@ -856,9 +1223,41 @@ def record_ev_seen(db, mode, mode_offers):
     db.commit()
 
 
+def corpus_cell_key(gpu_model, cpu_model):
+    """The unit of estimator coverage: a GPU model paired with a CPU family.
+
+    Matching keys on the GPU model and, one rung down, on CPU similarity, so
+    coverage is really a property of that pair rather than of either alone.
+    CPU family (not model) because that is the granularity the corpus can
+    actually fill — there are hundreds of CPU models on the market and we buy
+    a few hundred instances a month."""
+    return (estimator.normalize_gpu_model(gpu_model or "?"), estimator.cpu_match_key(cpu_model))
+
+
+def corpus_cell_counts(db):
+    """Reports per coverage cell, from the local mirror. GPU reports only:
+    an explore's value is the hardware pairing it prices, and the CPU-only
+    runs in its sweep are priced by the CPU chain regardless of GPU."""
+    counts = {}
+    for r in db.execute("SELECT gpu_model, cpu_model FROM corpus WHERE gpu = 1").fetchall():
+        key = (r["gpu_model"] or "?", estimator.cpu_match_key(r["cpu_model"]))
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def plan_explore(cfg, db, by_mode, dry):
-    """One explore instance benchmarks every mode, so a (gpu,cpu) pair is worth
-    exploring if it's uncertain in ANY mode. Funded from the primary bucket."""
+    """Buy benchmarks for the hardware the estimator cannot price yet.
+
+    Explore used to take the cheapest uncertain offer and cool down on the
+    exact (gpu, cpu) string pair. Both parts misfired: cheapest-first kept
+    landing on the same few budget cards, and because a popular GPU appears
+    with hundreds of different CPUs the pair-level cooldown never bit — 143 of
+    850 explores were RTX 3060 and 141 were RTX 3090, a third of the budget
+    spent re-measuring two already well-known cards.
+
+    Now that the whole corpus is local the controller can see its own coverage
+    directly, so it ranks by how thin a cell is and skips cells already deep
+    enough to price confidently. Cheapness only breaks ties."""
     now = time.time()
     balance = bucket_balance(db, primary_mode(cfg))
     if balance <= 0:
@@ -879,33 +1278,49 @@ def plan_explore(cfg, db, by_mode, dry):
     )
     if slots == 0:
         return
-    # Per offer id: the estimates across every mode, plus the offer object.
-    ests = {}
-    for m, mode_offers in by_mode.items():
-        for offer, est, _ev in mode_offers:
-            ests.setdefault(offer["id"], (offer, []))[1].append(est)
-    def uncertain(est):
-        return (
-            est.get("confidence", 0) < cfg["explore_confidence_threshold"]
-            or est.get("prediction_stage") in cfg["explore_stages"]
-        )
+    offers = {o["id"]: o for mode_offers in by_mode.values() for o, _e, _v in mode_offers}
+    counts = corpus_cell_counts(db)
+    target = cfg["explore_target_samples"]
+
+    # Cells explored recently, whether or not their reports have landed yet:
+    # without this the same thin cell is bought every tick until its benchmarks
+    # upload, and a cell whose uploads keep failing would be bought forever.
     cooldown = now - cfg["explore_cooldown_days"] * 86400
-    for offer, mode_ests in sorted(ests.values(), key=lambda t: float(t[0].get("min_bid", 9e9))):
+    recent = {
+        corpus_cell_key(r["gpu_name"], r["cpu_name"])
+        for r in db.execute("SELECT gpu_name, cpu_name FROM explored WHERE explored_at > ?",
+                            (cooldown,)).fetchall()
+    }
+
+    candidates = []
+    for offer in offers.values():
+        key = corpus_cell_key(offer.get("gpu_name"), offer.get("cpu_name"))
+        have = counts.get(key, 0)
+        if have >= target or key in recent:
+            continue
+        # offer id before the dict: it breaks exact (count, bid) ties so the
+        # sort never has to compare two offer dicts.
+        candidates.append((have, float(offer.get("min_bid", 9e9)), offer["id"], offer, key))
+    if not candidates:
+        log_event(db, "EXPLORE-SKIP", f"every priceable cell has >= {target} reports")
+        return
+
+    # Thinnest cell first; cheapest offer breaks the tie.
+    for have, _bid, _id, offer, key in sorted(candidates, key=lambda c: (c[0], c[1], c[2])):
         if slots == 0:
             break
-        if not any(uncertain(e) for e in mode_ests):
-            continue
-        seen = db.execute(
-            "SELECT COUNT(*) FROM explored WHERE gpu_name = ? AND cpu_name = ? AND explored_at > ?",
-            (offer.get("gpu_name") or "?", offer.get("cpu_name") or "?", cooldown),
-        ).fetchone()[0]
-        if seen:
-            continue
+        if key in recent:
+            continue   # a cheaper offer for this cell was already taken above
         bid = suggested_bid(offer, cfg, primary_mode(cfg))
+        log_event(
+            db, "EXPLORE-TARGET",
+            f"{key[0]} / {key[1]}: {have} report(s), target {target}",
+        )
         create_instance(
             cfg, db, offer, "explore", bid,
             cfg["explore_ttl_minutes"] / 60.0, 0.0, pounce=False, dry=dry, mode=None,
         )
+        recent.add(key)   # one buy per cell per tick, not one per matching offer
         slots -= 1
     db.commit()
 
@@ -1014,7 +1429,14 @@ def tick(cfg):
     # correcting the drift the per-tick bid*hold estimate leaves behind.
     reconcile_invoices(cfg, db, dry)
 
-    # 1c. Renew proven winners before their TTL churns them.
+    # 1c. Mirror new benchmark reports before anything estimates. A failed pull
+    # is survivable (we keep the stored corpus); an empty one is not, so the
+    # tick stops rather than pricing every offer off no data at all.
+    if sync_corpus(cfg, db) == 0:
+        log_event(db, "ERROR", "benchmark corpus empty; skipping tick")
+        return
+
+    # 1d. Renew proven winners before their TTL churns them.
     renew_exploits(cfg, db, dry)
 
     # 2. Accrue each mode's bucket.
@@ -1045,9 +1467,9 @@ def tick(cfg):
         hold = e_hold_hours(db, cfg, gpu)
         for m in modes:
             try:
-                est = api_estimate(cfg, offer, mode=m)
-            except OSError as e:
-                log_event(db, "WARN", f"estimate [{m}] failed for offer {offer.get('id')}: {e}")
+                est = estimate_offer(cfg, db, offer, mode=m)
+            except Exception as e:
+                log_event(db, "WARN", f"estimate [{m}] failed for offer {offer.get('id')}: {e!r}")
                 continue
             by_mode[m].append((offer, est, offer_ev(offer, est, hold, cfg, mode=m)))
     record_type_floors(db, offers)
@@ -1056,8 +1478,15 @@ def tick(cfg):
         log_event(db, "MARKET", f"[{m}] {len(by_mode[m])} offers; {confidence_spread(by_mode[m], cfg)}")
 
     # 5. Explore (all modes at once), then exploit (per mode).
-    plan_explore(cfg, db, by_mode, dry)
-    plan_exploit(cfg, db, by_mode, dry)
+    try:
+        plan_explore(cfg, db, by_mode, dry)
+        plan_exploit(cfg, db, by_mode, dry)
+    except InsufficientCredit:
+        # Commit first: creates that succeeded earlier this tick are already
+        # on Vast, and an uncommitted ledger row would get them reaped as
+        # orphans next tick.
+        db.commit()
+        log_event(db, "CREDIT", "account out of credit; buys aborted for this tick")
 
     # Tick summary.
     active = db.execute(
@@ -1077,14 +1506,47 @@ def tick(cfg):
 
 
 def main():
+    """One tick, self-contained: cron calls this directly.
+
+    Locking, log rotation and the run banner used to live in a shell wrapper
+    beside this file. None of it was shell-specific, and splitting them meant
+    the wrapper had to know where state lived in order to do its half."""
     parser = argparse.ArgumentParser(description="Nice fleet controller")
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--live", action="store_true", help="override config dry_run")
+    parser.add_argument(
+        "--log",
+        help="append output to this file instead of stdout, rotating it when "
+             "oversized (default: the config's log_path, if it sets one)",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.live:
         cfg["dry_run"] = False
-    tick(cfg)
+
+    log_path = args.log or cfg.get("log_path")
+    if log_path:
+        if not os.path.isabs(log_path):
+            log_path = os.path.join(os.path.dirname(os.path.abspath(args.config)), log_path)
+        redirect_output_to_log(log_path, cfg.get("log_max_bytes", 5 * 1024 * 1024))
+
+    started = time.strftime("%Y-%m-%d %H:%M:%S %z")
+    lock = acquire_tick_lock(cfg["tick_lock_path"] if os.path.isabs(cfg["tick_lock_path"])
+                             else os.path.join(os.path.dirname(os.path.abspath(args.config)),
+                                               cfg["tick_lock_path"]))
+    if lock is None:
+        print(f"===== tick {started} SKIPPED: previous tick still running =====")
+        return 0
+
+    print(f"===== tick {started} =====")
+    rc = 0
+    try:
+        tick(cfg)
+    except Exception:
+        traceback.print_exc()
+        rc = 1
+    print(f"----- exit {rc} at {time.strftime('%Y-%m-%d %H:%M:%S %z')} -----")
+    return rc
 
 
 if __name__ == "__main__":

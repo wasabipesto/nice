@@ -14,11 +14,18 @@ uv run -m unittest discover .        # 11 tests
 uv run controller.py --config config.json   # dry-run tick (default)
 ```
 
-Cron (10–15 minute cadence is plenty — market hold times are hours):
+Cron (10–15 minute cadence is plenty — market hold times are hours). The
+controller handles its own locking, log rotation and run banner, so there is
+no wrapper script; cron needs an absolute path to `uv` because its PATH is
+minimal, and everything else is resolved relative to the config file:
 
 ```cron
-*/10 * * * * cd /path/to/fleet && uv run controller.py --config config.json >> tick.log 2>&1
+*/10 * * * * /path/to/uv run /path/to/fleet/controller.py --config /path/to/state/config.json 2>> /path/to/state/tick.log
 ```
+
+Set `log_path` in the config to have the controller write the tick log itself.
+The `2>>` catches the narrow window before Python starts — a missing `uv`, an
+unresolvable dependency — which the controller cannot log for itself.
 
 ## Trust ramp
 

@@ -8,6 +8,7 @@ import time
 import unittest
 
 import controller
+import estimator
 from controller import (
     DEFAULT_CONFIG,
     exploit_allowed,
@@ -197,12 +198,12 @@ class InvoiceReconcileTests(unittest.TestCase):
         # id 1 under-charged (bug: $0 estimate, $0.05 real); id 2 over-charged.
         spend = {1: 0.0, 2: 0.10}
         actual = {1: 0.05, 2: 0.06}
-        updates, net = plan_invoice_trueup(spend, actual)
+        updates, net, _refused = plan_invoice_trueup(spend, actual)
         self.assertEqual({u[0] for u in updates}, {1, 2})
         # net owed = (0.05-0) + (0.06-0.10) = +0.01
         self.assertAlmostEqual(net, 0.01, places=6)
         # Re-running once spend == actual yields nothing.
-        updates2, net2 = plan_invoice_trueup(actual, actual)
+        updates2, net2, _r2 = plan_invoice_trueup(actual, actual)
         self.assertEqual(updates2, [])
         self.assertEqual(net2, 0.0)
 
@@ -289,8 +290,8 @@ class RenewExploitTests(unittest.TestCase):
         db.commit()
 
     def _patch_estimate(self, est):
-        orig = controller.api_estimate
-        controller.api_estimate = lambda cfg, offer, mode=None: est
+        orig = controller.estimate_offer
+        controller.estimate_offer = lambda cfg, db, offer, mode=None: est
         return orig
 
     def test_healthy_winner_is_renewed_not_reaped(self):
@@ -302,7 +303,7 @@ class RenewExploitTests(unittest.TestCase):
         try:
             renew_exploits(cfg(bid_multiplier=1.2, exploit_ttl_hours=24.0), db, dry=False)
         finally:
-            controller.api_estimate = orig
+            controller.estimate_offer = orig
         row = db.execute("SELECT ttl_at, destroyed_at FROM instances WHERE vast_id = 1").fetchone()
         self.assertIsNone(row["destroyed_at"], "a healthy winner must not be reaped")
         self.assertGreater(row["ttl_at"], time.time() + 20 * 3600, "TTL should be pushed ~24h out")
@@ -319,7 +320,7 @@ class RenewExploitTests(unittest.TestCase):
         try:
             renew_exploits(cfg(bid_multiplier=1.2, exploit_ttl_hours=24.0), db, dry=False)
         finally:
-            controller.api_estimate = orig_est
+            controller.estimate_offer = orig_est
             controller.destroy_instance = orig_destroy
         self.assertEqual(reaped, [(1, "ttl")], "a faded instance out of time must be reaped")
         # TTL was not extended.
@@ -330,12 +331,13 @@ class RenewExploitTests(unittest.TestCase):
         db = memory_db()
         self._seed_expired_exploit(db)
         called = {"n": 0}
-        orig = controller.api_estimate
-        controller.api_estimate = lambda cfg, offer: called.__setitem__("n", called["n"] + 1)
+        orig = controller.estimate_offer
+        controller.estimate_offer = (
+            lambda cfg, db, offer, mode=None: called.__setitem__("n", called["n"] + 1))
         try:
             renew_exploits(cfg(exploit_renew_window_hours=0), db, dry=False)
         finally:
-            controller.api_estimate = orig
+            controller.estimate_offer = orig
         self.assertEqual(called["n"], 0, "disabled renewal must not estimate or touch instances")
         row = db.execute("SELECT ttl_at, destroyed_at FROM instances WHERE vast_id = 1").fetchone()
         self.assertIsNone(row["destroyed_at"])
@@ -408,6 +410,480 @@ class MultiModeTests(unittest.TestCase):
         # Both modes participated, and niceonly (config order) got first pick.
         modes_used = {m for _oid, m in created}
         self.assertEqual(modes_used, {"niceonly", "detailed"})
+
+
+class InsufficientCreditTests(unittest.TestCase):
+    """An empty account is account-level: the first create that fails on it
+    aborts the whole buy phase instead of grinding through every offer."""
+
+    class _Resp:
+        text = '{"success": false, "error": "insufficient_credit", "msg": "Your account lacks credit; see the billing page."}'
+
+    class _HttpBoom(Exception):
+        def __init__(self, text):
+            super().__init__("402 Client Error")
+            self.response = type("R", (), {"text": text})()
+
+    def _stub_client(self, text):
+        test = self
+
+        class Stub:
+            def create_instance(self, **kw):
+                raise test._HttpBoom(text)
+
+        return Stub()
+
+    def test_create_raises_on_empty_account(self):
+        db = memory_db()
+        orig = controller.vast_client
+        controller.vast_client = lambda cfg: self._stub_client(self._Resp.text)
+        try:
+            with self.assertRaises(controller.InsufficientCredit):
+                controller.create_instance(
+                    cfg(dry_run=False), db,
+                    {"id": 1, "gpu_name": "RTX A4000", "cpu_name": "EPYC"},
+                    "exploit", 0.05, 1.0, 1.0e12, False, False, mode="niceonly",
+                )
+        finally:
+            controller.vast_client = orig
+
+    def test_stale_offer_failure_still_just_skips(self):
+        db = memory_db()
+        orig = controller.vast_client
+        controller.vast_client = lambda cfg: self._stub_client(
+            '{"success": false, "error": "no_such_ask", "msg": "Instance type 1 is no longer available."}'
+        )
+        try:  # per-offer failures stay per-offer: log and move on, no raise
+            controller.create_instance(
+                cfg(dry_run=False), db,
+                {"id": 1, "gpu_name": "RTX A4000", "cpu_name": "EPYC"},
+                "exploit", 0.05, 1.0, 1.0e12, False, False, mode="niceonly",
+            )
+        finally:
+            controller.vast_client = orig
+
+    def test_buy_phase_stops_at_first_credit_failure(self):
+        db = memory_db()
+        now = time.time()
+        c = cfg(exploit_modes={"niceonly": {}, "detailed": {}}, dry_run=False)
+        for m in ("niceonly", "detailed"):
+            db.execute(
+                "INSERT INTO buckets (mode, balance, updated_at) VALUES (?, 9.0, ?)", (m, now)
+            )
+        est = {"prediction_stage": "exact", "confidence": 85, "blended_rate_p25": 5.0e10}
+        offers = [({"id": i, "min_bid": 0.05, "gpu_name": "RTX A4000",
+                    "cpu_name": "EPYC"}, est, 1.0e12 * (10 - i)) for i in range(3)]
+        by_mode = {"niceonly": list(offers), "detailed": list(offers)}
+        attempts = []
+        orig = controller.create_instance
+
+        def broke(cfg_, db_, offer, *a, **kw):
+            attempts.append(offer["id"])
+            raise controller.InsufficientCredit("insufficient_credit")
+
+        controller.create_instance = broke
+        try:
+            with self.assertRaises(controller.InsufficientCredit):
+                controller.plan_exploit(c, db, by_mode, dry=False)
+        finally:
+            controller.create_instance = orig
+        # One attempt total — not one per offer, not one per mode.
+        self.assertEqual(len(attempts), 1)
+
+
+class FinalIntervalTests(unittest.TestCase):
+    """The stretch between the last tick and death was never billed, so
+    instances that lived and died inside one tick recorded $0."""
+
+    def _live_instance(self, db, vast_id, bid, charged_ago_h, mode="niceonly", now=None):
+        now = now or time.time()
+        db.execute(
+            "INSERT INTO instances (vast_id, label, purpose, gpu_name, bid, created_at, "
+            "ttl_at, last_charged_at, mode) VALUES (?, 'x', 'exploit', 'RTX 3080', ?, ?, ?, ?, ?)",
+            (vast_id, bid, now - charged_ago_h * 3600, now + 3600,
+             now - charged_ago_h * 3600, mode))
+        db.execute("INSERT OR REPLACE INTO buckets (mode, balance, updated_at) VALUES (?, 5.0, ?)",
+                   (mode, now))
+        return db.execute("SELECT * FROM instances WHERE vast_id = ?", (vast_id,)).fetchone()
+
+    def test_charges_half_the_unbilled_interval(self):
+        db = memory_db()
+        now = time.time()
+        row = self._live_instance(db, 1, bid=0.10, charged_ago_h=0.5, now=now)
+        cost = controller.charge_final_interval(db, cfg(), row, now)
+        # 0.5h at $0.10/hr, halved for the unknown stop time.
+        self.assertAlmostEqual(cost, 0.025, places=4)
+        self.assertAlmostEqual(
+            db.execute("SELECT spend FROM instances WHERE vast_id=1").fetchone()[0],
+            0.025, places=4)
+        self.assertAlmostEqual(
+            db.execute("SELECT balance FROM buckets WHERE mode='niceonly'").fetchone()[0],
+            5.0 - 0.025, places=4)
+
+    def test_no_double_charge_when_already_current(self):
+        # A deliberate destroy of an instance seen alive this tick: reconcile
+        # already advanced last_charged_at, so there is nothing left to bill.
+        db = memory_db()
+        now = time.time()   # reconcile threads one `now` through the whole tick
+        row = self._live_instance(db, 2, bid=0.10, charged_ago_h=0.0, now=now)
+        self.assertEqual(controller.charge_final_interval(db, cfg(), row, now), 0.0)
+        self.assertEqual(
+            db.execute("SELECT spend FROM instances WHERE vast_id=2").fetchone()[0], 0.0)
+
+    def test_sub_tick_instance_is_no_longer_free(self):
+        # The 44% case: created and dead inside one tick, never observed running.
+        db = memory_db()
+        now = time.time()
+        row = self._live_instance(db, 3, bid=0.06, charged_ago_h=10.0 / 60.0, now=now)
+        cost = controller.charge_final_interval(db, cfg(), row, now)
+        self.assertGreater(cost, 0.0, "an instance that lived a whole tick must not be free")
+
+
+class EHoldStatisticTests(unittest.TestCase):
+    def test_uses_mean_not_median(self):
+        # Right-skewed holds: the long tail carries nearly all delivered work,
+        # and amortisation is a mean operation, so the median under-values it.
+        db = memory_db()
+        now = time.time()
+        holds = [0.4, 0.4, 0.5, 0.5, 20.0]      # median 0.5, mean 4.36
+        for i, h in enumerate(holds):
+            db.execute(
+                "INSERT INTO instances (vast_id, label, purpose, gpu_name, bid, created_at, "
+                "ttl_at, last_charged_at, destroyed_at, destroy_reason) "
+                "VALUES (?, 'x', 'exploit', 'RTX 3080', 0.05, ?, ?, ?, ?, 'preempted')",
+                (i, now - h * 3600, now, now, now))
+        self.assertAlmostEqual(e_hold_hours(db, cfg(), "RTX 3080"), 4.36, places=2)
+
+
+class TickWrapperTests(unittest.TestCase):
+    """Locking, log rotation and path resolution, which used to live in a
+    shell wrapper beside the controller."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_lock_is_exclusive_across_processes(self):
+        import os, subprocess, sys as _sys
+        path = os.path.join(self.dir, ".tick.lock")
+        fd = controller.acquire_tick_lock(path)
+        self.assertIsNotNone(fd)
+        # A second process must be refused while we hold it. Same-process
+        # flock re-acquisition succeeds, so this has to be a real fork.
+        probe = subprocess.run(
+            [_sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import controller; "
+             "print(controller.acquire_tick_lock(%r) is not None)"
+             % (os.path.dirname(controller.__file__), path)],
+            capture_output=True, text=True)
+        self.assertEqual(probe.stdout.strip(), "False", probe.stderr)
+        os.close(fd)
+        # Released: the next tick gets it.
+        again = controller.acquire_tick_lock(path)
+        self.assertIsNotNone(again)
+        os.close(again)
+
+    def test_log_rotates_only_when_oversized(self):
+        import os
+        path = os.path.join(self.dir, "tick.log")
+        with open(path, "w") as f:
+            f.write("x" * 100)
+        # The call takes over the real descriptors, which for a one-shot CLI is
+        # the point and for a test runner would swallow its own report; save
+        # and restore them around it.
+        saved = (os.dup(1), os.dup(2))
+        try:
+            # Under the cap: left alone, no rotation file created.
+            controller.redirect_output_to_log(path, max_bytes=10_000).close()
+            under_cap = os.path.exists(path + ".1")
+            # Over the cap: previous generation preserved, fresh file started.
+            controller.redirect_output_to_log(path, max_bytes=50).close()
+            rotated = os.path.exists(path + ".1")
+            rotated_size = os.path.getsize(path + ".1") if rotated else None
+        finally:
+            os.dup2(saved[0], 1)
+            os.dup2(saved[1], 2)
+            os.close(saved[0])
+            os.close(saved[1])
+        self.assertFalse(under_cap)
+        self.assertTrue(rotated)
+        self.assertEqual(rotated_size, 100)
+
+    def test_config_paths_resolve_against_the_config_file(self):
+        import os, json as _json
+        cfgdir = os.path.join(self.dir, "state")
+        os.makedirs(cfgdir)
+        path = os.path.join(cfgdir, "config.json")
+        with open(path, "w") as f:
+            _json.dump({"db_path": "fleet.sqlite3", "kill_switch_path": "KILL"}, f)
+        loaded = controller.load_config(path)
+        # Resolved against the config, not the cwd cron happens to hand us.
+        self.assertEqual(loaded["db_path"], os.path.join(cfgdir, "fleet.sqlite3"))
+        self.assertEqual(loaded["kill_switch_path"], os.path.join(cfgdir, "KILL"))
+
+    def test_absolute_config_paths_are_left_alone(self):
+        import os, json as _json
+        path = os.path.join(self.dir, "config.json")
+        with open(path, "w") as f:
+            _json.dump({"db_path": "/var/lib/nice/fleet.sqlite3"}, f)
+        self.assertEqual(controller.load_config(path)["db_path"],
+                         "/var/lib/nice/fleet.sqlite3")
+
+
+class InvoiceGuardTests(unittest.TestCase):
+    """Guards learned from the true-up that zeroed 1465 instances."""
+
+    def test_live_instance_is_never_reduced(self):
+        # A running instance's bill is still accruing, so a partial invoice
+        # always looks like an over-charge.
+        updates, net, refused = plan_invoice_trueup(
+            {1: 0.50}, {1: 0.10}, alive_ids={1})
+        self.assertEqual(updates, [])
+        self.assertEqual(net, 0.0)
+        self.assertEqual(refused[0][0], 1)
+        # Destroyed, same numbers: the correction applies.
+        updates, _net, _r = plan_invoice_trueup({1: 0.50}, {1: 0.10})
+        self.assertEqual(updates, [(1, 0.10, -0.40)])
+
+    def test_spend_never_goes_negative(self):
+        updates, _net, _r = plan_invoice_trueup({1: 0.10}, {1: -5.0})
+        self.assertEqual(updates, [(1, 0.0, -0.10)])
+
+    def test_mass_reduction_is_refused_whole(self):
+        # The original failure: a pull that writes off most of the ledger.
+        spend = {i: 1.0 for i in range(10)}
+        actual = {i: 0.0 for i in range(10)}
+        updates, net, refused = plan_invoice_trueup(spend, actual, max_drop_fraction=0.25)
+        self.assertEqual(updates, [], "a batch this destructive must not apply")
+        self.assertEqual(net, 0.0)
+        self.assertIn("refusing", refused[0][1])
+        # A correction within the threshold still applies.
+        updates, _net, _r = plan_invoice_trueup(
+            spend, {0: 0.0, 1: 0.0}, max_drop_fraction=0.25)
+        self.assertEqual(len(updates), 2)
+
+    def test_under_charge_is_always_applied(self):
+        # Guards are one-directional: owing more is never refused.
+        updates, net, _r = plan_invoice_trueup(
+            {1: 0.10}, {1: 5.0}, alive_ids={1}, max_drop_fraction=0.25)
+        self.assertEqual(updates, [(1, 5.0, 4.9)])
+        self.assertAlmostEqual(net, 4.9)
+
+
+class CpuMatchKeyTests(unittest.TestCase):
+    def test_bridges_vast_and_cpuinfo_strings(self):
+        # Vast's listing string and the client's /proc/cpuinfo string for the
+        # same chip must land on one key, or coverage is never detected.
+        for vast, cpuinfo in [
+            ("Xeon\u00ae E5-2680 v4", "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz"),
+            ("AMD EPYC 7763 64-Core Processor", "AMD EPYC 7763 64-Core Processor"),
+            ("Core\u2122 i7-6700", "Intel(R) Core(TM) i7-6700 CPU @ 3.40GHz"),
+        ]:
+            self.assertEqual(estimator.cpu_match_key(vast),
+                             estimator.cpu_match_key(cpuinfo),
+                             f"{vast!r} and {cpuinfo!r} are the same chip")
+
+    def test_distinct_chips_stay_distinct(self):
+        self.assertNotEqual(estimator.cpu_match_key("Xeon E5-2680 v4"),
+                            estimator.cpu_match_key("Xeon E5-2690 v3"))
+        self.assertNotEqual(estimator.cpu_match_key("AMD EPYC 7763"),
+                            estimator.cpu_match_key("AMD EPYC 7402"))
+
+    def test_missing_cpu_is_safe(self):
+        self.assertEqual(estimator.cpu_match_key(None), "?")
+        self.assertEqual(estimator.cpu_match_key(""), "?")
+
+
+class ExploreTargetingTests(unittest.TestCase):
+    """Explore should buy the coverage it lacks, not the cheapest thing on
+    the market. The old rule spent a third of the budget re-measuring two
+    already well-known cards."""
+
+    def _seed_corpus(self, db, rows):
+        """rows: (gpu_model, cpu_model, count) already normalized."""
+        i = 0
+        for gpu_model, cpu_model, n in rows:
+            for _ in range(n):
+                i += 1
+                db.execute(
+                    "INSERT INTO corpus (id, client_version, gpu, mode, threads, cpu_model, "
+                    "gpu_model, scenarios) VALUES (?, '3.3.0', 1, 'Nice-only', 8, ?, ?, '[]')",
+                    (i, cpu_model, gpu_model))
+        db.commit()
+
+    def _offers(self, specs):
+        return {"niceonly": [({"id": i, "gpu_name": g, "cpu_name": c, "min_bid": b}, {}, 1.0)
+                             for i, (g, c, b) in enumerate(specs)]}
+
+    def _run(self, db, c, by_mode):
+        created = []
+        orig = controller.create_instance
+        controller.create_instance = (
+            lambda cfg, db_, offer, purpose, bid, ttl, ev, pounce, dry, mode=None:
+            created.append(offer["gpu_name"]))
+        try:
+            controller.plan_explore(c, db, by_mode, dry=False)
+        finally:
+            controller.create_instance = orig
+        return created
+
+    def test_prefers_the_thinnest_cell_over_the_cheapest_offer(self):
+        db = memory_db()
+        now = time.time()
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                   (now,))
+        self._seed_corpus(db, [("rtx 3060", "amd epyc 7763", 20)])   # well covered
+        c = cfg(explore_per_tick=1, explore_target_samples=8)
+        # The 3060 is far cheaper, but we already have 20 reports for it.
+        created = self._run(db, c, self._offers([
+            ("RTX 3060", "AMD EPYC 7763 64-Core", 0.01),
+            ("RTX 4090", "AMD EPYC 7763 64-Core", 0.90),
+        ]))
+        self.assertEqual(created, ["RTX 4090"])
+
+    def test_skips_cells_that_are_already_deep_enough(self):
+        db = memory_db()
+        now = time.time()
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                   (now,))
+        self._seed_corpus(db, [("rtx 3060", "amd epyc 7763", 20)])
+        c = cfg(explore_per_tick=2, explore_target_samples=8)
+        created = self._run(db, c, self._offers([("RTX 3060", "AMD EPYC 7763 64-Core", 0.01)]))
+        self.assertEqual(created, [], "a covered cell is not worth paying to re-measure")
+
+    def test_one_buy_per_cell_per_tick(self):
+        # Many offers share a cell; buying several would waste the whole slot
+        # budget on one gap.
+        db = memory_db()
+        now = time.time()
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                   (now,))
+        c = cfg(explore_per_tick=3, explore_target_samples=8)
+        created = self._run(db, c, self._offers([
+            ("RTX 4090", "AMD EPYC 7763 64-Core Processor", 0.10),
+            # Same chip as above, as /proc/cpuinfo spells it: one cell, one buy.
+            ("NVIDIA GeForce RTX 4090", "AMD EPYC 7763 64-Core Processor", 0.11),
+            ("RTX 4080", "Intel(R) Xeon(R) Gold 6230", 0.12),
+        ]))
+        self.assertEqual(sorted(created), ["RTX 4080", "RTX 4090"])
+
+    def test_cooldown_is_by_cell_not_exact_pair(self):
+        # The old cooldown keyed on the raw (gpu, cpu) strings, so one popular
+        # GPU across many CPU models never cooled down.
+        db = memory_db()
+        now = time.time()
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                   (now,))
+        db.execute("INSERT INTO explored (gpu_name, cpu_name, explored_at) VALUES "
+                   "('RTX 3090', 'Xeon\u00ae E5-2680 v4', ?)", (now,))
+        c = cfg(explore_per_tick=2, explore_target_samples=8, explore_cooldown_days=14)
+        created = self._run(db, c, self._offers([
+            # Same GPU and chip, spelled the way the other source spells them.
+            ("NVIDIA GeForce RTX 3090", "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz", 0.05),
+        ]))
+        self.assertEqual(created, [], "the same chip under two spellings is one cell")
+
+
+class CorpusSyncTests(unittest.TestCase):
+    """The corpus mirror: idempotent upsert, watermark advances past junk,
+    a failed pull leaves what we already had."""
+
+    def _report(self, i, gpu=True, mode="Nice-only", threads=8, cpu="AMD EPYC 7763",
+                gpu_model="RTX 3080", rate=2.0e9):
+        return {"id": i, "client_version": "3.3.0", "data": {
+            "schema_version": 1,
+            "config": {"gpu": gpu, "mode": mode, "threads": threads},
+            "hardware": {"cpu_model": cpu, "gpu_model": gpu_model},
+            "scenarios": [
+                {"key": "b50_msd_weak", "base": 50, "threads": threads, "rate": rate},
+                {"key": "b50_msd_weak_1t", "base": 50, "threads": 1, "rate": 3.0e8},
+            ]}}
+
+    def _patch_fetch(self, pages):
+        """pages: list of responses, or an Exception to raise."""
+        orig = controller._fetch_json
+        calls = []
+
+        def fake(cfg, url):
+            calls.append(url)
+            nxt = pages.pop(0) if pages else []
+            if isinstance(nxt, Exception):
+                raise nxt
+            return nxt
+
+        controller._fetch_json = fake
+        return orig, calls
+
+    def test_sync_stores_and_is_idempotent(self):
+        db = memory_db()
+        c = cfg(corpus_page_size=5000)
+        rows = [self._report(i) for i in (1, 2, 3)]
+        orig, _ = self._patch_fetch([list(rows)])
+        try:
+            self.assertEqual(controller.sync_corpus(c, db), 3)
+            # Re-syncing re-reads the overlap window; the upsert must not duplicate.
+            controller._fetch_json = lambda cfg_, url: list(rows)
+            self.assertEqual(controller.sync_corpus(c, db), 3)
+        finally:
+            controller._fetch_json = orig
+        self.assertEqual(controller.meta_get(db, "corpus_watermark"), 3)
+
+    def test_watermark_advances_past_undecodable_rows(self):
+        # A report we cannot decode must still move the watermark, or the sync
+        # re-fetches it forever and never reaches newer reports.
+        db = memory_db()
+        junk = {"id": 7, "client_version": "3.3.0", "data": {"schema_version": 2}}
+        orig, _ = self._patch_fetch([[junk]])
+        try:
+            controller.sync_corpus(cfg(), db)
+        finally:
+            controller._fetch_json = orig
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM corpus").fetchone()[0], 0)
+        self.assertEqual(controller.meta_get(db, "corpus_watermark"), 7)
+
+    def test_failed_pull_keeps_existing_corpus(self):
+        db = memory_db()
+        orig, _ = self._patch_fetch([[self._report(1)], OSError("boom")])
+        try:
+            controller.sync_corpus(cfg(), db)          # seeds one report
+            controller._fetch_json = lambda cfg_, url: (_ for _ in ()).throw(OSError("boom"))
+            self.assertEqual(controller.sync_corpus(cfg(), db), 1)   # survives, keeps it
+        finally:
+            controller._fetch_json = orig
+
+    def test_paginates_until_short_page(self):
+        db = memory_db()
+        c = cfg(corpus_page_size=2)
+        pages = [[self._report(1), self._report(2)], [self._report(3)]]
+        orig, calls = self._patch_fetch(pages)
+        try:
+            self.assertEqual(controller.sync_corpus(c, db), 3)
+        finally:
+            controller._fetch_json = orig
+        self.assertEqual(len(calls), 2, "should stop on the short page")
+        self.assertIn("id=gt.0", calls[0])
+        self.assertIn("id=gt.2", calls[1])
+
+    def test_estimate_offer_uses_local_corpus(self):
+        db = memory_db()
+        orig, _ = self._patch_fetch([[self._report(i) for i in (1, 2, 3)]])
+        try:
+            controller.sync_corpus(cfg(), db)
+        finally:
+            controller._fetch_json = orig
+        controller._corpus = None
+        out = controller.estimate_offer(
+            cfg(gpu=True, mode="niceonly"), db,
+            {"gpu_name": "NVIDIA GeForce RTX 3080", "cpu_name": "AMD EPYC 7763",
+             "cpu_cores_effective": 8})
+        controller._corpus = None
+        self.assertEqual(out["prediction_stage"], "exact")
+        self.assertEqual(out["samples_used"], 3)
+        self.assertLess(abs(out["blended_rate_p50"] - 2.0e9), 1.0)
 
 
 class OnstartTemplateTests(unittest.TestCase):
