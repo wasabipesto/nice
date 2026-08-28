@@ -58,6 +58,10 @@ class WorkerPool {
         // Current job data
         this.currentClaimId = null;
         this.currentUsername = null;
+
+        // Reported by each worker at init (they read it from the wasm
+        // build); stamped onto the aggregated submission.
+        this.clientVersion = "unknown";
     }
 
     async initialize() {
@@ -122,6 +126,9 @@ class WorkerPool {
                         if (e.data.success) {
                             workerInfo.isReady = true;
                             initializedCount++;
+                            if (e.data.version) {
+                                this.clientVersion = e.data.version;
+                            }
                             checkInitialization();
                         } else {
                             clearTimeout(timeout);
@@ -522,7 +529,7 @@ class WorkerPool {
         const finalResult = {
             claim_id: claim_id,
             username: username,
-            client_version: "3.0.0-wasm-worker",
+            client_version: `${this.clientVersion}-wasm-worker`,
             unique_distribution: serverDistribution,
             nice_numbers: this.aggregatedResults.niceNumbers,
         };
@@ -621,13 +628,6 @@ class WorkerPool {
 
     getWorkerCount() {
         return this.maxWorkers;
-    }
-
-    setWorkerCount(count) {
-        if (count > 0 && count <= (navigator.hardwareConcurrency || 4)) {
-            this.maxWorkers = count;
-            console.log(`Worker count set to ${count}`);
-        }
     }
 
     isReady() {

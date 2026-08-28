@@ -5,6 +5,10 @@ let wasm = null;
 let isInitialized = false;
 let shouldStop = false;
 
+// The workspace version, read from the wasm build at init so payloads
+// report what is actually running; the suffix tells the backends apart.
+let clientVersion = "unknown";
+
 // The wasm side serialises near-miss numbers as exact u128 values, but
 // JSON.parse turns every number into a double, and anything above 2^53 is
 // rounded to the nearest representable one. Base-49 fields sit near 2e16, so
@@ -42,11 +46,17 @@ async function initWasm(sharedModule) {
         await wasmModule.default(sharedModule);
         wasm = wasmModule;
         isInitialized = true;
+        if (wasm.client_version) {
+            clientVersion = wasm.client_version();
+        }
 
-        // Send initialization success message
+        // Send initialization success message. The version rides along so
+        // the pool can stamp its aggregated submission with it (the pool
+        // has no wasm instance of its own to ask).
         self.postMessage({
             type: "initialized",
             success: true,
+            version: clientVersion,
         });
     } catch (error) {
         self.postMessage({
@@ -163,7 +173,7 @@ function processDetailedWithProgress(claimDataJson, username) {
     const result = {
         claim_id: claimData.claim_id,
         username: username,
-        client_version: "3.0.0-wasm-worker",
+        client_version: `${clientVersion}-wasm-worker`,
         unique_distribution: serverDistribution,
         nice_numbers: serverNiceNumbers,
     };
@@ -288,7 +298,7 @@ async function processDetailedGpu(claimDataJson, username) {
     return stringifySubmission({
         claim_id: claimData.claim_id,
         username: username,
-        client_version: "3.0.0-wasm-webgpu",
+        client_version: `${clientVersion}-wasm-webgpu`,
         unique_distribution: serverDistribution,
         nice_numbers: serverNiceNumbers,
     });

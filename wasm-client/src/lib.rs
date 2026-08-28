@@ -20,6 +20,15 @@ extern "C" {
     fn log(s: &str);
 }
 
+/// The workspace client version, so browser submissions carry the real
+/// number instead of a string hardcoded in the JS (which had drifted three
+/// minor versions behind). The workers append a `-wasm-worker` /
+/// `-wasm-webgpu` suffix to keep the paths distinguishable server-side.
+#[wasm_bindgen]
+pub fn client_version() -> String {
+    nice_common::CLIENT_VERSION.to_string()
+}
+
 /// Process a chunk of numbers and return nice numbers and distribution updates
 #[wasm_bindgen]
 pub fn process_chunk_wasm(range_start_str: &str, range_end_str: &str, base: u32) -> String {
