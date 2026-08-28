@@ -1,6 +1,29 @@
 // Multi-threaded Worker Pool Manager for WASM Nice Number Processing
 // This manages multiple workers for parallel processing
 
+// Compile the wasm binary once for the whole page and hand the resulting
+// WebAssembly.Module to every worker. Without this each worker fetches and
+// compiles its own copy of the same ~1.9 MB file: on a cold cache that is one
+// download and one compile per thread, of identical bytes. The promise is
+// memoised, so callers racing at startup share a single fetch.
+//
+// A failure here is not fatal — resolving to undefined puts each worker back
+// on its own fetch-by-URL path.
+function niceWasmModule() {
+    if (!globalThis.__niceWasmModulePromise) {
+        globalThis.__niceWasmModulePromise = WebAssembly.compileStreaming(
+            fetch("./pkg/nice_wasm_client_bg.wasm"),
+        ).catch((e) => {
+            console.warn(
+                "shared wasm compile failed; each worker will load its own",
+                e,
+            );
+            return undefined;
+        });
+    }
+    return globalThis.__niceWasmModulePromise;
+}
+
 class WorkerPool {
     constructor(options = {}) {
         // Default to 80% of available cores
@@ -39,6 +62,7 @@ class WorkerPool {
 
     async initialize() {
         try {
+            const sharedModule = await niceWasmModule();
             // Create worker instances
             for (let i = 0; i < this.maxWorkers; i++) {
                 const worker = new Worker("./worker.js");
@@ -57,7 +81,10 @@ class WorkerPool {
                 this.workers.push(workerInfo);
 
                 // Initialize this worker
-                worker.postMessage({ type: "init" });
+                worker.postMessage({
+                    type: "init",
+                    data: { module: sharedModule },
+                });
             }
 
             // Wait for all workers to initialize
@@ -468,8 +495,15 @@ class WorkerPool {
     handleAllWorkersComplete(elapsedSeconds) {
         console.log("All workers completed processing");
 
-        // Sort nice numbers by value
-        this.aggregatedResults.niceNumbers.sort((a, b) => a.number - b.number);
+        // Sort nice numbers by value. These are strings (exact u128 digits,
+        // see parseFieldResults in worker.js), and subtracting them would go
+        // through a double and misorder anything above 2^53, so compare as
+        // BigInt.
+        this.aggregatedResults.niceNumbers.sort((a, b) => {
+            const x = BigInt(a.number);
+            const y = BigInt(b.number);
+            return x < y ? -1 : x > y ? 1 : 0;
+        });
 
         // Convert distribution map to server format
         const serverDistribution = Array.from(

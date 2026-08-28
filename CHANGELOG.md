@@ -34,6 +34,7 @@ Website:
 
 - Speed up the index page: start the data fetches while the plot library is still downloading, draw each chart as its own data arrives instead of waiting for all five requests, and load d3/Plot as two vendored files rather than 48 CDN modules spread over six dependency levels. `just vendor-fetch` downloads them; `just deploy-site` and `just dev` do it automatically.
 - Draw the notable numbers chart from `cache_notable_numbers` instead of every base's full top-10k list. The chart is unchanged to the eye; it was drawing ~81k points into a space with room for a few hundred distinguishable ones, which cost 686 KB of payload and about two seconds of blocking work per page load.
+- Add a GPU option to the web runner. When the browser offers a WebGPU adapter the search page can process fields on the GPU instead of the CPU worker pool, selected from a dropdown that only appears when an adapter is actually available. Detection is by feature test rather than browser version, and anything without WebGPU keeps using the worker pool with no configuration.
 
 ## Nice v3.3.0
 

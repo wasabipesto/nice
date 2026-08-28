@@ -10,6 +10,7 @@ pub mod client_process;
 pub mod client_process_cuda;
 pub mod client_process_vulkan;
 pub mod cubecl_backend;
+pub mod cubecl_web;
 pub mod consensus;
 #[cfg(feature = "database")]
 pub mod db_util;

@@ -962,6 +962,31 @@ pub enum CubeclContext {
 }
 
 impl CubeclContext {
+    /// Runtime options for the wgpu backend.
+    ///
+    /// In a browser this pins `ExclusivePages`, so every buffer is allocated
+    /// at exactly its own size. The default `SubSlices` pool instead builds a
+    /// ladder of page sizes down from `max_storage_buffer_binding_size` — the
+    /// *adapter's* maximum, since cubecl requests adapter limits — so on a
+    /// discrete card it will try to allocate pages of hundreds of megabytes
+    /// to satisfy a 21 MB request. A browser gives a tab far less GPU memory
+    /// than the card has, and refuses: observed on an RX 9070 XT under
+    /// LibreWolf 149 as "Not enough memory left", then an invalid buffer,
+    /// then a panic in CubeCL's buffer mapping. Native builds keep the
+    /// default pooling, which is measurably fine on the same card.
+    ///
+    /// This backend allocates a handful of long-lived buffers per field, so
+    /// exclusive pages cost nothing here.
+    fn runtime_options() -> cubecl::wgpu::RuntimeOptions {
+        #[allow(unused_mut)]
+        let mut options = cubecl::wgpu::RuntimeOptions::default();
+        #[cfg(target_family = "wasm")]
+        {
+            options.memory_config = cubecl::wgpu::MemoryConfiguration::ExclusivePages;
+        }
+        options
+    }
+
     /// Initialize on the runtime's default device (discrete first, then
     /// integrated, then software rasterizers), recording the adapter's
     /// marketing name for benchmark reports and the estimator.
@@ -971,12 +996,13 @@ impl CubeclContext {
     ///
     /// # Errors
     /// Returns an error if no wgpu device is available.
+
     pub fn new_default() -> Result<Self> {
         let (client, device_name) = WGPU_DEFAULT.get_or_init(|| {
             let device = cubecl::wgpu::WgpuDevice::default();
             let setup = cubecl::wgpu::init_setup::<cubecl::wgpu::AutoGraphicsApi>(
                 &device,
-                cubecl::wgpu::RuntimeOptions::default(),
+                Self::runtime_options(),
             );
             // Include the resolved graphics API: AutoGraphicsApi may pick
             // DX12 on Windows, and reports comparing this backend against
@@ -1008,7 +1034,7 @@ impl CubeclContext {
             let device = cubecl::wgpu::WgpuDevice::default();
             let setup = cubecl::wgpu::init_setup_async::<cubecl::wgpu::AutoGraphicsApi>(
                 &device,
-                cubecl::wgpu::RuntimeOptions::default(),
+                Self::runtime_options(),
             )
             .await;
             let info = setup.adapter.get_info();
@@ -1139,7 +1165,7 @@ pub async fn process_range_detailed_cubecl_async(
 /// An async fn rather than a closure (async closures aren't stable), and
 /// `read_async` rather than `read_one` so [`detailed_impl`] stays runnable
 /// on wasm, where a future cannot block.
-async fn drain<R: cubecl::prelude::Runtime>(
+pub(crate) async fn drain<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     handle: cubecl::server::Handle,
     histogram: &mut [u128],

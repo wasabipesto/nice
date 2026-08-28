@@ -1,0 +1,71 @@
+# The browser client: the wasm build, and the page that drives it.
+#
+# Neither is covered by the Rust workflow. That builds `-p nice_common -p
+# nice_client` for the release targets, and the one matrix entry that builds
+# every workspace member does so for the *host*, so nothing there compiles
+# wasm-client for wasm32 or loads web/search at all.
+#
+# CI coverage added here:
+#   wasm32 build     — wasm-pack, the only thing that exercises the
+#                      target-gated dependencies (getrandom/wasm_js, web-time)
+#                      and the wasm-bindgen surface
+#   page, CPU pool   — the real page in headless Chromium, offline benchmark
+#   page, WebGPU     — the same page on SwiftShader's software adapter, with
+#                      the two backends' histograms required to agree exactly,
+#                      so no GPU hardware is needed
+#   submission shape — a stubbed API captures the POST each backend builds,
+#                      checking claim_id's type and that a near miss above
+#                      2^53 survives as exact digits, without touching the
+#                      live server
+#
+# Not covered: real GPU hardware. WebGPU on a physical adapter is validated
+# manually — see the browser notes in the README.
+name: Browser Client
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+
+concurrency:
+    group: browser-client-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    browser:
+        name: wasm build + browser end-to-end
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Add the wasm target
+              run: rustup target add wasm32-unknown-unknown
+
+            - name: Cache cargo artifacts
+              # https://github.com/Swatinem/rust-cache
+              uses: Swatinem/rust-cache@v2
+              with:
+                  key: wasm32
+
+            - name: Install wasm-pack
+              # The installer ships a prebuilt binary; `cargo install` would
+              # build it from source on every run.
+              run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+
+            # Mirrors the `wasm-build` recipe in the justfile.
+            - name: Build the wasm client
+              working-directory: wasm-client
+              run: |
+                  wasm-pack build --target web --out-dir pkg
+                  cp -r pkg ../web/search/
+
+            # Runs the page in the Playwright container, so the browser and its
+            # dependencies come from the image rather than the runner.
+            - name: Browser end-to-end (CPU + WebGPU via SwiftShader)
+              run: bash wasm-client/e2e/run.sh

@@ -175,6 +175,24 @@
                             </div>
 
                             <div class="field">
+                                <label class="label" for="backendSelect"
+                                    >Compute Backend:</label
+                                >
+                                <div class="control">
+                                    <div class="select is-fullwidth">
+                                        <select id="backendSelect">
+                                            <option value="cpu" selected>
+                                                CPU
+                                            </option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="help" id="backendHelp">
+                                    Checking for WebGPU support...
+                                </div>
+                            </div>
+
+                            <div class="field">
                                 <label class="label" for="threadCount">
                                     Thread Count:
                                     <span id="threadCountValue">1</span>
@@ -681,14 +699,30 @@
                 }
                 const serverData = await response.json();
 
-                // Convert server integers to strings for compatibility
+                // The range fields are u128 and do not survive a JS number,
+                // so they are carried as strings and parsed with BigInt at
+                // the wasm boundary. claim_id is NOT one of them: it goes
+                // straight back to /submit, which deserializes it as an
+                // integer and rejects a quoted one with a 400.
                 return {
-                    claim_id: serverData.claim_id.toString(),
+                    claim_id: serverData.claim_id,
                     base: serverData.base,
                     range_start: serverData.range_start.toString(),
                     range_end: serverData.range_end.toString(),
                     range_size: serverData.range_size.toString(),
                 };
+            }
+
+            // Near-miss numbers are carried through the workers as strings so
+            // that JSON.parse cannot round them (see parseFieldResults in
+            // worker.js — base-49 fields sit above 2^53, where a double stops
+            // being able to hold consecutive integers). The server wants an
+            // integer there, so the digits go back on the wire unquoted.
+            function submissionBody(data) {
+                return JSON.stringify(data).replace(
+                    /"number":"(\d+)"/g,
+                    '"number":$1',
+                );
             }
 
             async function submitFieldToServer(data) {
@@ -698,7 +732,7 @@
                     headers: {
                         "Content-Type": "application/json",
                     },
-                    body: JSON.stringify(data),
+                    body: submissionBody(data),
                 });
                 const responseText = await response.text();
 
@@ -713,6 +747,10 @@
             function handleProcessingComplete(result, elapsedSeconds) {
                 const claimData = getCurrentClaimData();
                 if (!claimData) return;
+
+                // Final distribution, exposed for the e2e harness to compare
+                // across backends.
+                window.lastDistribution = result.unique_distribution;
 
                 const rangeSize = parseInt(claimData.range_size);
                 const numbersPerSecond = rangeSize / elapsedSeconds;
@@ -840,12 +878,217 @@
                 }
             }
 
+            // The GPU path runs in one dedicated worker: the device supplies
+            // the parallelism, so there is nothing for a pool to do.
+            let gpuWorker = null;
+            let gpuAdapterName = null;
+
+            function selectedBackend() {
+                return document.getElementById("backendSelect").value;
+            }
+
+            function initGpuWorker() {
+                return new Promise((resolve) => {
+                    const worker = new Worker("worker.js");
+                    const timeout = setTimeout(() => {
+                        worker.terminate();
+                        resolve(null);
+                    }, 15000);
+                    worker.onmessage = (e) => {
+                        if (e.data.type === "initialized") {
+                            if (e.data.success) {
+                                worker.postMessage({ type: "init_gpu" });
+                            } else {
+                                clearTimeout(timeout);
+                                worker.terminate();
+                                resolve(null);
+                            }
+                        } else if (e.data.type === "gpu_build_info") {
+                            console.log("gpu build info:", e.data.info);
+                        } else if (e.data.type === "gpu_initialized") {
+                            clearTimeout(timeout);
+                            if (e.data.success) {
+                                resolve({
+                                    worker,
+                                    adapterName: e.data.adapterName,
+                                });
+                            } else {
+                                console.log(
+                                    "No WebGPU:",
+                                    e.data.error,
+                                );
+                                worker.terminate();
+                                resolve(null);
+                            }
+                        }
+                    };
+                    worker.onerror = () => {
+                        clearTimeout(timeout);
+                        worker.terminate();
+                        resolve(null);
+                    };
+                    // Same compiled module the CPU pool uses (worker-pool.js);
+                    // the GPU worker should not re-download and re-compile it.
+                    niceWasmModule().then((sharedModule) =>
+                        worker.postMessage({
+                            type: "init",
+                            data: { module: sharedModule },
+                        }),
+                    );
+                });
+            }
+
+            // Ask the browser directly before involving wasm. Three
+            // distinguishable failures hide behind "no GPU", and each wants a
+            // different message; going through wasm first turns all of them
+            // into one opaque panic inside CubeCL's adapter request.
+            async function probeWebGpu() {
+                if (!navigator.gpu) {
+                    return {
+                        ok: false,
+                        why: window.isSecureContext
+                            ? "This browser does not expose WebGPU. Chrome and Edge 113+ and Safari 18+ support it; Firefox has not enabled it on every platform yet."
+                            : "WebGPU needs a secure context — open this page over HTTPS (or localhost) to enable the GPU option.",
+                    };
+                }
+                // Fallback adapters are allowed as a last resort: a software
+                // adapter is still much faster than nothing on a weak CPU,
+                // and the kernel is identical either way.
+                let adapter = null;
+                try {
+                    adapter =
+                        (await navigator.gpu.requestAdapter({
+                            powerPreference: "high-performance",
+                        })) ??
+                        (await navigator.gpu.requestAdapter()) ??
+                        (await navigator.gpu.requestAdapter({
+                            forceFallbackAdapter: true,
+                        }));
+                } catch (error) {
+                    return {
+                        ok: false,
+                        why: `WebGPU adapter request failed: ${error}`,
+                    };
+                }
+                if (!adapter) {
+                    // A machine can have working WebGPU and still refuse a
+                    // standard adapter: Chrome hands out compatibility-mode
+                    // adapters only when a page asks for them by name, and
+                    // the engine behind this client cannot drive one yet.
+                    // Distinguish that from having no GPU at all.
+                    let compat = null;
+                    try {
+                        compat = await navigator.gpu.requestAdapter({
+                            featureLevel: "compatibility",
+                        });
+                    } catch {
+                        compat = null;
+                    }
+                    return {
+                        ok: false,
+                        why: compat
+                            ? "This browser only offers a WebGPU compatibility-mode adapter, which this client cannot use yet."
+                            : "This browser has WebGPU but offered no adapter, usually because graphics acceleration is off or the GPU is not usable by the browser. Chromium reports the reason on chrome://gpu, Firefox under Graphics on about:support.",
+                    };
+                }
+                const info = adapter.info ?? {};
+                const described = [info.vendor, info.architecture, info.device]
+                    .filter(Boolean)
+                    .join(" ");
+                return {
+                    ok: true,
+                    name: described || info.description || "WebGPU device",
+                };
+            }
+
+            async function detectGpu() {
+                const help = document.getElementById("backendHelp");
+                const probe = await probeWebGpu();
+                if (!probe.ok) {
+                    help.textContent = `${probe.why} Using the CPU thread pool.`;
+                    return;
+                }
+
+                help.textContent = `Starting ${probe.name}...`;
+                const gpu = await initGpuWorker();
+                if (!gpu) {
+                    help.textContent = `WebGPU adapter found (${probe.name}) but the GPU worker failed to start; using the CPU thread pool. See the console for details.`;
+                    return;
+                }
+
+                gpuWorker = gpu.worker;
+                // Prefer the browser's adapter description: CubeCL reports an
+                // empty name on some adapters (software ones especially).
+                // Browsers deliberately redact adapter identity, so both
+                // names are often empty or a bare backend tag like
+                // "(BrowserWebGpu)". Prefer whichever actually names a
+                // device, and never render a label that starts with the
+                // backend in parentheses.
+                const cubeclName = gpu.adapterName?.trim() ?? "";
+                const named = cubeclName && !cubeclName.startsWith("(");
+                gpuAdapterName = named
+                    ? cubeclName
+                    : probe.name || "WebGPU device";
+                const select = document.getElementById("backendSelect");
+                const option = document.createElement("option");
+                option.value = "gpu";
+                option.textContent = `GPU — ${gpuAdapterName}`;
+                select.appendChild(option);
+                help.textContent =
+                    "WebGPU available; the GPU runs whole fields while the CPU option uses the thread pool.";
+                gpuWorker.onmessage = handleGpuWorkerMessage;
+            }
+
+            function handleGpuWorkerMessage(e) {
+                const { type, ...rest } = e.data;
+                switch (type) {
+                    case "progress":
+                        handleWorkerPoolProgress({
+                            percent: rest.percent,
+                            message: rest.message,
+                            processedCount: rest.processedCount,
+                            uniqueDistribution: rest.uniqueDistribution,
+                            niceNumbers: rest.niceNumbers,
+                        });
+                        break;
+                    case "complete":
+                        handleWorkerPoolComplete({
+                            result: rest.result,
+                            elapsedSeconds: rest.elapsedSeconds,
+                        });
+                        break;
+                    case "stopped":
+                        handleProcessingStopped(rest.message);
+                        break;
+                    case "error":
+                        handleWorkerPoolError(new Error(rest.error));
+                        break;
+                }
+            }
+
             function processCurrentField() {
-                if (!currentClaimData || !workerPool) return;
+                if (!currentClaimData) return;
 
                 const username =
                     document.getElementById("username").value || "anonymous";
 
+                if (selectedBackend() === "gpu" && gpuWorker) {
+                    updateStatus(
+                        `Processing field on ${gpuAdapterName}...`,
+                        "is-warning",
+                    );
+                    updateProgress(0, "Starting GPU processing...");
+                    gpuWorker.postMessage({
+                        type: "process_gpu",
+                        data: {
+                            claimData: currentClaimData,
+                            username: username,
+                        },
+                    });
+                    return;
+                }
+
+                if (!workerPool) return;
                 updateStatus(
                     `Processing field with ${workerPool.getWorkerCount()} workers in parallel...`,
                     "is-warning",
@@ -903,6 +1146,9 @@
             window.stopProcessing = function () {
                 shouldStop = true;
                 isProcessing = false;
+                if (gpuWorker) {
+                    gpuWorker.postMessage({ type: "stop" });
+                }
 
                 if (workerPool) {
                     workerPool.stopProcessing();
@@ -968,7 +1214,27 @@
             }
 
             // Initialize when page loads
+            // Log which wasm build is actually loaded. The page is small and
+            // revalidates, but the 2 MB wasm is exactly the kind of thing a
+            // browser keeps, so "did my fix reach you" is otherwise
+            // unanswerable from a console paste.
+            async function logBuild() {
+                try {
+                    const r = await fetch("./pkg/nice_wasm_client_bg.wasm", {
+                        method: "HEAD",
+                        cache: "no-cache",
+                    });
+                    console.log(
+                        `wasm build: ${r.headers.get("content-length")} bytes, modified ${r.headers.get("last-modified")}`,
+                    );
+                } catch {
+                    /* diagnostics only */
+                }
+            }
+
             document.addEventListener("DOMContentLoaded", () => {
+                logBuild();
+                detectGpu();
                 if (checkBrowserSupport()) {
                     setupCpuControls();
                     init();
