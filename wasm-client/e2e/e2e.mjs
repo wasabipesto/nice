@@ -163,14 +163,22 @@ async function runBackend(backend) {
 }
 
 const skipGpu = process.argv.includes("--skip-gpu");
+// `--skip-cpu` is for hardware benchmarking: the two backends want very
+// different field sizes to measure cleanly (the GPU needs a big one to
+// amortise kernel-compile warmup, which the CPU pool would then grind
+// through for minutes), so each is timed on its own run.
+const skipCpu = process.argv.includes("--skip-cpu");
 let failed = false;
 
-console.log("=== CPU backend ===");
-const cpu = await runBackend("cpu");
-console.log(cpu.status);
-if (!/complete/i.test(cpu.status ?? "")) {
-    console.log("CPU run did not complete:", cpu);
-    failed = true;
+let cpu = { skipped: "--skip-cpu" };
+if (!skipCpu) {
+    console.log("=== CPU backend ===");
+    cpu = await runBackend("cpu");
+    console.log(cpu.status);
+    if (!/complete/i.test(cpu.status ?? "")) {
+        console.log("CPU run did not complete:", cpu);
+        failed = true;
+    }
 }
 
 let gpu = { skipped: "--skip-gpu" };
@@ -190,7 +198,7 @@ if (!skipGpu) {
 
 // Cross-backend agreement: the offline benchmark is a fixed field, so the
 // two backends' histograms must match exactly.
-if (!failed && !gpu.skipped && cpu.histogram && gpu.histogram) {
+if (!failed && !gpu.skipped && !cpu.skipped && cpu.histogram && gpu.histogram) {
     const a = JSON.stringify(cpu.histogram);
     const b = JSON.stringify(gpu.histogram);
     if (a === b) {
@@ -301,7 +309,10 @@ async function submitShape(backend) {
 
 if (!failed) {
     console.log("=== submit payload shape ===");
-    for (const backend of skipGpu ? ["cpu"] : ["cpu", "gpu"]) {
+    const backends = ["cpu", "gpu"].filter(
+        (b) => !(b === "cpu" && skipCpu) && !(b === "gpu" && skipGpu),
+    );
+    for (const backend of backends) {
         const { captured, raw, wasmFetches, skipped } = await submitShape(backend);
         if (skipped) {
             console.log(`[submit:${backend}] skipped: ${skipped}`);
