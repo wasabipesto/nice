@@ -235,10 +235,16 @@ const CORS = {
     "Access-Control-Allow-Methods": "*",
 };
 
+// How many submissions to collect before judging the run. More than one
+// matters: the pipelined loop must keep claiming and submitting on its own,
+// and the claim/submit bookkeeping (distinct ids, prefetch depth) only
+// shows up across several fields.
+const WANT_SUBMITS = 4;
+
 async function submitShape(backend) {
     const page = await browser.newPage();
-    let captured = null;
-    let raw = "";
+    const submissions = []; // { body, raw } in arrival order
+    let claimsIssued = 0;
     // The page compiles the wasm once and structured-clones the Module to
     // every worker; if that regresses, each of the ~9 workers fetches its own
     // copy of the 1.9 MB binary and this count jumps with the thread count.
@@ -256,24 +262,30 @@ async function submitShape(backend) {
         }
         const url = req.url();
         if (url.includes("/claim/")) {
+            // Same field every time, but a fresh claim_id per claim, so the
+            // submissions can be matched 1:1 against what was claimed.
+            claimsIssued += 1;
             return route.fulfill({
                 status: 200,
                 headers: { ...CORS, "Content-Type": "application/json" },
-                body: JSON.stringify(CLAIM_STUB),
+                body: JSON.stringify({
+                    ...CLAIM_STUB,
+                    claim_id: CLAIM_STUB.claim_id + claimsIssued,
+                }),
             });
         }
         if (url.includes("/submit")) {
-            if (captured === null) {
-                // The raw text matters as much as the parsed object: JSON.parse
-                // here would round a near-miss number above 2^53 exactly the way
-                // the browser did, hiding the bug this checks for.
-                raw = req.postData() ?? "";
-                try {
-                    captured = req.postDataJSON();
-                } catch {
-                    captured = { unparseable: raw };
-                }
+            // The raw text matters as much as the parsed object: JSON.parse
+            // here would round a near-miss number above 2^53 exactly the way
+            // the browser did, hiding the bug this checks for.
+            const raw = req.postData() ?? "";
+            let body;
+            try {
+                body = req.postDataJSON();
+            } catch {
+                body = { unparseable: raw };
             }
+            submissions.push({ body, raw });
             return route.fulfill({ status: 200, headers: CORS, body: "accepted" });
         }
         return route.fulfill({ status: 404, headers: CORS, body: "" });
@@ -298,13 +310,15 @@ async function submitShape(backend) {
     await page.click("#startBtn");
 
     const deadline = Date.now() + 10 * 60 * 1000;
-    while (captured === null && Date.now() < deadline) {
+    while (submissions.length < WANT_SUBMITS && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 200));
     }
+    // Snapshot before closing: the loop keeps claiming as the page dies.
+    const claimsAtCapture = claimsIssued;
     // The page loops into the next field after a submission; closing here
     // stops it, and an in-flight route can reject as it goes.
     await page.close().catch(() => {});
-    return { captured, raw, wasmFetches };
+    return { submissions, claimsAtCapture, wasmFetches };
 }
 
 if (!failed) {
@@ -313,28 +327,25 @@ if (!failed) {
         (b) => !(b === "cpu" && skipCpu) && !(b === "gpu" && skipGpu),
     );
     for (const backend of backends) {
-        const { captured, raw, wasmFetches, skipped } = await submitShape(backend);
+        const { submissions, claimsAtCapture, wasmFetches, skipped } =
+            await submitShape(backend);
         if (skipped) {
             console.log(`[submit:${backend}] skipped: ${skipped}`);
             continue;
         }
-        if (!captured) {
+        if (!submissions?.length) {
             console.log(`[submit:${backend}] no submission was made`);
             failed = true;
             continue;
         }
         const problems = [];
+        const captured = submissions[0].body;
+        const raw = submissions[0].raw;
         if (typeof captured.claim_id !== "number") {
             problems.push(
                 `claim_id is ${typeof captured.claim_id} (${JSON.stringify(
                     captured.claim_id,
                 )}), server expects a number`,
-            );
-        } else if (captured.claim_id !== CLAIM_STUB.claim_id) {
-            // Only worth reporting once the type is right; otherwise the
-            // message reads as "245749450 != 245749450".
-            problems.push(
-                `claim_id ${captured.claim_id} != claimed ${CLAIM_STUB.claim_id}`,
             );
         }
         const dist = captured.unique_distribution;
@@ -360,15 +371,55 @@ if (!failed) {
         if (typeof captured.username !== "string") problems.push("username missing");
         if (typeof captured.client_version !== "string") {
             problems.push("client_version missing");
+        } else if (/^unknown|^3\.0\.0/.test(captured.client_version)) {
+            // 3.0.0 was the hardcoded string the payload carried for three
+            // minor versions; the version must now come from the wasm build.
+            problems.push(
+                `client_version ${captured.client_version} was not read from the wasm build`,
+            );
         }
+
+        // The pipelined loop must keep going unattended...
+        if (submissions.length < WANT_SUBMITS) {
+            problems.push(
+                `only ${submissions.length}/${WANT_SUBMITS} submissions arrived`,
+            );
+        }
+        // ...every submission must answer a distinct claim the stub issued...
+        const issued = new Set(
+            Array.from(
+                { length: claimsAtCapture },
+                (_, i) => CLAIM_STUB.claim_id + i + 1,
+            ),
+        );
+        const answered = submissions.map((s) => s.body.claim_id);
+        if (new Set(answered).size !== answered.length) {
+            problems.push(`duplicate claim_ids submitted: ${answered}`);
+        }
+        for (const id of answered) {
+            if (!issued.has(id)) {
+                problems.push(`claim_id ${id} was never issued by the stub`);
+            }
+        }
+        // ...and claims must run ahead of submissions: the buffer holding at
+        // least one unprocessed claim at capture time is what distinguishes
+        // the pipeline from the old claim-submit-claim serial loop.
+        if (claimsAtCapture <= submissions.length) {
+            problems.push(
+                `${claimsAtCapture} claims for ${submissions.length} submissions — ` +
+                    `no prefetch happened`,
+            );
+        }
+
         if (problems.length) {
             console.log(`[submit:${backend}] BAD PAYLOAD: ${problems.join("; ")}`);
             failed = true;
         } else {
             console.log(
-                `[submit:${backend}] ok — claim_id ${captured.claim_id} (number), ` +
-                    `${dist.length} bins, near miss ${NEAR_MISS} exact, ` +
-                    `1 wasm fetch, ` +
+                `[submit:${backend}] ok — ${submissions.length} submissions ` +
+                    `answering ${claimsAtCapture} claims (prefetch live), ` +
+                    `claim_id numeric, ${dist.length} bins, ` +
+                    `near miss ${NEAR_MISS} exact, 1 wasm fetch, ` +
                     `client_version ${captured.client_version}`,
             );
         }

@@ -35,6 +35,8 @@ Website:
 - Speed up the index page: start the data fetches while the plot library is still downloading, draw each chart as its own data arrives instead of waiting for all five requests, and load d3/Plot as two vendored files rather than 48 CDN modules spread over six dependency levels. `just vendor-fetch` downloads them; `just deploy-site` and `just dev` do it automatically.
 - Draw the notable numbers chart from `cache_notable_numbers` instead of every base's full top-10k list. The chart is unchanged to the eye; it was drawing ~81k points into a space with room for a few hundred distinguishable ones, which cost 686 KB of payload and about two seconds of blocking work per page load.
 - Add a GPU option to the web runner. When the browser offers a WebGPU adapter the search page can process fields on the GPU instead of the CPU worker pool, selected from a dropdown that only appears when an adapter is actually available. Detection is by feature test rather than browser version, and anything without WebGPU keeps using the worker pool with no configuration.
+- Pipeline the web runner's field loop the way the native client works: a small claim buffer sized in seconds of work keeps the processor fed, submissions go out without holding up the next field, transient API failures are retried with backoff, and the hardcoded one-second pause between fields is gone. Fast backends spend their time computing instead of waiting on round trips; slow devices are unaffected, since the client never claims ahead when a single field runs long enough to risk the claim expiring.
+- Browser submissions now report the actual workspace version in `client_version` (they had been hardcoded to 3.0.0 since the wasm client shipped)
 
 ## Nice v3.3.0
 

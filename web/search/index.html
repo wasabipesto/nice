@@ -389,10 +389,230 @@
             let isProcessing = false;
             let shouldStop = false;
             let currentClaimData = null;
-            let totalDigitsProcessed = 0;
             let numbersProcessedCount = 0;
             let startTime = null;
             let niceNumbersCount = 0;
+
+            // ============================================================
+            // Field pipeline
+            //
+            // The native client (client/src/main.rs) overlaps its API calls
+            // with processing: a buffer of claims sized in seconds of work
+            // feeds the processor, and submissions go out without holding
+            // up the next field. This is the same design under browser
+            // constraints, replacing a serial loop that spent several
+            // GPU-speed fields' worth of time per field on round trips and
+            // a hardcoded one-second pause.
+            // ============================================================
+
+            const API_BASE = "https://api.nicenumbers.net";
+
+            // Keep roughly this many seconds of claimed work on hand...
+            const PREFETCH_SECONDS = 3;
+            // ...but never more than this many fields beyond the one being
+            // processed. Far lower than the native client's 16: a closed
+            // tab abandons its buffer for the full server-side claim expiry
+            // (an hour), and a tab is closed far more casually than a
+            // process is killed.
+            const PREFETCH_MAX_AHEAD = 3;
+            // Never claim ahead at all when a single field runs longer than
+            // this. A buffered claim waits a whole field before its own
+            // processing begins, so a device doing dozens-of-minutes fields
+            // would let it expire before finishing it — and for a device
+            // that slow, two round trips amortized over the field were
+            // never overhead worth buffering away.
+            const PREFETCH_SAFE_FIELD_SECS = 15 * 60;
+            // At most this many claim requests in flight at once.
+            const CLAIM_CONCURRENCY = 2;
+            // Submissions in flight before the loop waits for one to land.
+            // Running unbounded ahead would quietly absorb a server outage
+            // instead of surfacing it (same rationale as the native cap).
+            const MAX_SUBMITS_IN_FLIGHT = 4;
+            // Backoff schedule for retrying transient API failures.
+            const API_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
+
+            // Exponentially weighted moving average of seconds per field —
+            // what the buffer depth is derived from. Same smoothing as the
+            // native client's sizer.
+            let fieldSecsEwma = null;
+
+            const claimBuffer = [];
+            let claimsInFlight = 0;
+            let claimFailure = null;
+            let claimWaiters = [];
+
+            const submitsInFlight = new Set();
+            let submitFailure = null;
+
+            // Resolver for the field currently being processed. Completion,
+            // error, and stop all funnel through settleField/failField so
+            // the loop can await exactly one promise per field.
+            let activeField = null;
+
+            class ApiError extends Error {
+                constructor(status, body) {
+                    super(`Server responded with ${status}: ${body}`);
+                    this.status = status;
+                }
+            }
+
+            // Network failures come out of fetch as TypeError and are
+            // always worth retrying. Of the server's answers only the
+            // transient family is: any other 4xx means the request itself
+            // is wrong, and repeating it will not improve it.
+            function isRetryable(error) {
+                if (error instanceof ApiError) {
+                    return [429, 500, 502, 503, 504].includes(error.status);
+                }
+                return true;
+            }
+
+            async function apiWithRetry(call) {
+                for (let attempt = 0; ; attempt++) {
+                    try {
+                        return await call();
+                    } catch (error) {
+                        const spent = attempt >= API_RETRY_DELAYS_MS.length;
+                        if (shouldStop || spent || !isRetryable(error)) {
+                            throw error;
+                        }
+                        const delay = API_RETRY_DELAYS_MS[attempt];
+                        console.warn(
+                            `API call failed (${error.message}); retrying in ${delay} ms`,
+                        );
+                        await new Promise((r) => setTimeout(r, delay));
+                    }
+                }
+            }
+
+            // How many claims to hold beyond the one being processed.
+            function prefetchAhead() {
+                // Nothing measured yet: no idea how fast this machine is,
+                // so do not gamble a claim on it being fast.
+                if (fieldSecsEwma === null) return 0;
+                if (fieldSecsEwma > PREFETCH_SAFE_FIELD_SECS) return 0;
+                const fields = Math.ceil(
+                    PREFETCH_SECONDS / Math.max(fieldSecsEwma, 0.05),
+                );
+                return Math.min(PREFETCH_MAX_AHEAD, fields);
+            }
+
+            function wakeClaimWaiters() {
+                const waiters = claimWaiters;
+                claimWaiters = [];
+                waiters.forEach((resolve) => resolve());
+            }
+
+            // Top claim requests up to the target depth. `minimum` lets an
+            // idle processor demand one claim even when the prefetch math
+            // says zero (nothing measured yet, slow device, hidden tab).
+            function topUpClaims(minimum = 0) {
+                if (!isProcessing || shouldStop || claimFailure) return;
+                // A hidden tab is throttled and may not keep up with what
+                // it claims, so do not build a buffer for one.
+                let want = document.hidden ? 0 : prefetchAhead();
+                want = Math.max(want, minimum);
+                while (
+                    claimBuffer.length + claimsInFlight < want &&
+                    claimsInFlight < CLAIM_CONCURRENCY
+                ) {
+                    claimsInFlight++;
+                    apiWithRetry(claimField)
+                        .then((claim) => claimBuffer.push(claim))
+                        .catch((error) => {
+                            claimFailure = claimFailure ?? error;
+                        })
+                        .finally(() => {
+                            claimsInFlight--;
+                            wakeClaimWaiters();
+                        });
+                }
+            }
+
+            async function nextClaim() {
+                let waiting = false;
+                while (isProcessing && !shouldStop) {
+                    if (claimBuffer.length > 0) return claimBuffer.shift();
+                    if (claimFailure) throw claimFailure;
+                    if (!waiting) {
+                        waiting = true;
+                        updateStatus(
+                            "Getting work from server...",
+                            "is-warning",
+                        );
+                    }
+                    topUpClaims(1);
+                    await new Promise((resolve) =>
+                        claimWaiters.push(resolve),
+                    );
+                }
+                return null;
+            }
+
+            // Fire a submission without holding the next field on the round
+            // trip. Resolves immediately unless the in-flight cap is
+            // reached, in which case it waits for one submission to land.
+            function queueSubmit(claimData, result) {
+                const task = apiWithRetry(() => submitField(result))
+                    .then((responseText) => {
+                        appendResults(
+                            `Field ${claimData.claim_id} accepted: ${responseText}`,
+                        );
+                    })
+                    .catch((error) => {
+                        submitFailure = submitFailure ?? error;
+                        appendResults(
+                            `Error submitting field ${claimData.claim_id}: ${error.message}`,
+                        );
+                    })
+                    .finally(() => submitsInFlight.delete(task));
+                submitsInFlight.add(task);
+                if (submitsInFlight.size >= MAX_SUBMITS_IN_FLIGHT) {
+                    return Promise.race([...submitsInFlight]);
+                }
+                return Promise.resolve();
+            }
+
+            // Work already done outranks whatever interrupted it: every
+            // in-flight submission is finished before the loop reports how
+            // it ended.
+            async function drainSubmits() {
+                if (submitsInFlight.size > 0) {
+                    updateStatus(
+                        `Waiting for ${submitsInFlight.size} submission(s) to finish...`,
+                        "is-warning",
+                    );
+                    await Promise.allSettled([...submitsInFlight]);
+                }
+            }
+
+            function noteFieldSeconds(seconds) {
+                fieldSecsEwma =
+                    fieldSecsEwma === null
+                        ? seconds
+                        : 0.7 * fieldSecsEwma + 0.3 * seconds;
+            }
+
+            // Process one field on the selected backend. Resolves with
+            // { result, elapsedSeconds }, or null if processing stopped.
+            function processField(claimData) {
+                return new Promise((resolve, reject) => {
+                    activeField = { resolve, reject };
+                    dispatchField(claimData);
+                });
+            }
+
+            function settleField(outcome) {
+                const settle = activeField;
+                activeField = null;
+                settle?.resolve(outcome);
+            }
+
+            function failField(error) {
+                const settle = activeField;
+                activeField = null;
+                settle?.reject(error);
+            }
 
             // Update histogram with current digit counts
             function updateHistogram(uniqueDistribution) {
@@ -503,7 +723,8 @@
                 }
             }
 
-            // Worker Pool Message Handlers
+            // Live progress from either backend (the GPU worker posts the
+            // same shape the pool aggregates to).
             function handleWorkerPoolProgress(progressData) {
                 updateProgress(progressData.percent, progressData.message);
 
@@ -513,98 +734,6 @@
                     progressData.niceNumbers.length,
                 );
                 updateHistogram(progressData.uniqueDistribution);
-            }
-
-            function handleWorkerPoolComplete(completeData) {
-                handleProcessingComplete(
-                    completeData.result,
-                    completeData.elapsedSeconds,
-                );
-            }
-
-            function handleWorkerPoolError(error) {
-                updateStatus(`Processing error: ${error}`, "is-danger");
-                appendResults(`Error: ${error}`);
-                resetUI();
-            }
-
-            // Legacy handlers - kept for compatibility
-            function handleWorkerMessage(e) {
-                const { type, data, ...rest } = e.data;
-
-                switch (type) {
-                    case "initialized":
-                        if (rest.success) {
-                            updateWorkerStatus(
-                                "Web Worker communicating!",
-                                "ready",
-                            );
-                            updateStatus(
-                                "Ready to start! Click 'Start Processing' to begin contributing to the search.",
-                                "is-success",
-                            );
-                            document.getElementById("startBtn").disabled =
-                                false;
-                        } else {
-                            updateWorkerStatus(
-                                "Web Worker initialization failed",
-                                "error",
-                            );
-                            updateStatus(
-                                `Error initializing WASM in worker pool: ${rest.error}`,
-                                "is-danger",
-                            );
-                        }
-                        break;
-
-                    case "progress":
-                        updateProgress(rest.percent, rest.message);
-
-                        // Update statistics display
-                        updateStatistics(
-                            rest.processedCount,
-                            rest.niceNumbers.length,
-                        );
-                        updateHistogram(rest.uniqueDistribution);
-                        break;
-
-                    case "complete":
-                        handleProcessingComplete(
-                            rest.result,
-                            rest.elapsedSeconds,
-                        );
-                        break;
-
-                    case "stopped":
-                        handleProcessingStopped(rest.message);
-                        break;
-
-                    case "error":
-                        updateStatus(
-                            `Processing error: ${rest.error}`,
-                            "is-danger",
-                        );
-                        appendResults(`Error: ${rest.error}`);
-                        resetUI();
-                        break;
-
-                    case "benchmark_data":
-                        handleBenchmarkData(data);
-                        break;
-
-                    default:
-                        console.warn("Unknown worker pool message type:", type);
-                }
-            }
-
-            function handleWorkerError(error) {
-                updateStatus(
-                    `Worker pool error: ${error.message}`,
-                    "is-danger",
-                );
-                updateWorkerStatus("Worker Pool error", "error");
-                console.error("Worker pool error:", error);
-                resetUI();
             }
 
             function updateWorkerStatus(message, type) {
@@ -687,15 +816,11 @@
                 resultsDiv.scrollTop = resultsDiv.scrollHeight;
             }
 
-            async function getFieldFromServer() {
-                const apiUrl = "https://api.nicenumbers.net";
-                const endpoint = "/claim/detailed";
-                const response = await fetch(`${apiUrl}${endpoint}`);
+            async function claimField() {
+                const response = await fetch(`${API_BASE}/claim/detailed`);
 
                 if (!response.ok) {
-                    throw new Error(
-                        `Server responded with ${response.status}: ${response.statusText}`,
-                    );
+                    throw new ApiError(response.status, await response.text());
                 }
                 const serverData = await response.json();
 
@@ -725,9 +850,8 @@
                 );
             }
 
-            async function submitFieldToServer(data) {
-                const apiUrl = "https://api.nicenumbers.net";
-                const response = await fetch(`${apiUrl}/submit`, {
+            async function submitField(data) {
+                const response = await fetch(`${API_BASE}/submit`, {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -737,17 +861,14 @@
                 const responseText = await response.text();
 
                 if (!response.ok) {
-                    throw new Error(
-                        `Server responded with ${response.status}: ${responseText}`,
-                    );
+                    throw new ApiError(response.status, responseText);
                 }
                 return responseText;
             }
 
-            function handleProcessingComplete(result, elapsedSeconds) {
-                const claimData = getCurrentClaimData();
-                if (!claimData) return;
-
+            // Show one finished field: stats, rate, and any finds. Purely
+            // presentation — submission is the pipeline's business.
+            function presentFieldResult(claimData, result, elapsedSeconds) {
                 // Final distribution, exposed for the e2e harness to compare
                 // across backends.
                 window.lastDistribution = result.unique_distribution;
@@ -781,101 +902,98 @@
                         );
                     });
                 }
+            }
 
-                const testMode =
-                    document.getElementById("testMode").value === "true";
-                if (!testMode) {
-                    submitResults(result);
-                } else {
+            // Drive the claim/process/submit pipeline until stop or failure.
+            async function runFieldLoop() {
+                try {
+                    while (isProcessing && !shouldStop) {
+                        const claimData = await nextClaim();
+                        if (!claimData) break;
+                        currentClaimData = claimData;
+                        startTime = Date.now();
+                        numbersProcessedCount = 0;
+                        updateStatistics(0, niceNumbersCount);
+                        appendResults(
+                            `Received field ${claimData.claim_id}: range ${claimData.range_start} to ${claimData.range_end} in base ${claimData.base}`,
+                        );
+
+                        // Refill in parallel with the processing below.
+                        topUpClaims();
+                        const outcome = await processField(claimData);
+                        if (!outcome) break; // stopped mid-field
+
+                        noteFieldSeconds(outcome.elapsedSeconds);
+                        presentFieldResult(
+                            claimData,
+                            outcome.result,
+                            outcome.elapsedSeconds,
+                        );
+                        topUpClaims();
+                        await queueSubmit(claimData, outcome.result);
+                        if (submitFailure) break;
+                    }
+                } catch (error) {
+                    appendResults(`Error: ${error.message}`);
+                    updateStatus(
+                        `Processing error: ${error.message}`,
+                        "is-danger",
+                    );
+                    console.error("Field loop error:", error);
+                    claimFailure = claimFailure ?? error;
+                }
+
+                await drainSubmits();
+
+                // Claims never processed stay held on the server until the
+                // claim window expires; say so instead of dropping them
+                // silently.
+                const abandoned = claimBuffer.length + claimsInFlight;
+                if (abandoned > 0) {
+                    appendResults(
+                        `Abandoning ${abandoned} unprocessed claim(s); the server releases them within the hour.`,
+                    );
+                }
+                claimBuffer.length = 0;
+
+                if (submitFailure) {
+                    updateStatus(
+                        `Submission failed: ${submitFailure.message}`,
+                        "is-danger",
+                    );
+                } else if (shouldStop) {
+                    updateStatus("Processing stopped by user", "is-info");
+                } else if (!claimFailure) {
+                    updateStatus("Processing finished", "is-info");
+                }
+                resetUI();
+            }
+
+            // Offline benchmark: one fixed field, nothing claimed or
+            // submitted.
+            async function runBenchmarkField() {
+                updateStatus("Getting benchmark data...", "is-warning");
+                appendResults("Using benchmark data (offline mode)");
+                const claimData = await workerPool.getBenchmarkData();
+                currentClaimData = claimData;
+                startTime = Date.now();
+                numbersProcessedCount = 0;
+                updateStatistics(0, 0);
+
+                const outcome = await processField(claimData);
+                if (outcome) {
+                    presentFieldResult(
+                        claimData,
+                        outcome.result,
+                        outcome.elapsedSeconds,
+                    );
                     updateProgress(100, "Benchmark complete!");
                     updateStatus(
                         "Benchmark processing completed!",
                         "is-success",
                     );
-                    resetUI();
                 }
-            }
-
-            function handleProcessingStopped(message) {
-                appendResults(`Processing stopped: ${message}`);
-                updateStatus("Processing stopped by user", "is-info");
                 resetUI();
-            }
-
-            async function submitResults(result) {
-                try {
-                    updateStatus(
-                        "Submitting results to server...",
-                        "is-warning",
-                    );
-                    appendResults("Submitting results...");
-
-                    const response = await submitFieldToServer(result);
-
-                    appendResults("Results submitted successfully!");
-                    appendResults(`Server response: ${response}`);
-                    updateStatus(
-                        "Results submitted! Getting next field...",
-                        "is-success",
-                    );
-
-                    // Continue processing if not stopped
-                    if (isProcessing && !shouldStop) {
-                        setTimeout(() => startNextField(), 1000);
-                    }
-                } catch (error) {
-                    appendResults(`Error submitting results: ${error.message}`);
-                    updateStatus(
-                        `Submission failed: ${error.message}`,
-                        "is-danger",
-                    );
-                    console.error("Submission error:", error);
-                    resetUI();
-                }
-            }
-
-            function getCurrentClaimData() {
-                return currentClaimData;
-            }
-
-            function handleBenchmarkData(data) {
-                currentClaimData = data;
-                startTime = Date.now();
-                updateStatistics(0, 0);
-                processCurrentField();
-            }
-
-            async function startNextField() {
-                if (!isProcessing || shouldStop) return;
-
-                try {
-                    updateStatus("Getting work from server...", "is-warning");
-                    appendResults("Requesting new field from server...");
-
-                    const username =
-                        document.getElementById("username").value ||
-                        "anonymous";
-
-                    const claimData = await getFieldFromServer();
-                    currentClaimData = claimData;
-
-                    // Initialize for new field
-                    startTime = Date.now();
-                    numbersProcessedCount = 0;
-                    updateStatistics(0, 0);
-
-                    appendResults(
-                        `Received field ${claimData.claim_id}: range ${claimData.range_start} to ${claimData.range_end} in base ${claimData.base}`,
-                    );
-
-                    processCurrentField();
-                } catch (error) {
-                    appendResults(
-                        `Error getting work from server: ${error.message}`,
-                    );
-                    updateStatus(`Server error: ${error.message}`, "is-danger");
-                    resetUI();
-                }
             }
 
             // The GPU path runs in one dedicated worker: the device supplies
@@ -1052,23 +1170,24 @@
                         });
                         break;
                     case "complete":
-                        handleWorkerPoolComplete({
+                        settleField({
                             result: rest.result,
                             elapsedSeconds: rest.elapsedSeconds,
                         });
                         break;
                     case "stopped":
-                        handleProcessingStopped(rest.message);
+                        appendResults(`Processing stopped: ${rest.message}`);
+                        settleField(null);
                         break;
                     case "error":
-                        handleWorkerPoolError(new Error(rest.error));
+                        failField(new Error(rest.error));
                         break;
                 }
             }
 
-            function processCurrentField() {
-                if (!currentClaimData) return;
-
+            // Start one field on the selected backend; the outcome arrives
+            // through settleField/failField.
+            function dispatchField(claimData) {
                 const username =
                     document.getElementById("username").value || "anonymous";
 
@@ -1081,25 +1200,31 @@
                     gpuWorker.postMessage({
                         type: "process_gpu",
                         data: {
-                            claimData: currentClaimData,
+                            claimData: claimData,
                             username: username,
                         },
                     });
                     return;
                 }
 
-                if (!workerPool) return;
+                if (!workerPool) {
+                    failField(new Error("worker pool is not ready"));
+                    return;
+                }
                 updateStatus(
                     `Processing field with ${workerPool.getWorkerCount()} workers in parallel...`,
                     "is-warning",
                 );
                 updateProgress(0, "Starting multi-threaded processing...");
 
-                // Send processing request to worker pool
-                workerPool.processClaimData(currentClaimData, username, {
+                workerPool.processClaimData(claimData, username, {
                     onProgress: handleWorkerPoolProgress,
-                    onComplete: handleWorkerPoolComplete,
-                    onError: handleWorkerPoolError,
+                    onComplete: (completeData) =>
+                        settleField({
+                            result: completeData.result,
+                            elapsedSeconds: completeData.elapsedSeconds,
+                        }),
+                    onError: (error) => failField(new Error(String(error))),
                 });
             }
 
@@ -1114,6 +1239,9 @@
                 startTime = Date.now();
                 numbersProcessedCount = 0;
                 niceNumbersCount = 0;
+                fieldSecsEwma = null;
+                claimFailure = null;
+                submitFailure = null;
 
                 document.getElementById("startBtn").classList.add("is-hidden");
                 document
@@ -1126,13 +1254,9 @@
 
                 try {
                     if (testMode) {
-                        updateStatus("Getting benchmark data...", "is-warning");
-                        appendResults("Using benchmark data (offline mode)");
-                        const benchmarkData =
-                            await workerPool.getBenchmarkData();
-                        handleBenchmarkData(benchmarkData);
+                        await runBenchmarkField();
                     } else {
-                        await startNextField();
+                        await runFieldLoop();
                     }
                 } catch (error) {
                     updateStatus(
@@ -1158,6 +1282,14 @@
                 appendResults(
                     "Stop requested by user - stopping all parallel workers",
                 );
+
+                // Settle the in-flight field directly rather than waiting
+                // for a worker acknowledgement (the CPU pool does not route
+                // one back), so the loop can move on to draining
+                // submissions; late worker messages find activeField null
+                // and are ignored.
+                settleField(null);
+                wakeClaimWaiters();
             };
 
             function resetUI() {
@@ -1239,6 +1371,23 @@
                     setupCpuControls();
                     init();
                 }
+
+                // A tab returning to the foreground may start buffering
+                // claims again (a hidden one stops, see topUpClaims).
+                document.addEventListener("visibilitychange", () => {
+                    if (!document.hidden) {
+                        topUpClaims();
+                    }
+                });
+
+                // The backends differ by more than an order of magnitude,
+                // so a measured field time from one says nothing about the
+                // other.
+                document
+                    .getElementById("backendSelect")
+                    .addEventListener("change", () => {
+                        fieldSecsEwma = null;
+                    });
             });
 
             // Setup thread controls
