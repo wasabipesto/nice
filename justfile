@@ -117,23 +117,10 @@ jobs:
 jobs-full:
     cargo run -r -p nice_jobs -- --full
 
-# Download third-party site assets that aren't committed to the repo
+# Download third-party site assets that aren't committed to the repo.
+# Lives in a script so the browser e2e harness can call the same logic.
 vendor-fetch:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # Plot's UMD build and the d3 global it expects. The CDN's ESM build fans
-    # out into 48 requests across six dependency levels, all of which the page
-    # has to wait on before it can fetch any data.
-    vendor="{{ justfile_directory() }}/web/vendor"
-    mkdir -p "$vendor"
-    curl -sSfL "https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js" \
-        -o "$vendor/d3.min.js"
-    curl -sSfL "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6.17/dist/plot.umd.min.js" \
-        -o "$vendor/plot.umd.min.js"
-    sha256sum -c - <<CHECKSUMS
-    f2094bbf6141b359722c4fe454eb6c4b0f0e42cc10cc7af921fc158fceb86539  $vendor/d3.min.js
-    4358086467740777dd788d6b27a95cebdbaefdd50c730a3060117073bd7134cb  $vendor/plot.umd.min.js
-    CHECKSUMS
+    bash {{ justfile_directory() }}/scripts/vendor-fetch.sh
 
 # Deploy the website and bundled assets
 deploy-site: vendor-fetch

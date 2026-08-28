@@ -146,6 +146,9 @@ async function runBackend(backend) {
         status: document.getElementById("status").textContent.trim(),
         results: document.getElementById("results").textContent.trim(),
         histogram: window.lastDistribution ?? null,
+        // The charts fail silent by design (a missing vendor bundle must
+        // not stop processing), so the harness checks the SVG landed.
+        histogramRendered: !!document.querySelector("#histogram svg"),
         adapter:
             [...document.querySelectorAll("#backendSelect option")]
                 .find((o) => o.value === "gpu")
@@ -177,6 +180,12 @@ if (!skipCpu) {
     console.log(cpu.status);
     if (!/complete/i.test(cpu.status ?? "")) {
         console.log("CPU run did not complete:", cpu);
+        failed = true;
+    }
+    if (!cpu.skipped && !cpu.histogramRendered) {
+        console.log(
+            "histogram chart never rendered — is the vendored Plot missing?",
+        );
         failed = true;
     }
 }
@@ -315,10 +324,18 @@ async function submitShape(backend) {
     }
     // Snapshot before closing: the loop keeps claiming as the page dies.
     const claimsAtCapture = claimsIssued;
+    const sessionState = await page
+        .evaluate(() => ({
+            fieldsCompleted:
+                document.getElementById("fieldsCompleted")?.textContent ?? "",
+            lifetime:
+                document.getElementById("lifetimeTotals")?.textContent ?? "",
+        }))
+        .catch(() => null);
     // The page loops into the next field after a submission; closing here
     // stops it, and an in-flight route can reject as it goes.
     await page.close().catch(() => {});
-    return { submissions, claimsAtCapture, wasmFetches };
+    return { submissions, claimsAtCapture, wasmFetches, sessionState };
 }
 
 if (!failed) {
@@ -327,7 +344,7 @@ if (!failed) {
         (b) => !(b === "cpu" && skipCpu) && !(b === "gpu" && skipGpu),
     );
     for (const backend of backends) {
-        const { submissions, claimsAtCapture, wasmFetches, skipped } =
+        const { submissions, claimsAtCapture, wasmFetches, sessionState, skipped } =
             await submitShape(backend);
         if (skipped) {
             console.log(`[submit:${backend}] skipped: ${skipped}`);
@@ -409,6 +426,21 @@ if (!failed) {
                 `${claimsAtCapture} claims for ${submissions.length} submissions — ` +
                     `no prefetch happened`,
             );
+        }
+        // The session panel and the localStorage lifetime line must have
+        // ticked along with the fields.
+        if (sessionState) {
+            if (parseInt(sessionState.fieldsCompleted) < submissions.length) {
+                problems.push(
+                    `session shows ${sessionState.fieldsCompleted} fields completed ` +
+                        `after ${submissions.length} submissions`,
+                );
+            }
+            if (!/All-time from this browser/.test(sessionState.lifetime)) {
+                problems.push(
+                    `lifetime totals never rendered (got ${JSON.stringify(sessionState.lifetime)})`,
+                );
+            }
         }
 
         if (problems.length) {

@@ -13,3 +13,4 @@ scratchpad
 .worktrees
 __pycache__
 web/vendor
+web/search/vendor
