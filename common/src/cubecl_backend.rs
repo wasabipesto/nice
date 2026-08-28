@@ -1911,16 +1911,6 @@ mod tests {
                         .collect::<Vec<u128>>(),
                 );
             }
-            for (shift, got) in per_width.iter().enumerate() {
-                assert_eq!(
-                    got,
-                    &per_width[0],
-                    "base {base}: {} lanes disagree with 1 lane",
-                    1 << shift
-                );
-            }
-            let got = per_width.swap_remove(0);
-
             // Every stride candidate in the range, filtered by the mirror.
             let end = start + u128::from(len);
             let (mut n, mut idx) = table.first_valid_at_or_after(start);
@@ -1935,7 +1925,21 @@ mod tests {
                 idx = (idx + 1) % table.gap_table.len();
             }
 
-            assert_eq!(got, want, "base {base}: prefilter survivors differ");
+            // Each lane width against the CPU mirror, not merely against
+            // each other: if the tiling drops or duplicates candidates at one
+            // width, comparing widths only says they disagree, while this says
+            // which one is wrong.
+            for (shift, got) in per_width.iter().enumerate() {
+                assert_eq!(
+                    got,
+                    &want,
+                    "base {base}: {} lanes disagree with the CPU mirror \
+                     ({} survivors vs {})",
+                    1 << shift,
+                    got.len(),
+                    want.len()
+                );
+            }
             assert!(!want.is_empty(), "base {base}: the mirror passed nothing");
             assert!(
                 want.len() < candidates as usize,
