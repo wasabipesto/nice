@@ -354,12 +354,23 @@
                     <div class="column">
                         <div class="box content">
                             <h2 class="title is-4 mb-3">
-                                Processing Statistics
+                                Session Statistics
                             </h2>
                             <div class="columns is-multiline">
-                                <div class="column is-half">
+                                <div class="column is-one-quarter">
                                     <div class="has-text-centered">
-                                        <p class="heading">Numbers Processed</p>
+                                        <p class="heading">Fields Completed</p>
+                                        <p
+                                            class="title is-4"
+                                            id="fieldsCompleted"
+                                        >
+                                            0
+                                        </p>
+                                    </div>
+                                </div>
+                                <div class="column is-one-quarter">
+                                    <div class="has-text-centered">
+                                        <p class="heading">Numbers Checked</p>
                                         <p
                                             class="title is-4"
                                             id="numbersProcessed"
@@ -368,9 +379,17 @@
                                         </p>
                                     </div>
                                 </div>
-                                <div class="column is-half">
+                                <div class="column is-one-quarter">
                                     <div class="has-text-centered">
-                                        <p class="heading">Processing Rate</p>
+                                        <p class="heading">Session Rate</p>
+                                        <p class="title is-4" id="sessionRate">
+                                            0/sec
+                                        </p>
+                                    </div>
+                                </div>
+                                <div class="column is-one-quarter">
+                                    <div class="has-text-centered">
+                                        <p class="heading">Field Rate</p>
                                         <p
                                             class="title is-4"
                                             id="processingRate"
@@ -379,10 +398,10 @@
                                         </p>
                                     </div>
                                 </div>
-                                <div class="column is-half">
+                                <div class="column is-one-quarter">
                                     <div class="has-text-centered">
                                         <p class="heading">
-                                            Semi-nice Numbers Found
+                                            Semi-nice Found
                                         </p>
                                         <p
                                             class="title is-4"
@@ -392,7 +411,15 @@
                                         </p>
                                     </div>
                                 </div>
-                                <div class="column is-half">
+                                <div class="column is-one-quarter">
+                                    <div class="has-text-centered">
+                                        <p class="heading">Best Find</p>
+                                        <p class="title is-4" id="bestFind">
+                                            -
+                                        </p>
+                                    </div>
+                                </div>
+                                <div class="column is-one-quarter">
                                     <div class="has-text-centered">
                                         <p class="heading">Current Base</p>
                                         <p class="title is-4" id="currentBase">
@@ -400,20 +427,52 @@
                                         </p>
                                     </div>
                                 </div>
+                                <div class="column is-one-quarter">
+                                    <div class="has-text-centered">
+                                        <p class="heading">Claims Buffered</p>
+                                        <p
+                                            class="title is-4"
+                                            id="claimsBuffered"
+                                        >
+                                            0
+                                        </p>
+                                    </div>
+                                </div>
                             </div>
+                            <p
+                                class="is-size-7 has-text-centered has-text-grey"
+                                id="lifetimeTotals"
+                            ></p>
                         </div>
 
                         <div class="box content">
                             <h2 class="title is-4 mb-5">Digit Distribution</h2>
                             <p class="subtitle is-6">
-                                Real-time histogram of digits found during
-                                processing
+                                How many unique digits each number's square and
+                                cube contained. Red ticks mark the
+                                uniform-random baseline — a fully nice number
+                                would land at the far right, past everything
+                                chance predicts.
                             </p>
                             <div id="histogram">
                                 <div class="is-info">
                                     This will be auto-populated once the process
                                     begins. Click 'Start Processing' to see
                                     results.
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="box content">
+                            <h2 class="title is-4 mb-5">Rate per Field</h2>
+                            <p class="subtitle is-6">
+                                Each point is one completed field. Dips reveal
+                                kernel warmup on a new base, thermal
+                                throttling, or a backgrounded tab.
+                            </p>
+                            <div id="rateStrip">
+                                <div class="is-info">
+                                    Populated as fields complete.
                                 </div>
                             </div>
                         </div>
@@ -434,8 +493,16 @@
         <!-- Import worker pool -->
         <script src="./worker-pool.js"></script>
 
+        <!-- Charting, vendored like the index page (`just vendor-fetch`):
+             the CDN ESM build fans out into 48 requests across six
+             dependency levels. Deferred scripts run in document order, so
+             d3 is defined before Plot reads it and both before the module
+             below. -->
+        <script src="./vendor/d3.min.js" defer></script>
+        <script src="./vendor/plot.umd.min.js" defer></script>
+
         <script type="module">
-            import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/+esm";
+            const Plot = window.Plot;
 
             let workerPool = null;
             let isProcessing = false;
@@ -610,6 +677,9 @@
                         appendResults(
                             `Field ${claimData.claim_id} accepted: ${responseText}`,
                         );
+                        // Only accepted contributions count toward the
+                        // all-time totals.
+                        bumpLifetime(BigInt(claimData.range_size));
                     })
                     .catch((error) => {
                         submitFailure = submitFailure ?? error;
@@ -666,13 +736,118 @@
                 settle?.reject(error);
             }
 
-            // Update histogram with current digit counts
+            // ============================================================
+            // Session statistics and charts
+            // ============================================================
+
+            // Accumulated across the fields of one processing run; the
+            // benchmark modes leave these alone.
+            let sessionStart = null;
+            let sessionFields = 0;
+            let sessionNumbers = BigInt(0);
+            let bestFind = null; // { number, num_uniques, base, pct }
+            let lastFieldRate = null;
+            // One entry per completed field, for the rate strip chart.
+            let sessionRates = [];
+            const SESSION_RATES_MAX = 500;
+
+            // Counts arrive as BigInt (or its decimal string) because a fast
+            // session overflows a double's integer range within hours.
+            function formatCount(value) {
+                const s = value.toString();
+                if (s.length <= 6) return Number(s).toLocaleString();
+                return `${s[0]}.${s.slice(1, 3)}e${s.length - 1}`;
+            }
+
+            function formatRate(rate) {
+                if (!Number.isFinite(rate) || rate <= 0) return "0";
+                if (rate >= 1e6) return rate.toExponential(2);
+                return Math.round(rate).toLocaleString();
+            }
+
+            // P(k distinct digits) when `base` digits land uniformly in
+            // `base` bins — the classic occupancy distribution, which is
+            // the natural baseline here because in the valid search range a
+            // number's square and cube together have exactly `base` digits.
+            // Computed in log space via the Stirling-number recurrence
+            // S(d,k) = k·S(d-1,k) + S(d-1,k-1); the raw values overflow a
+            // double long before base 40. Approximate as a baseline: real
+            // digits are not quite uniform (no leading zeros), but the gap
+            // is far smaller than the chart can show.
+            const occupancyCache = new Map();
+            function occupancyBaseline(base) {
+                if (occupancyCache.has(base)) {
+                    return occupancyCache.get(base);
+                }
+                const logAdd = (a, b) => {
+                    if (a === -Infinity) return b;
+                    if (b === -Infinity) return a;
+                    const hi = Math.max(a, b);
+                    return (
+                        hi + Math.log1p(Math.exp(Math.min(a, b) - hi))
+                    );
+                };
+                // logS[k] holds log S(d, k) for the current d.
+                let logS = new Array(base + 1).fill(-Infinity);
+                logS[0] = 0; // S(0,0) = 1
+                for (let d = 1; d <= base; d++) {
+                    const next = new Array(base + 1).fill(-Infinity);
+                    for (let k = 1; k <= d; k++) {
+                        next[k] = logAdd(
+                            Math.log(k) + logS[k],
+                            logS[k - 1],
+                        );
+                    }
+                    logS = next;
+                }
+                // P(k) = S(b,k) · b!/(b-k)! / b^b; the falling factorial
+                // accumulates as k grows.
+                const probs = new Array(base + 1).fill(0);
+                let logFalling = 0;
+                for (let k = 1; k <= base; k++) {
+                    logFalling += Math.log(base - k + 1);
+                    probs[k] = Math.exp(
+                        logS[k] + logFalling - base * Math.log(base),
+                    );
+                }
+                occupancyCache.set(base, probs);
+                return probs;
+            }
+
+            // Update histogram with current digit counts, overlaying the
+            // uniform-random baseline so the shape means something.
             function updateHistogram(uniqueDistribution) {
-                if (uniqueDistribution == undefined) return;
+                if (uniqueDistribution == undefined || !window.Plot) return;
                 const data = [...uniqueDistribution].map(([digit, count]) => ({
                     digit,
                     count,
                 }));
+
+                const marks = [
+                    Plot.barY(data, {
+                        x: "digit",
+                        y: "count",
+                        tip: true,
+                    }),
+                ];
+                const base = currentClaimData?.base;
+                const total = data.reduce((sum, d) => sum + d.count, 0);
+                if (base && total > 0) {
+                    const probs = occupancyBaseline(base);
+                    const expected = data.map((d) => ({
+                        digit: d.digit,
+                        expected: probs[d.digit] * total,
+                    }));
+                    marks.push(
+                        Plot.tickY(expected, {
+                            x: "digit",
+                            y: "expected",
+                            stroke: "#ff3860",
+                            strokeWidth: 2,
+                        }),
+                    );
+                }
+                marks.push(Plot.ruleY([0]));
 
                 const plot = Plot.plot({
                     width: 900,
@@ -686,14 +861,7 @@
                         label: "Count",
                         grid: true,
                     },
-                    marks: [
-                        Plot.barY(data, {
-                            x: "digit",
-                            y: "count",
-                            tip: true,
-                        }),
-                        Plot.ruleY([0]),
-                    ],
+                    marks: marks,
                 });
 
                 const histogramDiv = document.querySelector("#histogram");
@@ -701,18 +869,137 @@
                 histogramDiv.append(plot);
             }
 
-            // Update statistics display
-            function updateStatistics(numbersProcessedCount, niceNumbersCount) {
-                document.getElementById("numbersProcessed").textContent =
-                    numbersProcessedCount.toLocaleString();
-                document.getElementById("niceNumbersFound").textContent =
-                    niceNumbersCount.toString();
+            function recordFieldRate(rate) {
+                sessionRates.push({
+                    field: sessionFields,
+                    rate: rate,
+                    backend: selectedBackend(),
+                });
+                if (sessionRates.length > SESSION_RATES_MAX) {
+                    sessionRates.shift();
+                }
+            }
 
-                if (startTime && numbersProcessedCount > 0) {
+            function renderRateStrip() {
+                if (!window.Plot || sessionRates.length === 0) return;
+                const plot = Plot.plot({
+                    width: 900,
+                    height: 180,
+                    marginLeft: 75,
+                    x: { label: "Field # (this session)", tickFormat: "d" },
+                    y: { label: "numbers/sec", grid: true },
+                    color: {
+                        domain: ["cpu", "gpu"],
+                        range: ["#3273dc", "#48c774"],
+                        legend: sessionRates.some((r) => r.backend === "gpu"),
+                    },
+                    marks: [
+                        Plot.dot(sessionRates, {
+                            x: "field",
+                            y: "rate",
+                            fill: "backend",
+                            tip: true,
+                        }),
+                        Plot.ruleY([0]),
+                    ],
+                });
+                const stripDiv = document.querySelector("#rateStrip");
+                stripDiv.innerHTML = "";
+                stripDiv.append(plot);
+            }
+
+            // All-time totals for this browser, kept in localStorage. Purely
+            // a courtesy for returning contributors; storage can be absent
+            // (private windows) and everything degrades to session-only.
+            const LIFETIME_KEY = "nice-lifetime";
+            function loadLifetime() {
+                try {
+                    const raw = localStorage.getItem(LIFETIME_KEY);
+                    if (!raw) return { fields: 0, numbers: "0" };
+                    const parsed = JSON.parse(raw);
+                    return {
+                        fields: parsed.fields || 0,
+                        numbers: parsed.numbers || "0",
+                    };
+                } catch {
+                    return null;
+                }
+            }
+
+            function bumpLifetime(rangeSize) {
+                try {
+                    const lifetime = loadLifetime() ?? {
+                        fields: 0,
+                        numbers: "0",
+                    };
+                    lifetime.fields += 1;
+                    lifetime.numbers = (
+                        BigInt(lifetime.numbers) + rangeSize
+                    ).toString();
+                    localStorage.setItem(
+                        LIFETIME_KEY,
+                        JSON.stringify(lifetime),
+                    );
+                    renderLifetime();
+                } catch {
+                    /* storage unavailable; session stats still work */
+                }
+            }
+
+            function renderLifetime() {
+                const el = document.getElementById("lifetimeTotals");
+                const lifetime = loadLifetime();
+                if (!lifetime || lifetime.fields === 0) {
+                    el.textContent = "";
+                    return;
+                }
+                el.textContent =
+                    `All-time from this browser: ` +
+                    `${lifetime.fields.toLocaleString()} fields · ` +
+                    `${formatCount(lifetime.numbers)} numbers`;
+            }
+
+            // Refresh the session tiles. `currentFieldProcessed` and
+            // `currentFieldFinds` describe the field in flight, so the
+            // session numbers tick during long fields too.
+            function updateStatistics(currentFieldProcessed, currentFieldFinds) {
+                const current = BigInt(
+                    Math.max(0, Math.floor(currentFieldProcessed || 0)),
+                );
+                const checked = sessionNumbers + current;
+
+                document.getElementById("fieldsCompleted").textContent =
+                    sessionFields.toLocaleString();
+                document.getElementById("numbersProcessed").textContent =
+                    formatCount(checked);
+                document.getElementById("niceNumbersFound").textContent = (
+                    niceNumbersCount + (currentFieldFinds || 0)
+                ).toString();
+                document.getElementById("claimsBuffered").textContent =
+                    claimBuffer.length.toString();
+
+                if (sessionStart && checked > BigInt(0)) {
+                    const elapsed = (Date.now() - sessionStart) / 1000;
+                    document.getElementById("sessionRate").textContent =
+                        `${formatRate(Number(checked) / elapsed)}/sec`;
+                }
+
+                // Live rate for the field in flight; the last finished
+                // field's rate between fields.
+                let fieldRate = lastFieldRate;
+                if (startTime && currentFieldProcessed > 0) {
                     const elapsed = (Date.now() - startTime) / 1000;
-                    const rate = Math.round(numbersProcessedCount / elapsed);
-                    document.getElementById("processingRate").textContent =
-                        `${rate.toLocaleString()}/sec`;
+                    if (elapsed > 0) {
+                        fieldRate = currentFieldProcessed / elapsed;
+                    }
+                }
+                document.getElementById("processingRate").textContent =
+                    fieldRate ? `${formatRate(fieldRate)}/sec` : "0/sec";
+
+                const bestEl = document.getElementById("bestFind");
+                if (bestFind) {
+                    bestEl.textContent = `${bestFind.pct.toFixed(1)}%`;
+                    bestEl.title = `${bestFind.number} (${bestFind.num_uniques}/${bestFind.base} unique digits)`;
                 }
 
                 if (currentClaimData) {
@@ -928,12 +1215,23 @@
                 const rangeSize = parseInt(claimData.range_size);
                 const numbersPerSecond = rangeSize / elapsedSeconds;
 
-                // Update nice numbers count
+                // Update nice numbers count and the session's best find
                 if (result.nice_numbers && result.nice_numbers.length > 0) {
                     niceNumbersCount += result.nice_numbers.length;
+                    result.nice_numbers.forEach((nn) => {
+                        const pct =
+                            (100 * nn.num_uniques) / claimData.base;
+                        if (!bestFind || pct > bestFind.pct) {
+                            bestFind = {
+                                number: nn.number,
+                                num_uniques: nn.num_uniques,
+                                base: claimData.base,
+                                pct: pct,
+                            };
+                        }
+                    });
                 }
 
-                updateStatistics(rangeSize, niceNumbersCount);
                 updateHistogram();
 
                 appendResults(
@@ -949,8 +1247,12 @@
                 if (result.nice_numbers && result.nice_numbers.length > 0) {
                     appendResults("Semi-nice numbers found:");
                     result.nice_numbers.forEach((nn) => {
+                        const pct = (
+                            (100 * nn.num_uniques) /
+                            claimData.base
+                        ).toFixed(1);
                         appendResults(
-                            `  ${nn.number} (${nn.num_uniques} unique digits)`,
+                            `  ${nn.number} (${nn.num_uniques}/${claimData.base} unique digits — ${pct}% nice)`,
                         );
                     });
                 }
@@ -965,7 +1267,7 @@
                         currentClaimData = claimData;
                         startTime = Date.now();
                         numbersProcessedCount = 0;
-                        updateStatistics(0, niceNumbersCount);
+                        updateStatistics(0, 0);
                         appendResults(
                             `Received field ${claimData.claim_id}: range ${claimData.range_start} to ${claimData.range_end} in base ${claimData.base}`,
                         );
@@ -981,6 +1283,17 @@
                             outcome.result,
                             outcome.elapsedSeconds,
                         );
+
+                        // Fold the field into the session's running story.
+                        const rangeSize = BigInt(claimData.range_size);
+                        sessionFields += 1;
+                        sessionNumbers += rangeSize;
+                        lastFieldRate =
+                            Number(rangeSize) / outcome.elapsedSeconds;
+                        recordFieldRate(lastFieldRate);
+                        updateStatistics(0, 0);
+                        renderRateStrip();
+
                         topUpClaims();
                         await queueSubmit(claimData, outcome.result);
                         if (submitFailure) break;
@@ -1453,6 +1766,68 @@
                 });
             }
 
+            // Version-aware copy for browsers that expose no navigator.gpu
+            // at all. Feature detection stays the gate — this only shapes
+            // the help text. Shipped-version matrix as of 2026-08: Chrome
+            // 113+ on Windows/macOS and 121+ on Android, with Linux a
+            // driver-gated rollout that began around 144; Firefox 141+ on
+            // Windows and 145+ on macOS, Linux still ramping (Nightly has
+            // it); Safari 26 (macOS 26 / iOS 26).
+            function webGpuUpgradeHint() {
+                const ua = navigator.userAgent;
+                const major = (re) => {
+                    const m = re.exec(ua);
+                    return m ? parseInt(m[1], 10) : null;
+                };
+                const linux = /Linux/.test(ua) && !/Android/.test(ua);
+                const android = /Android/.test(ua);
+
+                const firefox = major(/Firefox\/(\d+)/);
+                if (firefox !== null) {
+                    if (linux) {
+                        return "Stable Firefox is still rolling WebGPU out on Linux; Firefox Nightly has it working today.";
+                    }
+                    if (/Mac OS X/.test(ua) && firefox < 145) {
+                        return `Firefox ${firefox} predates WebGPU on macOS — updating to Firefox 145 or newer enables the GPU option.`;
+                    }
+                    if (firefox < 141) {
+                        return `Firefox ${firefox} predates WebGPU — updating to Firefox 141 or newer enables the GPU option on Windows.`;
+                    }
+                    return "This Firefox does not expose WebGPU on this platform yet.";
+                }
+
+                // Safari's UA carries Version/NN; Chromium UAs never do.
+                const safari =
+                    /Safari\//.test(ua) && !/Chrome|Chromium/.test(ua)
+                        ? major(/Version\/(\d+)/)
+                        : null;
+                if (safari !== null) {
+                    if (safari < 26) {
+                        return `Safari ${safari} predates WebGPU — it arrived with Safari 26 (macOS 26 / iOS 26), so updating enables the GPU option.`;
+                    }
+                    return "This Safari does not expose WebGPU here; look for the WebGPU feature flag in Settings.";
+                }
+
+                const chrome = major(/Chrom(?:e|ium)\/(\d+)/);
+                if (chrome !== null) {
+                    if (/Windows NT (?:5\.|6\.[01])/.test(ua)) {
+                        return "This Windows version cannot run a WebGPU-capable browser, so the CPU pool is the option here.";
+                    }
+                    if (linux) {
+                        return "Chrome is still rolling WebGPU out on Linux one GPU family at a time; a recent version covers more hardware, and chrome://gpu shows where yours stands.";
+                    }
+                    if (android && chrome < 121) {
+                        return `Chrome ${chrome} predates WebGPU on Android — updating to 121 or newer enables the GPU option.`;
+                    }
+                    if (chrome < 113) {
+                        return `Chrome ${chrome} predates WebGPU — updating to 113 or newer enables the GPU option.`;
+                    }
+                    return "This browser build does not expose WebGPU.";
+                }
+
+                return "This browser does not expose WebGPU. Recent Chrome and Edge (113+), Firefox (141+), and Safari (26+) support it.";
+            }
+
             // Ask the browser directly before involving wasm. Three
             // distinguishable failures hide behind "no GPU", and each wants a
             // different message; going through wasm first turns all of them
@@ -1462,7 +1837,7 @@
                     return {
                         ok: false,
                         why: window.isSecureContext
-                            ? "This browser does not expose WebGPU. Chrome and Edge 113+ and Safari 18+ support it; Firefox has not enabled it on every platform yet."
+                            ? webGpuUpgradeHint()
                             : "WebGPU needs a secure context — open this page over HTTPS (or localhost) to enable the GPU option.",
                     };
                 }
@@ -1643,6 +2018,17 @@
                 claimFailure = null;
                 submitFailure = null;
 
+                // A fresh online run starts a fresh session story; the
+                // benchmark modes leave the panel alone.
+                if (mode === "false") {
+                    sessionStart = Date.now();
+                    sessionFields = 0;
+                    sessionNumbers = BigInt(0);
+                    bestFind = null;
+                    lastFieldRate = null;
+                    sessionRates = [];
+                }
+
                 document.getElementById("startBtn").classList.add("is-hidden");
                 document
                     .getElementById("stopContainer")
@@ -1769,6 +2155,7 @@
             document.addEventListener("DOMContentLoaded", () => {
                 logBuild();
                 detectGpu();
+                renderLifetime();
                 if (checkBrowserSupport()) {
                     setupCpuControls();
                     init();

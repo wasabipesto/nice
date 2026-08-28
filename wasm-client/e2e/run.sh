@@ -5,6 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
+# The page loads d3/Plot from its local vendor copy (deploys run `just
+# vendor-fetch`); fetch it here so the harness serves the same files.
+bash "$REPO_ROOT/scripts/vendor-fetch.sh"
 IMG=mcr.microsoft.com/playwright:v1.62.0-noble
 docker run --rm -v "$REPO_ROOT":/repo -w /repo/wasm-client/e2e \
     --ipc=host "$IMG" bash -c "
