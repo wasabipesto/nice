@@ -319,19 +319,39 @@ fn compiled_backends() -> String {
 /// (`panic_no_lib_found`, cudarc/src/lib.rs) — which is the ordinary case on any
 /// machine with no NVIDIA driver, i.e. precisely the case `--gpu-backend auto`
 /// exists to fall through. Upstream catches the same panic for the same reason
-/// in `nvrtc_compiles_kernels_for_all_supported_bases`.
+/// in `nvrtc_compiles_kernels_for_all_supported_bases`. See `guarded_init` for
+/// how the panic is contained and what that relies on.
+#[cfg(feature = "cuda")]
+fn try_init_cuda(device: usize) -> Result<CudaContext> {
+    guarded_init("the CUDA driver library could not be loaded", || {
+        CudaContext::new(device)
+    })
+}
+
+/// Run a GPU backend initializer that may panic instead of returning an error.
+///
+/// Several of them do. cudarc panics when it cannot dlopen libcuda. cubecl-wgpu
+/// panics when no adapter serves the requested backend, which is ordinary
+/// inside a CUDA container with no Vulkan ICD. cubecl's CUDA runtime brings its
+/// own worker thread down and then unwraps the resulting `RecvError` on ours,
+/// which is what an NVIDIA-less machine sees. Any of those unwinding out of the
+/// backend chain kills the process, so `auto` never reaches the backend that
+/// would have worked — the whole point of having a chain.
 ///
 /// The panic hook is silenced for the duration so a routine fallback does not
-/// print cudarc's 20-line message. GPU init runs before any worker threads
-/// start, so swapping the global hook here is safe.
+/// print somebody else's twenty-line message. GPU init runs before any of our
+/// worker threads start, so swapping the global hook here is safe.
 ///
 /// Note this relies on unwinding; under `panic = "abort"` the process would die
 /// as before. The workspace does not set that.
-#[cfg(feature = "cuda")]
-fn try_init_cuda(device: usize) -> Result<CudaContext> {
+#[cfg(any(feature = "cuda", feature = "cubecl"))]
+fn guarded_init<T>(
+    unknown_cause: &str,
+    init: impl FnOnce() -> Result<T> + std::panic::UnwindSafe,
+) -> Result<T> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let caught = std::panic::catch_unwind(|| CudaContext::new(device));
+    let caught = std::panic::catch_unwind(init);
     std::panic::set_hook(previous);
 
     match caught {
@@ -341,7 +361,7 @@ fn try_init_cuda(device: usize) -> Result<CudaContext> {
                 .downcast_ref::<String>()
                 .map(String::as_str)
                 .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("the CUDA driver library could not be loaded");
+                .unwrap_or(unknown_cause);
             Err(anyhow!("{msg}"))
         }
     }
@@ -390,7 +410,10 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
     // (validated by its smoke kernel) falls through to the wgpu runtime.
     #[cfg(feature = "cubecl-cuda")]
     if want == GpuBackend::CubeclCuda || (want == GpuBackend::Auto && detailed) {
-        match CubeclContext::new_cuda(cli.gpu_device) {
+        let attempt = guarded_init("the CubeCL CUDA runtime could not be started", || {
+            CubeclContext::new_cuda(cli.gpu_device)
+        });
+        match attempt {
             Ok(ctx) => {
                 info!(
                     "GPU initialized: CubeCL CUDA device {}, batch size {}",
@@ -448,7 +471,11 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
 
     #[cfg(feature = "cubecl")]
     if matches!(want, GpuBackend::Auto | GpuBackend::Cubecl) {
-        match CubeclContext::new_default() {
+        let attempt = guarded_init(
+            "no adapter available for the requested wgpu backend",
+            CubeclContext::new_default,
+        );
+        match attempt {
             Ok(ctx) => {
                 info!(
                     "GPU initialized: CubeCL wgpu device ({}), batch size {}",
@@ -462,7 +489,7 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 std::process::exit(1);
             }
             Err(e) => {
-                info!("CubeCL unavailable; trying Vulkan");
+                info!("CubeCL unavailable; trying the next backend");
                 debug!("  CubeCL init failed: {e:#}");
             }
         }
