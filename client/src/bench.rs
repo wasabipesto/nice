@@ -17,7 +17,9 @@
 
 use crate::{Cli, DEFAULT_LSD_K_VALUE, GpuCtx, process_field_sync};
 use log::debug;
-use nice_common::base_range::get_base_range_u128;
+use nice_common::bench_defs::{
+    BENCH_SCHEMA_VERSION, DETAILED_SCENARIOS, NICEONLY_SCENARIOS, ScenarioDef, compute_score,
+};
 use nice_common::client_api_async::Client;
 use nice_common::stride_filter::StrideTable;
 use nice_common::{BenchmarkToServer, CLIENT_VERSION, DataToClient, SearchMode};
@@ -26,9 +28,6 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-/// Version of the JSON report layout. Bump on breaking changes.
-pub const BENCH_SCHEMA_VERSION: u32 = 1;
 
 /// Version of the per-submission telemetry layout. Bump on breaking changes.
 pub const TELEMETRY_SCHEMA_VERSION: u32 = 1;
@@ -42,145 +41,6 @@ const ENV_ALLOWLIST: &[&str] = &[
     "SLURM_JOB_ID",
     "SLURM_CLUSTER_NAME",
     "SLURM_JOB_PARTITION",
-];
-
-/// A fixed measurement region. Both the start and the window length are
-/// hardcoded so every machine measures *identical work*; machine speed only
-/// changes how many repetitions fit in the scenario's time share. Repetition
-/// also solves timer granularity — a machine that clears the window in
-/// microseconds simply runs it thousands of times.
-struct ScenarioDef {
-    key: &'static str,
-    base: u32,
-    /// None = the base range start (a strongly MSD-filtered region).
-    start: Option<u128>,
-    /// Fixed window length for CPU runs; sized so one repetition stays
-    /// tractable on very slow devices (a Raspberry Pi class machine should
-    /// clear it within roughly a scenario share).
-    window_cpu: u128,
-    /// Fixed window length for GPU runs; sized so one repetition amortizes
-    /// launch overhead on data-center class devices.
-    window_gpu: u128,
-    /// Rough character of the region, for human readers of the report.
-    character: &'static str,
-    /// Run with a single thread instead of the configured thread count.
-    /// One such scenario per sweep lets analysis decompose full-thread
-    /// results into per-core rate × parallel efficiency.
-    single_thread: bool,
-}
-
-const NICEONLY_SCENARIOS: &[ScenarioDef] = &[
-    ScenarioDef {
-        key: "b40_msd_strong",
-        base: 40,
-        start: None,
-        window_cpu: 100_000_000,
-        window_gpu: 8_000_000_000,
-        character: "msd-strong",
-        single_thread: false,
-    },
-    ScenarioDef {
-        key: "b40_msd_weak",
-        base: 40,
-        start: Some(5_007_828_088_304),
-        window_cpu: 20_000_000,
-        window_gpu: 4_000_000_000,
-        character: "msd-weak",
-        single_thread: false,
-    },
-    ScenarioDef {
-        key: "b50_residue_dense",
-        base: 50,
-        start: Some(27_219_467_191_689_038),
-        window_cpu: 20_000_000,
-        window_gpu: 4_000_000_000,
-        character: "residue-dense",
-        single_thread: false,
-    },
-    ScenarioDef {
-        key: "b50_msd_weak",
-        base: 50,
-        start: Some(73_940_161_512_353_211),
-        window_cpu: 20_000_000,
-        window_gpu: 4_000_000_000,
-        character: "msd-weak",
-        single_thread: false,
-    },
-    ScenarioDef {
-        key: "b52_msd_weak",
-        base: 52,
-        start: Some(407_887_399_136_188_818),
-        window_cpu: 20_000_000,
-        window_gpu: 4_000_000_000,
-        character: "msd-weak",
-        single_thread: false,
-    },
-    // Same region and window as b50_msd_weak so the pair decomposes into
-    // per-core rate × parallel efficiency. On very slow devices a single
-    // repetition of this window may exceed the scenario share; one full
-    // repetition is always completed, so the budget is a soft target.
-    ScenarioDef {
-        key: "b50_msd_weak_1t",
-        base: 50,
-        start: Some(73_940_161_512_353_211),
-        window_cpu: 20_000_000,
-        window_gpu: 0,
-        character: "msd-weak",
-        single_thread: true,
-    },
-];
-
-const DETAILED_SCENARIOS: &[ScenarioDef] = &[
-    ScenarioDef {
-        key: "b40_detailed",
-        base: 40,
-        start: None,
-        window_cpu: 2_000_000,
-        window_gpu: 200_000_000,
-        character: "uniform",
-        single_thread: false,
-    },
-    ScenarioDef {
-        key: "b50_detailed",
-        base: 50,
-        start: None,
-        window_cpu: 2_000_000,
-        window_gpu: 200_000_000,
-        character: "uniform",
-        single_thread: false,
-    },
-    ScenarioDef {
-        key: "b50_detailed_1t",
-        base: 50,
-        start: None,
-        window_cpu: 1_000_000,
-        window_gpu: 0,
-        character: "uniform",
-        single_thread: true,
-    },
-];
-
-/// Reference rates (numbers/sec) for the synthetic score, pinned per client
-/// version: (scenario key, gpu, reference rate). CPU references were measured
-/// on a 4-core `x86_64` dev box, GPU references on an RTX 3060; a score of 1000
-/// means "matches the reference machine on the geometric mean".
-const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
-    ("b40_msd_strong", false, 1.0e12),
-    ("b40_msd_weak", false, 1.6e9),
-    ("b50_residue_dense", false, 1.1e9),
-    ("b50_msd_weak", false, 9.4e8),
-    ("b52_msd_weak", false, 3.2e9),
-    ("b50_msd_weak_1t", false, 2.0e8),
-    ("b40_detailed", false, 1.4e7),
-    ("b50_detailed", false, 8.9e6),
-    ("b50_detailed_1t", false, 2.2e6),
-    ("b40_msd_strong", true, 2.3e11),
-    ("b40_msd_weak", true, 1.5e11),
-    ("b50_residue_dense", true, 1.3e11),
-    ("b50_msd_weak", true, 1.3e11),
-    ("b52_msd_weak", true, 1.6e11),
-    ("b40_detailed", true, 4.5e9),
-    ("b50_detailed", true, 3.2e9),
 ];
 
 /// Prebuilt stride tables per base, so table construction is paid once per
@@ -248,7 +108,7 @@ pub async fn run_benchmark_sweep(cli: &Arc<Cli>, gpu: &GpuCtx, client: &Client) 
 
     let hardware = collect_hardware(cli, gpu);
     let environment = collect_environment();
-    let score = compute_score(&results, cli.gpu);
+    let score = compute_score(results.iter().map(|r| (r.key, r.rate)), cli.gpu);
 
     print_report(cli, &results, &ping_before, &ping_after, score);
 
@@ -335,10 +195,7 @@ fn run_scenario(
     } else {
         def.window_cpu.max(2_000_000 * threads as u128)
     };
-    let base_range = get_base_range_u128(def.base)
-        .expect("benchmark base must be valid")
-        .expect("benchmark base must have a range");
-    let start = def.start.unwrap_or_else(|| base_range.start());
+    let start = def.resolved_start();
 
     // Build the stride table outside the timed windows.
     let table = cache.get(cli.mode, def.base);
@@ -441,29 +298,6 @@ fn median(mut values: Vec<f64>) -> Option<f64> {
     }
     values.sort_by(f64::total_cmp);
     Some(values[values.len() / 2])
-}
-
-/// Geometric mean of measured rate over reference rate, scaled so the
-/// reference machine scores 1000. Scenarios without a pinned reference or
-/// that were dropped are excluded.
-fn compute_score(results: &[ScenarioResult], gpu: bool) -> Option<f64> {
-    let mut log_sum = 0.0;
-    let mut count = 0usize;
-    for r in results {
-        if r.rate <= 0.0 {
-            continue;
-        }
-        let Some((_, _, reference)) = SCORE_REFERENCES
-            .iter()
-            .find(|(key, is_gpu, _)| *key == r.key && *is_gpu == gpu)
-        else {
-            continue;
-        };
-        log_sum += (r.rate / reference).ln();
-        count += 1;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    (count > 0).then(|| 1000.0 * (log_sum / count as f64).exp())
 }
 
 fn print_report(
@@ -840,61 +674,4 @@ mod tests {
         assert_eq!(median(vec![5.0, 1.0, 3.0]), Some(3.0));
     }
 
-    #[test]
-    fn score_uses_only_referenced_scenarios() {
-        let reference_rate = SCORE_REFERENCES
-            .iter()
-            .find(|(k, g, _)| *k == "b50_msd_weak" && !g)
-            .unwrap()
-            .2;
-        let results = vec![
-            ScenarioResult {
-                key: "b50_msd_weak",
-                base: 50,
-                character: "msd-weak",
-                threads: 4,
-                window_start: 0,
-                window_size: 1,
-                repetitions: 1,
-                seconds: 1.0,
-                rate: reference_rate,
-                warmup_seconds: 0.0,
-            },
-            ScenarioResult {
-                key: "not_a_real_scenario",
-                base: 50,
-                character: "msd-weak",
-                threads: 4,
-                window_start: 0,
-                window_size: 1,
-                repetitions: 1,
-                seconds: 1.0,
-                rate: 1.0,
-                warmup_seconds: 0.0,
-            },
-        ];
-        // Exactly matching the reference on the only scored scenario = 1000.
-        let score = compute_score(&results, false).unwrap();
-        assert!((score - 1000.0).abs() < 1e-6);
-        // An unmeasured scenario contributes nothing.
-        let unmeasured = vec![ScenarioResult {
-            rate: 0.0,
-            ..results.into_iter().next().unwrap()
-        }];
-        assert_eq!(compute_score(&unmeasured, false), None);
-    }
-
-    #[test]
-    fn all_scenarios_have_cpu_references() {
-        // Every CPU scenario must be scoreable, or the score silently thins.
-        for def in NICEONLY_SCENARIOS.iter().chain(DETAILED_SCENARIOS) {
-            assert!(
-                SCORE_REFERENCES
-                    .iter()
-                    .any(|(k, gpu, _)| k == &def.key && !gpu),
-                "missing CPU score reference for {}",
-                def.key
-            );
-        }
-    }
 }

@@ -426,6 +426,118 @@ if (!failed) {
     }
 }
 
+// The benchmark suite: same fixed windows as the native sweep (the plan
+// comes out of the wasm build), scored in Rust, uploadable. CPU only here —
+// the GPU scenarios use 2e8-number windows sized for real hardware, which
+// SwiftShader would grind on for many minutes.
+async function benchmarkSuite() {
+    const page = await browser.newPage();
+    let uploaded = null;
+    page.on("pageerror", (e) => console.log(`[suite] pageerror:`, e.message));
+    await page.route("**/api.nicenumbers.net/**", async (route) => {
+        const req = route.request();
+        if (req.method() === "OPTIONS") {
+            return route.fulfill({ status: 204, headers: CORS });
+        }
+        const url = req.url();
+        if (url.includes("/ping")) {
+            return route.fulfill({ status: 200, headers: CORS, body: "pong" });
+        }
+        if (url.includes("/benchmark")) {
+            try {
+                uploaded = req.postDataJSON();
+            } catch {
+                uploaded = { unparseable: req.postData() };
+            }
+            return route.fulfill({
+                status: 200,
+                headers: { ...CORS, "Content-Type": "application/json" },
+                body: JSON.stringify({ message: "Benchmark stored, thanks!", benchmark_id: 42 }),
+            });
+        }
+        return route.fulfill({ status: 404, headers: CORS, body: "" });
+    });
+    await page.goto(url);
+    await page.waitForSelector("#startBtn:not([disabled])", { timeout: 120000 });
+
+    await page.selectOption("#testMode", "suite");
+    await page.selectOption("#backendSelect", "cpu");
+    await page.click("#startBtn");
+
+    await page.waitForFunction(
+        () => /suite complete/i.test(document.getElementById("status").textContent),
+        undefined,
+        { timeout: 10 * 60 * 1000 },
+    );
+    const scoreText = await page.textContent("#nicemarkScore");
+
+    await page.click("#uploadBtn");
+    // Wait for the page to process the stub's response, not merely for the
+    // request to be captured — the status label lags the POST.
+    await page
+        .waitForFunction(
+            () =>
+                /accepted|failed/i.test(
+                    document.getElementById("uploadStatus").textContent,
+                ),
+            undefined,
+            { timeout: 60000 },
+        )
+        .catch(() => {});
+    const uploadStatus = await page.textContent("#uploadStatus");
+    await page.close().catch(() => {});
+    return { scoreText, uploaded, uploadStatus };
+}
+
+if (!failed && !skipCpu) {
+    console.log("=== benchmark suite (cpu) ===");
+    const { scoreText, uploaded, uploadStatus } = await benchmarkSuite();
+    const problems = [];
+    if (!/^\d+$/.test(scoreText?.trim() ?? "")) {
+        problems.push(`NiceMark rendered as ${JSON.stringify(scoreText)}, expected a number`);
+    }
+    if (!uploaded) {
+        problems.push("no upload was posted");
+    } else {
+        const data = uploaded.data ?? {};
+        if (typeof uploaded.username !== "string") problems.push("upload missing username");
+        if (data.schema_version !== 1) {
+            problems.push(`schema_version ${data.schema_version}, server accepts 1`);
+        }
+        if (data.config?.platform !== "browser") {
+            problems.push("config.platform is not \"browser\"");
+        }
+        if (!/-wasm-worker$/.test(data.client_version ?? "")) {
+            problems.push(`client_version ${data.client_version} lacks the -wasm-worker suffix`);
+        }
+        const scenarios = data.scenarios ?? [];
+        if (scenarios.length !== 3) {
+            problems.push(`${scenarios.length} scenarios, expected the 3 detailed ones`);
+        }
+        if (!scenarios.every((s) => s.rate > 0 && s.repetitions >= 1)) {
+            problems.push("a scenario measured no work");
+        }
+        const solo = scenarios.find((s) => s.key.endsWith("_1t"));
+        if (!solo || solo.threads !== 1) {
+            problems.push("the single-thread scenario did not run on one worker");
+        }
+        if (typeof data.score !== "number") problems.push("score missing from report");
+    }
+    if (!/accepted/i.test(uploadStatus ?? "")) {
+        problems.push(`upload status ${JSON.stringify(uploadStatus)} never showed acceptance`);
+    }
+    if (problems.length) {
+        console.log(`[suite] BAD: ${problems.join("; ")}`);
+        failed = true;
+    } else {
+        console.log(
+            `[suite] ok — NiceMark ${scoreText.trim()}, ` +
+                `${uploaded.data.scenarios.length} scenarios uploaded ` +
+                `(platform browser, ${uploaded.data.client_version})`,
+        );
+    }
+}
+
 await browser.close();
 server.close();
 process.exit(failed ? 1 : 0);

@@ -167,10 +167,40 @@
                                                 Online
                                             </option>
                                             <option value="true">
-                                                Offline Benchmark
+                                                Offline Test Field
+                                            </option>
+                                            <option value="suite">
+                                                Benchmark Suite (NiceMark)
                                             </option>
                                         </select>
                                     </div>
+                                </div>
+                            </div>
+
+                            <div class="field is-hidden" id="benchBudgetField">
+                                <label class="label" for="benchBudget"
+                                    >Benchmark Budget:</label
+                                >
+                                <div class="control">
+                                    <div class="select is-fullwidth">
+                                        <select id="benchBudget">
+                                            <option value="10" selected>
+                                                10 seconds (quick)
+                                            </option>
+                                            <option value="30">
+                                                30 seconds
+                                            </option>
+                                            <option value="60">
+                                                60 seconds (thorough)
+                                            </option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="help">
+                                    The suite measures the same fixed windows
+                                    as the native client's benchmark; a bigger
+                                    budget just repeats them more for a
+                                    steadier number.
                                 </div>
                             </div>
 
@@ -285,6 +315,28 @@
                                     </div>
                                 </div>
                             </div>
+                        </div>
+
+                        <div class="box content is-hidden" id="benchReport">
+                            <p class="heading has-text-centered">NiceMark</p>
+                            <p
+                                class="title is-2 has-text-centered mb-2"
+                                id="nicemarkScore"
+                            >
+                                —
+                            </p>
+                            <p
+                                class="has-text-centered is-size-7"
+                                id="nicemarkDetail"
+                            ></p>
+                            <button
+                                id="uploadBtn"
+                                class="button is-link is-fullwidth mt-2"
+                                onclick="uploadBenchmark()"
+                            >
+                                Upload score
+                            </button>
+                            <p class="is-size-7 mt-1" id="uploadStatus"></p>
                         </div>
 
                         <div class="box content">
@@ -996,6 +1048,351 @@
                 resetUI();
             }
 
+            // ============================================================
+            // Benchmark suite (NiceMark)
+            //
+            // The browser counterpart of the native client's --benchmark
+            // sweep: the same fixed measurement windows (the plan comes out
+            // of the wasm build, which shares the table with the native
+            // client), one untimed warmup per scenario, then repetitions of
+            // the window until the scenario's share of the budget is spent.
+            // Scored against the same pinned references — a browser and a
+            // native run on one machine are directly comparable, the
+            // browser just scores lower.
+            // ============================================================
+
+            // While the suite drives fields, dispatchField suppresses its
+            // per-field status lines so the scenario progress stays visible.
+            let suiteRunning = false;
+            // The finished report, held for the upload button.
+            let lastBenchReport = null;
+
+            async function pingSamples(n) {
+                const out = [];
+                for (let i = 0; i < n; i++) {
+                    if (i > 0) {
+                        await new Promise((r) => setTimeout(r, 100));
+                    }
+                    const t0 = performance.now();
+                    try {
+                        const response = await fetch(`${API_BASE}/ping`);
+                        out.push(
+                            response.ok ? performance.now() - t0 : null,
+                        );
+                    } catch {
+                        out.push(null);
+                    }
+                }
+                return out;
+            }
+
+            function median(values) {
+                if (values.length === 0) return null;
+                const sorted = [...values].sort((a, b) => a - b);
+                return sorted[Math.floor(sorted.length / 2)];
+            }
+
+            // Hardware info, best effort: browsers expose far less than
+            // /proc does, and Chromium exposes more than the others. Every
+            // field is optional downstream, matching the native report.
+            async function collectBrowserHardware(gpu) {
+                const hardware = {
+                    user_agent: navigator.userAgent,
+                    cpu_threads_available:
+                        navigator.hardwareConcurrency ?? null,
+                    mem_total_kb: null,
+                    device_memory_gb: navigator.deviceMemory ?? null,
+                    arch: null,
+                    os: null,
+                    os_pretty: null,
+                    gpu_model: gpu ? gpuAdapterName : null,
+                    gpu_backend: gpu ? "webgpu" : null,
+                };
+                try {
+                    if (navigator.userAgentData?.getHighEntropyValues) {
+                        const ua =
+                            await navigator.userAgentData.getHighEntropyValues(
+                                [
+                                    "platform",
+                                    "platformVersion",
+                                    "architecture",
+                                ],
+                            );
+                        hardware.os = ua.platform ?? null;
+                        hardware.os_pretty =
+                            ua.platform && ua.platformVersion
+                                ? `${ua.platform} ${ua.platformVersion}`
+                                : null;
+                        hardware.arch = ua.architecture ?? null;
+                    }
+                } catch {
+                    /* UA-CH is Chromium-only; the UA string above remains */
+                }
+                return hardware;
+            }
+
+            // One timed window through the production path of the chosen
+            // runner. `soloPool` (the single-worker pool for the _1t
+            // scenario) bypasses the backend dispatch; everything else goes
+            // through processField like a real field does.
+            async function runSuiteWindow(def, windowSize, soloPool) {
+                const startBig = BigInt(def.start);
+                const claimData = {
+                    claim_id: 0,
+                    base: def.base,
+                    range_start: startBig.toString(),
+                    range_end: (startBig + windowSize).toString(),
+                    range_size: windowSize.toString(),
+                };
+                const t0 = performance.now();
+                if (soloPool) {
+                    await new Promise((resolve, reject) =>
+                        soloPool.processClaimData(claimData, "benchmark", {
+                            onProgress: () => {},
+                            onComplete: resolve,
+                            onError: (error) =>
+                                reject(new Error(String(error))),
+                        }),
+                    );
+                } else {
+                    const outcome = await processField(claimData);
+                    if (!outcome) {
+                        throw new Error("benchmark stopped");
+                    }
+                }
+                return (performance.now() - t0) / 1000;
+            }
+
+            async function runSuiteScenario(def, gpu, shareSecs, soloPool) {
+                const workers = def.single_thread
+                    ? 1
+                    : workerPool.getWorkerCount();
+                let windowSize = BigInt(gpu ? def.window_gpu : def.window_cpu);
+                if (!gpu && !def.single_thread) {
+                    // The pool hands each worker a contiguous 1/N slice
+                    // chunked at 100k numbers; keep at least two chunks per
+                    // worker so high-core machines don't measure their own
+                    // starvation (the native sweep applies the same rule at
+                    // its chunk size). Cross-machine comparisons should use
+                    // the fixed-window single-thread scenario.
+                    const floor = BigInt(200000 * workers);
+                    if (windowSize < floor) windowSize = floor;
+                }
+
+                // One untimed warmup so one-time costs (GPU kernel JIT for
+                // this base, cold caches) land outside the measurement. The
+                // GPU needs the full window to reach the device path; the
+                // CPU warms on a fraction so slow devices don't pay the
+                // window twice.
+                const warmupWindow = gpu
+                    ? windowSize
+                    : windowSize / BigInt(8) > BigInt(0)
+                      ? windowSize / BigInt(8)
+                      : BigInt(1);
+                const warmupT0 = performance.now();
+                await runSuiteWindow(def, warmupWindow, soloPool);
+                const warmupSeconds = (performance.now() - warmupT0) / 1000;
+
+                let repetitions = 0;
+                let totalSecs = 0;
+                const scenarioT0 = performance.now();
+                do {
+                    totalSecs += await runSuiteWindow(
+                        def,
+                        windowSize,
+                        soloPool,
+                    );
+                    repetitions += 1;
+                } while (
+                    (performance.now() - scenarioT0) / 1000 <
+                        shareSecs * 0.9 &&
+                    !shouldStop
+                );
+
+                const rate =
+                    (Number(windowSize) * repetitions) /
+                    Math.max(totalSecs, 1e-4);
+                return {
+                    key: def.key,
+                    base: def.base,
+                    character: def.character,
+                    threads: gpu ? null : workers,
+                    window_start: def.start,
+                    window_size: windowSize.toString(),
+                    repetitions: repetitions,
+                    seconds: totalSecs,
+                    rate: rate,
+                    warmup_seconds: warmupSeconds,
+                };
+            }
+
+            async function runBenchmarkSuite() {
+                const gpu = selectedBackend() === "gpu" && !!gpuWorker;
+                const budgetSecs = parseInt(
+                    document.getElementById("benchBudget").value,
+                );
+                document.getElementById("benchReport").classList.add(
+                    "is-hidden",
+                );
+                lastBenchReport = null;
+
+                const plan = await workerPool.getBenchmarkPlan();
+                if (!plan) {
+                    throw new Error(
+                        "this wasm build has no benchmark plan (rebuild the pkg)",
+                    );
+                }
+                const defs = plan.scenarios.filter(
+                    (d) => !(gpu && d.single_thread),
+                );
+                const shareSecs = budgetSecs / defs.length;
+
+                appendResults(
+                    `Benchmark suite: detailed ${gpu ? "gpu" : "cpu"}, ${defs.length} scenarios, ${budgetSecs}s budget`,
+                );
+                const pingBefore = await pingSamples(5);
+
+                // The _1t scenario needs a pool of exactly one worker; the
+                // wasm module is already compiled, so this is cheap.
+                let soloPool = null;
+                const results = [];
+                suiteRunning = true;
+                try {
+                    if (!gpu && defs.some((d) => d.single_thread)) {
+                        soloPool = new WorkerPool({ maxWorkers: 1 });
+                        await soloPool.initialize();
+                    }
+                    for (let i = 0; i < defs.length; i++) {
+                        if (shouldStop) break;
+                        const def = defs[i];
+                        updateStatus(
+                            `Benchmark ${i + 1}/${defs.length}: ${def.key}...`,
+                            "is-warning",
+                        );
+                        updateProgress((100 * i) / defs.length);
+                        const result = await runSuiteScenario(
+                            def,
+                            gpu,
+                            shareSecs,
+                            def.single_thread ? soloPool : null,
+                        );
+                        results.push(result);
+                        appendResults(
+                            `${def.key}: ${result.rate.toExponential(2)} numbers/sec ` +
+                                `(${result.repetitions} reps of ${Number(result.window_size).toExponential(1)}, ${result.seconds.toFixed(2)}s)`,
+                        );
+                    }
+                } finally {
+                    suiteRunning = false;
+                    if (soloPool) soloPool.terminate();
+                }
+
+                if (shouldStop) {
+                    updateStatus("Benchmark cancelled", "is-info");
+                    resetUI();
+                    return;
+                }
+
+                const pingAfter = await pingSamples(5);
+                const pings = [...pingBefore, ...pingAfter].filter(
+                    (p) => p !== null,
+                );
+                if (pings.length > 0) {
+                    appendResults(
+                        `API latency: median ${median(pings).toFixed(1)} ms over ${pings.length}/10 samples`,
+                    );
+                } else {
+                    appendResults("API latency: unavailable (offline?)");
+                }
+
+                const score = await workerPool.getNicemarkScore(
+                    results.map((r) => ({ key: r.key, rate: r.rate })),
+                    gpu,
+                );
+                const hardware = await collectBrowserHardware(gpu);
+                const clientVersion = `${workerPool.clientVersion}-wasm-${gpu ? "webgpu" : "worker"}`;
+
+                lastBenchReport = {
+                    schema_version: plan.schema_version,
+                    client_version: clientVersion,
+                    timestamp_epoch: Math.floor(Date.now() / 1000),
+                    config: {
+                        mode: "detailed",
+                        gpu: gpu,
+                        threads: gpu ? null : workerPool.getWorkerCount(),
+                        benchmark_secs: budgetSecs,
+                        // What PR'd server-side analysis keys on to keep
+                        // wasm-speed samples out of the native estimator.
+                        platform: "browser",
+                    },
+                    hardware: hardware,
+                    environment: {},
+                    api_latency: {
+                        endpoint: `${API_BASE}/ping`,
+                        before_ms: pingBefore,
+                        after_ms: pingAfter,
+                        median_ms: median(pings),
+                    },
+                    scenarios: results,
+                    score: score,
+                };
+                console.log("benchmark report:", lastBenchReport);
+
+                document.getElementById("nicemarkScore").textContent =
+                    score === null ? "n/a" : Math.round(score).toString();
+                document.getElementById("nicemarkDetail").textContent =
+                    `detailed ${gpu ? "gpu" : "cpu"} · ${clientVersion}` +
+                    (score === null ? "" : " · 1000 = native reference box");
+                const uploadBtn = document.getElementById("uploadBtn");
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = "Upload score";
+                document.getElementById("uploadStatus").textContent = "";
+                document
+                    .getElementById("benchReport")
+                    .classList.remove("is-hidden");
+
+                updateProgress(100, "Benchmark suite complete!");
+                updateStatus("Benchmark suite complete!", "is-success");
+                resetUI();
+            }
+
+            window.uploadBenchmark = async function () {
+                if (!lastBenchReport) return;
+                const uploadBtn = document.getElementById("uploadBtn");
+                const uploadStatus = document.getElementById("uploadStatus");
+                uploadBtn.disabled = true;
+                uploadStatus.textContent = "Uploading...";
+                try {
+                    const username =
+                        document.getElementById("username").value ||
+                        "anonymous";
+                    const response = await fetch(`${API_BASE}/benchmark`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            username: username,
+                            data: lastBenchReport,
+                        }),
+                    });
+                    const text = await response.text();
+                    if (!response.ok) {
+                        throw new ApiError(response.status, text);
+                    }
+                    let message = "stored";
+                    try {
+                        const body = JSON.parse(text);
+                        message = `${body.message ?? "stored"} (id ${body.benchmark_id ?? "?"})`;
+                    } catch {
+                        /* non-JSON success body */
+                    }
+                    uploadStatus.textContent = `Upload accepted: ${message}`;
+                    uploadBtn.textContent = "Uploaded";
+                } catch (error) {
+                    uploadStatus.textContent = `Upload failed: ${error.message}`;
+                    uploadBtn.disabled = false;
+                }
+            };
+
             // The GPU path runs in one dedicated worker: the device supplies
             // the parallelism, so there is nothing for a pool to do.
             let gpuWorker = null;
@@ -1192,11 +1589,13 @@
                     document.getElementById("username").value || "anonymous";
 
                 if (selectedBackend() === "gpu" && gpuWorker) {
-                    updateStatus(
-                        `Processing field on ${gpuAdapterName}...`,
-                        "is-warning",
-                    );
-                    updateProgress(0, "Starting GPU processing...");
+                    if (!suiteRunning) {
+                        updateStatus(
+                            `Processing field on ${gpuAdapterName}...`,
+                            "is-warning",
+                        );
+                        updateProgress(0, "Starting GPU processing...");
+                    }
                     gpuWorker.postMessage({
                         type: "process_gpu",
                         data: {
@@ -1211,11 +1610,13 @@
                     failField(new Error("worker pool is not ready"));
                     return;
                 }
-                updateStatus(
-                    `Processing field with ${workerPool.getWorkerCount()} workers in parallel...`,
-                    "is-warning",
-                );
-                updateProgress(0, "Starting multi-threaded processing...");
+                if (!suiteRunning) {
+                    updateStatus(
+                        `Processing field with ${workerPool.getWorkerCount()} workers in parallel...`,
+                        "is-warning",
+                    );
+                    updateProgress(0, "Starting multi-threaded processing...");
+                }
 
                 workerPool.processClaimData(claimData, username, {
                     onProgress: handleWorkerPoolProgress,
@@ -1231,8 +1632,7 @@
             window.startProcessing = async function () {
                 if (isProcessing || !workerPool) return;
 
-                const testMode =
-                    document.getElementById("testMode").value === "true";
+                const mode = document.getElementById("testMode").value;
 
                 isProcessing = true;
                 shouldStop = false;
@@ -1253,7 +1653,9 @@
                 document.getElementById("results").textContent = "";
 
                 try {
-                    if (testMode) {
+                    if (mode === "suite") {
+                        await runBenchmarkSuite();
+                    } else if (mode === "true") {
                         await runBenchmarkField();
                     } else {
                         await runFieldLoop();
@@ -1387,6 +1789,21 @@
                     .getElementById("backendSelect")
                     .addEventListener("change", () => {
                         fieldSecsEwma = null;
+                    });
+
+                // The budget selector only means something to the suite.
+                document
+                    .getElementById("testMode")
+                    .addEventListener("change", (e) => {
+                        const suite = e.target.value === "suite";
+                        document
+                            .getElementById("benchBudgetField")
+                            .classList.toggle("is-hidden", !suite);
+                        if (!suite) {
+                            document
+                                .getElementById("benchReport")
+                                .classList.add("is-hidden");
+                        }
                     });
             });
 

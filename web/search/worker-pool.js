@@ -600,7 +600,11 @@ class WorkerPool {
         this.currentUsername = null;
     }
 
-    async getBenchmarkData() {
+    // One-shot request/response against the first worker: send `message`,
+    // resolve with the first reply of `responseType`, pass everything else
+    // to the normal handler. The wasm instances live in the workers, so this
+    // is how the page asks the wasm build a question.
+    requestFromWorker(message, responseType, timeoutMs = 5000) {
         if (!this.isInitialized || this.workers.length === 0) {
             throw new Error("Worker pool not initialized");
         }
@@ -608,22 +612,51 @@ class WorkerPool {
         return new Promise((resolve, reject) => {
             const worker = this.workers[0].worker;
             const timeout = setTimeout(() => {
-                reject(new Error("Benchmark data timeout"));
-            }, 5000);
+                worker.onmessage = originalHandler;
+                reject(new Error(`${responseType} timeout`));
+            }, timeoutMs);
 
             const originalHandler = worker.onmessage;
             worker.onmessage = (e) => {
-                if (e.data.type === "benchmark_data") {
+                if (e.data.type === responseType) {
                     clearTimeout(timeout);
                     worker.onmessage = originalHandler;
-                    resolve(e.data.data);
+                    resolve(e.data);
                 } else if (originalHandler) {
                     originalHandler(e);
                 }
             };
 
-            worker.postMessage({ type: "benchmark" });
+            worker.postMessage(message);
         });
+    }
+
+    async getBenchmarkData() {
+        const reply = await this.requestFromWorker(
+            { type: "benchmark" },
+            "benchmark_data",
+        );
+        return reply.data;
+    }
+
+    // The shared benchmark scenario plan from the wasm build, or null on a
+    // build that predates it.
+    async getBenchmarkPlan() {
+        const reply = await this.requestFromWorker(
+            { type: "benchmark_plan" },
+            "benchmark_plan",
+        );
+        return reply.plan;
+    }
+
+    // NiceMark for measured rates, scored inside the wasm build against the
+    // same references the native client uses.
+    async getNicemarkScore(rates, gpu) {
+        const reply = await this.requestFromWorker(
+            { type: "nicemark", data: { rates: rates, gpu: gpu } },
+            "nicemark",
+        );
+        return reply.score;
     }
 
     getWorkerCount() {

@@ -47,6 +47,65 @@ pub fn process_chunk_wasm(range_start_str: &str, range_end_str: &str, base: u32)
 }
 
 // ============================================================================
+// Benchmark suite
+// ============================================================================
+
+/// The shared benchmark plan, resolved for the browser: the detailed
+/// scenarios from `nice_common::bench_defs` (the wasm client has no niceonly
+/// path), with start positions resolved against the base ranges. u128 values
+/// are carried as strings for the same reason the claim ranges are.
+///
+/// The page drives the sweep from this instead of hardcoding windows, so the
+/// browser suite and the native `--benchmark` sweep measure identical work
+/// by construction.
+#[wasm_bindgen]
+pub fn benchmark_plan() -> String {
+    let scenarios: Vec<serde_json::Value> = nice_common::bench_defs::DETAILED_SCENARIOS
+        .iter()
+        .map(|def| {
+            serde_json::json!({
+                "key": def.key,
+                "base": def.base,
+                "start": def.resolved_start().to_string(),
+                "window_cpu": def.window_cpu.to_string(),
+                "window_gpu": def.window_gpu.to_string(),
+                "character": def.character,
+                "single_thread": def.single_thread,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "schema_version": nice_common::bench_defs::BENCH_SCHEMA_VERSION,
+        "scenarios": scenarios,
+    })
+    .to_string()
+}
+
+/// The synthetic NiceMark score for a set of measured rates, via the same
+/// geometric mean over the same pinned references the native client scores
+/// against — a browser and a native run on one machine are directly
+/// comparable (the browser just scores lower). Input:
+/// `[{"key": "b40_detailed", "rate": 1.5e7}, ...]`. Returns nothing when no
+/// scenario matched a reference.
+#[wasm_bindgen]
+pub fn nicemark_score(rates_json: &str, gpu: bool) -> Result<Option<f64>, JsValue> {
+    let rates: serde_json::Value = serde_json::from_str(rates_json)
+        .map_err(|e| JsValue::from_str(&format!("bad rates: {e}")))?;
+    let pairs: Vec<(&str, f64)> = rates
+        .as_array()
+        .ok_or_else(|| JsValue::from_str("rates must be an array"))?
+        .iter()
+        .filter_map(|entry| {
+            Some((entry.get("key")?.as_str()?, entry.get("rate")?.as_f64()?))
+        })
+        .collect();
+    Ok(nice_common::bench_defs::compute_score(
+        pairs.iter().copied(),
+        gpu,
+    ))
+}
+
+// ============================================================================
 // GPU (WebGPU via CubeCL)
 // ============================================================================
 
