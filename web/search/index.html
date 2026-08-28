@@ -1562,12 +1562,13 @@
                     : workerPool.getWorkerCount();
                 let windowSize = BigInt(gpu ? def.window_gpu : def.window_cpu);
                 if (!gpu && !def.single_thread) {
-                    // The pool hands each worker a contiguous 1/N slice
-                    // chunked at 100k numbers; keep at least two chunks per
-                    // worker so high-core machines don't measure their own
-                    // starvation (the native sweep applies the same rule at
-                    // its chunk size). Cross-machine comparisons should use
-                    // the fixed-window single-thread scenario.
+                    // The pool feeds workers from a queue of sub-ranges no
+                    // smaller than 200k numbers; keep the window big enough
+                    // that every worker gets at least one, or high-core
+                    // machines measure their own starvation (the native
+                    // sweep applies the same rule at its chunk size).
+                    // Cross-machine comparisons should use the fixed-window
+                    // single-thread scenario.
                     const floor = BigInt(200000 * workers);
                     if (windowSize < floor) windowSize = floor;
                 }

@@ -42,6 +42,8 @@ Website:
 - Rework the web runner's statistics into a session view: fields completed, session totals and rates, best find, and a claims-buffered tile, plus a rate-per-field strip chart that surfaces kernel warmup, throttling, and backgrounded tabs at a glance. The digit distribution histogram now overlays the uniform-random occupancy baseline so a field's shape is legible against chance, near misses are logged with their niceness percentage, and all-time per-browser totals persist in localStorage.
 - Give the web runner's GPU detection version-aware help text: when a browser exposes no WebGPU at all, the page names the version that adds it for that browser and platform (or says plainly that no update will) instead of a generic sentence. Detection itself remains a feature test.
 - The search page now loads d3/Plot from the same vendored files as the index page instead of the CDN's 48-module ESM graph; `just vendor-fetch` (now `scripts/vendor-fetch.sh`, shared with the browser e2e harness) places a copy beside the page.
+- Overlap the web runner's GPU slices: the next slice's dispatches are enqueued before the previous slice's readback is awaited, so the device rolls straight from one slice into the next instead of idling at every progress tick.
+- Feed the web runner's CPU workers from a queue of sub-ranges instead of a static 1/N split, so one throttled or efficiency core no longer sets the whole field's finish time while the other workers sit idle; a stop now lands within one sub-range too. Worker failures now fail the field outright instead of "completing with partial results", which the server would have rejected anyway.
 
 ## Nice v3.3.0
 

@@ -240,21 +240,8 @@ async function processDetailedGpu(claimDataJson, username) {
     }
 
     let processed = BigInt(0);
-    for (
-        let current = rangeStart;
-        current < rangeEnd && !shouldStop;
-        current += sliceSize
-    ) {
-        const sliceEnd =
-            current + sliceSize > rangeEnd ? rangeEnd : current + sliceSize;
-
-        const sliceResultJson = await wasm.process_chunk_gpu(
-            current.toString(),
-            sliceEnd.toString(),
-            base,
-        );
+    const mergeSlice = (sliceResultJson, sliceNumbers) => {
         const sliceResult = parseFieldResults(sliceResultJson);
-
         allNiceNumbers.push(...sliceResult.nice_numbers);
         for (const entry of sliceResult.distribution) {
             const currentCount = uniqueDistribution.get(entry.num_uniques) || 0;
@@ -263,8 +250,7 @@ async function processDetailedGpu(claimDataJson, username) {
                 currentCount + entry.count,
             );
         }
-
-        processed += sliceEnd - current;
+        processed += sliceNumbers;
         const percent = Number((processed * BigInt(100)) / rangeSize);
         self.postMessage({
             type: "progress",
@@ -274,6 +260,36 @@ async function processDetailedGpu(claimDataJson, username) {
             uniqueDistribution: uniqueDistribution,
             niceNumbers: allNiceNumbers,
         });
+    };
+
+    // Two slices in flight: each slice ends in a readback that idles the
+    // device until the CPU has the data, so the next slice's dispatches are
+    // enqueued *before* awaiting the previous readback — the GPU rolls
+    // straight from one slice into the next while the JS side is waiting.
+    // Each wasm call allocates its own buffers, so the two never share
+    // state; awaiting the older one first keeps results in range order.
+    let pending = null; // { promise, size }
+    for (
+        let current = rangeStart;
+        current < rangeEnd && !shouldStop;
+        current += sliceSize
+    ) {
+        const sliceEnd =
+            current + sliceSize > rangeEnd ? rangeEnd : current + sliceSize;
+        const promise = wasm.process_chunk_gpu(
+            current.toString(),
+            sliceEnd.toString(),
+            base,
+        );
+        if (pending) {
+            mergeSlice(await pending.promise, pending.size);
+        }
+        pending = { promise, size: sliceEnd - current };
+    }
+    if (pending) {
+        // The last slice — or, after a stop, the one still on the device;
+        // either way it is finished work, so it is kept.
+        mergeSlice(await pending.promise, pending.size);
     }
 
     if (shouldStop) {
