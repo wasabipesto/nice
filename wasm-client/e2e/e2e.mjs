@@ -201,6 +201,134 @@ if (!failed && !gpu.skipped && cpu.histogram && gpu.histogram) {
     }
 }
 
+// The payload the client actually submits. Everything above runs the
+// offline benchmark, which never submits, so none of it covers the shape of
+// a real submission — and the CPU and GPU paths assemble that payload in
+// different files, which is exactly how a defect can land on one backend
+// only. (It did: the GPU path sent claim_id as a quoted string and the
+// server answered 400, while the CPU path coerced it to a number and
+// worked.) This claims a small field from a stubbed server, captures the
+// POST, and checks what each backend produced.
+const CLAIM_STUB = {
+    claim_id: 245749450, // a number, as the real API sends it
+    base: 40,
+    range_start: "1916284264916",
+    range_end: "1916284464916", // 200k numbers: seconds, not minutes
+    range_size: "200000",
+};
+const CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Methods": "*",
+};
+
+async function submitShape(backend) {
+    const page = await browser.newPage();
+    let captured = null;
+    page.on("pageerror", (e) => console.log(`[submit:${backend}] pageerror:`, e.message));
+    await page.route("**/api.nicenumbers.net/**", async (route) => {
+        const req = route.request();
+        if (req.method() === "OPTIONS") {
+            return route.fulfill({ status: 204, headers: CORS });
+        }
+        const url = req.url();
+        if (url.includes("/claim/")) {
+            return route.fulfill({
+                status: 200,
+                headers: { ...CORS, "Content-Type": "application/json" },
+                body: JSON.stringify(CLAIM_STUB),
+            });
+        }
+        if (url.includes("/submit")) {
+            if (captured === null) {
+                try {
+                    captured = req.postDataJSON();
+                } catch {
+                    captured = { unparseable: req.postData() };
+                }
+            }
+            return route.fulfill({ status: 200, headers: CORS, body: "accepted" });
+        }
+        return route.fulfill({ status: 404, headers: CORS, body: "" });
+    });
+    await page.goto(url);
+    await page.waitForSelector("#startBtn:not([disabled])", { timeout: 120000 });
+    await page.waitForFunction(
+        () => !document.getElementById("backendHelp").textContent.includes("Checking"),
+        undefined,
+        { timeout: 120000 },
+    );
+    const gpuOffered = await page.evaluate(
+        () => document.querySelectorAll("#backendSelect option").length > 1,
+    );
+    if (backend === "gpu" && !gpuOffered) {
+        await page.close();
+        return { skipped: "no WebGPU adapter offered" };
+    }
+
+    await page.selectOption("#testMode", "false"); // live mode: claims and submits
+    await page.selectOption("#backendSelect", backend);
+    await page.click("#startBtn");
+
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (captured === null && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 200));
+    }
+    // The page loops into the next field after a submission; closing here
+    // stops it, and an in-flight route can reject as it goes.
+    await page.close().catch(() => {});
+    return { captured };
+}
+
+if (!failed) {
+    console.log("=== submit payload shape ===");
+    for (const backend of skipGpu ? ["cpu"] : ["cpu", "gpu"]) {
+        const { captured, skipped } = await submitShape(backend);
+        if (skipped) {
+            console.log(`[submit:${backend}] skipped: ${skipped}`);
+            continue;
+        }
+        if (!captured) {
+            console.log(`[submit:${backend}] no submission was made`);
+            failed = true;
+            continue;
+        }
+        const problems = [];
+        if (typeof captured.claim_id !== "number") {
+            problems.push(
+                `claim_id is ${typeof captured.claim_id} (${JSON.stringify(
+                    captured.claim_id,
+                )}), server expects a number`,
+            );
+        } else if (captured.claim_id !== CLAIM_STUB.claim_id) {
+            // Only worth reporting once the type is right; otherwise the
+            // message reads as "245749450 != 245749450".
+            problems.push(
+                `claim_id ${captured.claim_id} != claimed ${CLAIM_STUB.claim_id}`,
+            );
+        }
+        const dist = captured.unique_distribution;
+        if (!Array.isArray(dist) || dist.length === 0) {
+            problems.push("unique_distribution missing or empty");
+        } else if (!dist.some((d) => d.count > 0)) {
+            problems.push("unique_distribution is all zeroes");
+        }
+        if (typeof captured.username !== "string") problems.push("username missing");
+        if (typeof captured.client_version !== "string") {
+            problems.push("client_version missing");
+        }
+        if (problems.length) {
+            console.log(`[submit:${backend}] BAD PAYLOAD: ${problems.join("; ")}`);
+            failed = true;
+        } else {
+            console.log(
+                `[submit:${backend}] ok — claim_id ${captured.claim_id} (number), ` +
+                    `${dist.length} bins, client_version ${captured.client_version}`,
+            );
+        }
+    }
+}
+
 await browser.close();
 server.close();
 process.exit(failed ? 1 : 0);

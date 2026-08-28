@@ -239,17 +239,27 @@ Unset, it picks the highest-powered adapter.
   wgpu this usually means the driver's watchdog reset the GPU (check `dmesg`
   for `ring gfx ... timeout`); please report it, since batches are sized to
   stay under watchdogs.
-- *Browser client, Firefox-family on Linux* — WebGPU there is still
-  pre-release, needing `dom.webgpu.enabled` and `dom.webgpu.workers.enabled`
-  in `about:config`. One machine (LibreWolf 149, AMD/RADV) additionally hit a
-  hard memory ceiling: roughly 10 MB of GPU memory in total, single
-  allocations of 8 MB and up refused, and no apparent reclaim on release,
-  which is not enough for this client's GPU path. Whether that ceiling is a
-  Firefox/Linux limitation or specific to LibreWolf's hardening (it ships
-  with `resistFingerprinting` on and WebGL disabled) is **untested on stock
-  Firefox**. Either way the page falls back to the CPU worker pool
-  automatically. Chromium on the same machine offers no adapter at all yet,
-  since AMD is not in its Linux rollout.
+- *Browser client on Linux* — WebGPU is still rolling out there, so which
+  browser you use decides whether the GPU option appears at all. Measured on
+  one AMD RX 9070 XT (RADV, Wayland):
+  - **Firefox Nightly works**, and is the recommended way to use the GPU
+    path on Linux today — a full field runs on the GPU with no flags.
+  - **Firefox release (152+)** has WebGPU behind `dom.webgpu.enabled` in
+    `about:config`. If the page still reports no adapter, also try
+    `dom.webgpu.workers.enabled` (this client runs WebGPU inside a Worker)
+    and `gfx.webgpu.ignore-blocklist` (Firefox ships a conservative adapter
+    blocklist on Linux, and a blocklisted adapter is reported as no adapter).
+  - **LibreWolf 149 does not work**, even with those prefs set: it caps GPU
+    memory at roughly 10 MB in total, refuses single allocations of 8 MB and
+    up, and does not appear to reclaim on release. Stock Firefox on the same
+    machine has no such ceiling, so this is LibreWolf's hardening (it ships
+    with `resistFingerprinting` on and WebGL disabled), not a Firefox
+    limitation.
+  - **Chromium offers no adapter** on AMD yet — Chrome's Linux rollout is
+    per-vendor and AMD is not in it.
+
+  In every failing case the page falls back to the CPU worker pool
+  automatically; nothing needs to be configured for that.
 - *"Unable to find a Vulkan driver"* on macOS — the experimental `vulkan` backend needs
   `brew install molten-vk vulkan-loader` and
   `VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`. The

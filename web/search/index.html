@@ -699,9 +699,13 @@
                 }
                 const serverData = await response.json();
 
-                // Convert server integers to strings for compatibility
+                // The range fields are u128 and do not survive a JS number,
+                // so they are carried as strings and parsed with BigInt at
+                // the wasm boundary. claim_id is NOT one of them: it goes
+                // straight back to /submit, which deserializes it as an
+                // integer and rejects a quoted one with a 400.
                 return {
-                    claim_id: serverData.claim_id.toString(),
+                    claim_id: serverData.claim_id,
                     base: serverData.base,
                     range_start: serverData.range_start.toString(),
                     range_end: serverData.range_end.toString(),

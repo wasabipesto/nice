@@ -362,7 +362,10 @@ self.onmessage = async function (e) {
         case "benchmark":
             // Return benchmark data
             const benchmarkData = {
-                claim_id: "0",
+                // A number, matching what the server sends and what /submit
+                // expects back — the benchmark never submits, but the shape
+                // should not differ from a real field's.
+                claim_id: 0,
                 base: 40,
                 range_start: "1916284264916",
                 range_end: "1916294264916",
