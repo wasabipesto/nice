@@ -197,14 +197,36 @@ async function processDetailedGpu(claimDataJson, username) {
         uniqueDistribution.set(i, 0);
     }
 
-    // ~32 progress ticks per field, in whole millions so slice boundaries
-    // stay friendly to the GPU's internal batching.
-    let sliceSize = rangeSize / BigInt(32);
+    // Every slice ends in a GPU->CPU readback, which drains the queue and
+    // holds the device idle until the CPU has the data. Sizing a slice to one
+    // of the kernel's internal batches therefore alternates a single dispatch
+    // with a full stall, which is most of where the browser client's time went
+    // — the card measured 18-20% busy. Several batches per slice let the
+    // dispatches queue back to back so only the last is waited on.
+    //
+    // The batch size comes from the wasm build rather than being repeated
+    // here, so the two cannot drift apart.
+    let batchSize = BigInt(32000000);
+    try {
+        const info = JSON.parse(wasm.gpu_build_info());
+        if (info && info.batch_size) {
+            batchSize = BigInt(info.batch_size);
+        }
+    } catch {
+        /* keep the default above */
+    }
     const megaBig = BigInt(1000000);
+    // Eight progress ticks a field, but never a slice so small that the GPU
+    // spends its time waiting rather than working.
+    let sliceSize = rangeSize / BigInt(8);
+    const minSlice = batchSize * BigInt(8);
+    if (sliceSize < minSlice) {
+        sliceSize = minSlice;
+    }
     if (sliceSize > megaBig) {
         sliceSize = (sliceSize / megaBig) * megaBig;
     }
-    if (sliceSize < BigInt(1)) {
+    if (sliceSize > rangeSize || sliceSize < BigInt(1)) {
         sliceSize = rangeSize;
     }
 
