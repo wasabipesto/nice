@@ -5,6 +5,11 @@
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>Nice!</title>
         <link
+            rel="preconnect"
+            href="https://data.nicenumbers.net"
+            crossorigin
+        />
+        <link
             rel="stylesheet"
             href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css"
         />
@@ -17,7 +22,67 @@
                 height: 0.75em;
                 width: 0.75em;
             }
+            /* Reserve the shape each chart will take so the column doesn't
+               jump as charts arrive one at a time. Plot's SVG scales to the
+               column width, so the reservation has to be a ratio rather than a
+               fixed height. It sits on the placeholder rather than the slot so
+               that it can never constrain the chart that replaces it. */
+            .chart-placeholder {
+                display: flex;
+                align-items: center;
+                aspect-ratio: 3 / 1;
+            }
+            .chart-placeholder.is-tall {
+                aspect-ratio: 9 / 4;
+            }
+            .chart-placeholder.is-short {
+                aspect-ratio: 18 / 5;
+            }
         </style>
+
+        <script>
+            // Start the data fetches during head parsing. Everything below is
+            // deferred, so without this the requests would not begin until the
+            // plot bundle had downloaded and run - a serial wait for no reason.
+            window.niceData = (() => {
+                const BASE = "https://data.nicenumbers.net";
+                const get = (path) => {
+                    const p = fetch(BASE + path).then((response) => {
+                        if (!response.ok) {
+                            throw new Error(`${path}: HTTP ${response.status}`);
+                        }
+                        return response.json();
+                    });
+                    // Mark the rejection handled now; the real handler does not
+                    // attach until the deferred script runs, and without this a
+                    // failed fetch logs an unhandled rejection in the meantime.
+                    p.catch(() => {});
+                    return p;
+                };
+                return {
+                    notable: get(
+                        "/cache_notable_numbers?select=number,niceness,base,num_uniques&order=off_by.desc",
+                    ),
+                    niceness: get(
+                        "/chunks?select=id,base_id,range_start,range_end,niceness_mean,niceness_stdev&niceness_mean=not.is.null&order=id.asc",
+                    ),
+                    completion: get(
+                        "/chunks?select=id,base_id,range_start,range_end,range_size,minimum_cl&base_id=gte.35&order=id.asc",
+                    ),
+                    rate: get("/cache_search_rate_daily?order=date.asc"),
+                    leaderboard: get(
+                        "/cache_search_leaderboard?order=total_range.desc",
+                    ),
+                };
+            })();
+        </script>
+        <!-- Two flat files instead of the 48-module, six-level import waterfall
+             the CDN's ESM build pulls in, none of which the page can start
+             fetching data behind. Downloaded by `just vendor-fetch`. Deferred
+             scripts run in document order, so d3 is defined before Plot reads
+             it, and both are defined before the inline module below. -->
+        <script src="vendor/d3.min.js" defer></script>
+        <script src="vendor/plot.umd.min.js" defer></script>
     </head>
     <body class="has-background-dark">
         <section class="section">
@@ -135,19 +200,19 @@
                         </div>
                     </div>
                     <div class="column is-three-fifths">
-                        <div id="chart-spinner" class="has-text-centered p-5">
-                            <p class="has-text-grey-light">Loading charts…</p>
-                            <progress
-                                class="progress is-small is-primary mt-3"
-                                max="100"
-                            ></progress>
-                        </div>
                         <div class="box content">
                             <h1 class="title is-4 mb-1">
                                 Notably Nice Numbers
                             </h1>
                             <p>Which numbers are closest to being 100% nice?</p>
-                            <div id="numbers"></div>
+                            <div id="numbers">
+                                <div class="chart-placeholder">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
+                            </div>
                         </div>
                         <div class="box content">
                             <h1 class="title is-4 mb-1">Chunk Niceness</h1>
@@ -155,7 +220,14 @@
                                 On average, how nice is each chunk we've
                                 searched?
                             </p>
-                            <div id="niceness"></div>
+                            <div id="niceness">
+                                <div class="chart-placeholder">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
+                            </div>
                         </div>
                         <div class="box content">
                             <h1 class="title is-4 mb-1">Chunk Completion</h1>
@@ -166,15 +238,36 @@
                                 quintillions of numbers and take many months of
                                 CPU time.
                             </p>
-                            <div id="completion"></div>
+                            <div id="completion">
+                                <div class="chart-placeholder is-tall">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
+                            </div>
                         </div>
                         <div class="box content">
                             <h1 class="title is-4 mb-1">Search Rate</h1>
                             <p>How much progress have we made recently?</p>
                             <h3 class="title is-5 mb-1">Detailed</h3>
-                            <div id="rate-detailed"></div>
+                            <div id="rate-detailed">
+                                <div class="chart-placeholder">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
+                            </div>
                             <h3 class="title is-5 mb-1">Nice Only</h3>
-                            <div id="rate-niceonly"></div>
+                            <div id="rate-niceonly">
+                                <div class="chart-placeholder">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
+                            </div>
                         </div>
                         <div class="box content">
                             <h1 class="title is-4 mb-1">Leaderboard</h1>
@@ -182,9 +275,23 @@
                                 Total range searched all time, by contributor.
                             </p>
                             <h3 class="title is-5 mb-1">Detailed</h3>
-                            <div id="leaderboard-detailed"></div>
+                            <div id="leaderboard-detailed">
+                                <div class="chart-placeholder is-short">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
+                            </div>
                             <h3 class="title is-5 mb-1">Nice Only</h3>
-                            <div id="leaderboard-niceonly"></div>
+                            <div id="leaderboard-niceonly">
+                                <div class="chart-placeholder is-short">
+                                    <progress
+                                        class="progress is-small is-primary"
+                                        max="100"
+                                    ></progress>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -198,13 +305,38 @@
         </section>
 
         <script type="module">
-            import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/+esm";
+            const Plot = window.Plot;
+            const data = window.niceData;
 
-            const BASE = "https://data.nicenumbers.net";
+            if (!Plot) {
+                // Every chart slot will fall through to its error branch below.
+                console.error(
+                    "vendor/plot.umd.min.js did not load - run `just vendor-fetch`",
+                );
+            }
 
-            async function fetchData(url) {
-                const response = await fetch(url);
-                return response.json();
+            // Give the browser a frame to actually paint what we just handed it
+            // before we start building the next chart. Without this every chart
+            // is built in one task and nothing appears until all of them finish.
+            const paint = () =>
+                new Promise((resolve) =>
+                    requestAnimationFrame(() => setTimeout(resolve, 0)),
+                );
+
+            // Fill one chart slot once its data arrives. Each chart is
+            // independent: a slow or failed fetch only affects its own slot.
+            async function draw(selector, promise, build) {
+                const slot = document.querySelector(selector);
+                let content;
+                try {
+                    const rows = await promise;
+                    await paint();
+                    content = build(rows);
+                } catch (error) {
+                    console.error(selector, error);
+                    content = "Could not load this chart.";
+                }
+                slot.replaceChildren(content ?? "No data yet.");
             }
 
             // Helper: given an array of {username, total_range} objects, return a Set of the
@@ -250,37 +382,13 @@
                 }));
             }
 
-            (async () => {
-                // Fire all five fetches in parallel.
-                const [
-                    basesData,
-                    nicenessChunks,
-                    completionChunks,
-                    rateDaily,
-                    leaderboard,
-                ] = await Promise.all([
-                    fetchData(`${BASE}/bases?select=id,numbers&order=id.asc`),
-                    fetchData(
-                        `${BASE}/chunks?select=id,base_id,range_start,range_end,niceness_mean,niceness_stdev&niceness_mean=not.is.null&order=id.asc`,
-                    ),
-                    fetchData(
-                        `${BASE}/chunks?select=id,base_id,range_start,range_end,range_size,minimum_cl&base_id=gte.35&order=id.asc`,
-                    ),
-                    fetchData(`${BASE}/cache_search_rate_daily?order=date.asc`),
-                    fetchData(
-                        `${BASE}/cache_search_leaderboard?order=total_range.desc`,
-                    ),
-                ]);
-
-                // Hide spinner now that data is in
-                document.querySelector("#chart-spinner").remove();
-
-                // ── Notable Numbers ──────────────────────────────────────────────────
-                const numbers = basesData.reduce(
-                    (acc, base) => acc.concat(base.numbers),
-                    [],
-                );
-                const number_plot = Plot.plot({
+            // ── Notable Numbers ──────────────────────────────────────────────────
+            // The rows are already thinned to the points that are visually
+            // distinguishable at this chart's size; see the cache_notable_numbers
+            // migration. Plotting every number in every base's top-10k list was
+            // ~81k marks and about two seconds of blocking work.
+            function buildNumbersChart(numbers) {
+                return Plot.plot({
                     width: 900,
                     height: 300,
                     inset: 10,
@@ -324,15 +432,16 @@
                         }),
                     ],
                 });
-                document.querySelector("#numbers").append(number_plot);
+            }
 
-                // ── Chunk Niceness ───────────────────────────────────────────────────
+            // ── Chunk Niceness ───────────────────────────────────────────────────
+            function buildNicenessChart(nicenessChunks) {
                 const max_range_end = nicenessChunks.reduce(
                     (max, item) =>
                         item.range_end > max ? item.range_end : max,
                     -Infinity,
                 );
-                const niceness_plot = Plot.plot({
+                return Plot.plot({
                     width: 900,
                     height: 300,
                     insetLeft: 10,
@@ -397,9 +506,10 @@
                         Plot.ruleY([0.632], { stroke: "black", opacity: 0.3 }),
                     ],
                 });
-                document.querySelector("#niceness").append(niceness_plot);
+            }
 
-                // ── Chunk Completion (base 35+) ──────────────────────────────────────
+            // ── Chunk Completion (base 35+) ──────────────────────────────────────
+            function buildCompletionChart(completionChunks) {
                 let currentBase = null;
                 let x = -1;
                 const chunks_for_completion_plot = completionChunks.map(
@@ -413,7 +523,7 @@
                         return { ...chunk, chunk_x: x };
                     },
                 );
-                const completion_plot = Plot.plot({
+                return Plot.plot({
                     width: 900,
                     x: { axis: null },
                     y: { label: "Base" },
@@ -441,118 +551,93 @@
                         }),
                     ],
                 });
-                document.querySelector("#completion").append(completion_plot);
+            }
 
-                // ── Search Rate helpers ───────────────────────────────────────────────
-                function buildRateChart(rows, mode) {
-                    const modeRows = rows.filter((r) => r.search_mode === mode);
-                    if (modeRows.length === 0) return null;
+            // ── Search Rate helpers ───────────────────────────────────────────────
+            function buildRateChart(rows, mode) {
+                const modeRows = rows.filter((r) => r.search_mode === mode);
+                if (modeRows.length === 0) return null;
 
-                    const top = topNUsernames(modeRows, 7);
-                    const bucketed = bucketAndAggregate(modeRows, top, [
-                        "date",
-                        "username",
-                    ]);
+                const top = topNUsernames(modeRows, 7);
+                const bucketed = bucketAndAggregate(modeRows, top, [
+                    "date",
+                    "username",
+                ]);
 
-                    return Plot.plot({
-                        width: 900,
-                        height: 300,
-                        x: { label: "Date" },
-                        y: { label: "Range Searched", tickFormat: ".0s" },
-                        marks: [
-                            Plot.rectY(
-                                bucketed,
-                                Plot.binX(
-                                    { y: "sum" },
-                                    {
-                                        x: {
-                                            value: "date",
-                                            interval: "2 days",
-                                        },
-                                        y: "total_range",
-                                        fill: "username",
-                                        tip: true,
+                return Plot.plot({
+                    width: 900,
+                    height: 300,
+                    x: { label: "Date" },
+                    y: { label: "Range Searched", tickFormat: ".0s" },
+                    marks: [
+                        Plot.rectY(
+                            bucketed,
+                            Plot.binX(
+                                { y: "sum" },
+                                {
+                                    x: {
+                                        value: "date",
+                                        interval: "2 days",
                                     },
-                                ),
+                                    y: "total_range",
+                                    fill: "username",
+                                    tip: true,
+                                },
                             ),
-                            Plot.ruleY([0]),
-                        ],
-                    });
-                }
+                        ),
+                        Plot.ruleY([0]),
+                    ],
+                });
+            }
 
-                const rate_detailed = buildRateChart(rateDaily, "detailed");
-                if (rate_detailed)
-                    document
-                        .querySelector("#rate-detailed")
-                        .append(rate_detailed);
-                else
-                    document.querySelector("#rate-detailed").textContent =
-                        "No data yet.";
+            // ── Leaderboard helpers ───────────────────────────────────────────────
+            function buildLeaderboardChart(rows, mode) {
+                const modeRows = rows.filter((r) => r.search_mode === mode);
+                if (modeRows.length === 0) return null;
 
-                const rate_niceonly = buildRateChart(rateDaily, "niceonly");
-                if (rate_niceonly)
-                    document
-                        .querySelector("#rate-niceonly")
-                        .append(rate_niceonly);
-                else
-                    document.querySelector("#rate-niceonly").textContent =
-                        "No data yet.";
+                const top = topNUsernames(modeRows, 10);
+                const bucketed = bucketAndAggregate(modeRows, top, [
+                    "username",
+                ]);
 
-                // ── Leaderboard helpers ───────────────────────────────────────────────
-                function buildLeaderboardChart(rows, mode) {
-                    const modeRows = rows.filter((r) => r.search_mode === mode);
-                    if (modeRows.length === 0) return null;
+                return Plot.plot({
+                    width: 900,
+                    height: 250,
+                    marginLeft: 100,
+                    x: { label: "Total Range Searched", tickFormat: ".0s" },
+                    y: { label: null },
+                    marks: [
+                        Plot.barX(bucketed, {
+                            y: "username",
+                            x: "total_range",
+                            fill: "username",
+                            sort: { y: "-x" },
+                            tip: true,
+                        }),
+                        Plot.ruleX([0]),
+                    ],
+                });
+            }
 
-                    const top = topNUsernames(modeRows, 10);
-                    const bucketed = bucketAndAggregate(modeRows, top, [
-                        "username",
-                    ]);
-
-                    return Plot.plot({
-                        width: 900,
-                        height: 250,
-                        marginLeft: 100,
-                        x: { label: "Total Range Searched", tickFormat: ".0s" },
-                        y: { label: null },
-                        marks: [
-                            Plot.barX(bucketed, {
-                                y: "username",
-                                x: "total_range",
-                                fill: "username",
-                                sort: { y: "-x" },
-                                tip: true,
-                            }),
-                            Plot.ruleX([0]),
-                        ],
-                    });
-                }
-
-                const lb_detailed = buildLeaderboardChart(
-                    leaderboard,
-                    "detailed",
-                );
-                if (lb_detailed)
-                    document
-                        .querySelector("#leaderboard-detailed")
-                        .append(lb_detailed);
-                else
-                    document.querySelector(
-                        "#leaderboard-detailed",
-                    ).textContent = "No data yet.";
-
-                const lb_niceonly = buildLeaderboardChart(
-                    leaderboard,
-                    "niceonly",
-                );
-                if (lb_niceonly)
-                    document
-                        .querySelector("#leaderboard-niceonly")
-                        .append(lb_niceonly);
-                else
-                    document.querySelector(
-                        "#leaderboard-niceonly",
-                    ).textContent = "No data yet.";
-            })();
+            // The numbers scatter is by far the most expensive chart to build,
+            // so let the cheap ones paint first instead of queueing behind it.
+            await Promise.allSettled([
+                draw("#niceness", data.niceness, buildNicenessChart),
+                draw("#completion", data.completion, buildCompletionChart),
+                draw("#rate-detailed", data.rate, (rows) =>
+                    buildRateChart(rows, "detailed"),
+                ),
+                draw("#rate-niceonly", data.rate, (rows) =>
+                    buildRateChart(rows, "niceonly"),
+                ),
+                draw("#leaderboard-detailed", data.leaderboard, (rows) =>
+                    buildLeaderboardChart(rows, "detailed"),
+                ),
+                draw("#leaderboard-niceonly", data.leaderboard, (rows) =>
+                    buildLeaderboardChart(rows, "niceonly"),
+                ),
+            ]);
+            await draw("#numbers", data.notable, buildNumbersChart);
         </script>
     </body>
 </html>

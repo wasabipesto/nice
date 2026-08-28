@@ -198,6 +198,39 @@ pub fn get_fields_in_base_with_detailed_subs(
         .collect::<Result<Vec<FieldRecord>>>()
 }
 
+/// Get the fields that received a new detailed submission in the given
+/// submission-id window, across all bases. These are exactly the fields whose
+/// consensus needs (re-)evaluating in an incremental jobs run: consensus is a
+/// pure function of a field's submissions, so a field with no new submissions
+/// cannot change its outcome. Manual edits that create no submission (e.g.
+/// disqualifying one) are invisible to this query - that is what the jobs
+/// binary's `--full` sweep is for.
+pub fn get_fields_with_new_detailed_submissions(
+    conn: &mut PgConnection,
+    after_id: i64,
+    up_to_id: i64,
+) -> Result<Vec<FieldRecord>> {
+    use diesel::sql_query;
+    use diesel::sql_types::BigInt;
+
+    let query = "SELECT DISTINCT ON (f.id) f.*
+        FROM submissions s
+        JOIN fields f ON f.id = s.field_id
+        WHERE s.search_mode = 'detailed' AND s.id > $1 AND s.id <= $2
+        ORDER BY f.id ASC";
+
+    let items_private: Vec<FieldPrivate> = sql_query(query)
+        .bind::<BigInt, _>(after_id)
+        .bind::<BigInt, _>(up_to_id)
+        .load(conn)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    items_private
+        .into_iter()
+        .map(private_to_public)
+        .collect::<Result<Vec<FieldRecord>>>()
+}
+
 /// The `check_level` predicate for a claim query.
 ///
 /// IMPORTANT: the two common bounds are emitted as *literals* rather than
@@ -947,6 +980,42 @@ pub fn get_chunk_stats_batch(conn: &mut PgConnection, base: u32) -> Result<Vec<C
 
     sql_query(query)
         .bind::<Integer, _>(base)
+        .load(conn)
+        .map_err(|e| anyhow!("{e}"))
+}
+
+/// Get statistics for a specific set of chunks. The incremental jobs run uses
+/// this to recompute only the chunks that received new submissions, instead of
+/// aggregating over every field of the base.
+pub fn get_chunk_stats_for_chunks(
+    conn: &mut PgConnection,
+    chunk_ids: &[u32],
+) -> Result<Vec<ChunkStats>> {
+    use diesel::sql_query;
+    use diesel::sql_types::{Array, Integer};
+
+    if chunk_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chunk_ids = chunk_ids
+        .iter()
+        .map(|&id| conversions::u32_to_i32(id))
+        .collect::<Result<Vec<i32>>>()?;
+
+    let query = "
+        SELECT
+            chunk_id,
+            MIN(check_level) as minimum_cl,
+            COALESCE(SUM(CASE WHEN check_level >= 1 THEN range_size ELSE 0 END), 0) as checked_niceonly,
+            COALESCE(SUM(CASE WHEN check_level >= 2 THEN range_size ELSE 0 END), 0) as checked_detailed
+        FROM fields
+        WHERE chunk_id = ANY($1)
+        GROUP BY chunk_id
+        ORDER BY chunk_id;
+    ";
+
+    sql_query(query)
+        .bind::<Array<Integer>, _>(chunk_ids)
         .load(conn)
         .map_err(|e| anyhow!("{e}"))
 }

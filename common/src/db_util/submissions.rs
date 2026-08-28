@@ -202,74 +202,92 @@ pub fn get_submissions_qualified_detailed_for_field(
         .collect::<Result<Vec<SubmissionRecord>>>()
 }
 
-/// Struct to hold submission with `chunk_id` from batch query
-#[derive(Debug, QueryableByName)]
-pub struct SubmissionWithChunk {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    pub id: i64,
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    pub claim_id: i32,
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    pub field_id: i32,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    pub search_mode: String,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    pub submit_time: DateTime<Utc>,
-    #[diesel(sql_type = diesel::sql_types::Float)]
-    pub elapsed_secs: f32,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    pub username: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    pub user_ip: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    pub client_version: String,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    pub disqualified: bool,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
-    pub distribution: Option<Value>,
-    #[diesel(sql_type = diesel::sql_types::Jsonb)]
-    pub numbers: Value,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
-    pub chunk_id: Option<i32>,
-}
-
-/// Get all canon submissions for a base with their `chunk_ids` in a single query.
-/// This is much more efficient than querying each chunk individually.
-pub fn get_canon_submissions_with_chunks_by_base(
+/// Get the canon submissions for every field in one chunk.
+///
+/// The jobs binary calls this per chunk and folds the results into
+/// accumulators, instead of loading a whole base's canon submissions (3.5M+
+/// rows for the largest bases, tens of GB once the jsonb columns are decoded)
+/// in a single query. One chunk is 1% of a base, so this bounds peak memory
+/// to the largest chunk regardless of how much history a base accumulates.
+pub fn get_canon_submissions_for_chunk(
     conn: &mut PgConnection,
-    base: u32,
-) -> Result<Vec<(SubmissionRecord, Option<u32>)>> {
+    chunk_id: u32,
+) -> Result<Vec<SubmissionRecord>> {
     use diesel::sql_query;
     use diesel::sql_types::Integer;
 
-    let base = conversions::u32_to_i32(base)?;
+    let chunk_id = conversions::u32_to_i32(chunk_id)?;
 
-    let query = "SELECT s.*, f.chunk_id
+    let query = "SELECT s.*
         FROM fields f
         JOIN submissions s ON f.canon_submission_id = s.id
-        WHERE f.base_id = $1;";
+        WHERE f.chunk_id = $1;";
 
-    let items: Vec<SubmissionWithChunk> = sql_query(query).bind::<Integer, _>(base).load(conn)?;
+    let items: Vec<SubmissionPrivate> = sql_query(query)
+        .bind::<Integer, _>(chunk_id)
+        .load(conn)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    items.into_iter().map(private_to_public).collect()
+}
+
+/// Get the highest submission id, or 0 if the table is empty. Snapshotted at
+/// the start of a jobs run so submissions arriving mid-run fall into the next
+/// run's window.
+pub fn get_max_submission_id(conn: &mut PgConnection) -> Result<i64> {
+    use diesel::sql_query;
+
+    #[derive(QueryableByName)]
+    struct MaxRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        max_id: i64,
+    }
+
+    let row: MaxRow = sql_query("SELECT COALESCE(MAX(id), 0) AS max_id FROM submissions")
+        .get_result(conn)
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(row.max_id)
+}
+
+/// Get the distinct (base, chunk) pairs containing fields that received any
+/// submission (either mode) in the id window. These are the chunks whose
+/// derived statistics may be stale: niceonly submissions move field
+/// `check_level` 0 -> 1 at submit time and detailed ones 1 -> 2, so both modes
+/// dirty a chunk even before consensus runs.
+pub fn get_chunks_with_new_submissions(
+    conn: &mut PgConnection,
+    after_id: i64,
+    up_to_id: i64,
+) -> Result<Vec<(u32, Option<u32>)>> {
+    use diesel::sql_query;
+    use diesel::sql_types::BigInt;
+
+    #[derive(QueryableByName)]
+    struct DirtyChunkRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        base_id: i32,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+        chunk_id: Option<i32>,
+    }
+
+    let query = "SELECT DISTINCT f.base_id, f.chunk_id
+        FROM submissions s
+        JOIN fields f ON f.id = s.field_id
+        WHERE s.id > $1 AND s.id <= $2;";
+
+    let items: Vec<DirtyChunkRow> = sql_query(query)
+        .bind::<BigInt, _>(after_id)
+        .bind::<BigInt, _>(up_to_id)
+        .load(conn)
+        .map_err(|e| anyhow!("{e}"))?;
 
     items
         .into_iter()
-        .map(|item| {
-            let submission = SubmissionRecord {
-                submission_id: conversions::i64_to_u128(item.id)?,
-                claim_id: conversions::i32_to_u128(item.claim_id)?,
-                field_id: conversions::i32_to_u128(item.field_id)?,
-                search_mode: conversions::deserialize_searchmode(item.search_mode)?,
-                submit_time: item.submit_time,
-                elapsed_secs: item.elapsed_secs,
-                username: item.username,
-                user_ip: item.user_ip,
-                client_version: item.client_version,
-                disqualified: item.disqualified,
-                distribution: conversions::deserialize_opt_distribution(item.distribution)?,
-                numbers: conversions::deserialize_numbers(item.numbers)?,
-            };
-            let chunk_id = conversions::opti32_to_optu32(item.chunk_id)?;
-            Ok((submission, chunk_id))
+        .map(|r| {
+            Ok((
+                conversions::i32_to_u32(r.base_id)?,
+                conversions::opti32_to_optu32(r.chunk_id)?,
+            ))
         })
-        .collect::<Result<Vec<_>>>()
+        .collect()
 }

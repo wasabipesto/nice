@@ -175,3 +175,46 @@ pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(
 
     Ok(())
 }
+
+/// Aggregate totals for a base from its chunk rows: total range checked at
+/// niceonly and detailed levels plus the minimum check level. Reading ~100
+/// chunk rows replaces re-aggregating over every field of the base, which is
+/// what makes the incremental jobs run's base update cheap - chunk rows are
+/// authoritative because the jobs run updates the dirty ones first.
+///
+/// A base with no chunks yields (0, 0, 255), matching the fold the jobs
+/// binary previously performed over an empty chunk list.
+pub fn get_base_totals_from_chunks(
+    conn: &mut PgConnection,
+    base: u32,
+) -> Result<(u128, u128, u8)> {
+    use diesel::sql_query;
+    use diesel::sql_types::Integer;
+
+    #[derive(QueryableByName)]
+    struct TotalsRow {
+        #[diesel(sql_type = diesel::sql_types::Numeric)]
+        checked_niceonly: BigDecimal,
+        #[diesel(sql_type = diesel::sql_types::Numeric)]
+        checked_detailed: BigDecimal,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        minimum_cl: i32,
+    }
+
+    let base = conversions::u32_to_i32(base)?;
+    let row: TotalsRow = sql_query(
+        "SELECT COALESCE(SUM(checked_niceonly), 0) AS checked_niceonly,
+                COALESCE(SUM(checked_detailed), 0) AS checked_detailed,
+                COALESCE(MIN(minimum_cl), 255) AS minimum_cl
+         FROM chunks WHERE base_id = $1",
+    )
+    .bind::<Integer, _>(base)
+    .get_result(conn)
+    .map_err(|e| anyhow!("{e}"))?;
+
+    Ok((
+        conversions::bigdec_to_u128(row.checked_niceonly)?,
+        conversions::bigdec_to_u128(row.checked_detailed)?,
+        conversions::i32_to_u8(row.minimum_cl)?,
+    ))
+}

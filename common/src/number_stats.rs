@@ -33,23 +33,54 @@ pub fn expand_numbers(numbers: &[NiceNumberSimple], base: u32) -> Vec<NiceNumber
         .collect()
 }
 
+/// Incrementally collects the top `SAVE_TOP_N_NUMBERS` numbers over batches of
+/// submissions.
+///
+/// The working set is compacted back to the cap whenever it doubles, so peak
+/// memory is bounded by 2x the cap no matter how many batches are folded in.
+/// Compaction never drops a number that belongs in the final top-N: the top-N
+/// of a set is contained in the top-N of every superset.
+#[derive(Default)]
+pub struct NumbersAccumulator {
+    numbers: Vec<NiceNumber>,
+}
+
+impl NumbersAccumulator {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a batch of submissions' numbers.
+    pub fn fold(&mut self, submissions: &[SubmissionRecord]) {
+        for sub in submissions {
+            self.numbers.extend(sub.numbers.iter().cloned());
+        }
+        if self.numbers.len() > SAVE_TOP_N_NUMBERS * 2 {
+            self.compact();
+        }
+    }
+
+    fn compact(&mut self) {
+        // Sort by number of uniques and take the top few
+        self.numbers.sort_by(|a, b| b.num_uniques.cmp(&a.num_uniques));
+        self.numbers.truncate(SAVE_TOP_N_NUMBERS);
+    }
+
+    #[must_use]
+    pub fn finalize(mut self) -> Vec<NiceNumber> {
+        self.compact();
+        self.numbers
+    }
+}
+
 /// Take a bunch of `SubmissionRecords`, which each have their own `NiceNumbers`, and aggregate
 /// them all into a single list. Then filters to the top 10k for a sanity check.
 #[must_use]
 pub fn downsample_numbers(submissions: &[SubmissionRecord]) -> Vec<NiceNumber> {
-    // Collate all numbers
-    let mut all_numbers = submissions.iter().fold(Vec::new(), |mut acc, sub| {
-        acc.extend(sub.numbers.iter().cloned());
-        acc
-    });
-
-    // Sort by number of uniques and take the top few
-    all_numbers.sort_by(|a, b| b.num_uniques.cmp(&a.num_uniques));
-    all_numbers
-        .iter()
-        .take(SAVE_TOP_N_NUMBERS)
-        .cloned()
-        .collect()
+    let mut acc = NumbersAccumulator::new();
+    acc.fold(submissions);
+    acc.finalize()
 }
 
 /// Removes some information from a list of `NiceNumbers` to make `NiceNumberSimple`.
@@ -67,6 +98,68 @@ pub fn shrink_numbers(numbers: &[NiceNumber]) -> Vec<NiceNumberSimple> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Folding batches through the accumulator, including across its internal
+    /// compaction, must select the same top-N as one sorted pass over
+    /// everything.
+    #[test]
+    fn numbers_accumulator_matches_single_pass() {
+        use crate::{SearchMode, SubmissionRecord};
+        use chrono::Utc;
+
+        // Enough numbers to force several compactions (threshold is
+        // 2 * SAVE_TOP_N_NUMBERS), with distinct num_uniques so the expected
+        // top-N is unambiguous.
+        let total = SAVE_TOP_N_NUMBERS * 5;
+        let make_sub = |ids: std::ops::Range<usize>| SubmissionRecord {
+            submission_id: 1,
+            claim_id: 1,
+            field_id: 1,
+            search_mode: SearchMode::Detailed,
+            submit_time: Utc::now(),
+            elapsed_secs: 1.0,
+            username: "test".to_string(),
+            user_ip: "test".to_string(),
+            client_version: "test".to_string(),
+            disqualified: false,
+            distribution: None,
+            numbers: ids
+                .map(|i| NiceNumber {
+                    number: i as u128,
+                    num_uniques: i as u32,
+                    base: 40,
+                    niceness: 1.0,
+                })
+                .collect(),
+        };
+        // Interleave so high values arrive across different batches.
+        let subs: Vec<SubmissionRecord> = (0..5)
+            .map(|batch| make_sub(batch * total / 5..(batch + 1) * total / 5))
+            .collect();
+
+        let single = downsample_numbers(&subs);
+
+        let mut acc = NumbersAccumulator::new();
+        for sub in &subs {
+            acc.fold(std::slice::from_ref(sub));
+        }
+        let folded = acc.finalize();
+
+        assert_eq!(single.len(), SAVE_TOP_N_NUMBERS);
+        assert_eq!(folded.len(), SAVE_TOP_N_NUMBERS);
+        // num_uniques are all distinct here, so the selected sets must match
+        // exactly regardless of tie-breaking.
+        let key = |v: &[NiceNumber]| {
+            let mut k: Vec<u32> = v.iter().map(|n| n.num_uniques).collect();
+            k.sort_unstable();
+            k
+        };
+        assert_eq!(key(&single), key(&folded));
+        assert_eq!(
+            key(&folded).first().copied(),
+            Some((total - SAVE_TOP_N_NUMBERS) as u32)
+        );
+    }
     use crate::SearchMode;
     use chrono::Utc;
 
