@@ -42,8 +42,6 @@ class WorkerPool {
         this.aggregatedResults = {
             niceNumbers: [],
             uniqueDistribution: new Map(),
-            totalProcessed: 0,
-            completedWorkers: 0,
             errors: [],
         };
 
@@ -169,7 +167,6 @@ class WorkerPool {
         this.resetAggregatedResults();
 
         try {
-            // Calculate range division
             const rangeStart = BigInt(claimData.range_start);
             const rangeEnd = BigInt(claimData.range_end);
             const totalRange = rangeEnd - rangeStart;
@@ -177,65 +174,77 @@ class WorkerPool {
             if (totalRange <= 0n) {
                 throw new Error("Invalid range: start must be less than end");
             }
-            const subRangeSize = totalRange / BigInt(this.maxWorkers);
 
-            // Handle edge case where range is smaller than worker count
-            const effectiveWorkers =
-                totalRange < BigInt(this.maxWorkers)
-                    ? Number(totalRange)
-                    : this.maxWorkers;
+            // A queue of sub-ranges instead of a static 1/N split. The
+            // browser schedules workers on whatever cores it likes —
+            // E-cores, throttled cores — and under a static split the
+            // slowest worker sets the field's finish time while the rest
+            // sit idle. A queue keeps every worker busy until the work
+            // itself runs out, and lets a stop land within one sub-range
+            // instead of one Nth of the field.
+            //
+            // ~32 pieces per worker balances the tail against per-message
+            // overhead; a piece is never smaller than two of the worker's
+            // internal 100k chunks, and never so large that a worker sits
+            // idle from the start.
+            let subSize = totalRange / (BigInt(this.maxWorkers) * 32n);
+            if (subSize < 200000n) subSize = 200000n;
+            const evenSplit = totalRange / BigInt(this.maxWorkers);
+            if (subSize > evenSplit) subSize = evenSplit;
+            if (subSize < 1n) subSize = 1n;
 
-            console.log(
-                `Dividing range ${totalRange} among ${effectiveWorkers} workers (${subRangeSize} per worker)`,
-            );
-
-            // Create sub-jobs for each worker
-            const jobs = [];
-            for (let i = 0; i < effectiveWorkers; i++) {
-                const subRangeStart = rangeStart + BigInt(i) * subRangeSize;
-                const subRangeEnd =
-                    i === effectiveWorkers - 1
-                        ? rangeEnd
-                        : subRangeStart + subRangeSize;
-
-                const subClaimData = {
-                    ...claimData,
-                    range_start: subRangeStart.toString(),
-                    range_end: subRangeEnd.toString(),
-                };
-
-                jobs.push({
-                    workerId: i,
-                    claimData: subClaimData,
-                    username: username,
-                    jobId: this.currentJobId,
-                });
+            this.workQueue = [];
+            for (let s = rangeStart; s < rangeEnd; s += subSize) {
+                const e = s + subSize > rangeEnd ? rangeEnd : s + subSize;
+                this.workQueue.push([s, e]);
             }
-
-            // Start processing on all workers
-            jobs.forEach((job) => {
-                const workerInfo = this.workers[job.workerId];
-                workerInfo.currentJob = job;
-                this.activeJobs.set(job.workerId, job);
-
-                workerInfo.worker.postMessage({
-                    type: "process",
-                    data: {
-                        claimData: job.claimData,
-                        username: job.username,
-                    },
-                });
-            });
+            this.baseClaimData = claimData;
+            this.totalRange = totalRange;
+            this.completedNumbers = 0n;
+            this.jobStartTime = Date.now();
 
             console.log(
-                `Started processing with ${this.maxWorkers} workers, range divided into sub-ranges`,
+                `Queued ${this.workQueue.length} sub-ranges of ~${subSize} for ${this.maxWorkers} workers`,
             );
+
+            // Prime every worker; each comes back for more on completion.
+            this.workers.forEach((workerInfo) => this.assignNext(workerInfo));
         } catch (error) {
             if (this.errorCallback) {
                 this.errorCallback(error.message);
             }
             throw error;
         }
+    }
+
+    // Hand a worker the next sub-range, or leave it idle when the queue is
+    // dry (the field finishes when the last active worker reports in).
+    assignNext(workerInfo) {
+        const next = this.workQueue.shift();
+        if (!next) {
+            workerInfo.currentJob = null;
+            this.activeJobs.delete(workerInfo.id);
+            return;
+        }
+        const [subStart, subEnd] = next;
+        const job = {
+            workerId: workerInfo.id,
+            jobId: this.currentJobId,
+            size: subEnd - subStart,
+        };
+        workerInfo.currentJob = job;
+        this.activeJobs.set(workerInfo.id, job);
+        workerInfo.worker.postMessage({
+            type: "process",
+            data: {
+                claimData: {
+                    ...this.baseClaimData,
+                    range_start: subStart.toString(),
+                    range_end: subEnd.toString(),
+                },
+                username: this.currentUsername,
+            },
+        });
     }
 
     handleWorkerMessage(workerInfo, e) {
@@ -309,66 +318,39 @@ class WorkerPool {
             return;
         }
 
-        // Aggregate this worker's results
+        // Aggregate this sub-range's results and account for its numbers;
+        // the worker's live-progress entry is superseded by the total.
         this.aggregateWorkerResults(result);
-        this.aggregatedResults.completedWorkers++;
-
-        // Clean up this job
+        const job = workerInfo.currentJob;
+        this.completedNumbers += job ? job.size : 0n;
+        this.workerProgress.delete(workerInfo.id);
         this.activeJobs.delete(workerInfo.id);
         workerInfo.currentJob = null;
 
-        // Check if all workers are done (use active jobs count for accuracy)
-        const expectedWorkers = Math.min(
-            this.maxWorkers,
-            this.activeJobs.size + this.aggregatedResults.completedWorkers,
-        );
-        if (
-            this.aggregatedResults.completedWorkers >= expectedWorkers ||
-            this.activeJobs.size === 0
-        ) {
-            this.handleAllWorkersComplete(elapsedSeconds);
+        // Back to the queue for more; the field is done when the queue is
+        // dry and the last active worker has reported in.
+        this.assignNext(workerInfo);
+        if (this.activeJobs.size === 0 && this.workQueue.length === 0) {
+            // Wall time of the whole field, not the last worker's own
+            // timer: with a queue the two genuinely differ.
+            this.handleAllWorkersComplete(
+                (Date.now() - this.jobStartTime) / 1000,
+            );
         }
     }
 
     handleError(workerInfo, error) {
+        // A failed sub-range fails the field. The previous version could
+        // "complete with partial results" after worker failures, but a
+        // partial distribution can never be submitted — the server checks
+        // that the counts cover the whole range — so the only honest
+        // outcome is an error the page can act on.
         console.error(`Worker ${workerInfo.id} error:`, error);
-        this.aggregatedResults.errors.push({
-            workerId: workerInfo.id,
-            error: error,
-            timestamp: new Date().toISOString(),
-        });
-
-        // Clean up failed worker job
         this.activeJobs.delete(workerInfo.id);
-        if (workerInfo.currentJob) {
-            workerInfo.currentJob = null;
-        }
-
-        // If too many workers fail, abort the entire operation
-        const failureThreshold = Math.ceil(this.maxWorkers / 2); // Allow up to half to fail
-        if (this.aggregatedResults.errors.length >= failureThreshold) {
-            if (this.errorCallback) {
-                this.errorCallback(
-                    `Too many worker failures (${this.aggregatedResults.errors.length}/${this.maxWorkers}). Aborting operation.`,
-                );
-            }
-            this.stopProcessing();
-            return;
-        }
-
+        workerInfo.currentJob = null;
+        this.stopProcessing();
         if (this.errorCallback) {
             this.errorCallback(`Worker ${workerInfo.id}: ${error}`);
-        }
-
-        // Check if we should complete with partial results
-        if (
-            this.activeJobs.size === 0 &&
-            this.aggregatedResults.completedWorkers > 0
-        ) {
-            console.warn(
-                `Completing with partial results due to worker failures`,
-            );
-            this.handleAllWorkersComplete(0);
         }
     }
 
@@ -385,7 +367,6 @@ class WorkerPool {
 
     calculateOverallProgress() {
         // Aggregate real-time progress from all workers
-        let totalPercent = 0;
         let totalProcessed = 0;
         let activeWorkerCount = 0;
         const combinedDistribution = new Map();
@@ -394,7 +375,6 @@ class WorkerPool {
         // Aggregate data from active workers
         this.workerProgress.forEach((progressData, workerId) => {
             if (progressData) {
-                totalPercent += progressData.percent || 0;
                 totalProcessed += progressData.processedCount || 0;
                 activeWorkerCount++;
 
@@ -433,28 +413,29 @@ class WorkerPool {
             },
         );
 
-        // Calculate average progress
-        const avgPercent =
-            activeWorkerCount > 0 ? totalPercent / activeWorkerCount : 0;
-        const completedRatio =
-            this.aggregatedResults.completedWorkers / this.maxWorkers;
+        // Progress is real numbers over the real total: completed
+        // sub-ranges are accounted exactly, active workers add their
+        // in-flight counts.
+        const inProgress = totalProcessed;
+        const done = Number(this.completedNumbers) + inProgress;
         const overallPercent = Math.min(
             99,
-            Math.floor(
-                avgPercent * (1 - completedRatio) + completedRatio * 100,
-            ),
+            Math.floor((100 * done) / Number(this.totalRange || 1n)),
         );
 
         return {
             type: "progress",
             percent: overallPercent,
-            message: `Processing with ${this.maxWorkers} workers... Active: ${activeWorkerCount}, Complete: ${this.aggregatedResults.completedWorkers}`,
-            processedCount:
-                totalProcessed + this.aggregatedResults.totalProcessed,
+            message: `Processing with ${this.maxWorkers} workers... Active: ${activeWorkerCount}, Queued: ${this.workQueue?.length ?? 0}`,
+            processedCount: done,
             uniqueDistribution: combinedDistribution,
-            niceNumbers: combinedNiceNumbers.sort(
-                (a, b) => a.number - b.number,
-            ),
+            // Exact u128 digits arrive as strings; subtracting them would
+            // go through a double and misorder anything above 2^53.
+            niceNumbers: combinedNiceNumbers.sort((a, b) => {
+                const x = BigInt(a.number);
+                const y = BigInt(b.number);
+                return x < y ? -1 : x > y ? 1 : 0;
+            }),
         };
     }
 
@@ -553,12 +534,13 @@ class WorkerPool {
         this.aggregatedResults = {
             niceNumbers: [],
             uniqueDistribution: new Map(),
-            totalProcessed: 0,
-            completedWorkers: 0,
             errors: [],
         };
         this.workerProgress.clear();
         this.lastProgressUpdate = 0;
+        this.workQueue = [];
+        this.completedNumbers = 0n;
+        this.totalRange = 0n;
     }
 
     stopProcessing() {
@@ -573,7 +555,9 @@ class WorkerPool {
             }
         });
 
-        // Clear active jobs and reset state
+        // Clear active jobs and the remaining work; workers finish only
+        // their current sub-range.
+        this.workQueue = [];
         this.activeJobs.clear();
         this.currentJobId = null;
 
