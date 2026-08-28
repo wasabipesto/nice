@@ -5,6 +5,28 @@ let wasm = null;
 let isInitialized = false;
 let shouldStop = false;
 
+// The wasm side serialises near-miss numbers as exact u128 values, but
+// JSON.parse turns every number into a double, and anything above 2^53 is
+// rounded to the nearest representable one. Base-49 fields sit near 2e16, so
+// the near miss 20363742218601559 reached the server as ...560 and the
+// submission was rejected: "Unique count for 20363742218601560 is incorrect
+// (submitted as 45, server calculated 29)" — the count was right, the number
+// had been rounded out from under it.
+//
+// So the near-miss numbers are quoted before parsing and carried through this
+// worker as strings, which is enough for display and accumulation, and
+// unquoted again on the way into a submission. Only `number` needs this: the
+// distribution's counts are bounded by the field size.
+function parseFieldResults(json) {
+    return JSON.parse(json.replace(/("number":)(\d+)/g, '$1"$2"'));
+}
+
+// Inverse of parseFieldResults' quoting. JSON.stringify would emit the exact
+// digits, but as a quoted string; the server wants an integer there.
+function stringifySubmission(payload) {
+    return JSON.stringify(payload).replace(/"number":"(\d+)"/g, '"number":$1');
+}
+
 // Initialize WASM module in worker context
 async function initWasm() {
     try {
@@ -74,7 +96,7 @@ function processDetailedWithProgress(claimDataJson, username) {
             base,
         );
 
-        const chunkResult = JSON.parse(chunkResultJson);
+        const chunkResult = parseFieldResults(chunkResultJson);
 
         // Merge nice numbers
         allNiceNumbers.push(...chunkResult.nice_numbers);
@@ -140,7 +162,7 @@ function processDetailedWithProgress(claimDataJson, username) {
         nice_numbers: serverNiceNumbers,
     };
 
-    return JSON.stringify(result);
+    return stringifySubmission(result);
 }
 
 // Process numbers on the GPU (WebGPU via CubeCL) with progress updates.
@@ -193,7 +215,7 @@ async function processDetailedGpu(claimDataJson, username) {
             sliceEnd.toString(),
             base,
         );
-        const sliceResult = JSON.parse(sliceResultJson);
+        const sliceResult = parseFieldResults(sliceResultJson);
 
         allNiceNumbers.push(...sliceResult.nice_numbers);
         for (const entry of sliceResult.distribution) {
@@ -235,7 +257,7 @@ async function processDetailedGpu(claimDataJson, username) {
         }))
         .sort((a, b) => a.num_uniques - b.num_uniques);
 
-    return JSON.stringify({
+    return stringifySubmission({
         claim_id: claimData.claim_id,
         username: username,
         client_version: "3.0.0-wasm-webgpu",
@@ -278,7 +300,7 @@ self.onmessage = async function (e) {
 
                     self.postMessage({
                         type: "complete",
-                        result: JSON.parse(resultJson),
+                        result: parseFieldResults(resultJson),
                         elapsedSeconds: elapsedSeconds,
                     });
                 }
@@ -339,7 +361,7 @@ self.onmessage = async function (e) {
                 if (!shouldStop && gpuResultJson) {
                     self.postMessage({
                         type: "complete",
-                        result: JSON.parse(gpuResultJson),
+                        result: parseFieldResults(gpuResultJson),
                         elapsedSeconds: (Date.now() - gpuStart) / 1000,
                     });
                 }

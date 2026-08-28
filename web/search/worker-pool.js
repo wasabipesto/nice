@@ -468,8 +468,15 @@ class WorkerPool {
     handleAllWorkersComplete(elapsedSeconds) {
         console.log("All workers completed processing");
 
-        // Sort nice numbers by value
-        this.aggregatedResults.niceNumbers.sort((a, b) => a.number - b.number);
+        // Sort nice numbers by value. These are strings (exact u128 digits,
+        // see parseFieldResults in worker.js), and subtracting them would go
+        // through a double and misorder anything above 2^53, so compare as
+        // BigInt.
+        this.aggregatedResults.niceNumbers.sort((a, b) => {
+            const x = BigInt(a.number);
+            const y = BigInt(b.number);
+            return x < y ? -1 : x > y ? 1 : 0;
+        });
 
         // Convert distribution map to server format
         const serverDistribution = Array.from(

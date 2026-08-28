@@ -209,12 +209,17 @@ if (!failed && !gpu.skipped && cpu.histogram && gpu.histogram) {
 // server answered 400, while the CPU path coerced it to a number and
 // worked.) This claims a small field from a stubbed server, captures the
 // POST, and checks what each backend produced.
+// A real base-49 field window, chosen because it contains a known near miss
+// whose value is above 2^53: 20363742218601559 has 45 unique digits, and a
+// double cannot hold it (the nearest one is ...560). Submitting that field is
+// what caught the precision bug, so the stub reproduces the conditions.
+const NEAR_MISS = "20363742218601559";
 const CLAIM_STUB = {
     claim_id: 245749450, // a number, as the real API sends it
-    base: 40,
-    range_start: "1916284264916",
-    range_end: "1916284464916", // 200k numbers: seconds, not minutes
-    range_size: "200000",
+    base: 49,
+    range_start: "20363742218551559",
+    range_end: "20363742218651559", // 100k numbers around the near miss
+    range_size: "100000",
 };
 const CORS = {
     "Access-Control-Allow-Origin": "*",
@@ -225,6 +230,7 @@ const CORS = {
 async function submitShape(backend) {
     const page = await browser.newPage();
     let captured = null;
+    let raw = "";
     page.on("pageerror", (e) => console.log(`[submit:${backend}] pageerror:`, e.message));
     await page.route("**/api.nicenumbers.net/**", async (route) => {
         const req = route.request();
@@ -241,10 +247,14 @@ async function submitShape(backend) {
         }
         if (url.includes("/submit")) {
             if (captured === null) {
+                // The raw text matters as much as the parsed object: JSON.parse
+                // here would round a near-miss number above 2^53 exactly the way
+                // the browser did, hiding the bug this checks for.
+                raw = req.postData() ?? "";
                 try {
                     captured = req.postDataJSON();
                 } catch {
-                    captured = { unparseable: req.postData() };
+                    captured = { unparseable: raw };
                 }
             }
             return route.fulfill({ status: 200, headers: CORS, body: "accepted" });
@@ -277,13 +287,13 @@ async function submitShape(backend) {
     // The page loops into the next field after a submission; closing here
     // stops it, and an in-flight route can reject as it goes.
     await page.close().catch(() => {});
-    return { captured };
+    return { captured, raw };
 }
 
 if (!failed) {
     console.log("=== submit payload shape ===");
     for (const backend of skipGpu ? ["cpu"] : ["cpu", "gpu"]) {
-        const { captured, skipped } = await submitShape(backend);
+        const { captured, raw, skipped } = await submitShape(backend);
         if (skipped) {
             console.log(`[submit:${backend}] skipped: ${skipped}`);
             continue;
@@ -313,6 +323,14 @@ if (!failed) {
         } else if (!dist.some((d) => d.count > 0)) {
             problems.push("unique_distribution is all zeroes");
         }
+        // Exact-value check against the raw body, not the parsed object.
+        if (!raw.includes(`"number":${NEAR_MISS}`)) {
+            const seen = /"number":\s*"?(\d+)"?/.exec(raw)?.[1] ?? "(none)";
+            problems.push(
+                `near miss submitted as ${seen}, expected the exact integer ` +
+                    `${NEAR_MISS} (a double cannot hold it)`,
+            );
+        }
         if (typeof captured.username !== "string") problems.push("username missing");
         if (typeof captured.client_version !== "string") {
             problems.push("client_version missing");
@@ -323,7 +341,8 @@ if (!failed) {
         } else {
             console.log(
                 `[submit:${backend}] ok — claim_id ${captured.claim_id} (number), ` +
-                    `${dist.length} bins, client_version ${captured.client_version}`,
+                    `${dist.length} bins, near miss ${NEAR_MISS} exact, ` +
+                    `client_version ${captured.client_version}`,
             );
         }
     }

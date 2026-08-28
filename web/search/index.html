@@ -713,6 +713,18 @@
                 };
             }
 
+            // Near-miss numbers are carried through the workers as strings so
+            // that JSON.parse cannot round them (see parseFieldResults in
+            // worker.js — base-49 fields sit above 2^53, where a double stops
+            // being able to hold consecutive integers). The server wants an
+            // integer there, so the digits go back on the wire unquoted.
+            function submissionBody(data) {
+                return JSON.stringify(data).replace(
+                    /"number":"(\d+)"/g,
+                    '"number":$1',
+                );
+            }
+
             async function submitFieldToServer(data) {
                 const apiUrl = "https://api.nicenumbers.net";
                 const response = await fetch(`${apiUrl}/submit`, {
@@ -720,7 +732,7 @@
                     headers: {
                         "Content-Type": "application/json",
                     },
-                    body: JSON.stringify(data),
+                    body: submissionBody(data),
                 });
                 const responseText = await response.text();
 

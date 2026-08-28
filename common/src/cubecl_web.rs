@@ -646,6 +646,54 @@ mod tests {
         }
     }
 
+    /// The near miss from the base-49 field that exposed the browser's
+    /// precision bug. All three implementations agree it is 20363742218601559
+    /// with 45 unique digits; the browser submitted 20363742218601560, because
+    /// that value is above 2^53 and had been through a double on the
+    /// JavaScript side. The kernels were never wrong — this test is what
+    /// established that, and it stays as the coverage that was missing.
+    ///
+    /// Every other near-miss assertion in this crate is either at base 10
+    /// (`web_kernel_finds_69_in_base_10`, one u32 limb) or over a range too
+    /// short to contain a near miss at all, so the emission path had never
+    /// been exercised at two limbs. This runs the CPU, the u32 web kernel and
+    /// the native kernel over the same candidates and compares all three.
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn web_kernel_near_miss_matches_cpu_at_base_49() {
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        let hit = 20_363_742_218_601_560u128;
+        for (label, range) in [
+            ("single candidate", FieldSize::new(hit, hit + 1)),
+            ("small window", FieldSize::new(hit - 512, hit + 512)),
+        ] {
+            let cpu = process_range_detailed(&range, 49);
+            let web = process_range_detailed_web(&ctx, &range, 49).expect("web kernel run");
+            let native = crate::cubecl_backend::process_range_detailed_cubecl(&ctx, &range, 49)
+                .expect("native kernel run");
+            println!("--- {label} ---");
+            println!("cpu    nice_numbers: {:?}", cpu.nice_numbers);
+            println!("web    nice_numbers: {:?}", web.nice_numbers);
+            println!("native nice_numbers: {:?}", native.nice_numbers);
+            assert_eq!(
+                web.distribution, cpu.distribution,
+                "{label}: web distribution mismatch"
+            );
+            assert_eq!(
+                native.distribution, cpu.distribution,
+                "{label}: native distribution mismatch"
+            );
+            assert_eq!(
+                web.nice_numbers, cpu.nice_numbers,
+                "{label}: web near-miss mismatch"
+            );
+            assert_eq!(
+                native.nice_numbers, cpu.nice_numbers,
+                "{label}: native near-miss mismatch"
+            );
+        }
+    }
+
     /// The known solution through the u32 kernel: 69 is nice in base 10.
     #[test]
     #[ignore = "requires a wgpu device"]
