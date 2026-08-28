@@ -222,7 +222,7 @@
                                 </div>
                             </div>
 
-                            <div class="field">
+                            <div class="field" id="threadCountField">
                                 <label class="label" for="threadCount">
                                     Thread Count:
                                     <span id="threadCountValue">1</span>
@@ -317,6 +317,19 @@
                             </div>
                         </div>
 
+                        <div class="box content">
+                            <h3 class="title is-5">Processing Results:</h3>
+                            <div
+                                class="worker-status initializing"
+                                id="workerStatus"
+                            >
+                                Initializing Worker Pool...
+                            </div>
+                            <div id="results" class="results"></div>
+                        </div>
+                    </div>
+
+                    <div class="column">
                         <div class="box content is-hidden" id="benchReport">
                             <p class="heading has-text-centered">NiceMark</p>
                             <p
@@ -339,19 +352,6 @@
                             <p class="is-size-7 mt-1" id="uploadStatus"></p>
                         </div>
 
-                        <div class="box content">
-                            <h3 class="title is-5">Processing Results:</h3>
-                            <div
-                                class="worker-status initializing"
-                                id="workerStatus"
-                            >
-                                Initializing Worker Pool...
-                            </div>
-                            <div id="results" class="results"></div>
-                        </div>
-                    </div>
-
-                    <div class="column">
                         <div class="box content">
                             <h2 class="title is-4 mb-3">
                                 Session Statistics
@@ -750,6 +750,19 @@
             // One entry per completed field, for the rate strip chart.
             let sessionRates = [];
             const SESSION_RATES_MAX = 500;
+            // Whether the current run is an online contribution run — the
+            // only kind that feeds the session panel and histogram; the
+            // benchmark modes drive the progress bar and results log only.
+            let onlineRun = false;
+            // Unique-count distribution accumulated over the session's
+            // completed fields (one base at a time — the server hands out
+            // fields from the frontier, so a base change is rare and just
+            // restarts the accumulation). Drawing the session total instead
+            // of each field's own tally is what stops the histogram
+            // resetting to empty — a visible flash — at every sub-second
+            // field boundary.
+            let sessionDistribution = new Map();
+            let sessionDistBase = null;
 
             // Counts arrive as BigInt (or its decimal string) because a fast
             // session overflows a double's integer range within hours.
@@ -761,7 +774,8 @@
 
             function formatRate(rate) {
                 if (!Number.isFinite(rate) || rate <= 0) return "0";
-                if (rate >= 1e6) return rate.toExponential(2);
+                // "1.60e9", not "1.60e+9" — the sign is noise in a tile.
+                if (rate >= 1e6) return rate.toExponential(2).replace("e+", "e");
                 return Math.round(rate).toLocaleString();
             }
 
@@ -814,10 +828,52 @@
                 return probs;
             }
 
+            // The session distribution plus the in-flight field's live
+            // tally, for drawing.
+            function mergedSessionDistribution(liveDistribution) {
+                const merged = new Map(sessionDistribution);
+                if (liveDistribution instanceof Map) {
+                    liveDistribution.forEach((count, numUniques) => {
+                        merged.set(
+                            numUniques,
+                            (merged.get(numUniques) || 0) + count,
+                        );
+                    });
+                }
+                return merged;
+            }
+
+            // Fold one completed field's final distribution (server-format
+            // array) into the session total.
+            function accumulateSessionDistribution(base, distribution) {
+                if (sessionDistBase !== base) {
+                    sessionDistBase = base;
+                    sessionDistribution = new Map();
+                }
+                for (const entry of distribution ?? []) {
+                    sessionDistribution.set(
+                        entry.num_uniques,
+                        (sessionDistribution.get(entry.num_uniques) || 0) +
+                            entry.count,
+                    );
+                }
+            }
+
+            // Redraws are throttled: at GPU speeds every progress tick and
+            // field boundary would otherwise rebuild the SVG several times
+            // a second.
+            let lastHistogramDraw = 0;
+            function updateHistogramThrottled(uniqueDistribution) {
+                const now = Date.now();
+                if (now - lastHistogramDraw < 500) return;
+                updateHistogram(uniqueDistribution);
+            }
+
             // Update histogram with current digit counts, overlaying the
             // uniform-random baseline so the shape means something.
             function updateHistogram(uniqueDistribution) {
                 if (uniqueDistribution == undefined || !window.Plot) return;
+                lastHistogramDraw = Date.now();
                 const data = [...uniqueDistribution].map(([digit, count]) => ({
                     digit,
                     count,
@@ -849,9 +905,12 @@
                 }
                 marks.push(Plot.ruleY([0]));
 
+                const histogramDiv = document.querySelector("#histogram");
                 const plot = Plot.plot({
-                    width: 900,
-                    marginLeft: 75,
+                    // Fill the box; counts get compact SI ticks ("50M") so
+                    // long numbers can't outgrow the margin.
+                    width: Math.max(400, histogramDiv.clientWidth || 900),
+                    marginLeft: 60,
                     x: {
                         label: "Digit",
                         domain: data.map((d) => d.digit),
@@ -860,13 +919,14 @@
                     y: {
                         label: "Count",
                         grid: true,
+                        tickFormat: "~s",
                     },
                     marks: marks,
                 });
 
-                const histogramDiv = document.querySelector("#histogram");
-                histogramDiv.innerHTML = "";
-                histogramDiv.append(plot);
+                // Atomic swap — clearing first paints an empty frame, which
+                // reads as a flash at every redraw.
+                histogramDiv.replaceChildren(plot);
             }
 
             function recordFieldRate(rate) {
@@ -882,16 +942,20 @@
 
             function renderRateStrip() {
                 if (!window.Plot || sessionRates.length === 0) return;
+                const stripDiv = document.querySelector("#rateStrip");
                 const plot = Plot.plot({
-                    width: 900,
+                    // Fill the box. No legend — it cost a whole row to
+                    // repeat what the tooltip already says; SI ticks
+                    // ("1.5G") so the labels fit the margin instead of
+                    // being clipped to ",000,000,000".
+                    width: Math.max(400, stripDiv.clientWidth || 900),
                     height: 180,
-                    marginLeft: 75,
+                    marginLeft: 60,
                     x: { label: "Field # (this session)", tickFormat: "d" },
-                    y: { label: "numbers/sec", grid: true },
+                    y: { label: "numbers/sec", grid: true, tickFormat: "~s" },
                     color: {
                         domain: ["cpu", "gpu"],
                         range: ["#3273dc", "#48c774"],
-                        legend: sessionRates.some((r) => r.backend === "gpu"),
                     },
                     marks: [
                         Plot.dot(sessionRates, {
@@ -903,9 +967,7 @@
                         Plot.ruleY([0]),
                     ],
                 });
-                const stripDiv = document.querySelector("#rateStrip");
-                stripDiv.innerHTML = "";
-                stripDiv.append(plot);
+                stripDiv.replaceChildren(plot);
             }
 
             // All-time totals for this browser, kept in localStorage. Purely
@@ -1064,15 +1126,31 @@
 
             // Live progress from either backend (the GPU worker posts the
             // same shape the pool aggregates to).
+            //
+            // The benchmark suite repeats small windows several times a
+            // second, so its per-window progress drives nothing here — the
+            // suite paints its own scenario-level progress, and letting the
+            // windows through made the histogram strobe and the session
+            // tiles count work that was never contributed. The session
+            // panel belongs to online runs only; the offline test field
+            // keeps its live histogram but stays out of the tiles.
             function handleWorkerPoolProgress(progressData) {
+                if (suiteRunning) return;
                 updateProgress(progressData.percent, progressData.message);
 
-                // Update statistics display
-                updateStatistics(
-                    progressData.processedCount,
-                    progressData.niceNumbers.length,
-                );
-                updateHistogram(progressData.uniqueDistribution);
+                if (onlineRun) {
+                    updateStatistics(
+                        progressData.processedCount,
+                        progressData.niceNumbers.length,
+                    );
+                    updateHistogramThrottled(
+                        mergedSessionDistribution(
+                            progressData.uniqueDistribution,
+                        ),
+                    );
+                } else {
+                    updateHistogramThrottled(progressData.uniqueDistribution);
+                }
             }
 
             function updateWorkerStatus(message, type) {
@@ -1232,8 +1310,6 @@
                     });
                 }
 
-                updateHistogram();
-
                 appendResults(
                     `Processing completed in ${elapsedSeconds.toFixed(2)} seconds`,
                 );
@@ -1291,7 +1367,12 @@
                         lastFieldRate =
                             Number(rangeSize) / outcome.elapsedSeconds;
                         recordFieldRate(lastFieldRate);
+                        accumulateSessionDistribution(
+                            claimData.base,
+                            outcome.result.unique_distribution,
+                        );
                         updateStatistics(0, 0);
+                        updateHistogramThrottled(sessionDistribution);
                         renderRateStrip();
 
                         topUpClaims();
@@ -1343,7 +1424,6 @@
                 currentClaimData = claimData;
                 startTime = Date.now();
                 numbersProcessedCount = 0;
-                updateStatistics(0, 0);
 
                 const outcome = await processField(claimData);
                 if (outcome) {
@@ -1715,6 +1795,16 @@
                 return document.getElementById("backendSelect").value;
             }
 
+            // The thread slider steers the CPU pool; in GPU mode the device
+            // supplies the parallelism and the slider is just a confusing
+            // knob that does nothing.
+            function updateBackendControls() {
+                const gpu = selectedBackend() === "gpu";
+                document
+                    .getElementById("threadCountField")
+                    .classList.toggle("is-hidden", gpu);
+            }
+
             function initGpuWorker() {
                 return new Promise((resolve) => {
                     const worker = new Worker("worker.js");
@@ -1924,6 +2014,14 @@
                 option.value = "gpu";
                 option.textContent = `GPU — ${gpuAdapterName}`;
                 select.appendChild(option);
+                // The GPU outruns the CPU pool on every machine measured,
+                // so once it exists it is the default — unless the user
+                // already started (or picked a backend) while detection was
+                // still warming up.
+                if (!isProcessing) {
+                    select.value = "gpu";
+                }
+                updateBackendControls();
                 help.textContent =
                     "WebGPU available; the GPU runs whole fields while the CPU option uses the thread pool.";
                 gpuWorker.onmessage = handleGpuWorkerMessage;
@@ -2020,13 +2118,16 @@
 
                 // A fresh online run starts a fresh session story; the
                 // benchmark modes leave the panel alone.
-                if (mode === "false") {
+                onlineRun = mode === "false";
+                if (onlineRun) {
                     sessionStart = Date.now();
                     sessionFields = 0;
                     sessionNumbers = BigInt(0);
                     bestFind = null;
                     lastFieldRate = null;
                     sessionRates = [];
+                    sessionDistribution = new Map();
+                    sessionDistBase = null;
                 }
 
                 document.getElementById("startBtn").classList.add("is-hidden");
@@ -2176,6 +2277,7 @@
                     .getElementById("backendSelect")
                     .addEventListener("change", () => {
                         fieldSecsEwma = null;
+                        updateBackendControls();
                     });
 
                 // The budget selector only means something to the suite.
