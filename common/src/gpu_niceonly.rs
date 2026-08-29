@@ -164,9 +164,8 @@ fn adaptive_floor() -> &'static Mutex<AdaptiveFloor> {
             }
         }
         #[allow(clippy::cast_precision_loss)]
-        let cpu_count = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(32) as f64;
+        let cpu_count =
+            std::thread::available_parallelism().map_or(32, std::num::NonZeroUsize::get) as f64;
         let seed = (ADAPT_BASE_CORE_PRODUCT / cpu_count).clamp(MSD_FLOOR_MIN, MSD_FLOOR_MAX);
         info!("GPU MSD floor: adaptive, seed {seed:.0} ({cpu_count:.0} logical cores)");
         Mutex::new(AdaptiveFloor {
@@ -290,8 +289,7 @@ pub fn run_range_pipeline<S: RangeSink>(
     let chunks = range.chunks(PROCESSING_CHUNK_SIZE);
     let floor = gpu_msd_floor();
     let num_threads = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(4)
+        .map_or(4, std::num::NonZeroUsize::get)
         .min(chunks.len().max(1));
 
     let next_chunk = AtomicUsize::new(0);
@@ -530,7 +528,11 @@ pub const MAX_STRIDE_MODULUS: u128 = 1 << 28;
 /// they cannot disagree.
 #[must_use]
 pub fn stride_chunk_bits(stride_m: u32) -> u32 {
-    if u128::from(stride_m) <= 1 << 24 { 8 } else { 4 }
+    if u128::from(stride_m) <= 1 << 24 {
+        8
+    } else {
+        4
+    }
 }
 
 #[cfg(test)]
@@ -611,13 +613,18 @@ mod tests {
         use crate::stride_filter::StrideTable;
 
         let base = 10;
-        let range = crate::base_range::get_base_range_u128(base).unwrap().unwrap();
+        let range = crate::base_range::get_base_range_u128(base)
+            .unwrap()
+            .unwrap();
         let field = FieldSize::new(range.range_start, range.range_end);
 
         let mut sink = Recorder::default();
         let stats = run_range_pipeline(&mut sink, &field, base).expect("pipeline");
         assert!(sink.synced, "the pipeline must sync the sink");
-        assert_eq!(stats.num_ranges, sink.batches.iter().map(|(o, _)| o.len()).sum::<usize>());
+        assert_eq!(
+            stats.num_ranges,
+            sink.batches.iter().map(|(o, _)| o.len()).sum::<usize>()
+        );
 
         let mut covered: Vec<(u128, u128)> = Vec::new();
         for (offsets, lens) in &sink.batches {

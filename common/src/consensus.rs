@@ -77,6 +77,8 @@ mod tests {
     use super::*;
     use crate::{NiceNumberSimple, SearchMode, UniquesDistributionSimple};
     use chrono::Utc;
+    use std::thread;
+    use std::time::Duration;
 
     fn create_test_field() -> FieldRecord {
         FieldRecord {
@@ -281,9 +283,6 @@ mod tests {
 
     #[test_log::test]
     fn test_evaluate_consensus_earliest_submission_selected() {
-        use std::thread;
-        use std::time::Duration;
-
         let field = create_test_field();
         let distribution = vec![UniquesDistributionSimple {
             num_uniques: 1,

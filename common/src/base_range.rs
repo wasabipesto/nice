@@ -15,6 +15,9 @@ pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
     let b = Natural::from(base);
     let k = u64::from(base / 5);
 
+    // `1 => None` and the unreachable `_` fallback share a body on purpose:
+    // the arms document the mathematical cases, not control flow.
+    #[allow(clippy::match_same_arms)]
     match base % 5 {
         0 => Some((b.clone().pow(3 * k - 1).ceiling_root(3), b.pow(k))),
         1 => None,

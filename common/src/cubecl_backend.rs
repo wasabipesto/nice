@@ -28,8 +28,7 @@
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::gpu_config::{
-    VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs,
-    vulkan_prefilter_params,
+    VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
 use crate::gpu_niceonly::{
     GPU_LSD_K, MAX_STRIDE_MODULUS, RangeSink, lane_shift_for, report_field, residue_empty_result,
@@ -75,14 +74,7 @@ const NEAR_MISS_CAPACITY: usize = 1 << 20;
 /// as the WGSL generator bakes literals: every division below is by a
 /// comptime constant, and every limb loop unrolls to straight-line code.
 #[cube(launch_unchecked)]
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    clippy::used_underscore_binding
-)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn detailed_kernel(
     hist: &Array<Atomic<u32>>,
     miss_count: &Array<Atomic<u32>>,
@@ -240,7 +232,8 @@ fn detailed_kernel(
                     let mut rem64 = 0u64;
                     let mut i: i32 = top;
                     while i >= 0 {
-                        let cur = (rem64 << 32u64) | u64::cast_from(sv_s[(svb + u32::cast_from(i)) as usize]);
+                        let cur = (rem64 << 32u64)
+                            | u64::cast_from(sv_s[(svb + u32::cast_from(i)) as usize]);
                         // Quotient once, remainder by mul-sub — see the
                         // niceonly scan; `%` would cost a second multiply-high
                         // sequence per word.
@@ -374,15 +367,15 @@ const NICEONLY_OUT_CAPACITY: usize = 1 << 16;
 #[cube(launch_unchecked)]
 // The single-character and lookalike names (m, g, j, rs/re, ...) deliberately
 // match the generated WGSL, so the two kernels review side by side.
+// `manual_midpoint`: `u32::midpoint` has no cube-dialect translation.
+// manual_midpoint: `u32::midpoint` has no cube translation, so the kernel
+// keeps the shift form.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    clippy::used_underscore_binding,
+    clippy::similar_names,
     clippy::many_single_char_names,
-    clippy::similar_names
+    clippy::manual_midpoint
 )]
 fn niceonly_kernel(
     residues: &Array<u32>,
@@ -458,7 +451,11 @@ fn niceonly_kernel(
         let mut acc = 0u32;
         #[unroll]
         for k in 0..offset_chunks {
-            let word = if comptime!(k < per_word) { off_hi } else { off_lo };
+            let word = if comptime!(k < per_word) {
+                off_hi
+            } else {
+                off_lo
+            };
             let shift = comptime!(32 - offset_chunk_bits - (k % per_word) * offset_chunk_bits);
             acc = ((acc << offset_chunk_bits) | ((word >> shift) & offset_chunk_mask)) % stride_m;
         }
@@ -689,7 +686,8 @@ fn niceonly_kernel(
                         let mut rem64 = 0u64;
                         let mut i: i32 = top;
                         while i >= 0 {
-                            let cur = (rem64 << 32u64) | u64::cast_from(sv_s[(svb + u32::cast_from(i)) as usize]);
+                            let cur = (rem64 << 32u64)
+                                | u64::cast_from(sv_s[(svb + u32::cast_from(i)) as usize]);
                             // Quotient once, remainder by mul-sub: `%` would
                             // lower as a second independent multiply-high
                             // correction sequence (the hand kernels avoid it
@@ -720,7 +718,7 @@ fn niceonly_kernel(
                         }
                         top -= 1;
                     }
-                
+
                     let mut chunk = rem;
                     let mut dup = 0u64;
                     if top >= 0 {
@@ -802,96 +800,97 @@ fn niceonly_kernel(
                         }
                         topc -= 1;
                     }
-                while topc >= 0 && ok {
-                    let mut rem = 0u32;
-                    if wide_chunk {
-                        let mut rem64 = 0u64;
-                        let mut i: i32 = topc;
-                        while i >= 0 {
-                            let cur = (rem64 << 32u64) | u64::cast_from(sv_s[(svb + u32::cast_from(i)) as usize]);
-                            // Quotient once, remainder by mul-sub: `%` would
-                            // lower as a second independent multiply-high
-                            // correction sequence (the hand kernels avoid it
-                            // the same way).
-                            let q = cur / u64::cast_from(chunk_div);
-                            sv_s[(svb + u32::cast_from(i)) as usize] = u32::cast_from(q);
-                            rem64 = cur - q * u64::cast_from(chunk_div);
-                            i -= 1;
+                    while topc >= 0 && ok {
+                        let mut rem = 0u32;
+                        if wide_chunk {
+                            let mut rem64 = 0u64;
+                            let mut i: i32 = topc;
+                            while i >= 0 {
+                                let cur = (rem64 << 32u64)
+                                    | u64::cast_from(sv_s[(svb + u32::cast_from(i)) as usize]);
+                                // Quotient once, remainder by mul-sub: `%` would
+                                // lower as a second independent multiply-high
+                                // correction sequence (the hand kernels avoid it
+                                // the same way).
+                                let q = cur / u64::cast_from(chunk_div);
+                                sv_s[(svb + u32::cast_from(i)) as usize] = u32::cast_from(q);
+                                rem64 = cur - q * u64::cast_from(chunk_div);
+                                i -= 1;
+                            }
+                            rem = u32::cast_from(rem64); // rem < chunk_div < 2^31
+                        } else {
+                            let mut i: i32 = topc;
+                            while i >= 0 {
+                                let vi = sv_s[(svb + u32::cast_from(i)) as usize];
+                                let c1 = (rem << 16u32) | (vi >> 16u32);
+                                let q1 = c1 / chunk_div;
+                                let r1 = c1 - q1 * chunk_div;
+                                let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
+                                let q2 = c2 / chunk_div;
+                                rem = c2 - q2 * chunk_div;
+                                sv_s[(svb + u32::cast_from(i)) as usize] = (q1 << 16u32) | q2;
+                                i -= 1;
+                            }
                         }
-                        rem = u32::cast_from(rem64); // rem < chunk_div < 2^31
-                    } else {
-                        let mut i: i32 = topc;
-                        while i >= 0 {
-                            let vi = sv_s[(svb + u32::cast_from(i)) as usize];
-                            let c1 = (rem << 16u32) | (vi >> 16u32);
-                            let q1 = c1 / chunk_div;
-                            let r1 = c1 - q1 * chunk_div;
-                            let c2 = (r1 << 16u32) | (vi & 0xFFFFu32);
-                            let q2 = c2 / chunk_div;
-                            rem = c2 - q2 * chunk_div;
-                            sv_s[(svb + u32::cast_from(i)) as usize] = (q1 << 16u32) | q2;
-                            i -= 1;
+                        while topc >= 0 {
+                            if sv_s[(svb + u32::cast_from(topc)) as usize] != 0u32 {
+                                break;
+                            }
+                            topc -= 1;
                         }
-                    }
-                    while topc >= 0 {
-                        if sv_s[(svb + u32::cast_from(topc)) as usize] != 0u32 {
-                            break;
-                        }
-                        topc -= 1;
-                    }
-                
-                    let mut chunk = rem;
-                    let mut dup = 0u64;
-                    if topc >= 0 {
-                        // Interior chunk: all chunk_digits digits, zeros included.
-                        #[unroll]
-                        for _k in 0..chunk_digits {
-                            let cq = chunk / base;
-                            let d = chunk - cq * base;
-                            chunk = cq;
-                            if two_masks {
-                                if d < 64u32 {
+
+                        let mut chunk = rem;
+                        let mut dup = 0u64;
+                        if topc >= 0 {
+                            // Interior chunk: all chunk_digits digits, zeros included.
+                            #[unroll]
+                            for _k in 0..chunk_digits {
+                                let cq = chunk / base;
+                                let d = chunk - cq * base;
+                                chunk = cq;
+                                if two_masks {
+                                    if d < 64u32 {
+                                        let bit = 1u64 << u64::cast_from(d);
+                                        dup |= m0 & bit;
+                                        m0 |= bit;
+                                    } else {
+                                        let bit = 1u64 << u64::cast_from(d - 64u32);
+                                        dup |= m1 & bit;
+                                        m1 |= bit;
+                                    }
+                                } else {
                                     let bit = 1u64 << u64::cast_from(d);
                                     dup |= m0 & bit;
                                     m0 |= bit;
-                                } else {
-                                    let bit = 1u64 << u64::cast_from(d - 64u32);
-                                    dup |= m1 & bit;
-                                    m1 |= bit;
                                 }
-                            } else {
-                                let bit = 1u64 << u64::cast_from(d);
-                                dup |= m0 & bit;
-                                m0 |= bit;
                             }
-                        }
-                    } else {
-                        // Most significant chunk: digits until zero.
-                        while chunk != 0u32 {
-                            let cq = chunk / base;
-                            let d = chunk - cq * base;
-                            chunk = cq;
-                            if two_masks {
-                                if d < 64u32 {
+                        } else {
+                            // Most significant chunk: digits until zero.
+                            while chunk != 0u32 {
+                                let cq = chunk / base;
+                                let d = chunk - cq * base;
+                                chunk = cq;
+                                if two_masks {
+                                    if d < 64u32 {
+                                        let bit = 1u64 << u64::cast_from(d);
+                                        dup |= m0 & bit;
+                                        m0 |= bit;
+                                    } else {
+                                        let bit = 1u64 << u64::cast_from(d - 64u32);
+                                        dup |= m1 & bit;
+                                        m1 |= bit;
+                                    }
+                                } else {
                                     let bit = 1u64 << u64::cast_from(d);
                                     dup |= m0 & bit;
                                     m0 |= bit;
-                                } else {
-                                    let bit = 1u64 << u64::cast_from(d - 64u32);
-                                    dup |= m1 & bit;
-                                    m1 |= bit;
                                 }
-                            } else {
-                                let bit = 1u64 << u64::cast_from(d);
-                                dup |= m0 & bit;
-                                m0 |= bit;
                             }
                         }
+                        if dup != 0u64 {
+                            ok = false;
+                        }
                     }
-                    if dup != 0u64 {
-                        ok = false;
-                    }
-                }
                 }
             }
 
@@ -971,8 +970,8 @@ impl CubeclContext {
     /// discrete card it will try to allocate pages of hundreds of megabytes
     /// to satisfy a 21 MB request. A browser gives a tab far less GPU memory
     /// than the card has, and refuses: observed on an RX 9070 XT under
-    /// LibreWolf 149 as "Not enough memory left", then an invalid buffer,
-    /// then a panic in CubeCL's buffer mapping. Native builds keep the
+    /// `LibreWolf` 149 as "Not enough memory left", then an invalid buffer,
+    /// then a panic in `CubeCL`'s buffer mapping. Native builds keep the
     /// default pooling, which is measurably fine on the same card.
     ///
     /// This backend allocates a handful of long-lived buffers per field, so
@@ -996,7 +995,6 @@ impl CubeclContext {
     ///
     /// # Errors
     /// Returns an error if no wgpu device is available.
-
     pub fn new_default() -> Result<Self> {
         let (client, device_name) = WGPU_DEFAULT.get_or_init(|| {
             let device = cubecl::wgpu::WgpuDevice::default();
@@ -1394,13 +1392,25 @@ pub fn process_range_niceonly_cubecl(
             client,
             niceonly_plans,
             ..
-        } => niceonly_impl(client, cached_plan(niceonly_plans, client, base)?, range, base, false),
+        } => niceonly_impl(
+            client,
+            cached_plan(niceonly_plans, client, base)?,
+            range,
+            base,
+            false,
+        ),
         #[cfg(feature = "cubecl-cuda")]
         CubeclContext::Cuda {
             client,
             niceonly_plans,
             ..
-        } => niceonly_impl(client, cached_plan(niceonly_plans, client, base)?, range, base, true),
+        } => niceonly_impl(
+            client,
+            cached_plan(niceonly_plans, client, base)?,
+            range,
+            base,
+            true,
+        ),
     }
 }
 
@@ -1420,12 +1430,7 @@ fn cached_plan<R: cubecl::prelude::Runtime>(
     // another thread asking for a *different* base should not wait on it.
     // A racing build of the same base wastes one table walk, harmlessly.
     let plan = Arc::new(NiceonlyPlan::build(client, base)?);
-    Ok(plans
-        .lock()
-        .unwrap()
-        .entry(base)
-        .or_insert(plan)
-        .clone())
+    Ok(plans.lock().unwrap().entry(base).or_insert(plan).clone())
 }
 
 /// Runtime-generic body of [`process_range_niceonly_cubecl`].
@@ -1559,7 +1564,8 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
         let nice_out = client.create(cubecl::bytes::Bytes::from_elems(vec![
             0u32;
             NICEONLY_OUT_CAPACITY
-                * NICEONLY_STRIDE as usize
+                * NICEONLY_STRIDE
+                    as usize
         ]));
         let nice_count = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
 
@@ -1646,8 +1652,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
         // Tile the dispatch to this batch's ranges; batches are homogeneous
         // enough for the mean to be a good summary, because the MSD recursion
         // bounds range length by the floor.
-        let mean_len =
-            lens.iter().map(|&l| u64::from(l)).sum::<u64>() / lens.len().max(1) as u64;
+        let mean_len = lens.iter().map(|&l| u64::from(l)).sum::<u64>() / lens.len().max(1) as u64;
         // NICE_CUBECL_LANES pins the tiling for A/B measurement, the same
         // shape of knob as NICE_VULKAN_LANES on the hand backend.
         let lane_shift = self
@@ -1791,8 +1796,14 @@ mod tests {
             let range = FieldSize::new(start, start + count);
             let gpu = process_range_detailed_cubecl(&ctx, &range, base).expect("cubecl-cuda run");
             let cpu = process_range_detailed(&range, base);
-            assert_eq!(gpu.distribution, cpu.distribution, "base {base}: distribution mismatch");
-            assert_eq!(gpu.nice_numbers, cpu.nice_numbers, "base {base}: near-miss mismatch");
+            assert_eq!(
+                gpu.distribution, cpu.distribution,
+                "base {base}: distribution mismatch"
+            );
+            assert_eq!(
+                gpu.nice_numbers, cpu.nice_numbers,
+                "base {base}: near-miss mismatch"
+            );
             println!("base {base}: {count} candidates match the CPU exactly (CUDA runtime)");
         }
     }
@@ -1924,7 +1935,10 @@ mod tests {
             for shift in 0..=MAX_LANES_PER_RANGE.ilog2() {
                 let mut run =
                     CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
-                assert!(run.plan.prefilter.is_some(), "base {base}: no prefilter params");
+                assert!(
+                    run.plan.prefilter.is_some(),
+                    "base {base}: no prefilter params"
+                );
                 run.probe = true;
                 run.lane_shift_override = Some(shift);
                 run.launch(&[0], &[len]).expect("dispatch");

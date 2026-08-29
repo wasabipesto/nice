@@ -63,9 +63,16 @@ build:
     cargo build -p "*"
     cargo build -p "*" -r
 
+# Check formatting and lints, exactly as the CI lint job does
+lint:
+    cargo fmt --all --check
+    cargo clippy -p "*" --all-targets -- -D warnings
+    # The GPU/vulkan code only exists under these features, so lint it too.
+    cargo clippy -p "*" --all-targets --features nice_client/gpu,nice_client/vulkan -- -D warnings
+
 # Build all packages, run all tests, and then run the client
 test:
-    cargo clippy -p "*"
+    just lint
     cargo build -p "*"
     cargo build -p "*" --features nice_client/gpu
     cargo build -p "*" --features nice_client/vulkan

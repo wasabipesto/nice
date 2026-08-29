@@ -63,7 +63,8 @@ impl NumbersAccumulator {
 
     fn compact(&mut self) {
         // Sort by number of uniques and take the top few
-        self.numbers.sort_by(|a, b| b.num_uniques.cmp(&a.num_uniques));
+        self.numbers
+            .sort_by_key(|a| std::cmp::Reverse(a.num_uniques));
         self.numbers.truncate(SAVE_TOP_N_NUMBERS);
     }
 
@@ -126,7 +127,7 @@ mod tests {
             numbers: ids
                 .map(|i| NiceNumber {
                     number: i as u128,
-                    num_uniques: i as u32,
+                    num_uniques: u32::try_from(i).unwrap(),
                     base: 40,
                     niceness: 1.0,
                 })
@@ -157,7 +158,7 @@ mod tests {
         assert_eq!(key(&single), key(&folded));
         assert_eq!(
             key(&folded).first().copied(),
-            Some((total - SAVE_TOP_N_NUMBERS) as u32)
+            Some(u32::try_from(total - SAVE_TOP_N_NUMBERS).unwrap())
         );
     }
     use crate::SearchMode;

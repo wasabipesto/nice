@@ -405,7 +405,6 @@ fn has_overlapping_digits(digits1: &[u32], digits2: &[u32]) -> bool {
 ///
 /// # Panics
 /// Panics if the range is invalid or the base is greater than 256.
-#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn has_duplicate_msd_prefix(range: FieldSize, base: u32) -> bool {
     // Check for edge cases
@@ -653,6 +652,7 @@ pub fn get_valid_ranges(range: FieldSize, base: u32) -> Vec<FieldSize> {
 mod tests {
     use super::*;
     use crate::base_range;
+    use crate::client_process::get_is_nice;
     use log::debug;
 
     /// Break up the range into chunks, returning the start and end of each.
@@ -711,8 +711,8 @@ mod tests {
         let mut state: u128 = 0x1234_5678_9abc_def0_cafe_babe_dead_beef;
         let mut rng = || {
             state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             state
         };
         for &base in bases {
@@ -1010,8 +1010,6 @@ mod tests {
         // Soundness: for every nice number found by brute force in small
         // bases, no range containing it may be reported as skippable —
         // regardless of the range's size or alignment.
-        use crate::client_process::get_is_nice;
-
         for base in 4u32..=16 {
             let Ok(Some(base_range)) = base_range::get_base_range_u128(base) else {
                 continue;
@@ -1044,8 +1042,6 @@ mod tests {
         // Integration-level soundness: running the production recursion over
         // the full base range must leave every nice number inside some
         // returned "must process" sub-range.
-        use crate::client_process::get_is_nice;
-
         for base in 4u32..=16 {
             let Ok(Some(base_range)) = base_range::get_base_range_u128(base) else {
                 continue;

@@ -82,8 +82,8 @@ impl KernelConfig {
     /// # Errors
     /// Returns an error for bases with no valid u128 search range.
     pub fn new(base: u32) -> Result<Self> {
-        let n_limbs = n_limbs(base)
-            .with_context(|| format!("base {base} has no valid u128 search range"))?;
+        let n_limbs =
+            n_limbs(base).with_context(|| format!("base {base} has no valid u128 search range"))?;
         let (chunk_digits, chunk_div) = chunk_constants_u16(base);
         Ok(Self {
             base,
@@ -446,7 +446,9 @@ impl NiceonlyConfig {
             stride_m: table.modulus as u32,
             stride_r: u32::try_from(table.valid_residues.len())
                 .with_context(|| format!("residue count overflows u32 for base {base}"))?,
-            prefilter: prefilter_enabled().then(|| vulkan_prefilter_params(base)).flatten(),
+            prefilter: prefilter_enabled()
+                .then(|| vulkan_prefilter_params(base))
+                .flatten(),
         })
     }
 }
@@ -764,7 +766,11 @@ fn niceonly_wgsl_impl(cfg: &NiceonlyConfig, probe: bool) -> String {
         s,
         "    if (!scan_dup(top_limb({cu_limbs}))) {{ return false; }}"
     );
-    let _ = writeln!(s, "    return ({}) == {base}u;\n}}\n", popcount_expr(&kernel));
+    let _ = writeln!(
+        s,
+        "    return ({}) == {base}u;\n}}\n",
+        popcount_expr(&kernel)
+    );
 
     // --- prefilter / candidate_is_nice --------------------------------------
     if let Some(pre) = prefilter {
@@ -1027,11 +1033,7 @@ mod tests {
     ) -> Vec<u128> {
         #[allow(clippy::cast_possible_truncation)]
         let modulus = table.modulus as u32;
-        let residues: Vec<u32> = table
-            .valid_residues
-            .iter()
-            .map(|&r| u32::try_from(r).unwrap())
-            .collect();
+        let residues: Vec<u32> = table.valid_residues.clone();
         let r_count = u32::try_from(residues.len()).unwrap();
 
         #[allow(clippy::cast_possible_truncation)]
@@ -1137,9 +1139,7 @@ mod tests {
     fn prefilter_bases() -> Vec<(u32, KernelConfig, VulkanPrefilterParams)> {
         (10..=MAX_GPU_DIGIT_MASK_BASE)
             .filter(|&b| gpu_supports_base(b))
-            .filter_map(|b| {
-                Some((b, KernelConfig::new(b).ok()?, vulkan_prefilter_params(b)?))
-            })
+            .filter_map(|b| Some((b, KernelConfig::new(b).ok()?, vulkan_prefilter_params(b)?)))
             .collect()
     }
 
@@ -1154,7 +1154,9 @@ mod tests {
     fn prefilter_chunks_match_direct_modular_powers() {
         let mut checked = 0;
         for (base, cfg, pre) in prefilter_bases() {
-            let range = crate::base_range::get_base_range_u128(base).unwrap().unwrap();
+            let range = crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap();
             let span = range.range_end - range.range_start;
             let modulus = u128::from(base).pow(pre.digits);
             let d = u128::from(pre.chunk_div);
@@ -1168,9 +1170,7 @@ mod tests {
                 let nm = n % modulus;
                 let sq_direct = nm * nm % modulus;
                 let cu_direct = sq_direct * nm % modulus;
-                for (chunks, direct, name) in
-                    [(&sq, sq_direct, "n²"), (&cu, cu_direct, "n³")]
-                {
+                for (chunks, direct, name) in [(&sq, sq_direct, "n²"), (&cu, cu_direct, "n³")] {
                     let rebuilt = chunks
                         .iter()
                         .rev()
@@ -1194,7 +1194,9 @@ mod tests {
     fn prefilter_is_sound_and_selective() {
         const SAMPLES: u32 = 2000;
         for (base, cfg, pre) in prefilter_bases() {
-            let range = crate::base_range::get_base_range_u128(base).unwrap().unwrap();
+            let range = crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap();
             let span = range.range_end - range.range_start;
             let mut x: u128 = 0xdead_beef_cafe_f00d_0d15_ea5e_feed_face;
             let mut rejected = 0u32;
@@ -1216,7 +1218,6 @@ mod tests {
                 rejected * 2 > SAMPLES,
                 "prefilter suspiciously weak at b{base}: {rejected}/{SAMPLES}"
             );
-            #[allow(clippy::cast_precision_loss)]
             {
                 println!(
                     "b{base}: {} digits/value, kill rate {:.1}%",
@@ -1245,7 +1246,10 @@ mod tests {
             let src = niceonly_wgsl(&cfg);
             assert!(src.contains("candidate_is_nice(n_lo, n_hi)"), "base {base}");
             if cfg.prefilter.is_some() {
-                assert!(src.contains("fn prefilter("), "base {base} lost its prefilter");
+                assert!(
+                    src.contains("fn prefilter("),
+                    "base {base} lost its prefilter"
+                );
                 with += 1;
             } else {
                 assert!(!src.contains("prefilter"), "base {base} gained a prefilter");
@@ -1269,7 +1273,11 @@ mod tests {
         // candidates — the configuration where a fixed 32 lanes leaves 1.2
         // candidates apiece, and where one lane each measured fastest.
         let batch = crate::gpu_niceonly::LAUNCH_BATCH_RANGES as u64;
-        assert_eq!(lane_shift_for(batch, 490, m, r), 0, "short ranges want 1 lane");
+        assert_eq!(
+            lane_shift_for(batch, 490, m, r),
+            0,
+            "short ranges want 1 lane"
+        );
         // Long ranges keep the full warp.
         assert_eq!(
             lane_shift_for(batch, 1 << 20, m, r),
@@ -1288,7 +1296,10 @@ mod tests {
         for len in (0..24).map(|k| 1u64 << k) {
             let shift = lane_shift_for(batch, len, m, r);
             assert!(shift >= prev, "tiling must not shrink as ranges grow");
-            assert!(1 << shift <= MAX_LANES_PER_RANGE, "len {len}: too many lanes");
+            assert!(
+                1 << shift <= MAX_LANES_PER_RANGE,
+                "len {len}: too many lanes"
+            );
             let candidates = len * u64::from(r) / u64::from(m);
             assert!(
                 (1u64 << shift) <= candidates.max(1),
@@ -1343,7 +1354,10 @@ mod dump {
     #[test]
     #[ignore = "developer aid"]
     fn dump_shader() {
-        let base: u32 = std::env::var("DUMP_BASE").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let base: u32 = std::env::var("DUMP_BASE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
         let cfg = super::KernelConfig::new(base).unwrap();
         if std::env::var("DUMP_MODE").as_deref() == Ok("niceonly") {
             let table = crate::stride_filter::StrideTable::new(base, 2);

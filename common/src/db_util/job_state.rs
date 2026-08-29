@@ -37,11 +37,12 @@ pub fn set_watermark(conn: &mut PgConnection, id: i64) -> Result<()> {
     use diesel::sql_query;
     use diesel::sql_types::BigInt;
 
-    let updated =
-        sql_query("UPDATE job_state SET last_processed_submission_id = $1, updated_at = NOW() WHERE id = 1")
-            .bind::<BigInt, _>(id)
-            .execute(conn)
-            .map_err(|e| anyhow!("{e}"))?;
+    let updated = sql_query(
+        "UPDATE job_state SET last_processed_submission_id = $1, updated_at = NOW() WHERE id = 1",
+    )
+    .bind::<BigInt, _>(id)
+    .execute(conn)
+    .map_err(|e| anyhow!("{e}"))?;
     if updated == 1 {
         Ok(())
     } else {

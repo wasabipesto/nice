@@ -112,7 +112,11 @@ mod tests {
                 .iter()
                 .map(|&(p, a)| {
                     if p == 2 {
-                        if a % 2 == 0 { 1 } else { 2u64.pow((a - 1) / 2) + 1 }
+                        if a % 2 == 0 {
+                            1
+                        } else {
+                            2u64.pow((a - 1) / 2) + 1
+                        }
                     } else {
                         p.pow(a / 2) + 1
                     }

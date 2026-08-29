@@ -35,14 +35,14 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
-use crate::{
-    CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
-    UniquesDistributionSimple,
-};
 use crate::gpu_config::{
     MAX_GPU_DIGIT_MASK_BASE, chunk_constants, gpu_supports_base, prefilter_params,
 };
 use crate::gpu_niceonly::{RangeSink, report_field, run_range_pipeline};
+use crate::{
+    CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
+    UniquesDistributionSimple,
+};
 use crate::{base_range, number_stats, residue_filter, stride_filter};
 use anyhow::{Context as _, Result, bail, ensure};
 use cudarc::driver::{
@@ -200,7 +200,6 @@ impl CudaContext {
     }
 }
 
-
 /// Defines shared by both kernels for a base: `BASE`, `N_LIMBS`,
 /// `CHUNK_DIGITS`, `CHUNK_DIV`. Fails for bases the GPU cannot handle
 /// (see [`gpu_supports_base`]).
@@ -268,7 +267,6 @@ fn niceonly_defines(base: u32) -> Result<(Vec<String>, stride_filter::StrideTabl
     }
     Ok((defines, table))
 }
-
 
 /// Compile the embedded CUDA source with the given `-D` defines via NVRTC.
 fn compile_kernel_ptx(defines: &[String]) -> Result<Ptx> {
@@ -610,8 +608,8 @@ pub fn process_niceonly_cuda(
 )]
 mod tests {
     use super::*;
-    use crate::gpu_config::PrefilterParams;
     use crate::client_process;
+    use crate::gpu_config::PrefilterParams;
     use crate::stride_filter::StrideTable;
 
     /// Bases used for CPU-side mirror tests: a mix of small, u64-range,
@@ -640,7 +638,7 @@ mod tests {
     fn mirror_kernel_candidates(range: &FieldSize, table: &StrideTable) -> Vec<u128> {
         let modulus = table.modulus as u32;
         let pow64_mod_m = ((1u128 << 64) % table.modulus) as u32;
-        let residues: Vec<u32> = table.valid_residues.iter().map(|&r| r as u32).collect();
+        let residues: Vec<u32> = table.valid_residues.clone();
         let r_count = residues.len() as u32;
 
         let m = mirror_mod_m(range.start(), modulus, pow64_mod_m);
@@ -937,9 +935,11 @@ mod tests {
         }
     }
 
+    /// Sample count for `prefilter_is_sound_and_selective`.
+    const SAMPLES: u32 = 2000;
+
     #[test_log::test]
     fn prefilter_is_sound_and_selective() {
-        const SAMPLES: u32 = 2000;
         for base in MIRROR_TEST_BASES {
             let Some(pre) = prefilter_params(base) else {
                 continue;
@@ -1020,7 +1020,6 @@ mod tests {
             );
         }
     }
-
 
     #[test_log::test]
     fn mirror_digit_extraction_matches_cpu() {

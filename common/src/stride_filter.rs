@@ -223,6 +223,8 @@ impl StrideTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base_range::get_base_range_u128;
+    use crate::client_process::get_is_nice;
 
     #[test_log::test]
     fn test_stride_table_base10_k1() {
@@ -333,9 +335,6 @@ mod tests {
         // The seeded fast path must agree with the plain check for every
         // stride candidate. Walk real candidates inside each base's search
         // range and compare both paths.
-        use crate::base_range::get_base_range_u128;
-        use crate::client_process::{get_is_nice, get_is_nice_with_known_lsd};
-
         for base in [40u32, 50, 52, 60, 64] {
             let table = StrideTable::new(base, 3);
             assert!(!table.low_digit_masks.is_empty());

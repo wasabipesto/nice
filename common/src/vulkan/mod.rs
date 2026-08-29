@@ -21,15 +21,15 @@
 
 pub mod codegen;
 
+use crate::NiceNumberSimple;
+use crate::gpu_niceonly::{GPU_LSD_K, RangeSink};
+use crate::stride_filter::StrideTable;
 use anyhow::{Context as _, Result, bail};
 use ash::vk;
 use codegen::{
     KernelConfig, MAX_LANES_PER_RANGE, MISS_STRIDE, NICE_STRIDE, NiceonlyConfig, WORKGROUP_SIZE,
     detailed_wgsl, lane_shift_for, niceonly_wgsl,
 };
-use crate::NiceNumberSimple;
-use crate::gpu_niceonly::{GPU_LSD_K, RangeSink};
-use crate::stride_filter::StrideTable;
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -298,12 +298,11 @@ impl VulkanContext {
         let feats = vk::PhysicalDeviceFeatures::default().shader_int64(true);
         // The spec requires VK_KHR_portability_subset to be enabled whenever
         // the physical device advertises it (again: MoltenVK).
-        let portability_subset = unsafe {
-            instance.enumerate_device_extension_properties(physical)
-        }
-        .unwrap_or_default()
-        .iter()
-        .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::portability_subset::NAME));
+        let portability_subset =
+            unsafe { instance.enumerate_device_extension_properties(physical) }
+                .unwrap_or_default()
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::portability_subset::NAME));
         let device_exts = [ash::khr::portability_subset::NAME.as_ptr()];
         let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
@@ -481,19 +480,20 @@ impl VulkanContext {
         let table = StrideTable::new(base, GPU_LSD_K);
         let cfg = NiceonlyConfig::new(KernelConfig::new(base)?, &table)?;
         let shader = self
-            .build_shader(
-                &niceonly_wgsl(&cfg),
-                5,
-                NICEONLY_PUSH_CONSTANT_SIZE,
-            )
+            .build_shader(&niceonly_wgsl(&cfg), 5, NICEONLY_PUSH_CONSTANT_SIZE)
             .with_context(|| format!("compiling the niceonly shader for base {base}"))?;
 
-        let mut residues = self.alloc_buf(table.valid_residues.len()).inspect_err(|_| {
-            self.destroy_shader(&shader);
-        })?;
-        #[allow(clippy::cast_possible_truncation)]
-        for (slot, &r) in residues.as_mut_slice().iter_mut().zip(&table.valid_residues) {
-            *slot = r as u32;
+        let mut residues = self
+            .alloc_buf(table.valid_residues.len())
+            .inspect_err(|_| {
+                self.destroy_shader(&shader);
+            })?;
+        for (slot, &r) in residues
+            .as_mut_slice()
+            .iter_mut()
+            .zip(&table.valid_residues)
+        {
+            *slot = r;
         }
 
         debug!(
@@ -507,7 +507,10 @@ impl VulkanContext {
             shader,
             residues,
         });
-        self.niceonly_pipelines.lock().unwrap().insert(base, p.clone());
+        self.niceonly_pipelines
+            .lock()
+            .unwrap()
+            .insert(base, p.clone());
         Ok(p)
     }
 
@@ -526,12 +529,17 @@ impl VulkanContext {
             5,
             NICEONLY_PUSH_CONSTANT_SIZE,
         )?;
-        let mut residues = self.alloc_buf(table.valid_residues.len()).inspect_err(|_| {
-            self.destroy_shader(&shader);
-        })?;
-        #[allow(clippy::cast_possible_truncation)]
-        for (slot, &r) in residues.as_mut_slice().iter_mut().zip(&table.valid_residues) {
-            *slot = r as u32;
+        let mut residues = self
+            .alloc_buf(table.valid_residues.len())
+            .inspect_err(|_| {
+                self.destroy_shader(&shader);
+            })?;
+        for (slot, &r) in residues
+            .as_mut_slice()
+            .iter_mut()
+            .zip(&table.valid_residues)
+        {
+            *slot = r;
         }
         Ok(Arc::new(NiceonlyPipeline {
             cfg,
@@ -720,8 +728,13 @@ impl VulkanContext {
                 &[set],
                 &[],
             );
-            self.device
-                .cmd_push_constants(cmd, shader.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+            self.device.cmd_push_constants(
+                cmd,
+                shader.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push,
+            );
             self.device.cmd_dispatch(cmd, groups, 1, 1);
             self.device.end_command_buffer(cmd)?;
 
@@ -1269,7 +1282,9 @@ mod tests {
         use crate::stride_filter::StrideTable;
         let mut n = 0;
         for base in 10..=MAX_GPU_DIGIT_MASK_BASE {
-            if !gpu_supports_base(base) || crate::residue_filter::get_residue_filter_u128(&base).is_empty() {
+            if !gpu_supports_base(base)
+                || crate::residue_filter::get_residue_filter_u128(&base).is_empty()
+            {
                 continue;
             }
             let table = StrideTable::new(base, crate::gpu_niceonly::GPU_LSD_K);
@@ -1311,7 +1326,9 @@ mod tests {
     #[test]
     fn push_constant_block_matches_the_generated_struct() {
         let src = detailed_wgsl(&KernelConfig::new(40).unwrap());
-        for field in ["s0", "s1", "s2", "s3", "cnt_lo", "cnt_hi", "miss_cap", "pad"] {
+        for field in [
+            "s0", "s1", "s2", "s3", "cnt_lo", "cnt_hi", "miss_cap", "pad",
+        ] {
             assert!(src.contains(field), "generated Params lacks {field}");
         }
         assert_eq!(PUSH_CONSTANT_SIZE as usize, std::mem::size_of::<Params>());
