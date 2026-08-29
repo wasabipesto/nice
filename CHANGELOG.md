@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Maintenance:
+
+- Update all dependencies to their latest versions, including major bumps of malachite (0.9 → 0.11, benchmarked with no CPU performance regression), reqwest (0.12 → 0.13), sysinfo (0.38 → 0.39), and rocket_prometheus (0.10 → 0.11), and remove the unused itertools dependency. This resolves every RustSec advisory fixable within our dependency tree; the one remaining advisory (RUSTSEC-2026-0258, h2 0.3.x) comes via rocket 0.5's hyper 0.14 and has no fixed 0.3.x release.
+- With reqwest 0.13, default (rustls) builds of the client now verify TLS against the platform trust store instead of bundled webpki roots, and the rustls crypto provider is aws-lc-rs instead of ring. Environments without system CA certificates (bare containers running the static musl binary) now need `ca-certificates` installed; the published docker images already include it.
+
 Features:
 
 - Add new GPU backends `cubecl`, `cubecl-cuda`, and `vulkan` (experimental) for additional device support in GPU-enabled builds. Notably the client can now utilize consumer AMD GPUs and Apple M-series GPUs. No new configuration is needed, the client will automatically detect and use a compatible backend. To manually select a backend use `--gpu-backend`.
