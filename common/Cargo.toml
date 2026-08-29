@@ -10,8 +10,8 @@ license-file.workspace = true
 
 [features]
 database = ["dep:diesel", "dep:dotenvy", "dep:bigdecimal", "dep:rand"]
-openssl-tls = ["reqwest/default-tls", "dep:openssl", "dep:tokio"]
-rustls-tls = ["reqwest/rustls-tls", "dep:tokio"]
+openssl-tls = ["reqwest/native-tls", "dep:openssl", "dep:tokio"]
+rustls-tls = ["reqwest/rustls", "dep:tokio"]
 cuda = ["dep:cudarc"]
 # Umbrella: every GPU backend this crate knows how to build. Building any of
 # them needs no GPU libraries at compile time; each backend dlopens its driver
@@ -36,12 +36,11 @@ chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 diesel = { version = "2.3", features = ["chrono", "postgres", "r2d2", "serde_json", "numeric"], optional = true }
 dotenvy = { version = "0.15", optional = true }
-itertools = { version = "0.14" }
 log = { version = "0.4" }
-malachite = { version = "0.9.1" }
-malachite-nz = { version = "0.9", features = ["enable_serde"] }
+malachite = { version = "0.11" }
+malachite-nz = { version = "0.11", features = ["enable_serde"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
-reqwest = { version = "0.12", features = ["json"], optional = true, default-features = false }
+reqwest = { version = "0.13", features = ["json"], optional = true, default-features = false }
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
