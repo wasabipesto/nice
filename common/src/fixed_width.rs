@@ -20,6 +20,8 @@
 //! Bases ≥ 69 fall back to malachite `Natural` in the caller (n³ exceeds
 //! 256 bits at base 70).
 
+// Pedantic's cast and inlining opinions are rejected wholesale here: this is
+// hot-path fixed-width arithmetic where the truncating casts are the point.
 #![allow(clippy::pedantic)]
 
 /// 256-bit unsigned integer, little-endian limbs.

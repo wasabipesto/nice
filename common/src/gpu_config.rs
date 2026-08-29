@@ -352,7 +352,8 @@ mod tests {
             if !gpu_supports_base(base) {
                 continue;
             }
-            if let (Some(cuda), Some(vulkan)) = (prefilter_params(base), vulkan_prefilter_params(base))
+            if let (Some(cuda), Some(vulkan)) =
+                (prefilter_params(base), vulkan_prefilter_params(base))
             {
                 assert!(
                     vulkan.digits <= cuda.digits,
@@ -394,4 +395,3 @@ mod tests {
         }
     }
 }
-

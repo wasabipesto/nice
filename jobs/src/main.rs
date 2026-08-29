@@ -79,18 +79,27 @@ fn main() {
     let mut dirty_bases: HashSet<u32> = HashSet::new();
     let mut fields_by_base: HashMap<u32, Vec<FieldRecord>> = HashMap::new();
     if !full {
-        for (base, chunk_id) in
-            db_util::submissions::get_chunks_with_new_submissions(&mut conn, watermark, max_submission_id)
-                .unwrap()
+        for (base, chunk_id) in db_util::submissions::get_chunks_with_new_submissions(
+            &mut conn,
+            watermark,
+            max_submission_id,
+        )
+        .unwrap()
         {
             dirty_bases.insert(base);
             if let Some(chunk_id) = chunk_id {
-                dirty_chunks_by_base.entry(base).or_default().insert(chunk_id);
+                dirty_chunks_by_base
+                    .entry(base)
+                    .or_default()
+                    .insert(chunk_id);
             }
         }
-        for field in
-            db_util::fields::get_fields_with_new_detailed_submissions(&mut conn, watermark, max_submission_id)
-                .unwrap()
+        for field in db_util::fields::get_fields_with_new_detailed_submissions(
+            &mut conn,
+            watermark,
+            max_submission_id,
+        )
+        .unwrap()
         {
             fields_by_base.entry(field.base).or_default().push(field);
         }
@@ -252,8 +261,11 @@ fn main() {
                 // sample; the chunk's canon submissions are fetched here (and
                 // only here), bounding memory to one chunk at a time
                 let submissions: Vec<SubmissionRecord> =
-                    db_util::submissions::get_canon_submissions_for_chunk(&mut conn, chunk.chunk_id)
-                        .unwrap();
+                    db_util::submissions::get_canon_submissions_for_chunk(
+                        &mut conn,
+                        chunk.chunk_id,
+                    )
+                    .unwrap();
                 updated_chunk.distribution =
                     distribution_stats::downsample_distributions(&submissions, base);
                 updated_chunk.numbers = number_stats::downsample_numbers(&submissions);
@@ -299,7 +311,7 @@ fn main() {
         let base_percent_checked_detailed =
             base_checked_detailed as f32 / base_record.range_size as f32;
 
-        print!("Base {base}: ",);
+        print!("Base {base}: ");
         print!(
             "CL{}, Checked {:.1}%, ",
             base_minimum_cl,
@@ -320,9 +332,11 @@ fn main() {
             let mut dist_acc = DistributionAccumulator::new(base);
             let mut num_acc = NumbersAccumulator::new();
             for chunk in &chunks {
-                let submissions =
-                    db_util::submissions::get_canon_submissions_for_chunk(&mut conn, chunk.chunk_id)
-                        .unwrap();
+                let submissions = db_util::submissions::get_canon_submissions_for_chunk(
+                    &mut conn,
+                    chunk.chunk_id,
+                )
+                .unwrap();
                 dist_acc.fold(&submissions);
                 num_acc.fold(&submissions);
             }

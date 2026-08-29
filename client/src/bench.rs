@@ -23,9 +23,9 @@ use nice_common::bench_defs::{
 use nice_common::client_api_async::Client;
 use nice_common::stride_filter::StrideTable;
 use nice_common::{BenchmarkToServer, CLIENT_VERSION, DataToClient, SearchMode};
-use std::io::{IsTerminal, Write};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -391,8 +391,7 @@ fn build_report_json(
         "client_version": CLIENT_VERSION,
         "timestamp_epoch": SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+            .map_or(0, |d| d.as_secs()),
         "config": {
             "mode": cli.mode.to_string(),
             "gpu": cli.gpu,
@@ -659,7 +658,10 @@ mod tests {
     #[test]
     fn environ_block_parses() {
         let vars = parse_environ(b"CONTAINER_ID=47102363\0VAST_CONTAINERLABEL=C.47102363\0BAD\0");
-        assert_eq!(vars.get("CONTAINER_ID").map(String::as_str), Some("47102363"));
+        assert_eq!(
+            vars.get("CONTAINER_ID").map(String::as_str),
+            Some("47102363")
+        );
         assert_eq!(
             vars.get("VAST_CONTAINERLABEL").map(String::as_str),
             Some("C.47102363")
@@ -673,5 +675,4 @@ mod tests {
         assert_eq!(median(vec![3.0]), Some(3.0));
         assert_eq!(median(vec![5.0, 1.0, 3.0]), Some(3.0));
     }
-
 }

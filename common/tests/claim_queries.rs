@@ -109,7 +109,11 @@ fn bulk_thin_advances_past_saturated_chunk(conn: &mut PgConnection) {
     let claimed = bulk_claim_thin_fields(conn, 5, claim_cutoff(), 1, FIELD_SIZE)
         .expect("bulk claim should execute");
 
-    assert_eq!(claimed.len(), 5, "expected a full batch from the next chunk");
+    assert_eq!(
+        claimed.len(),
+        5,
+        "expected a full batch from the next chunk"
+    );
     assert_eq!(
         chunk_ids_of(&claimed),
         vec![2],
@@ -183,9 +187,15 @@ fn try_claim_thin_advances_past_saturated_chunk(conn: &mut PgConnection) {
     reset_fixture(conn);
     saturate_chunk(conn, 1);
 
-    let claimed = try_claim_field(conn, FieldClaimStrategy::Thin, claim_cutoff(), 1, FIELD_SIZE)
-        .expect("thin claim should execute")
-        .expect("a field in chunk 2 is free");
+    let claimed = try_claim_field(
+        conn,
+        FieldClaimStrategy::Thin,
+        claim_cutoff(),
+        1,
+        FIELD_SIZE,
+    )
+    .expect("thin claim should execute")
+    .expect("a field in chunk 2 is free");
 
     assert_eq!(claimed.chunk_id, Some(2));
 }
@@ -202,10 +212,15 @@ fn try_claim_thin_finds_the_last_free_field(conn: &mut PgConnection) {
             .execute(conn)
             .expect("free one field");
 
-        let claimed =
-            try_claim_field(conn, FieldClaimStrategy::Thin, claim_cutoff(), 1, FIELD_SIZE)
-                .expect("thin claim should execute")
-                .expect("field 5 is free");
+        let claimed = try_claim_field(
+            conn,
+            FieldClaimStrategy::Thin,
+            claim_cutoff(),
+            1,
+            FIELD_SIZE,
+        )
+        .expect("thin claim should execute")
+        .expect("field 5 is free");
 
         assert_eq!(
             claimed.field_id, 5,
@@ -220,8 +235,14 @@ fn try_claim_thin_returns_none_when_everything_is_claimed(conn: &mut PgConnectio
         saturate_chunk(conn, chunk);
     }
 
-    let claimed = try_claim_field(conn, FieldClaimStrategy::Thin, claim_cutoff(), 1, FIELD_SIZE)
-        .expect("thin claim should execute");
+    let claimed = try_claim_field(
+        conn,
+        FieldClaimStrategy::Thin,
+        claim_cutoff(),
+        1,
+        FIELD_SIZE,
+    )
+    .expect("thin claim should execute");
 
     assert!(claimed.is_none());
 }
@@ -247,9 +268,15 @@ fn next_advances_past_completed_chunks(conn: &mut PgConnection) {
     reset_fixture(conn);
     complete_chunk(conn, 1);
 
-    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 1, FIELD_SIZE)
-        .expect("next claim should execute")
-        .expect("chunk 2 has claimable fields");
+    let claimed = try_claim_field(
+        conn,
+        FieldClaimStrategy::Next,
+        claim_cutoff(),
+        1,
+        FIELD_SIZE,
+    )
+    .expect("next claim should execute")
+    .expect("chunk 2 has claimable fields");
 
     assert_eq!(
         claimed.field_id, 11,
@@ -265,11 +292,20 @@ fn next_skips_completed_then_saturated_chunks(conn: &mut PgConnection) {
     complete_chunk(conn, 1);
     saturate_chunk(conn, 2);
 
-    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 1, FIELD_SIZE)
-        .expect("next claim should execute")
-        .expect("chunk 3 has claimable fields");
+    let claimed = try_claim_field(
+        conn,
+        FieldClaimStrategy::Next,
+        claim_cutoff(),
+        1,
+        FIELD_SIZE,
+    )
+    .expect("next claim should execute")
+    .expect("chunk 3 has claimable fields");
 
-    assert_eq!(claimed.field_id, 21, "chunk 3's first field is the frontier");
+    assert_eq!(
+        claimed.field_id, 21,
+        "chunk 3's first field is the frontier"
+    );
 }
 
 /// `minimum_cl` is maintained by the `jobs` binary, so it can lag the fields within a
@@ -282,9 +318,15 @@ fn next_tolerates_stale_minimum_cl(conn: &mut PgConnection) {
         .execute(conn)
         .expect("complete chunk 1 fields only");
 
-    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 1, FIELD_SIZE)
-        .expect("next claim should execute")
-        .expect("chunk 2 has claimable fields");
+    let claimed = try_claim_field(
+        conn,
+        FieldClaimStrategy::Next,
+        claim_cutoff(),
+        1,
+        FIELD_SIZE,
+    )
+    .expect("next claim should execute")
+    .expect("chunk 2 has claimable fields");
 
     assert_eq!(
         claimed.field_id, 11,
@@ -298,9 +340,15 @@ fn next_recheck_claims_completed_work(conn: &mut PgConnection) {
     reset_fixture(conn);
     complete_chunk(conn, 1);
 
-    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 2, FIELD_SIZE)
-        .expect("recheck claim should execute")
-        .expect("chunk 1's completed fields are claimable at cl<=2");
+    let claimed = try_claim_field(
+        conn,
+        FieldClaimStrategy::Next,
+        claim_cutoff(),
+        2,
+        FIELD_SIZE,
+    )
+    .expect("recheck claim should execute")
+    .expect("chunk 1's completed fields are claimable at cl<=2");
 
     assert_eq!(
         claimed.field_id, 1,
@@ -314,8 +362,14 @@ fn next_returns_none_when_everything_is_claimed(conn: &mut PgConnection) {
         saturate_chunk(conn, chunk);
     }
 
-    let claimed = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 1, FIELD_SIZE)
-        .expect("next claim should execute");
+    let claimed = try_claim_field(
+        conn,
+        FieldClaimStrategy::Next,
+        claim_cutoff(),
+        1,
+        FIELD_SIZE,
+    )
+    .expect("next claim should execute");
 
     assert!(
         claimed.is_none(),
@@ -329,19 +383,37 @@ fn next_returns_none_when_everything_is_claimed(conn: &mut PgConnection) {
 fn unscoped_strategies_execute(conn: &mut PgConnection) {
     reset_fixture(conn);
 
-    let next = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 1, FIELD_SIZE)
-        .expect("next claim should execute")
-        .expect("field 1 is free");
+    let next = try_claim_field(
+        conn,
+        FieldClaimStrategy::Next,
+        claim_cutoff(),
+        1,
+        FIELD_SIZE,
+    )
+    .expect("next claim should execute")
+    .expect("field 1 is free");
     assert_eq!(next.field_id, 1, "Next takes the lowest free id");
 
-    let random = try_claim_field(conn, FieldClaimStrategy::Random, claim_cutoff(), 1, FIELD_SIZE)
-        .expect("random claim should execute");
+    let random = try_claim_field(
+        conn,
+        FieldClaimStrategy::Random,
+        claim_cutoff(),
+        1,
+        FIELD_SIZE,
+    )
+    .expect("random claim should execute");
     assert!(random.is_some());
 
     // check_level = 2 takes the `check_level <= $2` parameterized branch.
     reset_fixture(conn);
-    let recheck = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 2, FIELD_SIZE)
-        .expect("recheck claim should execute");
+    let recheck = try_claim_field(
+        conn,
+        FieldClaimStrategy::Next,
+        claim_cutoff(),
+        2,
+        FIELD_SIZE,
+    )
+    .expect("recheck claim should execute");
     assert!(recheck.is_some());
 
     // And the nice-only paths, which use the `check_level = 0` literal: the bulk refill
@@ -351,12 +423,13 @@ fn unscoped_strategies_execute(conn: &mut PgConnection) {
     sql_query("UPDATE fields SET check_level = 0")
         .execute(conn)
         .expect("reset check levels");
-    let niceonly =
-        bulk_claim_fields(conn, 7, claim_cutoff(), 0, u128::MAX).expect("bulk claim should execute");
+    let niceonly = bulk_claim_fields(conn, 7, claim_cutoff(), 0, u128::MAX)
+        .expect("bulk claim should execute");
     assert_eq!(niceonly.len(), 7);
-    let niceonly_next = try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 0, u128::MAX)
-        .expect("niceonly next claim should execute")
-        .expect("unclaimed cl=0 fields remain");
+    let niceonly_next =
+        try_claim_field(conn, FieldClaimStrategy::Next, claim_cutoff(), 0, u128::MAX)
+            .expect("niceonly next claim should execute")
+            .expect("unclaimed cl=0 fields remain");
     assert_eq!(
         niceonly_next.field_id, 8,
         "the unscoped cl=0 Next continues where the bulk claim left off"

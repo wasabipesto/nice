@@ -140,14 +140,14 @@ mod tests {
     use chrono::Utc;
 
     /// Build a submission whose distribution has the given counts for
-    /// num_uniques 1..=counts.len().
+    /// `num_uniques` `1..=counts.len()`.
     fn sub_with_counts(counts: &[u128]) -> SubmissionRecord {
-        let base = counts.len() as u32;
+        let base = u32::try_from(counts.len()).unwrap();
         let dist: Vec<UniquesDistributionSimple> = counts
             .iter()
             .enumerate()
             .map(|(i, &count)| UniquesDistributionSimple {
-                num_uniques: i as u32 + 1,
+                num_uniques: u32::try_from(i).unwrap() + 1,
                 count,
             })
             .collect();

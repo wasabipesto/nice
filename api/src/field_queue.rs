@@ -382,7 +382,10 @@ mod tests {
 
         let first = queue.claim_niceonly(&mut conn).expect("refill then pop");
         let second = queue.claim_niceonly(&mut conn).expect("pop");
-        assert!(second.field_id > first.field_id, "queue must preserve claim order");
+        assert!(
+            second.field_id > first.field_id,
+            "queue must preserve claim order"
+        );
 
         // Drain past the threshold: the queue refills itself and keeps serving.
         for _ in 0..(REFILL_AMOUNT + REFILL_THRESHOLD) {
@@ -390,7 +393,10 @@ mod tests {
                 .claim_niceonly(&mut conn)
                 .expect("queue refills across the threshold");
         }
-        assert_eq!(claimed_count(&mut pool.get().unwrap(), 0), 2 * REFILL_AMOUNT as i64);
+        assert_eq!(
+            claimed_count(&mut pool.get().unwrap(), 0),
+            2 * REFILL_AMOUNT as i64
+        );
     }
 
     #[test]

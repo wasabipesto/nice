@@ -93,7 +93,7 @@ pub fn decode_sample(client_version: &str, data: &Value) -> Option<BenchmarkSamp
         gpu_model: hardware
             .get("gpu_model")
             .and_then(Value::as_str)
-            .map(|m| normalize_gpu_model(m)),
+            .map(normalize_gpu_model),
         scenarios,
     })
 }
@@ -165,7 +165,7 @@ pub fn normalize_model(raw: &str) -> String {
 /// vendor/branding tokens and memory-size suffixes are dropped and hyphens
 /// split, because the two naming authorities disagree: Vast offer listings
 /// say "RTX 3080" or "A100 SXM4" while CUDA device names (what benchmarks
-/// record) say "NVIDIA GeForce RTX 3080" or "NVIDIA A100-SXM4-40GB".
+/// record) say `NVIDIA GeForce RTX 3080` or `NVIDIA A100-SXM4-40GB`.
 /// Remaining tokens must match exactly (see `gpu_models_match` for the one
 /// exception: optional trailing form-factor tokens), so "rtx 3060" never
 /// matches "rtx 3060 ti".
@@ -207,8 +207,19 @@ pub fn gpu_models_match(a: &str, b: &str) -> bool {
 /// the other. Vast lists "Xeon(R) E5-2680 v4" while the client reads
 /// "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz" out of /proc/cpuinfo.
 const CPU_NOISE: &[&str] = &[
-    "intel", "amd", "genuine", "authentic", "cpu", "processor", "core", "with",
-    "radeon", "graphics", "ryzen", "th", "gen",
+    "intel",
+    "amd",
+    "genuine",
+    "authentic",
+    "cpu",
+    "processor",
+    "core",
+    "with",
+    "radeon",
+    "graphics",
+    "ryzen",
+    "th",
+    "gen",
 ];
 
 /// Identity of a CPU across the two places we read its name. Drops the clock
@@ -670,9 +681,18 @@ mod tests {
     fn cpu_keys_bridge_vast_and_cpuinfo() {
         // The same chip as Vast lists it and as /proc/cpuinfo reports it.
         for (vast, cpuinfo) in [
-            ("Xeon(R) E5-2680 v4", "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz"),
-            ("AMD EPYC 7763 64-Core Processor", "AMD EPYC 7763 64-Core Processor"),
-            ("Core(TM) i7-6700", "Intel(R) Core(TM) i7-6700 CPU @ 3.40GHz"),
+            (
+                "Xeon(R) E5-2680 v4",
+                "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz",
+            ),
+            (
+                "AMD EPYC 7763 64-Core Processor",
+                "AMD EPYC 7763 64-Core Processor",
+            ),
+            (
+                "Core(TM) i7-6700",
+                "Intel(R) Core(TM) i7-6700 CPU @ 3.40GHz",
+            ),
         ] {
             assert_eq!(
                 cpu_match_key(vast),
@@ -685,7 +705,10 @@ mod tests {
             cpu_match_key("Xeon E5-2680 v4"),
             cpu_match_key("Xeon E5-2690 v3")
         );
-        assert_ne!(cpu_match_key("AMD EPYC 7763"), cpu_match_key("AMD EPYC 7402"));
+        assert_ne!(
+            cpu_match_key("AMD EPYC 7763"),
+            cpu_match_key("AMD EPYC 7402")
+        );
     }
 
     #[test]
@@ -862,10 +885,7 @@ mod tests {
         // The same report without the marker decodes, so the exclusion is
         // the platform key and nothing else.
         let mut native = browser.clone();
-        native["config"]
-            .as_object_mut()
-            .unwrap()
-            .remove("platform");
+        native["config"].as_object_mut().unwrap().remove("platform");
         assert!(decode_sample("3.4.0", &native).is_some());
     }
 

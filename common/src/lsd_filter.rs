@@ -190,7 +190,6 @@ pub fn get_valid_multi_lsd_bitmap(base: u32, k: u32) -> Vec<bool> {
         seen.fill(false);
         let mut is_valid = true;
         for _ in 0..k {
-            #[allow(clippy::cast_possible_truncation)]
             let d = (sq % base_u128) as usize;
             if seen[d] {
                 is_valid = false;
@@ -201,7 +200,6 @@ pub fn get_valid_multi_lsd_bitmap(base: u32, k: u32) -> Vec<bool> {
         }
         if is_valid {
             for _ in 0..k {
-                #[allow(clippy::cast_possible_truncation)]
                 let d = (cb % base_u128) as usize;
                 if seen[d] {
                     is_valid = false;
@@ -220,7 +218,6 @@ pub fn get_valid_multi_lsd_bitmap(base: u32, k: u32) -> Vec<bool> {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
     let filter_rate = 100.0 * (1.0 - f64::from(valid_count) / f64::from(modulus));
     trace!(
         "Multi-digit LSD filter: {valid_count}/{modulus} suffixes valid ({filter_rate:.1}% filtered)"
@@ -246,6 +243,8 @@ pub fn get_recommended_k(_base: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base_range::get_base_range_u128;
+    use crate::client_process::get_is_nice;
 
     #[test_log::test]
     fn test_get_valid_lsds_base10() {
@@ -591,9 +590,6 @@ mod tests {
         // Brute-force every number in the base range for small bases and
         // check its suffix passes the bitmap for k=1..=2 (k=3 where b^3
         // stays manageable).
-        use crate::base_range::get_base_range_u128;
-        use crate::client_process::get_is_nice;
-
         for base in 4u32..=16 {
             let Ok(Some(range)) = get_base_range_u128(base) else {
                 continue;

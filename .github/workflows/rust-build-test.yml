@@ -21,6 +21,20 @@ env:
     RUST_BACKTRACE: 1
 
 jobs:
+    lint:
+        name: Format and clippy
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Install just
+              uses: extractions/setup-just@v3
+
+            # Same checks a developer runs locally; keep the two in sync by
+            # keeping the commands in the justfile.
+            - name: Check formatting and lints
+              run: just lint
+
     build:
         name: Build ${{ matrix.platform.build_name }}
         runs-on: ${{ matrix.platform.runs_on }}

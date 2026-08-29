@@ -184,10 +184,7 @@ pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<(
 ///
 /// A base with no chunks yields (0, 0, 255), matching the fold the jobs
 /// binary previously performed over an empty chunk list.
-pub fn get_base_totals_from_chunks(
-    conn: &mut PgConnection,
-    base: u32,
-) -> Result<(u128, u128, u8)> {
+pub fn get_base_totals_from_chunks(conn: &mut PgConnection, base: u32) -> Result<(u128, u128, u8)> {
     use diesel::sql_query;
     use diesel::sql_types::Integer;
 

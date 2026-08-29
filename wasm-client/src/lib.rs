@@ -95,9 +95,7 @@ pub fn nicemark_score(rates_json: &str, gpu: bool) -> Result<Option<f64>, JsValu
         .as_array()
         .ok_or_else(|| JsValue::from_str("rates must be an array"))?
         .iter()
-        .filter_map(|entry| {
-            Some((entry.get("key")?.as_str()?, entry.get("rate")?.as_f64()?))
-        })
+        .filter_map(|entry| Some((entry.get("key")?.as_str()?, entry.get("rate")?.as_f64()?)))
         .collect();
     Ok(nice_common::bench_defs::compute_score(
         pairs.iter().copied(),

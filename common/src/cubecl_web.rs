@@ -85,16 +85,7 @@ pub fn near_miss_capacity() -> usize {
 #[cube(launch_unchecked)]
 // The single-character and lookalike names deliberately match the native
 // kernel and the generated WGSL, so the three review side by side.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    clippy::used_underscore_binding,
-    clippy::many_single_char_names,
-    clippy::similar_names
-)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn detailed_kernel_u32(
     hist: &Array<Atomic<u32>>,
     miss_count: &Array<Atomic<u32>>,
@@ -469,9 +460,7 @@ pub async fn process_range_detailed_web_async(
     for batch in range.chunks(CUBECL_WEB_BATCH_SIZE) {
         let start = batch.start();
         let count = u32::try_from(batch.size()).expect("web batch fits u32");
-        let cubes = count
-            .div_ceil(WORKGROUP_SIZE)
-            .clamp(1, MAX_CUBES_WEB);
+        let cubes = count.div_ceil(WORKGROUP_SIZE).clamp(1, MAX_CUBES_WEB);
 
         unsafe {
             detailed_kernel_u32::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
@@ -516,11 +505,7 @@ pub async fn process_range_detailed_web_async(
     // separate reads paid that latency three times over for data that is
     // ready at the same moment.
     let mut reads = client
-        .read_async(vec![
-            hist_handle,
-            miss_count_handle,
-            miss_data_handle,
-        ])
+        .read_async(vec![hist_handle, miss_count_handle, miss_data_handle])
         .await
         .map_err(|e| anyhow::anyhow!("result read failed: {e:?}"))?;
     let miss_bytes = reads.pop().expect("miss data read");
@@ -608,7 +593,7 @@ mod tests {
     #[test]
     fn half_limb_accumulation_cannot_overflow() {
         let max = u64::from(u16::MAX);
-        assert!(max * max + max + max <= u64::from(u32::MAX));
+        assert!(u32::try_from(max * max + max + max).is_ok());
     }
 
     /// A drain interval of web batches must not overflow a u32 bin. Must

@@ -44,12 +44,12 @@ use nice_common::client_process_cuda::{
 use nice_common::client_process_vulkan::{
     VULKAN_BATCH_SIZE, process_range_detailed_vulkan, process_range_niceonly_vulkan,
 };
-#[cfg(feature = "vulkan")]
-use nice_common::vulkan::VulkanContext;
 #[cfg(feature = "cubecl")]
 use nice_common::cubecl_backend::{
     CUBECL_BATCH_SIZE, CubeclContext, process_range_detailed_cubecl, process_range_niceonly_cubecl,
 };
+#[cfg(feature = "vulkan")]
+use nice_common::vulkan::VulkanContext;
 
 /// Which GPU backend to drive.
 ///
@@ -1103,7 +1103,8 @@ async fn main() -> Result<()> {
     builder.init();
 
     // Check for GPU support
-    if cli.gpu && !(cfg!(feature = "cuda") || cfg!(feature = "vulkan") || cfg!(feature = "cubecl")) {
+    if cli.gpu && !(cfg!(feature = "cuda") || cfg!(feature = "vulkan") || cfg!(feature = "cubecl"))
+    {
         error!(
             "Error: GPU support not enabled. Rebuild with --features gpu (CUDA) \
              and/or --features vulkan"

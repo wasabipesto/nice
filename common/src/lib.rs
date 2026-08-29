@@ -1,7 +1,6 @@
 //! A library with common utilities for dealing with square-cube pandigitals.
 
 #![warn(clippy::all, clippy::pedantic)]
-#![allow(clippy::match_same_arms)]
 
 pub mod base_range;
 pub mod bench_defs;
@@ -10,9 +9,9 @@ pub mod client_api_async;
 pub mod client_process;
 pub mod client_process_cuda;
 pub mod client_process_vulkan;
+pub mod consensus;
 pub mod cubecl_backend;
 pub mod cubecl_web;
-pub mod consensus;
 #[cfg(feature = "database")]
 pub mod db_util;
 pub mod distribution_stats;

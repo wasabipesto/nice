@@ -2,7 +2,6 @@
 //! Ideally this will be ripped out and implemented as whatever custom diesel types end up being necessary.
 
 #![allow(
-    clippy::unnecessary_wraps,
     clippy::needless_pass_by_value,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,

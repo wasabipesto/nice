@@ -211,7 +211,10 @@ mod tests {
                 None => assert!(!empty, "base {base} is residue-empty but was not caught"),
             }
         }
-        assert!(checked >= 10, "only {checked} residue-empty bases exercised");
+        assert!(
+            checked >= 10,
+            "only {checked} residue-empty bases exercised"
+        );
     }
 
     /// CPU/GPU parity on the detailed path. Requires a Vulkan device, so it is

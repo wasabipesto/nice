@@ -9,16 +9,14 @@ extern crate rocket;
 use chrono::{TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
-    PgPool, benchmarks::insert_benchmark,
-    claims::get_claim_by_id, claims::insert_claim,
+    PgPool, benchmarks::insert_benchmark, claims::get_claim_by_id, claims::insert_claim,
     fields::get_field_by_id, fields::get_validation_field, fields::try_claim_field,
-    fields::update_field_canon_and_cl, get_database_pool,
+    fields::update_field_canon_and_cl, get_database_pool, submissions::insert_submission,
     try_get_pooled_database_connection,
-    submissions::insert_submission,
 };
 use nice_common::distribution_stats::expand_distribution;
-use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
 use nice_common::estimator;
+use nice_common::number_stats::{expand_numbers, get_near_miss_cutoff};
 use nice_common::{
     BenchmarkToServer, CLAIM_DURATION_HOURS, DETAILED_SEARCH_MAX_FIELD_SIZE, DataToClient,
     DataToServer, EstimateRequest, EstimateResponse, FieldClaimStrategy, NiceNumber,
