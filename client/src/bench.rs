@@ -81,10 +81,23 @@ struct ScenarioResult {
     warmup_seconds: f64,
 }
 
+/// Print a human-facing line: to stdout normally, to stderr under
+/// `--benchmark-json`, where stdout is reserved for the JSON document.
+macro_rules! say {
+    ($cli:expr, $($arg:tt)*) => {
+        if $cli.benchmark_json {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    };
+}
+
 /// Run the full sweep and print the report. Never contacts the server except
 /// for `/ping` latency samples, which are skipped gracefully offline.
 pub async fn run_benchmark_sweep(cli: &Arc<Cli>, gpu: &GpuCtx, client: &Client) {
-    println!(
+    say!(
+        cli,
         "Nice benchmark sweep: v{CLIENT_VERSION}, {} mode, {}, {:.1}s budget",
         cli.mode,
         if cli.gpu {
@@ -110,8 +123,6 @@ pub async fn run_benchmark_sweep(cli: &Arc<Cli>, gpu: &GpuCtx, client: &Client) 
     let environment = collect_environment();
     let score = compute_score(results.iter().map(|r| (r.key, r.rate)), cli.gpu);
 
-    print_report(cli, &results, &ping_before, &ping_after, score);
-
     let report = build_report_json(
         cli,
         &results,
@@ -122,21 +133,28 @@ pub async fn run_benchmark_sweep(cli: &Arc<Cli>, gpu: &GpuCtx, client: &Client) 
         score,
         &table_build_secs,
     );
-    println!("\n--- benchmark report (json) ---");
-    println!("{}", serde_json::to_string_pretty(&report).unwrap());
-    println!();
+
+    if cli.benchmark_json {
+        // The one thing on stdout: a single parseable document.
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    } else {
+        print_report(cli, &results, &ping_before, &ping_after, score);
+    }
 
     match decide_upload(cli.benchmark_upload, std::io::stdin().is_terminal()) {
         UploadDecision::Yes => upload_report(client, cli, &report).await,
         UploadDecision::Prompt => {
-            if prompt_yes(&cli.api_base) {
+            if prompt_yes(cli) {
                 upload_report(client, cli, &report).await;
             } else {
-                println!("Not uploaded.");
+                say!(cli, "Not uploaded.");
             }
         }
         UploadDecision::No => {
-            println!("Not uploading (non-interactive; pass --benchmark-upload to upload).");
+            say!(
+                cli,
+                "Not uploading (non-interactive; pass --benchmark-upload to upload)."
+            );
         }
     }
 }
@@ -460,9 +478,15 @@ fn decide_upload(upload_flag: bool, is_tty: bool) -> UploadDecision {
 }
 
 /// Ask on the terminal, defaulting to yes on an empty answer.
-fn prompt_yes(api_base: &str) -> bool {
-    print!("Upload results to {api_base}? [Y/n] ");
-    let _ = std::io::stdout().flush();
+fn prompt_yes(cli: &Cli) -> bool {
+    let api_base = &cli.api_base;
+    if cli.benchmark_json {
+        eprint!("Upload results to {api_base}? [Y/n] ");
+        let _ = std::io::stderr().flush();
+    } else {
+        print!("Upload results to {api_base}? [Y/n] ");
+        let _ = std::io::stdout().flush();
+    }
     let mut answer = String::new();
     if std::io::stdin().read_line(&mut answer).is_err() {
         return false;
@@ -481,16 +505,23 @@ async fn upload_report(client: &Client, cli: &Cli, report: &Value) {
     let url = format!("{}/benchmark", cli.api_base);
     match client.post(&url).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
-            let msg = resp
-                .json::<Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("message").and_then(Value::as_str).map(String::from))
-                .unwrap_or_else(|| "ok".to_string());
-            println!("Upload accepted: {msg}");
+            let body = resp.json::<Value>().await.ok();
+            let msg = body
+                .as_ref()
+                .and_then(|v| v.get("message").and_then(Value::as_str))
+                .unwrap_or("ok");
+            // The id names this run in the stored corpus; print it so a
+            // result can be found (or disqualified) later.
+            match body
+                .as_ref()
+                .and_then(|v| v.get("benchmark_id").and_then(Value::as_u64))
+            {
+                Some(id) => say!(cli, "Upload accepted: {msg} (benchmark id {id})"),
+                None => say!(cli, "Upload accepted: {msg}"),
+            }
         }
-        Ok(resp) => println!("Upload rejected ({}).", resp.status()),
-        Err(e) => println!("Upload failed: {e}"),
+        Ok(resp) => say!(cli, "Upload rejected ({}).", resp.status()),
+        Err(e) => say!(cli, "Upload failed: {e}"),
     }
 }
 

@@ -20,7 +20,7 @@
 
 use crate::{FieldResults, FieldSize, msd_prefix_filter, residue_filter};
 use anyhow::Result;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -138,7 +138,7 @@ impl AdaptiveFloor {
         let factor = ratio.clamp(1.0 / ADAPT_MAX_STEP, ADAPT_MAX_STEP);
         let new_floor = (self.floor * factor).clamp(MSD_FLOOR_MIN, MSD_FLOOR_MAX);
         if (new_floor - self.floor).abs() > self.floor * 0.05 {
-            info!(
+            debug!(
                 "GPU MSD floor: {:.0} → {:.0} (msd {:.3}s, gpu_tail {:.3}s)",
                 self.floor, new_floor, msd_secs, gpu_tail,
             );
@@ -154,7 +154,7 @@ fn adaptive_floor() -> &'static Mutex<AdaptiveFloor> {
         if let Ok(v) = std::env::var("NICE_GPU_MSD_FLOOR") {
             match v.parse::<f64>() {
                 Ok(f) if f >= 1.0 => {
-                    info!("GPU MSD floor fixed at {f:.0} via NICE_GPU_MSD_FLOOR");
+                    debug!("GPU MSD floor fixed at {f:.0} via NICE_GPU_MSD_FLOOR");
                     return Mutex::new(AdaptiveFloor {
                         floor: f,
                         warmup: u32::MAX,
@@ -167,7 +167,7 @@ fn adaptive_floor() -> &'static Mutex<AdaptiveFloor> {
         let cpu_count =
             std::thread::available_parallelism().map_or(32, std::num::NonZeroUsize::get) as f64;
         let seed = (ADAPT_BASE_CORE_PRODUCT / cpu_count).clamp(MSD_FLOOR_MIN, MSD_FLOOR_MAX);
-        info!("GPU MSD floor: adaptive, seed {seed:.0} ({cpu_count:.0} logical cores)");
+        debug!("GPU MSD floor: adaptive, seed {seed:.0} ({cpu_count:.0} logical cores)");
         Mutex::new(AdaptiveFloor {
             floor: seed,
             warmup: ADAPT_WARMUP,
@@ -399,7 +399,7 @@ pub fn run_range_pipeline<S: RangeSink>(
 /// Panics if the adaptive-floor mutex was poisoned by an earlier panic.
 #[allow(clippy::cast_precision_loss)]
 pub fn report_field(backend: &str, base: u32, range: &FieldSize, stats: &NiceonlyStats) {
-    info!(
+    debug!(
         "{backend} niceonly b{base}: msd {:.3}s -> {} ranges ({:.2}% of field), gpu {:.3}s, total {:.3}s, {:.2e} n/s overall",
         stats.msd_secs,
         stats.num_ranges,

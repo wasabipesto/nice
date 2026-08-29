@@ -70,7 +70,8 @@ enum GpuBackend {
     Vulkan,
     /// `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base.
     Cubecl,
-    /// `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature).
+    /// `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda`
+    /// feature and, like `cuda`, the CUDA toolkit at runtime for NVRTC).
     CubeclCuda,
 }
 
@@ -165,7 +166,9 @@ type GpuCtx = Option<Arc<GpuHandle>>;
 
 extern crate serde_json;
 use anyhow::{Result, anyhow};
-use clap::{Parser, ValueEnum};
+use clap::builder::FalseyValueParser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use env_logger::Env;
 use log::{LevelFilter, debug, error, info, warn};
 use rayon::prelude::*;
@@ -224,11 +227,11 @@ pub struct Cli {
     username: String,
 
     /// Run indefinitely with the current settings
-    #[arg(short, long, env = "NICE_REPEAT")]
+    #[arg(short, long, env = "NICE_REPEAT", value_parser = FalseyValueParser::new())]
     repeat: bool,
 
     /// Hide the progress bar
-    #[arg(short, long, env = "NICE_NO_PROGRESS")]
+    #[arg(short, long, env = "NICE_NO_PROGRESS", value_parser = FalseyValueParser::new())]
     no_progress: bool,
 
     /// Run parallel with this many threads
@@ -248,8 +251,9 @@ pub struct Cli {
     #[arg(long, default_value_t = DEFAULT_PREFETCH_CONCURRENCY, env = "NICE_PREFETCH_CONCURRENCY")]
     prefetch_concurrency: usize,
 
-    /// Run an offline benchmark sweep and print a detailed report
-    #[arg(short, long, env = "NICE_BENCHMARK")]
+    /// Run an offline benchmark sweep and print a detailed report.
+    /// Implied by the other --benchmark-* options.
+    #[arg(short, long, env = "NICE_BENCHMARK", value_parser = FalseyValueParser::new())]
     benchmark: bool,
 
     /// Approximate time budget for the benchmark sweep, in seconds
@@ -257,19 +261,26 @@ pub struct Cli {
     benchmark_secs: f64,
 
     /// Upload benchmark results without prompting
-    #[arg(long, env = "NICE_BENCHMARK_UPLOAD")]
+    #[arg(long, env = "NICE_BENCHMARK_UPLOAD", value_parser = FalseyValueParser::new())]
     benchmark_upload: bool,
 
+    /// Print the benchmark report as machine-readable JSON instead of the
+    /// table; everything else (progress, upload chatter) moves to stderr so
+    /// stdout is exactly one JSON document
+    #[arg(long, env = "NICE_BENCHMARK_JSON", value_parser = FalseyValueParser::new())]
+    benchmark_json: bool,
+
     /// Attach hardware/config telemetry to each submission
-    #[arg(long, env = "NICE_TELEMETRY")]
+    #[arg(long, env = "NICE_TELEMETRY", value_parser = FalseyValueParser::new())]
     telemetry: bool,
 
     /// Validate results against the server before submitting
-    #[arg(long, env = "NICE_VALIDATE")]
+    #[arg(long, env = "NICE_VALIDATE", value_parser = FalseyValueParser::new())]
     validate: bool,
 
-    /// Use GPU acceleration (requires gpu feature)
-    #[arg(long, env = "NICE_GPU")]
+    /// Use GPU acceleration (requires a build with the gpu feature).
+    /// Implied by the other --gpu-* options.
+    #[arg(long, env = "NICE_GPU", value_parser = FalseyValueParser::new())]
     gpu: bool,
 
     /// GPU device to use (0 for first GPU, 1 for second, etc.)
@@ -394,6 +405,18 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
     }
     let want = cli.gpu_backend;
     let detailed = cli.mode == SearchMode::Detailed;
+
+    // Mesa prints "<driver> is not a conformant Vulkan implementation" straight
+    // to stderr — driver chatter our log filter can't reach. Silence it through
+    // Mesa's own knob at normal verbosity; an explicit user setting (either
+    // way) or debug logging leaves it alone.
+    // Safety: init_gpu runs before any worker thread starts (same argument as
+    // the CUBECL_WGPU_DEFAULT_DEVICE set below).
+    if !log::log_enabled!(log::Level::Debug)
+        && std::env::var_os("MESA_VK_IGNORE_CONFORMANCE_WARNING").is_none()
+    {
+        unsafe { std::env::set_var("MESA_VK_IGNORE_CONFORMANCE_WARNING", "true") };
+    }
 
     // The CubeCL wgpu runtime reads its device selection from this env var
     // (typed adapter namespaces; --gpu-device's flat ordinal cannot name
@@ -1089,25 +1112,66 @@ async fn run_pipelined_loop(cli: &Arc<Cli>, client: &Client, gpu: &GpuCtx) -> Re
     }
 }
 
+/// Whether the user set any of these arguments themselves — on the command
+/// line or through its `NICE_*` environment variable, which counts the same
+/// because docker and fleet deployments configure the client through the
+/// environment. A value that clap filled in from a default does not count.
+fn user_set(matches: &ArgMatches, ids: &[&str]) -> bool {
+    ids.iter().any(|id| {
+        matches!(
+            matches.value_source(id),
+            Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+        )
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments. Shared behind an `Arc` because every field
     // handed to the blocking pool needs an owned copy of the settings.
-    let cli = Arc::new(Cli::parse());
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).expect("clap already validated the matches");
 
-    // Set up logger
-    let mut builder = env_logger::Builder::from_env(Env::default().default_filter_or("info"));
+    // Reaching for a sub-option is asking for the feature: --gpu-backend
+    // without --gpu (or NICE_BENCHMARK_SECS without -b) should work, not
+    // silently do nothing. Bool sub-options imply only when truthy, so
+    // NICE_BENCHMARK_UPLOAD=false doesn't switch the benchmark on.
+    let gpu_implied =
+        !cli.gpu && user_set(&matches, &["gpu_device", "gpu_backend", "gpu_wgpu_device"]);
+    if gpu_implied {
+        cli.gpu = true;
+    }
+    let benchmark_implied = !cli.benchmark
+        && (user_set(&matches, &["benchmark_secs"]) || cli.benchmark_upload || cli.benchmark_json);
+    if benchmark_implied {
+        cli.benchmark = true;
+    }
+    let cli = Arc::new(cli);
+
+    // Set up logger. The default filter quiets the wgpu stack's adapter and
+    // server chatter at info level; RUST_LOG or --log-level replaces the
+    // whole filter, so `-l debug` still shows everything.
+    let mut builder = env_logger::Builder::from_env(Env::default().default_filter_or(
+        "info,wgpu_core=warn,wgpu_hal=warn,naga=warn,cubecl_wgpu=warn,cubecl_runtime=warn",
+    ));
     if let Some(level) = cli.log_level {
         builder.filter_level(level.into());
     }
     builder.init();
 
+    if gpu_implied {
+        debug!("--gpu implied by an explicit --gpu-* option");
+    }
+    if benchmark_implied {
+        debug!("--benchmark implied by an explicit --benchmark-* option");
+    }
+
     // Check for GPU support
     if cli.gpu && !(cfg!(feature = "cuda") || cfg!(feature = "vulkan") || cfg!(feature = "cubecl"))
     {
         error!(
-            "Error: GPU support not enabled. Rebuild with --features gpu (CUDA) \
-             and/or --features vulkan"
+            "This build carries no GPU backends. Use a GPU release binary \
+             (or the `-gpu` docker tag), or rebuild with --features gpu."
         );
         std::process::exit(1);
     }
@@ -1282,6 +1346,33 @@ mod tests {
         // no longer a statement about what actually ships.
         assert!((DEFAULT_PREFETCH_SECONDS - 2.0).abs() < f64::EPSILON);
         assert_eq!(DEFAULT_PREFETCH_MAX, 16);
+    }
+
+    #[test]
+    fn sub_options_imply_their_umbrella() {
+        // Positive cases only: an exported NICE_* variable can only add an
+        // explicit source, never remove one, so these hold in any shell. The
+        // negative case (nothing passed → nothing implied) would be hostage
+        // to the environment, per the note at the top of this module.
+        use clap::CommandFactory;
+        let m = super::Cli::command().get_matches_from(["nice_client", "--gpu-device", "1"]);
+        assert!(super::user_set(
+            &m,
+            &["gpu_device", "gpu_backend", "gpu_wgpu_device"]
+        ));
+        let m = super::Cli::command().get_matches_from(["nice_client", "--gpu-backend", "cubecl"]);
+        assert!(super::user_set(
+            &m,
+            &["gpu_device", "gpu_backend", "gpu_wgpu_device"]
+        ));
+        let m = super::Cli::command().get_matches_from(["nice_client", "--benchmark-secs", "5"]);
+        assert!(super::user_set(&m, &["benchmark_secs"]));
+        // Passing the default value explicitly still counts as asking for it.
+        let m = super::Cli::command().get_matches_from(["nice_client", "--gpu-device", "0"]);
+        assert!(super::user_set(
+            &m,
+            &["gpu_device", "gpu_backend", "gpu_wgpu_device"]
+        ));
     }
 
     /// `cudarc` panics rather than returning when the CUDA shared library is

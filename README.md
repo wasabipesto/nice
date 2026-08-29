@@ -128,7 +128,7 @@ Options:
           [default: 4]
 
   -b, --benchmark
-          Run an offline benchmark sweep and print a detailed report
+          Run an offline benchmark sweep and print a detailed report. Implied by the other --benchmark-* options
           
           [env: NICE_BENCHMARK=]
 
@@ -143,6 +143,11 @@ Options:
           
           [env: NICE_BENCHMARK_UPLOAD=]
 
+      --benchmark-json
+          Print the benchmark report as machine-readable JSON instead of the table; everything else (progress, upload chatter) moves to stderr so stdout is exactly one JSON document
+          
+          [env: NICE_BENCHMARK_JSON=]
+
       --telemetry
           Attach hardware/config telemetry to each submission
           
@@ -154,7 +159,7 @@ Options:
           [env: NICE_VALIDATE=]
 
       --gpu
-          Use GPU acceleration (requires gpu feature)
+          Use GPU acceleration (requires a build with the gpu feature). Implied by the other --gpu-* options
           
           [env: NICE_GPU=]
 
@@ -172,7 +177,7 @@ Options:
           - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC
           - vulkan:      Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe). Experimental: only present in builds with the `vulkan` feature, which the `gpu` umbrella no longer includes
           - cubecl:      `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base
-          - cubecl-cuda: `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature)
+          - cubecl-cuda: `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature and, like `cuda`, the CUDA toolkit at runtime for NVRTC)
           
           [env: NICE_GPU_BACKEND=]
           [default: auto]
