@@ -146,7 +146,7 @@ wasm-build:
     cp -rv pkg {{ justfile_directory() }}/web/search/
 
 # Run the browser end-to-end test (CPU + WebGPU-via-SwiftShader) in docker
-wasm-e2e *ARGS: 
+wasm-e2e *ARGS:
     bash wasm-client/e2e/run.sh {{ ARGS }}
 
 # Build WASM app and start dev server

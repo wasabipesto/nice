@@ -1,26 +1,17 @@
 # Changelog
 
-## Unreleased
+## Nice v3.4.0
 
-Maintenance:
-
-- Update all dependencies to their latest versions, including major bumps of malachite (0.9 → 0.11, benchmarked with no CPU performance regression), reqwest (0.12 → 0.13), sysinfo (0.38 → 0.39), and rocket_prometheus (0.10 → 0.11), and remove the unused itertools dependency. This resolves every RustSec advisory fixable within our dependency tree; the one remaining advisory (RUSTSEC-2026-0258, h2 0.3.x) comes via rocket 0.5's hyper 0.14 and has no fixed 0.3.x release.
-- With reqwest 0.13, default (rustls) builds of the client now verify TLS against the platform trust store instead of bundled webpki roots, and the rustls crypto provider is aws-lc-rs instead of ring. Environments without system CA certificates (bare containers running the static musl binary) now need `ca-certificates` installed; the published docker images already include it.
-- Enforce formatting and clippy (all targets, including the GPU feature builds) in CI via a new `just lint` recipe, and fix everything it flagged. Remove the unused `docker/` build-container Dockerfiles, superseded by the cross-compiled release workflow.
-
-Features:
-
-- Client sub-options now imply their umbrella flag: any explicit `--gpu-*` option enables `--gpu`, and any `--benchmark-*` option enables `--benchmark`. Values set through the `NICE_*` environment variables count as explicit, since docker and fleet deployments configure the client that way.
-- Add `--benchmark-json`: prints the benchmark report as a single machine-readable JSON document on stdout (the table, progress, and upload messages move to stderr). Without it the JSON is no longer printed at all — the table stays the human default.
-- After a benchmark upload the client now prints the server-assigned benchmark id, so a run can be located in the corpus later.
-- Boolean `NICE_*` environment variables now parse falsey values: `NICE_GPU=false` or `=0` no longer counts as enabling the GPU.
-- Quieter default logging: the wgpu/CubeCL adapter and server chatter and the client's per-field GPU pipeline details moved to debug level, and Mesa's non-conformant-driver warning is suppressed at normal verbosity via `MESA_VK_IGNORE_CONFORMANCE_WARNING` (an explicit user setting, or `--log-level debug`, leaves it alone). `RUST_LOG` and `--log-level` still override everything.
-- Remove the build-time CUDA warning: building never needed the toolkit, and at runtime only the `cuda` and `cubecl-cuda` backends need it (for NVRTC); the wgpu `cubecl` backend needs only a driver. The `--gpu-backend` help and README state the per-backend requirement.
+Client features:
 
 - Add new GPU backends `cubecl`, `cubecl-cuda`, and `vulkan` (experimental) for additional device support in GPU-enabled builds. Notably the client can now utilize consumer AMD GPUs and Apple M-series GPUs. No new configuration is needed, the client will automatically detect and use a compatible backend. To manually select a backend use `--gpu-backend`.
+- Add WebGPU support to the live WASM web client, which now supports most GPU/OS/browser configurations. (Notable exceptions include AMD cards on linux for most browsers except Firefox Nightly.)
+- Pipeline the web client similarly to the native client with a small claim buffer and parallel network calls to keep the backend working at full duty cycle. Add a greedy work queue so an efficiency core does not slow down the whole client.
 - Add the fleet controller (`fleet/`): a cron-driven explore/exploit loop over the Vast.ai interruptible market utilizing croudsourced benchmarks
-- Rework `--benchmark` into a structured sweep over many bases and windows to fill an adjustable time budget (`--benchmark-secs`, default 10). Reports hardware info, recorded performance, API latency, scheduler correlation IDs, and a synthetic score. Allows uploading to the coordination server for aggregation (manually or with `--benchmark-upload`).
+- Rework `--benchmark` into a structured sweep over many bases and windows to fill an adjustable time budget (`--benchmark-secs`, default 10) and output (table by default or json with `--benchmark-json`). Reports hardware info, recorded performance, API latency, scheduler correlation IDs, and a synthetic score. Allows uploading to the coordination server for aggregation (manually or with `--benchmark-upload`).
+- Add the reworked benchmark (and synthetic NiceMark score) process to the web client with similar options for work sizing and uploading the score. This client doesn't have access to the CPU details so can't be used for the fleet estimator but can still be used for bragging rights.
 - Add opt-in submission telemetry: `--telemetry` attaches hardware, scheduler environment, client config, and client-side processing time to each submission
+- Client sub-options now imply their umbrella flag: any explicit `--gpu-*` option enables `--gpu`, and any `--benchmark-*` option enables `--benchmark`. Values set through the `NICE_*` environment variables trigger this also, with boolean `NICE_*` environment variables parsing falsy values (`NICE_GPU=false` or `=0` do not enable the GPU).
 
 Performance:
 
@@ -28,10 +19,17 @@ Performance:
 - Deepen the stride table's LSD filter from k=2 to k=3, removing 15-22% of candidates before the nice check, which was made effective by precomputing specific steps of the process
 - Raise the CPU MSD recursion floor from 250 to 1000 due to the increased speed of per-digit checks and lower need for MSD prefiltering
 
+Website:
+
+- Start the index page data fetches while the plot library is still downloading, draw each chart as its own data arrives instead of waiting for all five requests, and load d3/Plot as vendored files
+- Draw the notable numbers chart from a subset stored in `cache_notable_numbers` instead of every base's full top-10k list
+- Rework the web runner's statistics into a session view: fields completed, session totals and rates, best find, a rate-per-field strip chart, and all-time per-browser totals persisted in localStorage
+- Add a uniform-random occupancy baseline to the web runner's digit distribution histogram overlay so a field's shape is legible against the expected values
+
 Backend:
 
 - Add `POST /benchmark`: saves community benchmarks from user reports, validating schema and capping report size
-- Add `POST /estimate`: predicts per-scenario and blended performance for a hardware configuration from recent benchmark uploads via hierarchical matching
+- Add `POST /estimate`: predicts per-scenario and blended performance for a hardware configuration from recent benchmark uploads via hierarchical matching (experimental, this endpoint may be removed at any point)
 - Add `GET /ping`: a static response for client-side latency measurement
 - Make the scheduled jobs incremental and stream the downsampling aggregation to decrease job time and memory usage. A `--full` option restores the previous sweep-everything behavior for use after manual disqualifications.
 - Serve `/estimate` from an in-memory benchmark corpus cache instead of re-fetching and re-decoding up to 2000 jsonb reports per request 
@@ -41,22 +39,13 @@ Backend:
   - Make queue refills single-flight and run them on the requesting handler's database connection
   - Thanks to [Janzert](https://github.com/Janzert) for the report and diagnoses
 - Add `common/tests/claim_queries.rs`: the claim path is hand-written SQL with positional bindings that the compiler cannot check, so it is now exercised against a real PostgreSQL. Skipped unless `NICE_TEST_DATABASE_URL` is set.
-- Exclude browser-suite benchmark reports (`config.platform: "browser"`) from the `/estimate` corpus, in both the API's estimator and the fleet controller's Python port: wasm rates are not native rates, and a browser cannot name its CPU, so these samples would pool into the coarse fallback buckets and drag native estimates down. The reports themselves are still stored.
-- Add `cache_notable_numbers`, refreshed by the scheduled jobs alongside the other caches: the plot-ready subset of every base's top-10k number list, thinned to the points that are visually distinguishable on the website's chart. Covered by `common/tests/notable_numbers_cache.rs`.
 
-Website:
+Maintenance:
 
-- Speed up the index page: start the data fetches while the plot library is still downloading, draw each chart as its own data arrives instead of waiting for all five requests, and load d3/Plot as two vendored files rather than 48 CDN modules spread over six dependency levels. `just vendor-fetch` downloads them; `just deploy-site` and `just dev` do it automatically.
-- Draw the notable numbers chart from `cache_notable_numbers` instead of every base's full top-10k list. The chart is unchanged to the eye; it was drawing ~81k points into a space with room for a few hundred distinguishable ones, which cost 686 KB of payload and about two seconds of blocking work per page load.
-- Add a GPU option to the web runner. When the browser offers a WebGPU adapter the search page can process fields on the GPU instead of the CPU worker pool, selected from a dropdown that only appears when an adapter is actually available. Detection is by feature test rather than browser version, and anything without WebGPU keeps using the worker pool with no configuration.
-- Pipeline the web runner's field loop the way the native client works: a small claim buffer sized in seconds of work keeps the processor fed, submissions go out without holding up the next field, transient API failures are retried with backoff, and the hardcoded one-second pause between fields is gone. Fast backends spend their time computing instead of waiting on round trips; slow devices are unaffected, since the client never claims ahead when a single field runs long enough to risk the claim expiring.
-- Browser submissions now report the actual workspace version in `client_version` (they had been hardcoded to 3.0.0 since the wasm client shipped)
-- Add a benchmark suite to the web runner: the same fixed measurement windows the native client's `--benchmark` sweeps (the scenario tables now live in `nice_common` so the two cannot drift), warmup plus repetition within a selectable time budget, and a NiceMark score computed against the same references — a browser and a native run on one machine are directly comparable. Results can be uploaded to the same `POST /benchmark` endpoint, tagged `platform: "browser"`. The old single-field offline benchmark remains as "Offline Test Field".
-- Rework the web runner's statistics into a session view: fields completed, session totals and rates, best find, and a claims-buffered tile, plus a rate-per-field strip chart that surfaces kernel warmup, throttling, and backgrounded tabs at a glance. The digit distribution histogram now overlays the uniform-random occupancy baseline so a field's shape is legible against chance, near misses are logged with their niceness percentage, and all-time per-browser totals persist in localStorage.
-- Give the web runner's GPU detection version-aware help text: when a browser exposes no WebGPU at all, the page names the version that adds it for that browser and platform (or says plainly that no update will) instead of a generic sentence. Detection itself remains a feature test.
-- The search page now loads d3/Plot from the same vendored files as the index page instead of the CDN's 48-module ESM graph; `just vendor-fetch` (now `scripts/vendor-fetch.sh`, shared with the browser e2e harness) places a copy beside the page.
-- Overlap the web runner's GPU slices: the next slice's dispatches are enqueued before the previous slice's readback is awaited, so the device rolls straight from one slice into the next instead of idling at every progress tick.
-- Feed the web runner's CPU workers from a queue of sub-ranges instead of a static 1/N split, so one throttled or efficiency core no longer sets the whole field's finish time while the other workers sit idle; a stop now lands within one sub-range too. Worker failures now fail the field outright instead of "completing with partial results", which the server would have rejected anyway.
+- Update all dependencies to their latest versions, including major bumps of malachite, reqwest, sysinfo, and rocket_prometheus. This resolves every RustSec advisory fixable within our dependency tree; the one remaining advisory (RUSTSEC-2026-0258, h2 0.3.x) comes via rocket 0.5's hyper 0.14 and has no fixed 0.3.x release
+- With reqwest 0.13, default (rustls) builds of the client now verify TLS against the platform trust store instead of bundled webpki roots, and the rustls crypto provider is aws-lc-rs instead of ring. Environments without system CA certificates (bare containers running the static musl binary) now need `ca-certificates` installed; the published docker images already include it.
+- Enforce formatting and clippy (all targets, including the GPU feature builds) in CI via a new `just lint` recipe, and fix everything it flagged.
+- Remove the unused `docker/` build-container Dockerfiles, superseded by the cross-compiled release workflow
 
 ## Nice v3.3.0
 
