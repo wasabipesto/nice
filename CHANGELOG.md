@@ -10,6 +10,13 @@ Maintenance:
 
 Features:
 
+- Client sub-options now imply their umbrella flag: any explicit `--gpu-*` option enables `--gpu`, and any `--benchmark-*` option enables `--benchmark`. Values set through the `NICE_*` environment variables count as explicit, since docker and fleet deployments configure the client that way.
+- Add `--benchmark-json`: prints the benchmark report as a single machine-readable JSON document on stdout (the table, progress, and upload messages move to stderr). Without it the JSON is no longer printed at all — the table stays the human default.
+- After a benchmark upload the client now prints the server-assigned benchmark id, so a run can be located in the corpus later.
+- Boolean `NICE_*` environment variables now parse falsey values: `NICE_GPU=false` or `=0` no longer counts as enabling the GPU.
+- Quieter default logging: the wgpu/CubeCL adapter and server chatter and the client's per-field GPU pipeline details moved to debug level, and Mesa's non-conformant-driver warning is suppressed at normal verbosity via `MESA_VK_IGNORE_CONFORMANCE_WARNING` (an explicit user setting, or `--log-level debug`, leaves it alone). `RUST_LOG` and `--log-level` still override everything.
+- Remove the build-time CUDA warning: building never needed the toolkit, and at runtime only the `cuda` and `cubecl-cuda` backends need it (for NVRTC); the wgpu `cubecl` backend needs only a driver. The `--gpu-backend` help and README state the per-backend requirement.
+
 - Add new GPU backends `cubecl`, `cubecl-cuda`, and `vulkan` (experimental) for additional device support in GPU-enabled builds. Notably the client can now utilize consumer AMD GPUs and Apple M-series GPUs. No new configuration is needed, the client will automatically detect and use a compatible backend. To manually select a backend use `--gpu-backend`.
 - Add the fleet controller (`fleet/`): a cron-driven explore/exploit loop over the Vast.ai interruptible market utilizing croudsourced benchmarks
 - Rework `--benchmark` into a structured sweep over many bases and windows to fill an adjustable time budget (`--benchmark-secs`, default 10). Reports hardware info, recorded performance, API latency, scheduler correlation IDs, and a synthetic score. Allows uploading to the coordination server for aggregation (manually or with `--benchmark-upload`).

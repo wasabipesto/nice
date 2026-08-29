@@ -13,16 +13,10 @@ fn main() {
         // Tell cargo to rerun this build script if the CUDA kernels change
         println!("cargo:rerun-if-changed=src/cuda/nice_kernels.cu");
 
-        // Note: cudarc with "cuda-version-from-build-system" and "fallback-latest"
-        // will try to detect the CUDA version using nvcc at build time.
-        // If nvcc is not found (building without CUDA toolkit installed),
-        // it will fall back to using the latest CUDA bindings.
-        // This allows building on machines without CUDA installed, then
-        // running the binary on machines with CUDA GPUs.
-
-        println!(
-            "cargo:warning=CUDA kernels will be compiled at runtime via NVRTC so the host MUST have CUDA Toolkit 12.0+ and drivers available for GPU operation."
-        );
+        // Nothing here needs the CUDA toolkit: cudarc dlopens the driver and
+        // NVRTC at runtime, so the build works on any machine. The runtime
+        // requirement (toolkit for the cuda/cubecl-cuda backends, driver only
+        // for cubecl/wgpu) is documented on --gpu-backend and in the README.
     }
 
     #[cfg(not(feature = "cuda"))]
