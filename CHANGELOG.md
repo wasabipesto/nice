@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+Performance:
+
+- Add a sound cross-end residue filter to the CPU niceonly path: the MSD interval-domain analysis now returns a certificate of digits that provably occupy high output positions for every n in a surviving range, and the stride iteration skips any residue whose exact low output digits intersect it — one AND against a mask the loop already loads. Production-weighted accounting measures 84-90% of remaining candidates skipped at bases 40-60. Unlike the unsound MSD×LSD cross-check removed in v3.3.0 (which guessed one low mask per range), the low facts here are attached to each stride residue, where they are exact.
+
 ## Nice v3.4.0
 
 Client features:
