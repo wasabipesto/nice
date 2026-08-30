@@ -325,8 +325,16 @@ fn has_duplicate_msd_prefix_u256_const<const BASE: u32>(range: FieldSize) -> boo
 // k=3 stride table and the seeded nice check keeping per-candidate cost
 // low, 1000 benchmarks 10-25% faster end-to-end than 250 across bases
 // 40-52 in both MSD-strong and MSD-weak regions.
+//
+// A 2026-08 sweep in the coarser direction (production-weighted slices,
+// whole-field = MSD recursion + iterate_range, measured on two machines)
+// found 2000 beats 1000 by ~2-5% at b40 and ~9-12% at b52; 4000 adds
+// nothing beyond noise while costing 8% more stride candidates. Note
+// binary subdivision of the 1e6-number chunks quantizes leaf sizes to
+// ~976/1953/3906, so only power-of-two-ish floors are distinct (1500 and
+// 2000 are the same filter).
 pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 22;
-pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 1000;
+pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 2000;
 pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 
 /// Find the longest common prefix of the most significant digits.

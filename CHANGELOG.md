@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+Performance:
+
+- Raise the CPU MSD recursion floor from 1000 to 2000: a production-weighted whole-field sweep on two machines measured 2-5% (b40) and 9-12% (b52) end-to-end improvement, with coarser floors adding nothing beyond noise.
+
 ## Nice v3.4.0
 
 Client features:
