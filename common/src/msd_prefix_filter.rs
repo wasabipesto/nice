@@ -354,12 +354,17 @@ fn analyze_msd_prefix_u256_const<const BASE: u32>(
 //
 // The floor trades MSD recursion time against extra candidates for the
 // stride table: halving it roughly doubles the number of endpoint
-// digit-extractions while the deepest levels skip only slivers. With the
-// k=3 stride table and the seeded nice check keeping per-candidate cost
-// low, 1000 benchmarks 10-25% faster end-to-end than 250 across bases
-// 40-52 in both MSD-strong and MSD-weak regions.
+// digit-extractions while the deepest levels skip only slivers. The
+// cross-end residue filter moved the optimum sharply coarser: most of the
+// candidates a coarse floor lets through now die on a one-AND mask test
+// instead of a full nice check. A 2026-08 whole-field sweep through the
+// masked production path (production-weighted slices, two machines) has
+// its minimum at 8000 on b40 and is flat 8000-16000 on b52; 2000 costs
+// ~25-40% more and 1000 ~70-100% more. Note binary subdivision of
+// 1e6-number chunks quantizes leaf sizes to ~976/1953/3906/7812/..., so
+// only power-of-two-ish floors are distinct.
 pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 22;
-pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 1000;
+pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 8000;
 pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 
 /// Find the longest common prefix of the most significant digits.
