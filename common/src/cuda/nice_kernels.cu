@@ -411,12 +411,29 @@ __device__ __forceinline__ u32 lower_bound_residue(
     return lo;
 }
 
+#ifdef COMPACT
+// Survivor-ordinal queue capacity per warp: at most 31 leftovers plus one
+// 32-wide ballot before the drain loop runs.
+#define COMPACT_QUEUE 64
+#endif
+
 // One warp per MSD-valid range. Each range is (field_start + offset,
 // field_start + offset + len). Lanes stride through the range's valid
 // candidates by global residue-sequence index; the g-th candidate at or
 // after the range start is B0 + (g / R) * M + residues[g % R], where
 // B0 = range_start - (range_start mod M) and g starts at the lower bound
 // of (range_start mod M) in the residue table.
+//
+// With CROSS_FILTER, each candidate is first tested against the range's
+// cross-end certificate: `low_masks[j]` holds residue j's exact low output
+// digits, `range_masks[r]` the digits certainly occupying high output
+// positions for every n in range r; an intersection proves a duplicated
+// digit across two distinct positions, so the candidate is skipped without
+// a check. With COMPACT, survivors of that one-AND test are additionally
+// ballot-compacted into a per-warp queue and checked in dense 32-wide
+// waves — at 84-90% rejection a naive per-lane skip leaves almost every
+// warp iteration with some surviving lane, so compaction is where the
+// wall-time is.
 extern "C" __global__ void niceonly_ranges_kernel(
     u64 field_start_lo,
     u64 field_start_hi,
@@ -427,11 +444,21 @@ extern "C" __global__ void niceonly_ranges_kernel(
     u64* __restrict__ nice_out, // (lo, hi) pairs
     u32* __restrict__ nice_count,
     u32 nice_capacity
+#ifdef CROSS_FILTER
+    ,
+    const u64* __restrict__ low_masks,  // per residue: exact low-digit mask
+    const u64* __restrict__ range_masks // per range: certain-high-digit mask
+#endif
 ) {
     u32 gtid = blockIdx.x * blockDim.x + threadIdx.x;
     u32 warp = gtid >> 5;
     u32 lane = gtid & 31;
     u32 nwarps = (gridDim.x * blockDim.x) >> 5;
+
+#if defined(CROSS_FILTER) && defined(COMPACT)
+    __shared__ u32 queue[WARPS_PER_BLOCK][COMPACT_QUEUE];
+    u32* q = queue[threadIdx.x >> 5];
+#endif
 
     for (u32 r = warp; r < num_ranges; r += nwarps) {
         // range_start = field_start + offset
@@ -449,6 +476,55 @@ extern "C" __global__ void niceonly_ranges_kernel(
         // All lanes compute the same search (cheap, keeps the warp uniform).
         u32 idx0 = lower_bound_residue(residues, m);
 
+#ifdef CROSS_FILTER
+        u64 rmask = range_masks[r];
+#endif
+
+#if defined(CROSS_FILTER) && defined(COMPACT)
+        // Warp-compacted enumeration. No lane may leave this loop early:
+        // every ballot/all below is warp-collective.
+        u32 qn = 0;
+        for (u32 gbase = idx0;; gbase += 32) {
+            u32 g = gbase + lane;
+            u32 cycle = g / STRIDE_R; // const divisor -> multiply-high
+            u32 j = g - cycle * STRIDE_R;
+            u64 add = (u64)cycle * STRIDE_M + residues[j];
+            u64 n_lo = b0_lo + add;
+            u64 n_hi = b0_hi + (n_lo < b0_lo ? 1 : 0);
+            bool in_range = !(n_hi > re_hi || (n_hi == re_hi && n_lo >= re_lo));
+            bool pass = in_range && (low_masks[j] & rmask) == 0;
+            unsigned bal = __ballot_sync(0xffffffffu, pass);
+            if (pass) {
+                q[qn + __popc(bal & ((1u << lane) - 1u))] = g;
+            }
+            qn += __popc(bal);
+            bool done = __all_sync(0xffffffffu, !in_range);
+            // qn is warp-uniform (derived from ballots alone), so every
+            // lane agrees on when and how much to drain.
+            while (qn >= 32 || (done && qn > 0)) {
+                u32 take = qn >= 32 ? 32 : qn;
+                if (lane < take) {
+                    u32 gq = q[qn - take + lane];
+                    u32 cy = gq / STRIDE_R;
+                    u32 jj = gq - cy * STRIDE_R;
+                    u64 ad = (u64)cy * STRIDE_M + residues[jj];
+                    u64 c_lo = b0_lo + ad;
+                    u64 c_hi = b0_hi + (c_lo < b0_lo ? 1 : 0);
+                    if (candidate_is_nice(c_lo, c_hi)) {
+                        u32 pos = atomicAdd(nice_count, 1);
+                        if (pos < nice_capacity) {
+                            nice_out[2 * (size_t)pos] = c_lo;
+                            nice_out[2 * (size_t)pos + 1] = c_hi;
+                        }
+                    }
+                }
+                qn -= take;
+            }
+            if (done) {
+                break;
+            }
+        }
+#else
         for (u32 g = idx0 + lane;; g += 32) {
             u32 cycle = g / STRIDE_R; // const divisor -> multiply-high
             u32 j = g - cycle * STRIDE_R;
@@ -458,6 +534,11 @@ extern "C" __global__ void niceonly_ranges_kernel(
             if (n_hi > re_hi || (n_hi == re_hi && n_lo >= re_lo)) {
                 break;
             }
+#ifdef CROSS_FILTER
+            if ((low_masks[j] & rmask) != 0) {
+                continue;
+            }
+#endif
             if (candidate_is_nice(n_lo, n_hi)) {
                 u32 pos = atomicAdd(nice_count, 1);
                 if (pos < nice_capacity) {
@@ -466,6 +547,7 @@ extern "C" __global__ void niceonly_ranges_kernel(
                 }
             }
         }
+#endif
     }
 }
 

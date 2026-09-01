@@ -1083,7 +1083,10 @@ impl<'a> NiceonlyRun<'a> {
 }
 
 impl RangeSink for NiceonlyRun<'_> {
-    fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()> {
+    fn launch(&mut self, offsets: &[u64], lens: &[u32], _masks: &[u64]) -> Result<()> {
+        // `masks` (cross-end certificates) are not yet applied on this
+        // backend: WGSL has no u64, so the mask test needs a two-word port.
+        // Ignoring them only means checking more candidates - never fewer.
         for (batch_offsets, batch_lens) in offsets
             .chunks(RANGES_PER_DISPATCH)
             .zip(lens.chunks(RANGES_PER_DISPATCH))
@@ -1402,7 +1405,7 @@ mod tests {
                 let mut run =
                     NiceonlyRun::from_pipeline(&ctx, pipe.clone(), start).expect("probe run");
                 run.lane_shift = Some(shift);
-                run.launch(&[0], &[len]).expect("dispatch");
+                run.launch(&[0], &[len], &[0]).expect("dispatch");
                 per_width.push(
                     run.finish()
                         .expect("results")

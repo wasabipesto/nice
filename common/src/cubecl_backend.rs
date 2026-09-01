@@ -1632,7 +1632,11 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
 }
 
 impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
-    fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()> {
+    fn launch(&mut self, offsets: &[u64], lens: &[u32], _masks: &[u64]) -> Result<()> {
+        // `masks` (cross-end certificates) are not yet applied on this
+        // backend: wgpu targets lack u64, so the mask test needs a two-word
+        // port. Ignoring them only means checking more candidates - never
+        // fewer.
         // Pack offsets as lo/hi u32 pairs; buffers are created per dispatch
         // and sized to the batch (CubeCL pools the allocations). These
         // per-dispatch writes also flush the stream, so each dispatch is
@@ -1941,7 +1945,7 @@ mod tests {
                 );
                 run.probe = true;
                 run.lane_shift_override = Some(shift);
-                run.launch(&[0], &[len]).expect("dispatch");
+                run.launch(&[0], &[len], &[0]).expect("dispatch");
                 run.sync().expect("sync");
                 per_width.push(
                     run.finish()

@@ -6,7 +6,8 @@
 //! - **Niceonly**: the CPU runs the real MSD prefix filter (parallelized
 //!   across cores) with a coarser recursion floor than the CPU client (see
 //!   [`AdaptiveFloor`]), then ships only compact *range descriptors*
-//!   to the GPU (~12 bytes per surviving range). The GPU reconstructs the
+//!   to the GPU (20 bytes per surviving range, including its cross-end
+//!   certificate mask). The GPU reconstructs the
 //!   stride filter's candidates on-device from the residue table — the g-th
 //!   valid candidate at or after a range start is
 //!   `B0 + (g/R)*M + residues[g%R]` — and runs the early-exit nice check.
@@ -85,6 +86,9 @@ struct NiceonlyPlan {
     residues: CudaSlice<u32>,
     modulus: u32,
     num_residues: u32,
+    /// Per-residue exact low-digit masks on device, present when the kernel
+    /// was compiled with `CROSS_FILTER` (it then takes two extra arguments).
+    low_masks: Option<CudaSlice<u64>>,
 }
 
 /// GPU context: CUDA device handle plus caches of per-base compiled kernels.
@@ -155,6 +159,11 @@ impl CudaContext {
         let module = self.device.load_module(ptx)?;
         let func = module.load_function("niceonly_ranges_kernel")?;
         let residues = self.stream.clone_htod(&residues_host)?;
+        let low_masks = if defines.iter().any(|d| d == "CROSS_FILTER") {
+            Some(self.stream.clone_htod(&table.low_digit_masks)?)
+        } else {
+            None
+        };
 
         debug!(
             "GPU niceonly plan for base {base}: M={modulus}, R={num_residues}, built in {:.2}s",
@@ -167,6 +176,7 @@ impl CudaContext {
             residues,
             modulus,
             num_residues,
+            low_masks,
         });
         self.niceonly_plans
             .lock()
@@ -264,6 +274,17 @@ fn niceonly_defines(base: u32) -> Result<(Vec<String>, stride_filter::StrideTabl
         defines.push(format!("POW64_MOD_PRE={}ull", pre.pow64_mod));
     } else {
         debug!("modular prefilter disabled for base {base}");
+    }
+    // Cross-end residue filter (and its warp compaction): on by default
+    // wherever the low-mask table exists (base <= 64); NICE_CUDA_CROSS=0 /
+    // NICE_CUDA_COMPACT=0 disable them for A/B measurement.
+    let cross = !table.low_digit_masks.is_empty()
+        && std::env::var("NICE_CUDA_CROSS").map_or(true, |v| v != "0");
+    if cross {
+        defines.push("CROSS_FILTER".to_string());
+        if std::env::var("NICE_CUDA_COMPACT").map_or(true, |v| v != "0") {
+            defines.push("COMPACT".to_string());
+        }
     }
     Ok((defines, table))
 }
@@ -398,14 +419,20 @@ impl RangeSink for NiceonlyLauncher<'_> {
     /// Upload a batch of range descriptors and launch the kernel on them.
     /// Launches are asynchronous on the stream; results accumulate in the
     /// shared output buffers until [`NiceonlyLauncher::finish`].
-    fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()> {
+    fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
         let nice_capacity = NICE_OUT_CAPACITY as u32;
-        for (batch_offsets, batch_lens) in offsets
+        for ((batch_offsets, batch_lens), batch_masks) in offsets
             .chunks(RANGES_PER_LAUNCH)
             .zip(lens.chunks(RANGES_PER_LAUNCH))
+            .zip(masks.chunks(RANGES_PER_LAUNCH))
         {
             let d_offsets = self.ctx.stream.clone_htod(batch_offsets)?;
             let d_lens = self.ctx.stream.clone_htod(batch_lens)?;
+            let d_masks = if self.plan.low_masks.is_some() {
+                Some(self.ctx.stream.clone_htod(batch_masks)?)
+            } else {
+                None
+            };
             let num_ranges = batch_offsets.len() as u32;
 
             // One warp per range.
@@ -427,6 +454,13 @@ impl RangeSink for NiceonlyLauncher<'_> {
             launch_args.arg(&self.d_nice_out);
             launch_args.arg(&mut self.d_nice_count);
             launch_args.arg(&nice_capacity);
+            if let Some(low_masks) = &self.plan.low_masks {
+                launch_args.arg(low_masks);
+                let d_masks = d_masks
+                    .as_ref()
+                    .expect("range masks uploaded whenever the kernel has CROSS_FILTER");
+                launch_args.arg(d_masks);
+            }
             unsafe {
                 launch_args.launch(cfg)?;
             }
@@ -671,6 +705,91 @@ mod tests {
             idx = (idx + 1) % table.gap_table.len();
         }
         out
+    }
+
+    /// Mirror of the kernel's `CROSS_FILTER` candidate selection (both the
+    /// naive-skip and the compacted variant check exactly this set): the
+    /// residue index of the g-th candidate is g mod R, and a candidate
+    /// survives iff its residue's low mask misses the range's certificate.
+    fn mirror_kernel_candidates_masked(
+        range: &FieldSize,
+        table: &StrideTable,
+        high_mask: u64,
+    ) -> Vec<u128> {
+        let r_count = table.valid_residues.len() as u32;
+        let m = mirror_mod_m(
+            range.start(),
+            table.modulus as u32,
+            ((1u128 << 64) % table.modulus) as u32,
+        );
+        let b0 = range.start() - u128::from(m);
+        let idx0 = table.valid_residues.partition_point(|&r| r < m) as u32;
+        let mut out = Vec::new();
+        let mut g = idx0;
+        loop {
+            let cycle = g / r_count;
+            let j = (g - cycle * r_count) as usize;
+            let add = u64::from(cycle) * table.modulus as u64 + u64::from(table.valid_residues[j]);
+            let n = b0 + u128::from(add);
+            if n >= range.end() {
+                break;
+            }
+            if table.low_digit_masks[j] & high_mask == 0 {
+                out.push(n);
+            }
+            g += 1;
+        }
+        out
+    }
+
+    /// The kernel's mask-filtered candidate set must equal the CPU's
+    /// masked stride iteration for the same (range, certificate).
+    #[test_log::test]
+    fn kernel_cross_filter_matches_cpu_masked_iteration() {
+        for base in [40u32, 52, 62] {
+            let Ok(Some(base_range)) = base_range::get_base_range_u128(base) else {
+                continue;
+            };
+            let table = StrideTable::new(base, GPU_LSD_K);
+            let span = base_range.range_end - base_range.range_start;
+            let mut x: u128 = 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100;
+            let mut nonempty = 0;
+            // Unconditioned random ranges reject often (no surviving
+            // ancestors pre-screen them), so sample until enough live
+            // certificates have been exercised.
+            for i in 0..2000u128 {
+                if nonempty >= 25 {
+                    break;
+                }
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
+                let start = base_range.range_start + (x % (span - 10_000));
+                let range = FieldSize::new(start, start + 1953);
+                let crate::msd_prefix_filter::MsdAnalysis::Live { fixed_mask } =
+                    crate::msd_prefix_filter::analyze_range(range, base, GPU_LSD_K as usize)
+                else {
+                    continue;
+                };
+                if fixed_mask != 0 {
+                    nonempty += 1;
+                }
+                // CPU truth: candidates the masked iteration would check.
+                let mut cpu = Vec::new();
+                let (mut n, mut idx) = table.first_valid_at_or_after(range.start());
+                while n < range.end() {
+                    if table.low_digit_masks[idx] & fixed_mask == 0 {
+                        cpu.push(n);
+                    }
+                    n += u128::from(table.gap_table[idx]);
+                    idx = (idx + 1) % table.gap_table.len();
+                }
+                assert_eq!(
+                    mirror_kernel_candidates_masked(&range, &table, fixed_mask),
+                    cpu,
+                    "masked candidate mismatch: base {base} range [{start}, ..)"
+                );
+            }
+            assert!(nonempty >= 25, "b{base}: too few live certificates to test");
+        }
     }
 
     #[test_log::test]
@@ -1084,6 +1203,26 @@ mod tests {
                 compile_kernel_ptx(&defines).unwrap_or_else(|e| {
                     panic!("niceonly kernel failed to compile for b{base}: {e:?}")
                 });
+                // Also cover the variants the env toggles can produce:
+                // cross without compaction, and neither.
+                if defines.iter().any(|d| d == "CROSS_FILTER") {
+                    let no_compact: Vec<String> = defines
+                        .iter()
+                        .filter(|d| *d != "COMPACT")
+                        .cloned()
+                        .collect();
+                    compile_kernel_ptx(&no_compact).unwrap_or_else(|e| {
+                        panic!("no-compact niceonly kernel failed for b{base}: {e:?}")
+                    });
+                    let plain: Vec<String> = defines
+                        .iter()
+                        .filter(|d| *d != "COMPACT" && *d != "CROSS_FILTER")
+                        .cloned()
+                        .collect();
+                    compile_kernel_ptx(&plain).unwrap_or_else(|e| {
+                        panic!("plain niceonly kernel failed for b{base}: {e:?}")
+                    });
+                }
             }
         }
     }
