@@ -1466,29 +1466,37 @@ pub async fn process_range_detailed_cubecl_async(
 /// Which chunk-scan flavor a client should run.
 ///
 /// The wide flavor divides limb pairs with 64-bit arithmetic and is the
-/// CUDA-native form. On wgpu it is legal only when the device exposes
-/// `u64` *and* the shader goes through one of CubeCL's direct compilers
-/// (`wgpu<spirv>` / `wgpu<msl>`); the WGSL path miscompiles its checked
-/// u64 division on Metal (naga, wgpu 29), so it keeps split16 regardless of
-/// what the adapter advertises. `NICE_CUBECL_WIDE=0|1` forces either flavor
-/// for A/B runs; a forced wide flavor on a device without u64 fails at
-/// compile time, loudly.
+/// CUDA-native form. On wgpu it is *legal* wherever the device exposes
+/// `u64` and the shader goes through one of CubeCL's direct compilers
+/// (`wgpu<spirv>` / `wgpu<msl>`; naga's MSL backend miscompiles its checked
+/// u64 division), but legal is not fast: on an Apple M4 under `wgpu<msl>`
+/// the wide flavor measured 4.6x *slower* than split16 (64-bit integer
+/// division is emulated on Apple GPUs). So wgpu defaults to split16 and
+/// `NICE_CUBECL_WIDE=1` opts in for A/B runs on devices where it is legal;
+/// `NICE_CUBECL_WIDE=0` forces split16 anywhere. A forced wide flavor on a
+/// device without u64 fails at shader compile time, loudly.
 fn wide_chunk_for<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
 ) -> bool {
-    if let Ok(v) = std::env::var("NICE_CUBECL_WIDE") {
-        return v != "0";
-    }
     let name = R::name(client);
-    if name.contains("cuda") {
-        return true;
-    }
+    let cuda = name.contains("cuda");
     let direct = name.contains("spirv") || name.contains("msl");
     let u64_ok = client.properties().features.supports_type(cubecl::ir::Type::scalar(
         cubecl::ir::ElemType::UInt(cubecl::ir::UIntKind::U64),
     ));
-    debug!("CubeCL chunk flavor on {name}: direct compiler {direct}, u64 {u64_ok}");
-    direct && u64_ok
+    let wide = match std::env::var("NICE_CUBECL_WIDE").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => cuda,
+    };
+    if wide && !cuda && !(direct && u64_ok) {
+        warn!(
+            "NICE_CUBECL_WIDE=1 on {name} (direct compiler {direct}, u64 {u64_ok}): \
+             the wide chunk scan is not expected to compile here"
+        );
+    }
+    debug!("CubeCL chunk flavor on {name}: wide {wide} (direct compiler {direct}, u64 {u64_ok})");
+    wide
 }
 
 /// Read one histogram buffer and fold its bins into the accumulator.
