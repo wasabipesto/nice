@@ -2319,7 +2319,10 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .range_start;
-            let len: u32 = 2_000_000;
+            // Small enough that even the no-prefilter base's probe survivors
+            // fit the output buffer with wide margin (probe reports every
+            // survivor, not just nice numbers).
+            let len: u32 = 400_000;
 
             // Host mirror: every stride candidate whose residue's exact low
             // digits miss the certificate and (where present) whose low
@@ -2340,6 +2343,11 @@ mod tests {
             assert!(
                 cross_rejected > 1000,
                 "base {base}: certificate {mask:#x} rejected too little to test"
+            );
+            assert!(
+                want.len() < NICEONLY_OUT_CAPACITY / 2,
+                "base {base}: {} probe survivors would risk the output buffer; shrink the window",
+                want.len()
             );
 
             for forced_compact in [true, false] {
