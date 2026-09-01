@@ -4,10 +4,7 @@
 
 Performance:
 
-- Plane-compact the cross-end filter's survivors in the CubeCL niceonly kernel before checking them, mirroring the CUDA warp compaction portably: survivors queue in per-plane shared memory via `plane_exclusive_sum` and are checked in dense `PLANE_DIM`-wide waves, wave32/64 agnostic. On device-bound hosts (consumer AMD via RADV) the naive per-lane skip left most of the filter's value on the table. `NICE_CUBECL_COMPACT=0` opts out.
-
-Performance:
-
+- Compact the cross-end filter's survivors in the CubeCL niceonly kernel before checking them, mirroring the CUDA warp compaction portably: survivors queue in cube-scoped shared memory (positions from a two-level plane scan, handoffs fenced with workgroup barriers — WGSL has no plane-scope barrier) and are checked in dense workgroup-wide waves, wave32/64 agnostic. On device-bound hosts this recovers the value the naive per-lane skip left on the table: 2.3x over the naive skip on an RX 9070 XT via RADV. Dispatches whose certificates are all zero (the no-MSD bypass) take the plain path. `NICE_CUBECL_COMPACT=0` opts out.
 - Bring the cross-end residue filter to the CUDA and CubeCL niceonly paths: range descriptors now carry each range's certificate mask, the per-residue low-digit mask table lives on-device, and candidates whose masks intersect are skipped. Because 84-90% rejection still leaves a survivor in nearly every warp, survivors are ballot-compacted into per-warp queues and checked in dense 32-wide waves instead of a naive per-lane skip (`NICE_CUDA_CROSS=0` / `NICE_CUDA_COMPACT=0` opt out). The CubeCL kernel applies the same mask test as two-word u32 arithmetic so it runs on every runtime including wgpu (`NICE_CUBECL_CROSS=0` opts out).
 - Add an explicit no-MSD bypass to the GPU pipeline: at the maximum recursion floor (now one full processing chunk, up from 256k), chunks are shipped as single descriptors with no endpoint analysis, letting a strong device paired with a weak CPU skip host-side MSD filtering entirely. The adaptive floor controller can now discover this mode on its own.
 

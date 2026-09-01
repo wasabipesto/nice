@@ -1854,6 +1854,9 @@ struct CubeclNiceonlyRun<'a, R: cubecl::prelude::Runtime> {
     probe: bool,
     /// Pin the lane tiling instead of sizing it per dispatch (device tests).
     lane_shift_override: Option<u32>,
+    /// Force the compact specialization on or off (device tests).
+    #[cfg(test)]
+    compact_override: Option<bool>,
 }
 
 impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
@@ -1910,6 +1913,8 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
             wide_chunk,
             probe: false,
             lane_shift_override: None,
+            #[cfg(test)]
+            compact_override: None,
         })
     }
 
@@ -1970,6 +1975,21 @@ fn certificate_words(masks: &[u64], cross: bool) -> Vec<u32> {
     }
 }
 
+impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'_, R> {
+    /// Whether this dispatch should use the compacted specialization. The
+    /// no-MSD bypass ships all-zero certificates; the compacted kernel can
+    /// only cost there (queue traffic and two barriers per iteration for a
+    /// filter that never fires), so such dispatches take the plain path.
+    /// Mixed batches keep compaction.
+    fn dispatch_compact(&self, masks: &[u64]) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.compact_override {
+            return forced;
+        }
+        self.plan.compact && masks.iter().any(|&m| m != 0)
+    }
+}
+
 impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
     fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
         ensure!(
@@ -1996,6 +2016,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
             .create(cubecl::bytes::Bytes::from_elems(lens.to_vec()));
         let mask_words = certificate_words(masks, self.plan.cross);
         let masks_len = mask_words.len();
+        let compact = self.dispatch_compact(masks);
         let masks_handle = self
             .client
             .create(cubecl::bytes::Bytes::from_elems(mask_words));
@@ -2080,7 +2101,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
                 pre_chunk_div,
                 self.probe,
                 self.plan.cross,
-                self.plan.compact,
+                compact,
             );
         }
         Ok(())
@@ -2248,31 +2269,105 @@ mod tests {
     /// prefilter *passes*, at every lane width, and the mirror here computes
     /// the expected survivors by the definition (`x^k mod d^p` in u128) rather
     /// than by the kernel's chunk arithmetic, so the two cannot share a bug.
+    /// Do the lowest `digits` base-`base` digits of n² and n³, computed
+    /// mod `chunk_div^limbs`, contain no duplicate? Host mirror of the
+    /// kernel's low-digit prefilter, shared by the probe tests.
+    fn prefilter_mirror(n: u128, base: u32, pre: &VulkanPrefilterParams) -> bool {
+        let modulus = u128::from(pre.chunk_div).pow(pre.limbs);
+        let m = n % modulus;
+        let sq = (m * m) % modulus;
+        let cu = (sq * m) % modulus;
+        let mut seen = 0u128;
+        let mut dup = false;
+        for mut v in [sq, cu] {
+            for _ in 0..pre.digits {
+                let d = (v % u128::from(base)) as u32;
+                v /= u128::from(base);
+                let bit = 1u128 << d;
+                dup |= seen & bit != 0;
+                seen |= bit;
+            }
+        }
+        !dup
+    }
+
+    /// The cross-end filter's device semantics against a host mirror, with
+    /// certificates that actually fire: word packing of both the low-mask
+    /// table and the range certificates, residue-to-mask indexing, and the
+    /// nonzero-intersection skip — in both the compacted and plain
+    /// specializations. Probe mode reports the exact survivor set, so an
+    /// over-rejection (the failure ordinary parity misses when a range holds
+    /// no nice number) shows up as a missing survivor here.
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn cubecl_cross_filter_survivors_match_the_host_mirror() {
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        #[allow(irrefutable_let_patterns)]
+        let CubeclContext::Wgpu { client, .. } = &ctx else {
+            unreachable!("new_default returns the wgpu variant");
+        };
+        // b40: prefilter base, digits reach 39 (bits in both mask words).
+        // b50: no prefilter, so probe reports pure cross-filter survivors;
+        // digits reach 49.
+        for (base, mask) in [
+            (40u32, (1u64 << 5) | (1u64 << 39)),
+            (50, (1u64 << 3) | (1u64 << 45)),
+        ] {
+            let pre = vulkan_prefilter_params(base);
+            let table = StrideTable::new(base, GPU_LSD_K);
+            let start = crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap()
+                .range_start;
+            let len: u32 = 2_000_000;
+
+            // Host mirror: every stride candidate whose residue's exact low
+            // digits miss the certificate and (where present) whose low
+            // digits pass the prefilter.
+            let end = start + u128::from(len);
+            let (mut n, mut idx) = table.first_valid_at_or_after(start);
+            let mut want = Vec::new();
+            let mut cross_rejected = 0u32;
+            while n < end {
+                if table.low_digit_masks[idx] & mask != 0 {
+                    cross_rejected += 1;
+                } else if pre.is_none_or(|p| prefilter_mirror(n, base, &p)) {
+                    want.push(n);
+                }
+                n += u128::from(table.gap_table[idx]);
+                idx = (idx + 1) % table.gap_table.len();
+            }
+            assert!(
+                cross_rejected > 1000,
+                "base {base}: certificate {mask:#x} rejected too little to test"
+            );
+
+            for forced_compact in [true, false] {
+                let mut run =
+                    CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
+                run.probe = true;
+                run.compact_override = Some(forced_compact);
+                run.launch(&[0], &[len], &[mask]).expect("dispatch");
+                run.sync().expect("sync");
+                let mut got: Vec<u128> = run
+                    .finish()
+                    .expect("results")
+                    .iter()
+                    .map(|n| n.number)
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(
+                    got, want,
+                    "base {base} compact={forced_compact}: cross-filtered survivor set mismatch"
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires a wgpu device"]
     fn cubecl_prefilter_survivors_match_the_host_mirror() {
         use crate::gpu_niceonly::MAX_LANES_PER_RANGE;
-
-        /// Do the lowest `digits` base-`base` digits of n² and n³, computed
-        /// mod `chunk_div^limbs`, contain no duplicate?
-        fn mirror(n: u128, base: u32, pre: &VulkanPrefilterParams) -> bool {
-            let modulus = u128::from(pre.chunk_div).pow(pre.limbs);
-            let m = n % modulus;
-            let sq = (m * m) % modulus;
-            let cu = (sq * m) % modulus;
-            let mut seen = 0u128;
-            let mut dup = false;
-            for mut v in [sq, cu] {
-                for _ in 0..pre.digits {
-                    let d = (v % u128::from(base)) as u32;
-                    v /= u128::from(base);
-                    let bit = 1u128 << d;
-                    dup |= seen & bit != 0;
-                    seen |= bit;
-                }
-            }
-            !dup
-        }
 
         let ctx = CubeclContext::new_default().expect("CubeCL init");
         #[allow(irrefutable_let_patterns)]
@@ -2320,7 +2415,7 @@ mod tests {
             let mut candidates = 0u32;
             while n < end {
                 candidates += 1;
-                if mirror(n, base, &pre) {
+                if prefilter_mirror(n, base, &pre) {
                     want.push(n);
                 }
                 n += u128::from(table.gap_table[idx]);
