@@ -76,8 +76,8 @@ const NEAR_MISS_CAPACITY: usize = 1 << 20;
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn detailed_kernel(
-    hist: &Array<Atomic<u32>>,
-    miss_count: &Array<Atomic<u32>>,
+    hist: &mut Array<Atomic<u32>>,
+    miss_count: &mut Array<Atomic<u32>>,
     miss_data: &mut Array<u32>,
     s0: u32,
     s1: u32,
@@ -376,7 +376,7 @@ fn candidate_check(
     sv_s: &mut SharedMemory<u32>,
     svb: u32,
     nice_out: &mut Array<u32>,
-    nice_count: &Array<Atomic<u32>>,
+    nice_count: &mut Array<Atomic<u32>>,
     nice_cap: u32,
     #[comptime] base: u32,
     #[comptime] limbs: u32,
@@ -841,7 +841,7 @@ fn niceonly_kernel(
     range_offsets: &Array<u32>, // lo, hi pairs
     range_lens: &Array<u32>,
     nice_out: &mut Array<u32>,
-    nice_count: &Array<Atomic<u32>>,
+    nice_count: &mut Array<Atomic<u32>>,
     low_masks: &Array<u32>, // per residue: lo,hi words of its exact low-digit mask
     range_masks: &Array<u32>, // per range: lo,hi words of its certificate
     fs0: u32,
