@@ -1467,7 +1467,7 @@ pub async fn process_range_detailed_cubecl_async(
 ///
 /// The wide flavor divides limb pairs with 64-bit arithmetic and is the
 /// CUDA-native form. On wgpu it is *legal* wherever the device exposes
-/// `u64` and the shader goes through one of CubeCL's direct compilers
+/// `u64` and the shader goes through one of `CubeCL`'s direct compilers
 /// (`wgpu<spirv>` / `wgpu<msl>`; naga's MSL backend miscompiles its checked
 /// u64 division), but legal is not fast: on an Apple M4 under `wgpu<msl>`
 /// the wide flavor measured 4.6x *slower* than split16 (64-bit integer
