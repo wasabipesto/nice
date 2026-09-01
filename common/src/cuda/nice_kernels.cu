@@ -523,6 +523,11 @@ extern "C" __global__ void niceonly_ranges_kernel(
             }
             qn += __popc(bal);
             bool done = __all_sync(0xffffffffu, !in_range);
+            // Vote intrinsics synchronize execution but are not documented
+            // as shared-memory fences; the drain below reads entries other
+            // lanes wrote, so the handoff needs an explicit barrier under
+            // independent thread scheduling.
+            __syncwarp();
             // qn is warp-uniform (derived from ballots alone), so every
             // lane agrees on when and how much to drain.
             while (qn >= 32 || (done && qn > 0)) {
@@ -544,6 +549,9 @@ extern "C" __global__ void niceonly_ranges_kernel(
                 }
                 qn -= take;
             }
+            // And the reverse handoff: the next iteration's writes reuse
+            // slots this drain just read from other lanes.
+            __syncwarp();
             if (done) {
                 break;
             }

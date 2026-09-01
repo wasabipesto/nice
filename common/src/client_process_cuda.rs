@@ -420,6 +420,13 @@ impl RangeSink for NiceonlyLauncher<'_> {
     /// Launches are asynchronous on the stream; results accumulate in the
     /// shared output buffers until [`NiceonlyLauncher::finish`].
     fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+        ensure!(
+            offsets.len() == lens.len() && offsets.len() == masks.len(),
+            "range descriptor slices have mismatched lengths ({}/{}/{})",
+            offsets.len(),
+            lens.len(),
+            masks.len()
+        );
         let nice_capacity = NICE_OUT_CAPACITY as u32;
         for ((batch_offsets, batch_lens), batch_masks) in offsets
             .chunks(RANGES_PER_LAUNCH)

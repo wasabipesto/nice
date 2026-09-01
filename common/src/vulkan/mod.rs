@@ -1083,7 +1083,15 @@ impl<'a> NiceonlyRun<'a> {
 }
 
 impl RangeSink for NiceonlyRun<'_> {
-    fn launch(&mut self, offsets: &[u64], lens: &[u32], _masks: &[u64]) -> Result<()> {
+    fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+        anyhow::ensure!(
+            offsets.len() == lens.len() && offsets.len() == masks.len(),
+            "range descriptor slices have mismatched lengths ({}/{}/{})",
+            offsets.len(),
+            lens.len(),
+            masks.len()
+        );
+        let _ = masks; // certificates not yet applied on this backend
         // `masks` (cross-end certificates) are not yet applied on this
         // backend: WGSL has no u64, so the mask test needs a two-word port.
         // Ignoring them only means checking more candidates - never fewer.

@@ -1680,8 +1680,29 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
     }
 }
 
+/// Certificates as (lo, hi) u32 words, matching the offset encoding; a
+/// 2-word dummy when the cross filter is off.
+#[allow(clippy::cast_possible_truncation)]
+fn certificate_words(masks: &[u64], cross: bool) -> Vec<u32> {
+    if cross {
+        masks
+            .iter()
+            .flat_map(|&m| [m as u32, (m >> 32) as u32])
+            .collect()
+    } else {
+        vec![0u32; 2]
+    }
+}
+
 impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
     fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+        ensure!(
+            offsets.len() == lens.len() && offsets.len() == masks.len(),
+            "range descriptor slices have mismatched lengths ({}/{}/{})",
+            offsets.len(),
+            lens.len(),
+            masks.len()
+        );
         // Pack offsets as lo/hi u32 pairs; buffers are created per dispatch
         // and sized to the batch (CubeCL pools the allocations). These
         // per-dispatch writes also flush the stream, so each dispatch is
@@ -1697,16 +1718,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
         let lens_handle = self
             .client
             .create(cubecl::bytes::Bytes::from_elems(lens.to_vec()));
-        // Certificates as (lo, hi) u32 words, matching the offset encoding.
-        #[allow(clippy::cast_possible_truncation)]
-        let mask_words: Vec<u32> = if self.plan.cross {
-            masks
-                .iter()
-                .flat_map(|&m| [m as u32, (m >> 32) as u32])
-                .collect()
-        } else {
-            vec![0u32; 2]
-        };
+        let mask_words = certificate_words(masks, self.plan.cross);
         let masks_len = mask_words.len();
         let masks_handle = self
             .client
