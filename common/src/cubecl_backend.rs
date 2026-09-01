@@ -1475,15 +1475,16 @@ pub async fn process_range_detailed_cubecl_async(
 /// `NICE_CUBECL_WIDE=1` opts in for A/B runs on devices where it is legal;
 /// `NICE_CUBECL_WIDE=0` forces split16 anywhere. A forced wide flavor on a
 /// device without u64 fails at shader compile time, loudly.
-fn wide_chunk_for<R: cubecl::prelude::Runtime>(
-    client: &cubecl::prelude::ComputeClient<R>,
-) -> bool {
+fn wide_chunk_for<R: cubecl::prelude::Runtime>(client: &cubecl::prelude::ComputeClient<R>) -> bool {
     let name = R::name(client);
     let cuda = name.contains("cuda");
     let direct = name.contains("spirv") || name.contains("msl");
-    let u64_ok = client.properties().features.supports_type(cubecl::ir::Type::scalar(
-        cubecl::ir::ElemType::UInt(cubecl::ir::UIntKind::U64),
-    ));
+    let u64_ok = client
+        .properties()
+        .features
+        .supports_type(cubecl::ir::Type::scalar(cubecl::ir::ElemType::UInt(
+            cubecl::ir::UIntKind::U64,
+        )));
     let wide = match std::env::var("NICE_CUBECL_WIDE").ok().as_deref() {
         Some("0") => false,
         Some(_) => true,
