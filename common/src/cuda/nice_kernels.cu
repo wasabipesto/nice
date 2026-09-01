@@ -481,6 +481,30 @@ extern "C" __global__ void niceonly_ranges_kernel(
 #endif
 
 #if defined(CROSS_FILTER) && defined(COMPACT)
+        if (rmask == 0) {
+            // No certificate (no-MSD bypass emits mask 0, and some analyzed
+            // ranges genuinely have none): the ballot/queue machinery can
+            // only cost here (~7% measured at the bypass floor), so run the
+            // plain enumeration for this range instead.
+            for (u32 g = idx0 + lane;; g += 32) {
+                u32 cycle = g / STRIDE_R;
+                u32 j = g - cycle * STRIDE_R;
+                u64 add = (u64)cycle * STRIDE_M + residues[j];
+                u64 n_lo = b0_lo + add;
+                u64 n_hi = b0_hi + (n_lo < b0_lo ? 1 : 0);
+                if (n_hi > re_hi || (n_hi == re_hi && n_lo >= re_lo)) {
+                    break;
+                }
+                if (candidate_is_nice(n_lo, n_hi)) {
+                    u32 pos = atomicAdd(nice_count, 1);
+                    if (pos < nice_capacity) {
+                        nice_out[2 * (size_t)pos] = n_lo;
+                        nice_out[2 * (size_t)pos + 1] = n_hi;
+                    }
+                }
+            }
+            continue;
+        }
         // Warp-compacted enumeration. No lane may leave this loop early:
         // every ballot/all below is warp-collective.
         u32 qn = 0;
