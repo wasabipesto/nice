@@ -1297,8 +1297,13 @@ impl CubeclContext {
             // DX12 on Windows, and reports comparing this backend against
             // the hand-Vulkan one need to know which API actually ran.
             let info = setup.adapter.get_info();
-            let device_name = format!("{} ({:?})", info.name, info.backend);
             let client = cubecl::wgpu::WgpuRuntime::client(&device);
+            let device_name = format!(
+                "{} ({:?}, {})",
+                info.name,
+                info.backend,
+                <cubecl::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::name(&client)
+            );
             (client, device_name)
         });
         Ok(Self::Wgpu {
@@ -1327,8 +1332,13 @@ impl CubeclContext {
             )
             .await;
             let info = setup.adapter.get_info();
-            let device_name = format!("{} ({:?})", info.name, info.backend);
             let client = cubecl::wgpu::WgpuRuntime::client(&device);
+            let device_name = format!(
+                "{} ({:?}, {})",
+                info.name,
+                info.backend,
+                <cubecl::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::name(&client)
+            );
             // A racing initializer winning this set is fine: both describe
             // the same process-wide runtime registration.
             let _ = WGPU_DEFAULT.set((client, device_name));
@@ -1443,10 +1453,42 @@ pub async fn process_range_detailed_cubecl_async(
     }
 
     match ctx {
-        CubeclContext::Wgpu { client, .. } => detailed_impl(client, range, base, false).await,
+        CubeclContext::Wgpu { client, .. } => {
+            detailed_impl(client, range, base, wide_chunk_for(client)).await
+        }
         #[cfg(feature = "cubecl-cuda")]
-        CubeclContext::Cuda { client, .. } => detailed_impl(client, range, base, true).await,
+        CubeclContext::Cuda { client, .. } => {
+            detailed_impl(client, range, base, wide_chunk_for(client)).await
+        }
     }
+}
+
+/// Which chunk-scan flavor a client should run.
+///
+/// The wide flavor divides limb pairs with 64-bit arithmetic and is the
+/// CUDA-native form. On wgpu it is legal only when the device exposes
+/// `u64` *and* the shader goes through one of CubeCL's direct compilers
+/// (`wgpu<spirv>` / `wgpu<msl>`); the WGSL path miscompiles its checked
+/// u64 division on Metal (naga, wgpu 29), so it keeps split16 regardless of
+/// what the adapter advertises. `NICE_CUBECL_WIDE=0|1` forces either flavor
+/// for A/B runs; a forced wide flavor on a device without u64 fails at
+/// compile time, loudly.
+fn wide_chunk_for<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+) -> bool {
+    if let Ok(v) = std::env::var("NICE_CUBECL_WIDE") {
+        return v != "0";
+    }
+    let name = R::name(client);
+    if name.contains("cuda") {
+        return true;
+    }
+    let direct = name.contains("spirv") || name.contains("msl");
+    let u64_ok = client.properties().features.supports_type(cubecl::ir::Type::scalar(
+        cubecl::ir::ElemType::UInt(cubecl::ir::UIntKind::U64),
+    ));
+    debug!("CubeCL chunk flavor on {name}: direct compiler {direct}, u64 {u64_ok}");
+    direct && u64_ok
 }
 
 /// Read one histogram buffer and fold its bins into the accumulator.
@@ -1584,7 +1626,7 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
     // hint does too: a CUDA runtime without NVRTC, or a wgpu device the
     // driver's watchdog reset.
     let counted: u128 = histogram.iter().sum();
-    let hint = if wide_chunk {
+    let hint = if R::name(client).contains("cuda") {
         "is the CUDA toolkit, including NVRTC, installed?"
     } else {
         "was the device reset by the driver's watchdog? check the kernel log"
@@ -1688,7 +1730,7 @@ pub fn process_range_niceonly_cubecl(
             cached_plan(niceonly_plans, client, base)?,
             range,
             base,
-            false,
+            wide_chunk_for(client),
         ),
         #[cfg(feature = "cubecl-cuda")]
         CubeclContext::Cuda {
@@ -1700,7 +1742,7 @@ pub fn process_range_niceonly_cubecl(
             cached_plan(niceonly_plans, client, base)?,
             range,
             base,
-            true,
+            wide_chunk_for(client),
         ),
     }
 }
