@@ -142,6 +142,34 @@ class GpuChainTests(unittest.TestCase):
 
 
 class VersionAndDecodeTests(unittest.TestCase):
+    def test_same_version_samples_are_preferred(self):
+        samples = [sample(False, "AMD EPYC 7763", None, 8, r, r / 7)
+                   for r in (1.0e9, 1.1e9, 0.9e9)]
+        for _ in range(3):
+            s = sample(False, "AMD EPYC 7763", None, 8, 4.0e9, 6.0e8)
+            s.client_version = "3.5.0"
+            samples.append(s)
+        out = estimate(samples, inp(False, cpu="AMD EPYC 7763", threads=8,
+                                    client_version="3.5.0"))
+        self.assertEqual(out["versions_used"], ["3.5.0"])
+        self.assertEqual(out["samples_used"], 3)
+        row = next(s for s in out["scenarios"] if s["key"] == "b50_msd_weak")
+        self.assertGreater(row["rate_p50"], 3.5e9)
+        self.assertTrue(any("restricted" in n for n in out["notes"]))
+
+    def test_sparse_version_stays_pooled_with_discount(self):
+        samples = [sample(False, "AMD EPYC 7763", None, 8, r, r / 7)
+                   for r in (1.0e9, 1.1e9, 0.9e9)]
+        s = sample(False, "AMD EPYC 7763", None, 8, 4.0e9, 6.0e8)
+        s.client_version = "3.5.0"
+        samples.append(s)
+        out = estimate(samples, inp(False, cpu="AMD EPYC 7763", threads=8,
+                                    client_version="3.5.0"))
+        self.assertEqual(out["samples_used"], 4)
+        self.assertEqual(out["confidence"], 70)
+        self.assertIn("3.4.0", out["versions_used"])
+        self.assertTrue(any("only 1 samples" in n for n in out["notes"]))
+
     def test_version_mismatch_discounts(self):
         samples = [sample(False, "AMD EPYC 7763", None, 8, 2.0e9, 3.0e8)]
         out = estimate(samples, inp(False, cpu="AMD EPYC 7763", threads=8,

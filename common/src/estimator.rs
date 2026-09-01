@@ -508,14 +508,56 @@ fn scaled_stage<'a>(
     }
 }
 
+/// Minimum matched samples from the requested client version before the
+/// estimate restricts itself to that version's rates.
+pub const MIN_VERSION_SAMPLES: usize = 3;
+
 /// Produce the estimate. `samples` should be recent decoded reports; order
 /// does not matter.
 #[must_use]
 pub fn estimate(samples: &[BenchmarkSample], input: &EstimateInput) -> EstimateOutcome {
     let mut matched = match_stage(samples, input);
 
-    // Version awareness: report which client versions back the estimate and
-    // discount if the requested version has no representation.
+    // Version segmentation: rates are only comparable within a client
+    // version — filters and floor retunes move whole scenario classes by
+    // multiples between releases — so when the requested version has enough
+    // matched samples, the estimate uses those alone. With too few, the
+    // pool stays mixed and the confidence discount plus note say so.
+    if let Some(want) = &input.client_version
+        && !matched.rows.is_empty()
+    {
+        let same: Vec<(&BenchmarkSample, f64)> = matched
+            .rows
+            .iter()
+            .filter(|(s, _)| &s.client_version == want)
+            .copied()
+            .collect();
+        if same.len() >= MIN_VERSION_SAMPLES {
+            if same.len() < matched.rows.len() {
+                matched.notes.push(format!(
+                    "estimate restricted to {} samples from client version {want}; \
+                     cross-version rates are not comparable",
+                    same.len()
+                ));
+                matched.rows = same;
+            }
+        } else {
+            let mut others: Vec<String> = matched
+                .rows
+                .iter()
+                .map(|(s, _)| s.client_version.clone())
+                .filter(|v| v != want)
+                .collect();
+            others.sort();
+            others.dedup();
+            matched.confidence = matched.confidence.saturating_sub(15).max(5);
+            matched.notes.push(format!(
+                "only {} samples from client version {want}; estimates pool other \
+                 versions {others:?} whose rates may not be comparable",
+                same.len()
+            ));
+        }
+    }
     let mut versions_used: Vec<String> = matched
         .rows
         .iter()
@@ -523,15 +565,6 @@ pub fn estimate(samples: &[BenchmarkSample], input: &EstimateInput) -> EstimateO
         .collect();
     versions_used.sort();
     versions_used.dedup();
-    if let Some(want) = &input.client_version
-        && !matched.rows.is_empty()
-        && !versions_used.contains(want)
-    {
-        matched.confidence = matched.confidence.saturating_sub(15).max(5);
-        matched.notes.push(format!(
-            "no samples from client version {want}; estimates come from {versions_used:?}"
-        ));
-    }
 
     // Group scaled rates by scenario key.
     let mut by_key: Vec<(String, u32, Vec<f64>)> = Vec::new();
@@ -848,6 +881,68 @@ mod tests {
         assert_eq!(out.prediction_stage, "exact");
         assert_eq!(out.confidence, 70);
         assert!(out.notes.iter().any(|n| n.contains("9.9.9")));
+    }
+
+    #[test]
+    fn same_version_samples_are_preferred() {
+        let mut samples = vec![
+            sample(false, "AMD EPYC 7763", None, 8, 1.0e9, 1.5e8),
+            sample(false, "AMD EPYC 7763", None, 8, 1.1e9, 1.6e8),
+            sample(false, "AMD EPYC 7763", None, 8, 0.9e9, 1.4e8),
+        ];
+        for _ in 0..MIN_VERSION_SAMPLES {
+            let mut s = sample(false, "AMD EPYC 7763", None, 8, 4.0e9, 6.0e8);
+            s.client_version = "3.5.0".to_string();
+            samples.push(s);
+        }
+        let mut req = input(false, Some("AMD EPYC 7763"), None, Some(8));
+        req.client_version = Some("3.5.0".to_string());
+        let out = estimate(&samples, &req);
+        assert_eq!(out.versions_used, vec!["3.5.0".to_string()]);
+        assert_eq!(out.samples_used, MIN_VERSION_SAMPLES);
+        let s = out
+            .scenarios
+            .iter()
+            .find(|s| s.key == "b50_msd_weak")
+            .unwrap();
+        assert!(
+            s.rate_p50 > 3.5e9,
+            "old-version rates leaked into the pool: {}",
+            s.rate_p50
+        );
+        assert!(out.notes.iter().any(|n| n.contains("restricted")));
+
+        // The old version still gets its own clean segment.
+        let mut req_old = input(false, Some("AMD EPYC 7763"), None, Some(8));
+        req_old.client_version = Some("3.4.0".to_string());
+        let out_old = estimate(&samples, &req_old);
+        assert_eq!(out_old.versions_used, vec!["3.4.0".to_string()]);
+        let s_old = out_old
+            .scenarios
+            .iter()
+            .find(|s| s.key == "b50_msd_weak")
+            .unwrap();
+        assert!(s_old.rate_p50 < 1.5e9);
+    }
+
+    #[test]
+    fn sparse_version_stays_pooled_with_discount() {
+        let mut samples = vec![
+            sample(false, "AMD EPYC 7763", None, 8, 1.0e9, 1.5e8),
+            sample(false, "AMD EPYC 7763", None, 8, 1.1e9, 1.6e8),
+            sample(false, "AMD EPYC 7763", None, 8, 0.9e9, 1.4e8),
+        ];
+        let mut s = sample(false, "AMD EPYC 7763", None, 8, 4.0e9, 6.0e8);
+        s.client_version = "3.5.0".to_string();
+        samples.push(s);
+        let mut req = input(false, Some("AMD EPYC 7763"), None, Some(8));
+        req.client_version = Some("3.5.0".to_string());
+        let out = estimate(&samples, &req);
+        // Pool stays mixed, confidence discounted, both versions reported.
+        assert_eq!(out.samples_used, 4);
+        assert_eq!(out.confidence, 70);
+        assert!(out.versions_used.contains(&"3.4.0".to_string()));
+        assert!(out.notes.iter().any(|n| n.contains("only 1 samples")));
     }
 
     #[test]
