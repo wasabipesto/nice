@@ -3,7 +3,8 @@
 //! Both GPU backends run niceonly the same way: the CPU runs the real MSD
 //! prefix filter across all cores with a coarser recursion floor than the CPU
 //! client uses (see [`AdaptiveFloor`]), and ships only compact *range
-//! descriptors* — ~12 bytes per surviving range — to the device, which
+//! descriptors* — 20 bytes per surviving range (offset, length, cross-end
+//! certificate mask) — to the device, which
 //! reconstructs the stride filter's candidates itself. No per-candidate data
 //! ever crosses the bus.
 //!
@@ -52,8 +53,8 @@ pub const LAUNCH_BATCH_RANGES: usize = 1 << 16;
 /// backend. A CUDA launch is asynchronous, so that consumer never really
 /// blocks and any bound is slack. A Vulkan dispatch blocks on a fence, so with
 /// an unbounded channel the workers would race arbitrarily far ahead: a base-52
-/// field at floor 250 is ~9e7 surviving ranges, and 12 bytes apiece is over a
-/// gigabyte of queued descriptors. Bounding the channel keeps the overlap —
+/// field at floor 250 is ~9e7 surviving ranges, and 20 bytes apiece is nearly two
+/// gigabytes of queued descriptors. Bounding the channel keeps the overlap —
 /// workers refill the queue while the consumer waits on the device.
 ///
 /// **The unit here is one chunk, not one launch batch.** Each item a worker
@@ -62,7 +63,7 @@ pub const LAUNCH_BATCH_RANGES: usize = 1 << 16;
 /// what sits in the channel. So the cap is `PIPELINE_DEPTH` × the most ranges a
 /// chunk can yield — the recursion returns a range whole once it is at or below
 /// the floor, so that is about `PROCESSING_CHUNK_SIZE / floor`, i.e. ~4000 at
-/// [`MSD_FLOOR_MIN`] and fewer at any coarser floor. Roughly 3 MB of
+/// [`MSD_FLOOR_MIN`] and fewer at any coarser floor. Roughly 5 MB of
 /// descriptors at the worst floor, comfortably below the gigabyte above.
 const PIPELINE_DEPTH: usize = 64;
 
@@ -71,9 +72,13 @@ const PIPELINE_DEPTH: usize = 64;
 /// check itself, so there is no point going lower.
 const MSD_FLOOR_MIN: f64 = 250.0;
 
-/// Maximum useful MSD recursion floor. Beyond ~64 000 the survival rate
-/// saturates around 23 % (b52 measurement), so larger values buy nothing.
-/// Measured on a real b52 production field (per 1e12 numbers, single core):
+/// Maximum MSD recursion floor: one whole [`PROCESSING_CHUNK_SIZE`] chunk,
+/// i.e. explicit no-MSD mode — chunks are emitted as single descriptors with
+/// no Hall analysis at all (see [`descriptors_for_chunk`]). Letting the
+/// adaptive controller reach this is deliberate: on a strong device paired
+/// with a weak CPU, even coarse endpoint analysis can be the bottleneck, and
+/// the device-side cross-end mask test plus the on-device stride table
+/// still bound the wasted work. Survival data (b52, per 1e12, single core):
 ///
 /// | floor  | CPU time | surviving |
 /// |--------|----------|-----------|
@@ -81,7 +86,8 @@ const MSD_FLOOR_MIN: f64 = 250.0;
 /// | 4 000  | 50 s     | 15.2 %    |
 /// | 16 000 | 15 s     | 19.0 %    |
 /// | 64 000 | 4.8 s    | 22.6 %    |
-const MSD_FLOOR_MAX: f64 = 256_000.0;
+#[allow(clippy::cast_precision_loss)]
+const MSD_FLOOR_MAX: f64 = PROCESSING_CHUNK_SIZE as f64;
 
 /// Adaptive MSD recursion floor for the niceonly GPU pipeline.
 ///
@@ -211,11 +217,16 @@ pub struct NiceonlyStats {
 /// the object-safe surface down to the two calls the pipeline actually makes.
 pub trait RangeSink {
     /// Dispatch one batch. `offsets` are relative to the field start, `lens`
-    /// are candidate counts; the two slices are the same length.
+    /// are candidate counts, and `masks` are the ranges' cross-end
+    /// certificates (digits certainly occupying output positions >= k for
+    /// every n in the range — see `msd_prefix_filter::MsdAnalysis`); the
+    /// three slices are the same length. A backend that has no device-side
+    /// mask test yet may ignore `masks` — the filter is an optimization,
+    /// never required for correctness.
     ///
     /// # Errors
     /// Returns an error on any device failure.
-    fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()>;
+    fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()>;
 
     /// Wait for everything launched so far to finish on the device. Called
     /// once, inside the timed region, so `total_secs` covers real device work
@@ -230,7 +241,8 @@ pub trait RangeSink {
 
 /// MSD-filter one chunk into descriptors relative to `field_start`.
 ///
-/// Each surviving range becomes 12 bytes: a u64 offset and a u32 length. That
+/// Each surviving range becomes 20 bytes: a u64 offset, a u32 length, and a
+/// u64 cross-end certificate mask. That
 /// encoding, not the filter, is what bounds a range — a field is at most 1e12
 /// numbers so the offset always fits, but a range longer than `u32::MAX` would
 /// not, which is why this can fail.
@@ -239,23 +251,52 @@ fn descriptors_for_chunk(
     base: u32,
     floor: u128,
     field_start: u128,
-) -> Result<(Vec<u64>, Vec<u32>)> {
+) -> Result<(Vec<u64>, Vec<u32>, Vec<u64>)> {
     let mut offsets: Vec<u64> = Vec::new();
     let mut lens: Vec<u32> = Vec::new();
-    for sub in msd_prefix_filter::get_valid_ranges_recursive(
+    let mut masks: Vec<u64> = Vec::new();
+    if floor >= PROCESSING_CHUNK_SIZE {
+        // Explicit no-MSD bypass: the whole chunk as one descriptor, no
+        // endpoint analysis and no certificate. The device still applies
+        // the stride table; it just checks every stride candidate.
+        let offset = u64::try_from(chunk.start() - field_start);
+        let len = u32::try_from(chunk.size());
+        match (offset, len) {
+            (Ok(offset), Ok(len)) => {
+                offsets.push(offset);
+                lens.push(len);
+                masks.push(0);
+            }
+            _ => anyhow::bail!(
+                "chunk doesn't fit descriptor: start {} size {}",
+                chunk.start(),
+                chunk.size()
+            ),
+        }
+        return Ok((offsets, lens, masks));
+    }
+    let mut leaves: Vec<(FieldSize, u64)> = Vec::new();
+    msd_prefix_filter::get_valid_ranges_recursive_masked(
         chunk,
-        base,
+        &msd_prefix_filter::MaskedRecursion {
+            base,
+            fixed_lsd_k: GPU_LSD_K as usize,
+            max_depth: msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH,
+            min_range_size: floor,
+            subdivision_factor: msd_prefix_filter::MSD_RECURSIVE_SUBDIVISION_FACTOR,
+        },
         0,
-        msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH,
-        floor,
-        msd_prefix_filter::MSD_RECURSIVE_SUBDIVISION_FACTOR,
-    ) {
+        0,
+        &mut leaves,
+    );
+    for (sub, mask) in leaves {
         let offset = u64::try_from(sub.start() - field_start);
         let len = u32::try_from(sub.size());
         match (offset, len) {
             (Ok(offset), Ok(len)) => {
                 offsets.push(offset);
                 lens.push(len);
+                masks.push(mask);
             }
             _ => anyhow::bail!(
                 "valid range doesn't fit descriptor: start {} size {}",
@@ -264,7 +305,7 @@ fn descriptors_for_chunk(
             ),
         }
     }
-    Ok((offsets, lens))
+    Ok((offsets, lens, masks))
 }
 
 /// Run one niceonly field: MSD workers stream surviving-range descriptors
@@ -294,7 +335,7 @@ pub fn run_range_pipeline<S: RangeSink>(
 
     let next_chunk = AtomicUsize::new(0);
     let worker_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u64>, Vec<u32>)>(PIPELINE_DEPTH);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u64>, Vec<u32>, Vec<u64>)>(PIPELINE_DEPTH);
 
     let mut stats = NiceonlyStats {
         msd_secs: 0.0,
@@ -306,6 +347,7 @@ pub fn run_range_pipeline<S: RangeSink>(
     };
     let mut buf_offsets: Vec<u64> = Vec::new();
     let mut buf_lens: Vec<u32> = Vec::new();
+    let mut buf_masks: Vec<u64> = Vec::new();
     let mut launch_error: Option<anyhow::Error> = None;
 
     std::thread::scope(|scope| {
@@ -319,10 +361,10 @@ pub fn run_range_pipeline<S: RangeSink>(
                     let i = next_chunk.fetch_add(1, Ordering::Relaxed);
                     let Some(chunk) = chunks.get(i) else { break };
                     match descriptors_for_chunk(*chunk, base, floor, range.start()) {
-                        Ok((offsets, lens)) if !offsets.is_empty() => {
+                        Ok((offsets, lens, masks)) if !offsets.is_empty() => {
                             // A closed channel means the consumer gave up on a
                             // launch error; the remaining chunks are moot.
-                            if tx.send((offsets, lens)).is_err() {
+                            if tx.send((offsets, lens, masks)).is_err() {
                                 break;
                             }
                         }
@@ -340,14 +382,15 @@ pub fn run_range_pipeline<S: RangeSink>(
         // ours lets `recv` disconnect once they all finish.
         drop(tx);
 
-        while let Ok((offsets, lens)) = rx.recv() {
+        while let Ok((offsets, lens, masks)) = rx.recv() {
             stats.num_ranges += offsets.len();
             stats.valid_numbers += lens.iter().map(|&l| u64::from(l)).sum::<u64>();
             buf_offsets.extend_from_slice(&offsets);
             buf_lens.extend_from_slice(&lens);
+            buf_masks.extend_from_slice(&masks);
             if buf_offsets.len() >= LAUNCH_BATCH_RANGES {
                 let t = Instant::now();
-                let outcome = sink.launch(&buf_offsets, &buf_lens);
+                let outcome = sink.launch(&buf_offsets, &buf_lens, &buf_masks);
                 stats.device_secs += t.elapsed().as_secs_f64();
                 if let Err(e) = outcome {
                     launch_error = Some(e);
@@ -356,6 +399,7 @@ pub fn run_range_pipeline<S: RangeSink>(
                 stats.launches += 1;
                 buf_offsets.clear();
                 buf_lens.clear();
+                buf_masks.clear();
             }
         }
         // Break out of the consume loop and the workers are still producing
@@ -378,7 +422,7 @@ pub fn run_range_pipeline<S: RangeSink>(
     }
     let tail = Instant::now();
     if !buf_offsets.is_empty() {
-        sink.launch(&buf_offsets, &buf_lens)?;
+        sink.launch(&buf_offsets, &buf_lens, &buf_masks)?;
         stats.launches += 1;
     }
     sink.sync()?;
@@ -545,13 +589,14 @@ mod tests {
     /// A sink that records what it was handed instead of touching a device.
     #[derive(Default)]
     struct Recorder {
-        batches: Vec<(Vec<u64>, Vec<u32>)>,
+        batches: Vec<(Vec<u64>, Vec<u32>, Vec<u64>)>,
         synced: bool,
     }
 
     impl RangeSink for Recorder {
-        fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()> {
-            self.batches.push((offsets.to_vec(), lens.to_vec()));
+        fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+            self.batches
+                .push((offsets.to_vec(), lens.to_vec(), masks.to_vec()));
             Ok(())
         }
         fn sync(&mut self) -> Result<()> {
@@ -564,7 +609,7 @@ mod tests {
     struct Failing;
 
     impl RangeSink for Failing {
-        fn launch(&mut self, _offsets: &[u64], _lens: &[u32]) -> Result<()> {
+        fn launch(&mut self, _offsets: &[u64], _lens: &[u32], _masks: &[u64]) -> Result<()> {
             anyhow::bail!("simulated device failure")
         }
     }
@@ -603,6 +648,38 @@ mod tests {
         assert!(errored, "the launch failure must reach the caller");
     }
 
+    /// At the bypass floor, a chunk becomes exactly one descriptor with no
+    /// certificate; below it, descriptors match the masked recursion.
+    #[test]
+    fn bypass_floor_emits_whole_chunks() {
+        let base = 40;
+        let range = crate::base_range::get_base_range_u128(base)
+            .unwrap()
+            .unwrap();
+        let start = range.start();
+        // Mid-range chunk: the band start is MSD-strong and can reject a
+        // whole chunk, which would make the certificate assertions vacuous.
+        let mid = start + (range.end() - start) / 2;
+        let chunk = FieldSize::new(mid, mid + PROCESSING_CHUNK_SIZE);
+        let (offsets, lens, masks) =
+            descriptors_for_chunk(chunk, base, PROCESSING_CHUNK_SIZE, start).unwrap();
+        assert_eq!(offsets, vec![u64::try_from(mid - start).unwrap()]);
+        assert_eq!(lens, vec![PROCESSING_CHUNK_SIZE as u32]);
+        assert_eq!(masks, vec![0]);
+
+        // A sub-bypass floor produces the masked recursion's leaves.
+        let (offsets, lens, masks) = descriptors_for_chunk(chunk, base, 8000, start).unwrap();
+        let leaves = msd_prefix_filter::get_valid_ranges_masked(chunk, base, GPU_LSD_K as usize);
+        assert_eq!(offsets.len(), leaves.len());
+        assert_eq!(masks.len(), leaves.len());
+        for (i, (leaf, mask)) in leaves.iter().enumerate() {
+            assert_eq!(u128::from(offsets[i]), leaf.start() - start);
+            assert_eq!(u128::from(lens[i]), leaf.size());
+            assert_eq!(masks[i], *mask);
+        }
+        assert!(masks.iter().any(|&m| m != 0), "expected live certificates");
+    }
+
     /// The descriptors the pipeline emits must cover every candidate the CPU
     /// stride iteration would visit. The MSD floor makes the GPU's set a
     /// *superset* (coarser pruning is still sound), so this checks containment
@@ -623,11 +700,12 @@ mod tests {
         assert!(sink.synced, "the pipeline must sync the sink");
         assert_eq!(
             stats.num_ranges,
-            sink.batches.iter().map(|(o, _)| o.len()).sum::<usize>()
+            sink.batches.iter().map(|(o, _, _)| o.len()).sum::<usize>()
         );
 
         let mut covered: Vec<(u128, u128)> = Vec::new();
-        for (offsets, lens) in &sink.batches {
+        for (offsets, lens, masks) in &sink.batches {
+            assert_eq!(offsets.len(), masks.len());
             for (&o, &l) in offsets.iter().zip(lens) {
                 let s = field.start() + u128::from(o);
                 covered.push((s, s + u128::from(l)));

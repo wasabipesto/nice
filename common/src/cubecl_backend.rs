@@ -370,12 +370,15 @@ const NICEONLY_OUT_CAPACITY: usize = 1 << 16;
 // `manual_midpoint`: `u32::midpoint` has no cube-dialect translation.
 // manual_midpoint: `u32::midpoint` has no cube translation, so the kernel
 // keeps the shift form.
+// `collapsible_if`: `has_prefilter` is comptime and `ok` is runtime; the
+// cube macro wants them in separate `if`s so the outer one folds away.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::similar_names,
     clippy::many_single_char_names,
-    clippy::manual_midpoint
+    clippy::manual_midpoint,
+    clippy::collapsible_if
 )]
 fn niceonly_kernel(
     residues: &Array<u32>,
@@ -383,6 +386,8 @@ fn niceonly_kernel(
     range_lens: &Array<u32>,
     nice_out: &mut Array<u32>,
     nice_count: &Array<Atomic<u32>>,
+    low_masks: &Array<u32>, // per residue: lo,hi words of its exact low-digit mask
+    range_masks: &Array<u32>, // per range: lo,hi words of its certificate
     fs0: u32,
     fs1: u32,
     fs2: u32,
@@ -403,6 +408,7 @@ fn niceonly_kernel(
     #[comptime] pre_chunk_digits: u32,
     #[comptime] pre_chunk_div: u32,
     #[comptime] probe: bool, // report prefilter survivors instead of nice numbers
+    #[comptime] cross: bool, // cross-end residue filter (certificate x low mask)
 ) {
     let sq_limbs = comptime!(2 * limbs);
     let cu_limbs = comptime!(3 * limbs);
@@ -432,6 +438,14 @@ fn niceonly_kernel(
         let off_lo = range_offsets[(2u32 * r) as usize];
         let off_hi = range_offsets[(2u32 * r + 1u32) as usize];
         let offset = (u64::cast_from(off_hi) << 32u64) | u64::cast_from(off_lo);
+
+        // Cross-end certificate for this range (0 = no filtering; the
+        // no-MSD bypass and mask-less analyses ship exactly that).
+        let mut rmask = 0u64;
+        if cross {
+            rmask = (u64::cast_from(range_masks[(2u32 * r + 1u32) as usize]) << 32u64)
+                | u64::cast_from(range_masks[(2u32 * r) as usize]);
+        }
 
         // range_start = field_start + offset, range_end = + len.
         let rs_lo = fs_lo + offset;
@@ -498,6 +512,18 @@ fn niceonly_kernel(
             // --- candidate_is_nice(n_lo, n_hi), inlined ----------------------
             let mut ok = true;
 
+            // Cross-end residue filter: residue j's exact low output digits
+            // against the range's certain high digits. An intersection is a
+            // duplicated digit across two distinct positions - skip the
+            // candidate without checking anything.
+            if cross {
+                let lm = (u64::cast_from(low_masks[(2u32 * j + 1u32) as usize]) << 32u64)
+                    | u64::cast_from(low_masks[(2u32 * j) as usize]);
+                if (lm & rmask) != 0u64 {
+                    ok = false;
+                }
+            }
+
             // Low-digit modular prefilter: are the lowest
             // `pre_limbs * pre_chunk_digits` digits of n² and n³ all distinct?
             // Fixed-length and branch-free — lanes only save work when their
@@ -505,118 +531,120 @@ fn niceonly_kernel(
             // as digit-chunks of base `pre_chunk_div < 2^16` so the truncated
             // multiplies stay in u32 (`x^k mod b^p == (x mod b^p)^k mod b^p`).
             if has_prefilter {
-                // v = n's u32 limbs; a[r] = successive `mod pre_chunk_div`
-                // chunks peeled off by the same split16 step the digit scan
-                // uses.
-                let mut v = Array::<u32>::new(limbs as usize);
-                #[unroll]
-                for i in 0..limbs {
-                    let shift = comptime!(((i & 1) * 32) as u64);
-                    if comptime!(i < 2) {
-                        v[i as usize] = u32::cast_from(n_lo >> shift);
-                    } else {
-                        v[i as usize] = u32::cast_from(n_hi >> shift);
-                    }
-                }
-                let mut a = Array::<u32>::new(pre_limbs as usize);
-                #[unroll]
-                for rr in 0..pre_limbs {
-                    let mut rem = 0u32;
+                if ok {
+                    // v = n's u32 limbs; a[r] = successive `mod pre_chunk_div`
+                    // chunks peeled off by the same split16 step the digit scan
+                    // uses.
+                    let mut v = Array::<u32>::new(limbs as usize);
                     #[unroll]
                     for i in 0..limbs {
-                        let idx = comptime!(limbs - 1 - i);
-                        let vi = v[idx as usize];
-                        // Plain paired `%` here, unlike the digit scan: the
-                        // mul-sub form of these four prefilter sites
-                        // miscompiles under naga's MSL backend (survivors
-                        // diverge from the host mirror on Apple GPUs, caught
-                        // by the probe test), and the prefilter runs once per
-                        // candidate so the pairing costs nothing measurable.
-                        let c1 = (rem << 16u32) | (vi >> 16u32);
-                        let q1 = c1 / pre_chunk_div;
-                        let c2 = ((c1 % pre_chunk_div) << 16u32) | (vi & 0xFFFFu32);
-                        rem = c2 % pre_chunk_div;
-                        v[idx as usize] = (q1 << 16u32) | (c2 / pre_chunk_div);
+                        let shift = comptime!(((i & 1) * 32) as u64);
+                        if comptime!(i < 2) {
+                            v[i as usize] = u32::cast_from(n_lo >> shift);
+                        } else {
+                            v[i as usize] = u32::cast_from(n_hi >> shift);
+                        }
                     }
-                    a[rr as usize] = rem;
-                }
-
-                // sq = a², cu = sq·a, truncated schoolbook over digit-chunks —
-                // dropping products at or above chunk `pre_limbs` is exactly
-                // reduction mod pre_chunk_div^pre_limbs.
-                let mut psq = Array::<u32>::new(pre_limbs as usize);
-                #[unroll]
-                for i in 0..pre_limbs {
-                    psq[i as usize] = 0u32;
-                }
-                #[unroll]
-                for i in 0..pre_limbs {
-                    let mut carry = 0u32;
+                    let mut a = Array::<u32>::new(pre_limbs as usize);
                     #[unroll]
-                    for j in 0..comptime!(pre_limbs - i) {
-                        let k = comptime!(i + j);
-                        let t = a[i as usize] * a[j as usize] + psq[k as usize] + carry;
-                        psq[k as usize] = t % pre_chunk_div;
-                        carry = t / pre_chunk_div;
+                    for rr in 0..pre_limbs {
+                        let mut rem = 0u32;
+                        #[unroll]
+                        for i in 0..limbs {
+                            let idx = comptime!(limbs - 1 - i);
+                            let vi = v[idx as usize];
+                            // Plain paired `%` here, unlike the digit scan: the
+                            // mul-sub form of these four prefilter sites
+                            // miscompiles under naga's MSL backend (survivors
+                            // diverge from the host mirror on Apple GPUs, caught
+                            // by the probe test), and the prefilter runs once per
+                            // candidate so the pairing costs nothing measurable.
+                            let c1 = (rem << 16u32) | (vi >> 16u32);
+                            let q1 = c1 / pre_chunk_div;
+                            let c2 = ((c1 % pre_chunk_div) << 16u32) | (vi & 0xFFFFu32);
+                            rem = c2 % pre_chunk_div;
+                            v[idx as usize] = (q1 << 16u32) | (c2 / pre_chunk_div);
+                        }
+                        a[rr as usize] = rem;
                     }
-                }
-                let mut pcu = Array::<u32>::new(pre_limbs as usize);
-                #[unroll]
-                for i in 0..pre_limbs {
-                    pcu[i as usize] = 0u32;
-                }
-                #[unroll]
-                for i in 0..pre_limbs {
-                    let mut carry = 0u32;
-                    #[unroll]
-                    for j in 0..comptime!(pre_limbs - i) {
-                        let k = comptime!(i + j);
-                        let t = psq[i as usize] * a[j as usize] + pcu[k as usize] + carry;
-                        pcu[k as usize] = t % pre_chunk_div;
-                        carry = t / pre_chunk_div;
-                    }
-                }
 
-                // Duplicate scan over both values' chunks; every chunk holds
-                // exactly pre_chunk_digits real digits, leading zeros included
-                // (that is what the host's digit-count guarantee buys).
-                let mut p0 = 0u64;
-                let mut p1 = 0u64;
-                let mut dup = 0u64;
-                let mut src: u32 = 0u32;
-                while src < 2u32 {
+                    // sq = a², cu = sq·a, truncated schoolbook over digit-chunks —
+                    // dropping products at or above chunk `pre_limbs` is exactly
+                    // reduction mod pre_chunk_div^pre_limbs.
+                    let mut psq = Array::<u32>::new(pre_limbs as usize);
                     #[unroll]
                     for i in 0..pre_limbs {
-                        let mut c = if src == 0u32 {
-                            psq[i as usize]
-                        } else {
-                            pcu[i as usize]
-                        };
+                        psq[i as usize] = 0u32;
+                    }
+                    #[unroll]
+                    for i in 0..pre_limbs {
+                        let mut carry = 0u32;
                         #[unroll]
-                        for _k in 0..pre_chunk_digits {
-                            let d = c % base;
-                            c /= base;
-                            if two_masks {
-                                if d < 64u32 {
+                        for j in 0..comptime!(pre_limbs - i) {
+                            let k = comptime!(i + j);
+                            let t = a[i as usize] * a[j as usize] + psq[k as usize] + carry;
+                            psq[k as usize] = t % pre_chunk_div;
+                            carry = t / pre_chunk_div;
+                        }
+                    }
+                    let mut pcu = Array::<u32>::new(pre_limbs as usize);
+                    #[unroll]
+                    for i in 0..pre_limbs {
+                        pcu[i as usize] = 0u32;
+                    }
+                    #[unroll]
+                    for i in 0..pre_limbs {
+                        let mut carry = 0u32;
+                        #[unroll]
+                        for j in 0..comptime!(pre_limbs - i) {
+                            let k = comptime!(i + j);
+                            let t = psq[i as usize] * a[j as usize] + pcu[k as usize] + carry;
+                            pcu[k as usize] = t % pre_chunk_div;
+                            carry = t / pre_chunk_div;
+                        }
+                    }
+
+                    // Duplicate scan over both values' chunks; every chunk holds
+                    // exactly pre_chunk_digits real digits, leading zeros included
+                    // (that is what the host's digit-count guarantee buys).
+                    let mut p0 = 0u64;
+                    let mut p1 = 0u64;
+                    let mut dup = 0u64;
+                    let mut src: u32 = 0u32;
+                    while src < 2u32 {
+                        #[unroll]
+                        for i in 0..pre_limbs {
+                            let mut c = if src == 0u32 {
+                                psq[i as usize]
+                            } else {
+                                pcu[i as usize]
+                            };
+                            #[unroll]
+                            for _k in 0..pre_chunk_digits {
+                                let d = c % base;
+                                c /= base;
+                                if two_masks {
+                                    if d < 64u32 {
+                                        let bit = 1u64 << u64::cast_from(d);
+                                        dup |= p0 & bit;
+                                        p0 |= bit;
+                                    } else {
+                                        let bit = 1u64 << u64::cast_from(d - 64u32);
+                                        dup |= p1 & bit;
+                                        p1 |= bit;
+                                    }
+                                } else {
                                     let bit = 1u64 << u64::cast_from(d);
                                     dup |= p0 & bit;
                                     p0 |= bit;
-                                } else {
-                                    let bit = 1u64 << u64::cast_from(d - 64u32);
-                                    dup |= p1 & bit;
-                                    p1 |= bit;
                                 }
-                            } else {
-                                let bit = 1u64 << u64::cast_from(d);
-                                dup |= p0 & bit;
-                                p0 |= bit;
                             }
                         }
+                        src += 1u32;
                     }
-                    src += 1u32;
-                }
-                if dup != 0u64 {
-                    ok = false;
+                    if dup != 0u64 {
+                        ok = false;
+                    }
                 }
             }
 
@@ -1476,6 +1504,10 @@ pub struct NiceonlyPlan {
     stride_r: u32,
     residues: cubecl::server::Handle,
     prefilter: Option<VulkanPrefilterParams>,
+    /// Per-residue exact low-digit masks on device as (lo, hi) u32 words,
+    /// for the cross-end residue filter; a 2-word dummy when `cross` is off.
+    low_masks: cubecl::server::Handle,
+    cross: bool,
 }
 
 impl NiceonlyPlan {
@@ -1500,12 +1532,29 @@ impl NiceonlyPlan {
         let stride_m = table.modulus as u32;
         let stride_r = u32::try_from(table.valid_residues.len())
             .with_context(|| format!("residue count overflows u32 for base {base}"))?;
+        // Cross-end residue filter: on by default wherever the low-mask
+        // table exists (base <= 64); NICE_CUBECL_CROSS=0 opts out for A/B.
+        let cross = !table.low_digit_masks.is_empty()
+            && std::env::var("NICE_CUBECL_CROSS").map_or(true, |v| v != "0");
+        #[allow(clippy::cast_possible_truncation)]
+        let mask_words: Vec<u32> = if cross {
+            table
+                .low_digit_masks
+                .iter()
+                .flat_map(|&m| [m as u32, (m >> 32) as u32])
+                .collect()
+        } else {
+            vec![0u32; 2]
+        };
+        let low_masks = client.create(cubecl::bytes::Bytes::from_elems(mask_words));
         let residues = client.create(cubecl::bytes::Bytes::from_elems(table.valid_residues));
         Ok(Self {
             stride_m,
             stride_r,
             residues,
             prefilter: vulkan_prefilter_params(base),
+            low_masks,
+            cross,
         })
     }
 }
@@ -1631,8 +1680,29 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
     }
 }
 
+/// Certificates as (lo, hi) u32 words, matching the offset encoding; a
+/// 2-word dummy when the cross filter is off.
+#[allow(clippy::cast_possible_truncation)]
+fn certificate_words(masks: &[u64], cross: bool) -> Vec<u32> {
+    if cross {
+        masks
+            .iter()
+            .flat_map(|&m| [m as u32, (m >> 32) as u32])
+            .collect()
+    } else {
+        vec![0u32; 2]
+    }
+}
+
 impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
-    fn launch(&mut self, offsets: &[u64], lens: &[u32]) -> Result<()> {
+    fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+        ensure!(
+            offsets.len() == lens.len() && offsets.len() == masks.len(),
+            "range descriptor slices have mismatched lengths ({}/{}/{})",
+            offsets.len(),
+            lens.len(),
+            masks.len()
+        );
         // Pack offsets as lo/hi u32 pairs; buffers are created per dispatch
         // and sized to the batch (CubeCL pools the allocations). These
         // per-dispatch writes also flush the stream, so each dispatch is
@@ -1648,6 +1718,11 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
         let lens_handle = self
             .client
             .create(cubecl::bytes::Bytes::from_elems(lens.to_vec()));
+        let mask_words = certificate_words(masks, self.plan.cross);
+        let masks_len = mask_words.len();
+        let masks_handle = self
+            .client
+            .create(cubecl::bytes::Bytes::from_elems(mask_words));
 
         // Tile the dispatch to this batch's ranges; batches are homogeneous
         // enough for the mean to be a good summary, because the MSD recursion
@@ -1699,6 +1774,15 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
                     NICEONLY_OUT_CAPACITY * NICEONLY_STRIDE as usize,
                 ),
                 ArrayArg::from_raw_parts(self.nice_count.clone(), 1),
+                ArrayArg::from_raw_parts(
+                    self.plan.low_masks.clone(),
+                    if self.plan.cross {
+                        2 * self.plan.stride_r as usize
+                    } else {
+                        2
+                    },
+                ),
+                ArrayArg::from_raw_parts(masks_handle, masks_len),
                 self.field_start as u32,
                 (self.field_start >> 32) as u32,
                 (self.field_start >> 64) as u32,
@@ -1719,6 +1803,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
                 pre_chunk_digits,
                 pre_chunk_div,
                 self.probe,
+                self.plan.cross,
             );
         }
         Ok(())
@@ -1941,7 +2026,7 @@ mod tests {
                 );
                 run.probe = true;
                 run.lane_shift_override = Some(shift);
-                run.launch(&[0], &[len]).expect("dispatch");
+                run.launch(&[0], &[len], &[0]).expect("dispatch");
                 run.sync().expect("sync");
                 per_width.push(
                     run.finish()
