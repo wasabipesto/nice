@@ -189,17 +189,41 @@ impl StrideTable {
     /// A vector of nice numbers found in the range
     #[must_use]
     pub fn iterate_range(&self, range: &FieldSize, base: u32) -> Vec<NiceNumberSimple> {
+        self.iterate_range_masked(range, base, 0)
+    }
+
+    /// [`StrideTable::iterate_range`] with the cross-end residue filter:
+    /// `high_mask` holds digits the MSD analysis proved occupy some output
+    /// position `>= k` for every `n` in this range
+    /// (`msd_prefix_filter::MsdAnalysis`). A residue whose exact low-digit
+    /// mask intersects it would repeat a digit across two distinct
+    /// positions, so its candidates are skipped without a nice check —
+    /// one AND on a mask this loop already loads.
+    ///
+    /// Sound only when `high_mask` excludes positions below `k` (which
+    /// `analyze_range(_, _, k)` guarantees); pass 0 to disable.
+    #[must_use]
+    pub fn iterate_range_masked(
+        &self,
+        range: &FieldSize,
+        base: u32,
+        high_mask: u64,
+    ) -> Vec<NiceNumberSimple> {
         let mut results = Vec::new();
         let (mut n, mut idx) = self.first_valid_at_or_after(range.start());
 
         // Seed the nice check with each residue's known low digits when
         // masks are available (base ≤ 64). `get_is_nice_with_known_lsd`
         // itself falls back to the plain check for unspecialized bases.
+        // (For bases above 64 the mask table is empty and `high_mask` is
+        // always 0 — the analysis never emits mask bits there.)
         let masks = &self.low_digit_masks;
 
         while n < range.end() {
             let is_nice = if masks.is_empty() {
                 crate::client_process::get_is_nice(n, base)
+            } else if masks[idx] & high_mask != 0 {
+                false
             } else {
                 get_is_nice_with_known_lsd(n, base, self.k, masks[idx])
             };

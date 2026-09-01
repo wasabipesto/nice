@@ -568,16 +568,20 @@ pub fn process_range_niceonly(
     // This adaptively subdivides the range to skip portions where the MSD prefix indicates
     // all numbers will have duplicate/overlapping digits. It's more effective than fixed
     // chunking because it only subdivides when needed and can find natural boundaries.
-    let valid_msd_ranges = msd_prefix_filter::get_valid_ranges(*range, base);
+    // Each surviving range carries its cross-end certificate: the digits the
+    // MSD analysis proved occupy high output positions for every n in it.
+    let valid_msd_ranges =
+        msd_prefix_filter::get_valid_ranges_masked(*range, base, stride_table.k as usize);
 
     // The stride table integrates the residue filter (mod b-1) and the multi-digit
     // LSD filter (mod b^k). It allows us to jump between valid candidates instead of
-    // iterating over each one.
+    // iterating over each one, and its per-residue exact low digits combine
+    // with each range's certificate to skip most candidates on one AND.
     // The table is precomputed once per field and passed in to avoid redundant computation.
 
     let mut nice_list = Vec::new();
-    for sub_range in valid_msd_ranges {
-        let sub_results = stride_table.iterate_range(&sub_range, base);
+    for (sub_range, high_mask) in valid_msd_ranges {
+        let sub_results = stride_table.iterate_range_masked(&sub_range, base, high_mask);
         nice_list.extend(sub_results);
     }
 
