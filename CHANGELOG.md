@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Backend:
+
+- Segment `/estimate` by client version (and mirror it in the fleet estimator): with enough matched samples from the requested version the estimate uses those alone, since rates are not comparable across versions once filters and floor retunes move whole scenario classes by multiples; with too few, the pool stays mixed with a confidence discount and an explanatory note.
+
 Performance:
 
 - Bring the cross-end residue filter to the CUDA and CubeCL niceonly paths: range descriptors now carry each range's certificate mask, the per-residue low-digit mask table lives on-device, and candidates whose masks intersect are skipped. Because 84-90% rejection still leaves a survivor in nearly every warp, survivors are ballot-compacted into per-warp queues and checked in dense 32-wide waves instead of a naive per-lane skip (`NICE_CUDA_CROSS=0` / `NICE_CUDA_COMPACT=0` opt out). The CubeCL kernel applies the same mask test as two-word u32 arithmetic so it runs on every runtime including wgpu, without the warp compaction for now (`NICE_CUBECL_CROSS=0` opts out).

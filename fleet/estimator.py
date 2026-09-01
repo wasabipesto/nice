@@ -27,6 +27,10 @@ DETAIL_TOKENS = ("sxm", "sxm2", "sxm3", "sxm4", "sxm5", "pcie", "nvl")
 
 BENCHMARK_SCHEMA_VERSION = 1
 
+# Minimum matched samples from the requested client version before the
+# estimate restricts itself to that version's rates (mirrors the Rust).
+MIN_VERSION_SAMPLES = 3
+
 
 # ---------------------------------------------------------------------------
 # Normalization
@@ -335,13 +339,29 @@ def estimate(samples, inp):
     irrelevant. Returns a dict shaped like the API's /estimate response."""
     matched = match_stage(samples, inp)
 
-    versions_used = sorted({s.client_version for s, _ in matched.rows})
+    # Version segmentation: rates are only comparable within a client
+    # version, so with enough same-version samples the estimate restricts
+    # itself to them; with too few, the pool stays mixed, discounted and
+    # noted. Mirrors the Rust estimator exactly.
     want_version = inp.get("client_version")
-    if want_version and matched.rows and want_version not in versions_used:
-        matched.confidence = max(matched.confidence - 15, 5)
-        matched.notes.append(
-            f"no samples from client version {want_version}; estimates come from {versions_used}"
-        )
+    if want_version and matched.rows:
+        same = [(s, sc) for s, sc in matched.rows if s.client_version == want_version]
+        if len(same) >= MIN_VERSION_SAMPLES:
+            if len(same) < len(matched.rows):
+                matched.notes.append(
+                    f"estimate restricted to {len(same)} samples from client version "
+                    f"{want_version}; cross-version rates are not comparable"
+                )
+                matched.rows = same
+        else:
+            others = sorted({s.client_version for s, _ in matched.rows
+                             if s.client_version != want_version})
+            matched.confidence = max(matched.confidence - 15, 5)
+            matched.notes.append(
+                f"only {len(same)} samples from client version {want_version}; "
+                f"estimates pool other versions {others} whose rates may not be comparable"
+            )
+    versions_used = sorted({s.client_version for s, _ in matched.rows})
 
     # Group thread-scaled rates by scenario key, preserving first-seen order
     # so the output matches the Rust before its final sort.
