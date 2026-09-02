@@ -13,15 +13,7 @@
 
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS runtime
 
-# Install runtime dependencies: TLS certs for HTTPS, and the CUDA runtime
-# headers. The `cubecl-cuda` backend compiles its kernels with NVRTC from
-# source that begins `#include <cuda_runtime.h>`, and NVRTC resolves that
-# against /usr/local/cuda/include — which the `-runtime` base image does not
-# ship (only the `-devel` one does). Without it every cubecl-cuda kernel fails
-# to compile ("cannot open source file cuda_runtime.h") and `--gpu-backend
-# cubecl-cuda` exits at init; the hand-written CUDA backend is unaffected
-# because its kernel source is self-contained. cuda-cudart-dev (plus its
-# cuda-cccl dependency) is ~20 MB; the version must track the base image.
+# Install runtime dependencies: TLS certs for HTTPS, and the CUDA runtime headers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     cuda-cudart-dev-12-8 \

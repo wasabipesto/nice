@@ -143,14 +143,12 @@ jobs:
             - name: Smoke-test the binary inside the image (amd64, GPU)
               # Build the image locally and run the binary in it before pushing:
               # a binary built on the runner can need a newer glibc than the
-              # base image ships (3.4.1-gpu failed on Anvil with
-              # "GLIBC_2.38 not found"), and only running it inside the
-              # container proves the pair is compatible.
+              # base image ships, and only running it inside the container proves
+              # the pair is compatible.
+              # Also test that the CUDA runtime headers are present in the image.
               run: |
                   docker build -t nice_client:smoke /tmp/docker-context-gpu
                   docker run --rm nice_client:smoke --version
-                  # The cubecl-cuda backend needs the CUDA runtime headers at
-                  # NVRTC's include path; the -runtime base does not ship them.
                   docker run --rm --entrypoint test nice_client:smoke \
                       -f /usr/local/cuda/include/cuda_runtime.h
 
