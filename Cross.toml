@@ -1,0 +1,19 @@
+# Container images for `cross` builds (https://github.com/cross-rs/cross).
+#
+# The glibc floor of a dynamically linked release binary is whatever glibc it
+# was *built* against, so the Linux-x86_64 and Linux-aarch64 release binaries
+# are built inside cross's v0.2.5 images (Ubuntu 16.04, glibc 2.23) instead
+# of on the GitHub runner (Ubuntu 24.04, glibc 2.39). Pinned by digest-free
+# tag on purpose: cross's unreleased `main` images have moved to Ubuntu 24.04,
+# so "latest" would silently raise the floor back to 2.39. CI asserts the
+# floor (GLIBC_MAX in rust-build-test.yml) after every build, so a bump here
+# that raises it fails loudly.
+#
+# The docker images are unaffected: they ship their own glibc next to the
+# binary.
+
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5"
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"

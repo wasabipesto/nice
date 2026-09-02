@@ -35,6 +35,17 @@ jobs:
             - name: Check formatting and lints
               run: just lint
 
+    # The Linux-x86_64 release build moved into a cross container that has no
+    # libpq, so the full workspace (api, jobs, ...) is tested natively here.
+    test-workspace:
+        name: Test workspace (native Linux-x86_64)
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - uses: dtolnay/rust-toolchain@stable
+            - name: Run tests
+              run: cargo test --locked --release --no-fail-fast
+
     build:
         name: Build ${{ matrix.platform.build_name }}
         runs-on: ${{ matrix.platform.runs_on }}
@@ -42,20 +53,31 @@ jobs:
             fail-fast: false
             matrix:
                 platform:
+                    # The two glibc release binaries most people download are
+                    # built inside cross's pinned Ubuntu 16.04 images (see
+                    # Cross.toml) so they run on hosts as old as glibc 2.23;
+                    # built natively on ubuntu-latest they would need 2.38+.
+                    # `glibc_max` is asserted after the build.
                     - build_name: Linux-x86_64
                       runs_on: ubuntu-latest
                       rust_target: x86_64-unknown-linux-gnu
-                      packages: "" # Default to all packages
+                      packages: "-p nice_common -p nice_client"
+                      force_cross: true
+                      glibc_max: "2.28"
 
                     - build_name: Linux-x86_64-musl
                       runs_on: ubuntu-latest
                       rust_target: x86_64-unknown-linux-musl
                       packages: "-p nice_common -p nice_client"
 
+                    # cross images are amd64-only, so this cross-compiles from
+                    # an x86 runner and runs the tests under qemu-user.
                     - build_name: Linux-aarch64
-                      runs_on: ubuntu-24.04-arm
+                      runs_on: ubuntu-latest
                       rust_target: aarch64-unknown-linux-gnu
                       packages: "-p nice_common -p nice_client"
+                      force_cross: true
+                      glibc_max: "2.28"
 
                     - build_name: Linux-aarch64-musl
                       runs_on: ubuntu-24.04-arm
@@ -120,6 +142,8 @@ jobs:
                   command: test
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
+                  force-use-cross: ${{ matrix.platform.force_cross == true }}
+                  cross-version: "v0.2.5"
 
             # Build, using cross when needed. This will explicitly put the binaries in a stable location.
             - name: Build binaries
@@ -129,6 +153,23 @@ jobs:
                   command: build
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release"
+                  force-use-cross: ${{ matrix.platform.force_cross == true }}
+                  cross-version: "v0.2.5"
+
+            # The floor is a property of the build environment, not of the
+            # source, so assert it on the artifact: every GLIBC_x.y version the
+            # binary requires must be <= glibc_max. readelf reads any ELF
+            # architecture, unlike the host objdump.
+            - name: Assert glibc floor (<= ${{ matrix.platform.glibc_max }})
+              if: ${{ matrix.platform.glibc_max }}
+              env:
+                  GLIBC_MAX: ${{ matrix.platform.glibc_max }}
+              run: |
+                  bin=target/${{ matrix.platform.rust_target }}/release/nice_client
+                  need=$(readelf -V "$bin" | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n | uniq | tail -n1)
+                  echo "$bin requires up to $need (allowed: GLIBC_$GLIBC_MAX)"
+                  test -n "$need"
+                  test "$(printf '%s\n' "GLIBC_$GLIBC_MAX" "$need" | sort -t. -k2 -n | tail -n1)" = "GLIBC_$GLIBC_MAX"
 
             # Package a single executable as a tarball/zip plus checksum for release upload.
             - name: Create release artifacts
@@ -143,7 +184,7 @@ jobs:
     release:
         name: Publish GitHub Release
         runs-on: ubuntu-latest
-        needs: build
+        needs: [test-workspace, build]
         if: startsWith(github.ref, 'refs/tags/v')
 
         steps:
