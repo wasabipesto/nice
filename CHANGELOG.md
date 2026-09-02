@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## Nice v3.4.3
 
 - Ship the CUDA runtime headers in the `-gpu` docker image. NVRTC could not find `cuda_runtime.h` in the runtime-only base, so the `cubecl-cuda` backend failed to compile every kernel and `--gpu-backend auto` silently fell through to the hand-written CUDA backend. CI now checks the header is present in the built image.
 - GPU niceonly: cap the adaptive MSD floor at half a processing chunk so the controller can no longer ratchet into the no-MSD bypass. The bypass remains available by pinning e.g. `NICE_GPU_MSD_FLOOR=1000000` explicitly.
