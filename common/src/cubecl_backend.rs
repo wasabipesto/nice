@@ -1425,6 +1425,13 @@ pub enum CubeclContext {
         niceonly_pipeline:
             Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::cuda::CudaRuntime>>>>,
     },
+    #[cfg(feature = "cubecl-hip")]
+    Hip {
+        client: cubecl::prelude::ComputeClient<cubecl::hip::HipRuntime>,
+        device_name: String,
+        /// Per-base niceonly plans, cached across fields — see [`NiceonlyPlan`].
+        niceonly_plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
+    },
 }
 
 /// The device's real name from the CUDA driver, e.g. `NVIDIA A100-SXM4-40GB`.
@@ -1627,6 +1634,42 @@ impl CubeclContext {
         })
     }
 
+    /// Initialize on the native HIP (`ROCm`) runtime, device `device_index`.
+    ///
+    /// Same smoke-kernel contract as [`Self::new_cuda`]: hiprtc must compile
+    /// and run something before init reports success.
+    ///
+    /// # Errors
+    /// Returns an error if the HIP runtime cannot compile or run a kernel.
+    #[cfg(feature = "cubecl-hip")]
+    pub fn new_hip(device_index: usize) -> Result<Self> {
+        let device = cubecl::hip::AmdDevice::new(device_index);
+        let client = cubecl::hip::HipRuntime::client(&device);
+
+        let out = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
+        unsafe {
+            smoke_kernel::launch_unchecked::<cubecl::hip::HipRuntime>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                ArrayArg::from_raw_parts(out.clone(), 1),
+            );
+        }
+        let bytes = client.read_one(out).map_err(|e| {
+            anyhow::anyhow!("CubeCL HIP smoke test failed to read back: {e:?} (is ROCm installed?)")
+        })?;
+        ensure!(
+            u32::from_bytes(&bytes)[0] == 42,
+            "CubeCL HIP smoke kernel did not run (is ROCm installed?)"
+        );
+
+        Ok(Self::Hip {
+            client,
+            device_name: format!("cubecl-hip device {device_index}"),
+            niceonly_plans: Mutex::new(HashMap::new()),
+        })
+    }
+
     /// The adapter/device name, for reports.
     #[must_use]
     pub fn device_name(&self) -> String {
@@ -1634,6 +1677,8 @@ impl CubeclContext {
             Self::Wgpu { device_name, .. } => device_name.clone(),
             #[cfg(feature = "cubecl-cuda")]
             Self::Cuda { device_name, .. } => device_name.clone(),
+            #[cfg(feature = "cubecl-hip")]
+            Self::Hip { device_name, .. } => device_name.clone(),
         }
     }
 
@@ -1645,6 +1690,8 @@ impl CubeclContext {
             Self::Wgpu { .. } => "cubecl",
             #[cfg(feature = "cubecl-cuda")]
             Self::Cuda { .. } => "cubecl-cuda",
+            #[cfg(feature = "cubecl-hip")]
+            Self::Hip { .. } => "cubecl-hip",
         }
     }
 }
@@ -1690,6 +1737,10 @@ pub async fn process_range_detailed_cubecl_async(
         CubeclContext::Cuda { client, .. } => {
             detailed_impl(client, range, base, wide_chunk_for(client)).await
         }
+        #[cfg(feature = "cubecl-hip")]
+        CubeclContext::Hip { client, .. } => {
+            detailed_impl(client, range, base, wide_chunk_for(client)).await
+        }
     }
 }
 
@@ -1708,7 +1759,7 @@ pub async fn process_range_detailed_cubecl_async(
 fn wide_chunk_for<R: cubecl::prelude::Runtime>(client: &cubecl::prelude::ComputeClient<R>) -> bool {
     let name = R::name(client);
     let cuda = name.contains("cuda");
-    let direct = name.contains("spirv") || name.contains("msl");
+    let direct = name.contains("spirv") || name.contains("msl") || name == "hip";
     let u64_ok = client
         .properties()
         .features
@@ -1998,6 +2049,18 @@ pub fn begin_niceonly_cubecl(
             software,
             range,
             base,
+        ),
+        #[cfg(feature = "cubecl-hip")]
+        CubeclContext::Hip {
+            client,
+            niceonly_plans,
+            ..
+        } => niceonly_impl(
+            client,
+            cached_plan(niceonly_plans, client, base, software)?,
+            range,
+            base,
+            wide_chunk_for(client),
         ),
     }
 }
@@ -2713,6 +2776,64 @@ mod tests {
                 "base {base}: near-miss mismatch"
             );
             println!("base {base}: {count} candidates match the CPU exactly");
+        }
+    }
+
+    /// CPU/CubeCL parity through the native HIP runtime, on real AMD silicon.
+    #[test]
+    #[cfg(feature = "cubecl-hip")]
+    #[ignore = "requires an AMD device with ROCm"]
+    fn cubecl_hip_matches_cpu_detailed() {
+        let ctx = CubeclContext::new_hip(0).expect("CubeCL HIP init");
+        for (base, count) in [
+            (10u32, 1_000_000u128),
+            (40, 2_000_000),
+            (62, 200_000),
+            (80, 100_000),
+        ] {
+            let start = crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap()
+                .range_start;
+            let range = FieldSize::new(start, start + count);
+            let gpu = process_range_detailed_cubecl(&ctx, &range, base).expect("cubecl-hip run");
+            let cpu = process_range_detailed(&range, base);
+            assert_eq!(
+                gpu.distribution, cpu.distribution,
+                "base {base}: distribution mismatch"
+            );
+            assert_eq!(
+                gpu.nice_numbers, cpu.nice_numbers,
+                "base {base}: near-miss mismatch"
+            );
+            println!("base {base}: {count} candidates match the CPU exactly (HIP runtime)");
+        }
+    }
+
+    /// Niceonly parity through the native HIP runtime.
+    #[test]
+    #[cfg(feature = "cubecl-hip")]
+    #[ignore = "requires an AMD device with ROCm"]
+    fn cubecl_hip_matches_cpu_niceonly() {
+        let ctx = CubeclContext::new_hip(0).expect("CubeCL HIP init");
+        for base in [10u32, 12, 25, 40, 45, 62, 80] {
+            let Ok(Some(base_range)) = crate::base_range::get_base_range_u128(base) else {
+                continue;
+            };
+            let start = base_range.range_start;
+            let end = (start + 5_000_000).min(base_range.range_end);
+            let range = FieldSize::new(start, end);
+
+            let table = StrideTable::new(base, GPU_LSD_K);
+            let mut cpu = process_range_niceonly(&range, base, &table).nice_numbers;
+            cpu.sort_by_key(|n| n.number);
+            let gpu = process_range_niceonly_cubecl(&ctx, &range, base).expect("cubecl-hip run");
+
+            assert_eq!(cpu, gpu.nice_numbers, "base {base}: niceonly mismatch");
+            println!(
+                "base {base}: [{start}, {end}) agrees, {} nice (HIP runtime)",
+                gpu.nice_numbers.len()
+            );
         }
     }
 

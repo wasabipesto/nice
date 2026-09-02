@@ -30,6 +30,10 @@ cubecl-cuda = ["cubecl", "cubecl/cuda", "dep:cudarc"]
 # instead of WGSL through naga. Build-time selection; see scratchpad/2026-09-cubecl-explore.
 cubecl-spirv = ["cubecl", "cubecl/vulkan"]
 cubecl-metal = ["cubecl", "cubecl/metal"]
+# CubeCL over its native HIP runtime (AMD). Links libamdhip64/libhiprtc at
+# build time via `hipconfig`, so it is NOT in the gpu umbrella; opt-in for
+# machines with ROCm installed.
+cubecl-hip = ["cubecl", "cubecl/hip"]
 
 [dependencies]
 # Pinned exactly: CubeCL is pre-1.0 and its host API drifts between
