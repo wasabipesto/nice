@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- GPU niceonly: cap the adaptive MSD floor at half a processing chunk so the controller can no longer ratchet into the no-MSD bypass. Its only signal is the device tail after the workers finish, which stays small whenever the device keeps pace, so on Anvil (A100 + 32 cores) the floor climbed to the bypass within 13 fields and stayed there at 2.5e11 n/s, against 1.2-6.3e12 n/s one step below. The bypass remains available by pinning `NICE_GPU_MSD_FLOOR=1000000` explicitly.
+
 ## Nice v3.4.2
 
 - Fix the `-gpu` docker image failing to start with "version `GLIBC_2.38' not found": the binary is built on Ubuntu 24.04 (glibc 2.39) and the rustls crypto backend that #117 pulled in references glibc 2.38 symbols, but the image's Ubuntu 22.04 base only had 2.35. The base is now `nvidia/cuda:12.8.1-runtime-ubuntu24.04`, and CI runs the binary inside every image it builds before pushing.

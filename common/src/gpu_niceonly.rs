@@ -72,13 +72,30 @@ const PIPELINE_DEPTH: usize = 64;
 /// check itself, so there is no point going lower.
 const MSD_FLOOR_MIN: f64 = 250.0;
 
-/// Maximum MSD recursion floor: one whole [`PROCESSING_CHUNK_SIZE`] chunk,
-/// i.e. explicit no-MSD mode — chunks are emitted as single descriptors with
-/// no Hall analysis at all (see [`descriptors_for_chunk`]). Letting the
-/// adaptive controller reach this is deliberate: on a strong device paired
-/// with a weak CPU, even coarse endpoint analysis can be the bottleneck, and
-/// the device-side cross-end mask test plus the on-device stride table
-/// still bound the wasted work. Survival data (b52, per 1e12, single core):
+/// Maximum MSD recursion floor the adaptive controller may reach: half a
+/// [`PROCESSING_CHUNK_SIZE`] chunk, i.e. one level of subdivision below the
+/// whole-chunk check ([`msd_prefix_filter::MSD_RECURSIVE_SUBDIVISION_FACTOR`]
+/// is 2).
+///
+/// The controller used to be allowed all the way up to one whole chunk, the
+/// explicit no-MSD bypass ([`descriptors_for_chunk`] ships every chunk as one
+/// descriptor with no endpoint analysis), on the theory that a strong device
+/// paired with a weak CPU would want it. In practice the controller reached
+/// it on a strong CPU too and stuck there: its only signal is the device
+/// *tail* after the workers finish, which is small whenever the device keeps
+/// pace, so the floor ratchets up every field until nothing pulls it back.
+/// At the bypass every candidate survives, and the device then has to check
+/// the whole field. Measured on Anvil (A100 + 32 EPYC cores, base 54, 1e13
+/// fields): 2.5e11 n/s at the bypass against 1.2-6.3e12 n/s at floors
+/// between 100k and 900k. Below the bypass the same ratchet is harmless — if
+/// the device really is the bottleneck the tail grows and pulls the floor
+/// back down.
+///
+/// The bypass itself is still there for the one configuration it was meant
+/// for: pin it explicitly with `NICE_GPU_MSD_FLOOR=1000000`, which bypasses
+/// this clamp.
+///
+/// Survival data (b52, per 1e12, single core):
 ///
 /// | floor  | CPU time | surviving |
 /// |--------|----------|-----------|
@@ -87,7 +104,7 @@ const MSD_FLOOR_MIN: f64 = 250.0;
 /// | 16 000 | 15 s     | 19.0 %    |
 /// | 64 000 | 4.8 s    | 22.6 %    |
 #[allow(clippy::cast_precision_loss)]
-const MSD_FLOOR_MAX: f64 = PROCESSING_CHUNK_SIZE as f64;
+const MSD_FLOOR_MAX: f64 = (PROCESSING_CHUNK_SIZE / 2) as f64;
 
 /// Adaptive MSD recursion floor for the niceonly GPU pipeline.
 ///
@@ -646,6 +663,34 @@ mod tests {
             .recv_timeout(Duration::from_secs(120))
             .expect("run_range_pipeline did not return: the workers are deadlocked");
         assert!(errored, "the launch failure must reach the caller");
+    }
+
+    /// The controller's ratchet must stop short of the no-MSD bypass, however
+    /// many fields report a negligible device tail. Only an explicit
+    /// `NICE_GPU_MSD_FLOOR` pin may reach it.
+    #[test]
+    fn adaptive_floor_never_ratchets_into_the_bypass() {
+        let mut floor = AdaptiveFloor {
+            floor: ADAPT_BASE_CORE_PRODUCT / 32.0,
+            warmup: 0,
+        };
+        for _ in 0..100 {
+            // A field where the workers took a while and the device tail was
+            // nothing: the strongest possible "raise the floor" signal.
+            floor.update(5.0, 5.0);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let bypass = PROCESSING_CHUNK_SIZE as f64;
+        assert!(
+            floor.floor < bypass,
+            "floor {} reached the bypass",
+            floor.floor
+        );
+        assert!((floor.floor - MSD_FLOOR_MAX).abs() < f64::EPSILON);
+        // And the clamp is a real cap, not a coincidence of the step size.
+        floor.floor = MSD_FLOOR_MAX * 0.99;
+        floor.update(5.0, 5.0);
+        assert!((floor.floor - MSD_FLOOR_MAX).abs() < f64::EPSILON);
     }
 
     /// At the bypass floor, a chunk becomes exactly one descriptor with no
