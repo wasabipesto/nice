@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Benchmark: the niceonly GPU sweep now pins the MSD floor (at the adaptive controller's cap) instead of letting it adapt per field. The floor is process-global state that moved hundreds of times within one 60-second sweep, so every scenario's rate depended on where the previous scenarios had left it and results were not comparable across machines (an A100 scored below an RTX 3060). `NICE_GPU_MSD_FLOOR` still overrides it for floor sweeps. The report's `config` gains `gpu_msd_floor`.
 - Ship the CUDA runtime headers in the `-gpu` docker image. NVRTC could not find `cuda_runtime.h` in the runtime-only base, so the `cubecl-cuda` backend failed to compile every kernel and `--gpu-backend auto` silently fell through to the hand-written CUDA backend. CI now checks the header is present in the built image.
 - GPU niceonly: cap the adaptive MSD floor at half a processing chunk so the controller can no longer ratchet into the no-MSD bypass. The bypass remains available by pinning e.g. `NICE_GPU_MSD_FLOOR=1000000` explicitly.
+- GPU niceonly benchmark: pin the MSD floor at the adaptive controller's cap instead of letting it adapt per field in order to be comparable across machines and runs. `NICE_GPU_MSD_FLOOR` still overrides it for floor sweeps. The report's `config` now includes `gpu_msd_floor`.
 - GPU niceonly: MSD workers now send descriptors to the dispatch thread in batches (4096 ranges or 256 chunks) instead of one message per chunk.
 
 ## Nice v3.4.2
