@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- GPU niceonly: cap the adaptive MSD floor at half a processing chunk so the controller can no longer ratchet into the no-MSD bypass. Its only signal is the device tail after the workers finish, which stays small whenever the device keeps pace, so on Anvil (A100 + 32 cores) the floor climbed to the bypass within 13 fields and stayed there at 2.5e11 n/s, against 1.2-6.3e12 n/s one step below. The bypass remains available by pinning `NICE_GPU_MSD_FLOOR=1000000` explicitly.
 - Ship the CUDA runtime headers in the `-gpu` docker image. NVRTC could not find `cuda_runtime.h` in the runtime-only base, so the `cubecl-cuda` backend failed to compile every kernel and `--gpu-backend auto` silently fell through to the hand-written CUDA backend. CI now checks the header is present in the built image.
+- GPU niceonly: cap the adaptive MSD floor at half a processing chunk so the controller can no longer ratchet into the no-MSD bypass. The bypass remains available by pinning e.g. `NICE_GPU_MSD_FLOOR=1000000` explicitly.
 - GPU niceonly: MSD workers now send descriptors to the dispatch thread in batches (4096 ranges or 256 chunks) instead of one message per chunk.
 
 ## Nice v3.4.2

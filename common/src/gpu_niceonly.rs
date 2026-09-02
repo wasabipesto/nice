@@ -106,12 +106,6 @@ const MSD_FLOOR_MIN: f64 = 250.0;
 /// it on a strong CPU too and stuck there: its only signal is the device
 /// *tail* after the workers finish, which is small whenever the device keeps
 /// pace, so the floor ratchets up every field until nothing pulls it back.
-/// At the bypass every candidate survives, and the device then has to check
-/// the whole field. Measured on Anvil (A100 + 32 EPYC cores, base 54, 1e13
-/// fields): 2.5e11 n/s at the bypass against 1.2-6.3e12 n/s at floors
-/// between 100k and 900k. Below the bypass the same ratchet is harmless — if
-/// the device really is the bottleneck the tail grows and pulls the floor
-/// back down.
 ///
 /// The bypass itself is still there for the one configuration it was meant
 /// for: pin it explicitly with `NICE_GPU_MSD_FLOOR=1000000`, which bypasses
@@ -761,6 +755,7 @@ mod tests {
         floor.floor = MSD_FLOOR_MAX * 0.99;
         floor.update(5.0, 5.0);
         assert!((floor.floor - MSD_FLOOR_MAX).abs() < f64::EPSILON);
+
     /// A worker batch flushes on either bound and never sends an empty one.
     #[test]
     fn worker_batch_flushes_on_either_bound() {
