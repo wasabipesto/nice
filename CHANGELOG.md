@@ -3,6 +3,7 @@
 ## Unreleased
 
 - GPU niceonly: MSD workers now send descriptors to the dispatch thread in batches (4096 ranges or 256 chunks) instead of one message per chunk. With many cores the per-chunk channel traffic dominated: at the no-MSD bypass floor a 1e13 field on Anvil's 32-core node spent 36 s producing descriptors the A100 checked in under a second, and the same pipeline got slower as threads were added (1e6 chunks: 0.22 s on one thread, 1.6 s on twelve). Results are unchanged; only the message granularity moves.
+- Ship the CUDA runtime headers in the `-gpu` docker image. NVRTC could not find `cuda_runtime.h` in the runtime-only base, so the `cubecl-cuda` backend failed to compile every kernel and `--gpu-backend auto` silently fell through to the hand-written CUDA backend. CI now checks the header is present in the built image.
 
 ## Nice v3.4.2
 
