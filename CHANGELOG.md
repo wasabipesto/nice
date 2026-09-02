@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- GPU niceonly: MSD workers now send descriptors to the dispatch thread in batches (4096 ranges or 256 chunks) instead of one message per chunk. With many cores the per-chunk channel traffic dominated: at the no-MSD bypass floor a 1e13 field on Anvil's 32-core node spent 36 s producing descriptors the A100 checked in under a second, and the same pipeline got slower as threads were added (1e6 chunks: 0.22 s on one thread, 1.6 s on twelve). Results are unchanged; only the message granularity moves.
+
 ## Nice v3.4.2
 
 - Fix the `-gpu` docker image failing to start with "version `GLIBC_2.38' not found": the binary is built on Ubuntu 24.04 (glibc 2.39) and the rustls crypto backend that #117 pulled in references glibc 2.38 symbols, but the image's Ubuntu 22.04 base only had 2.35. The base is now `nvidia/cuda:12.8.1-runtime-ubuntu24.04`, and CI runs the binary inside every image it builds before pushing.

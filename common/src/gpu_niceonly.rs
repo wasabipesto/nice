@@ -57,15 +57,37 @@ pub const LAUNCH_BATCH_RANGES: usize = 1 << 16;
 /// gigabytes of queued descriptors. Bounding the channel keeps the overlap —
 /// workers refill the queue while the consumer waits on the device.
 ///
-/// **The unit here is one chunk, not one launch batch.** Each item a worker
-/// sends is the whole output of one [`PROCESSING_CHUNK_SIZE`] chunk;
-/// [`LAUNCH_BATCH_RANGES`] is the consumer's flush threshold and never bounds
-/// what sits in the channel. So the cap is `PIPELINE_DEPTH` × the most ranges a
-/// chunk can yield — the recursion returns a range whole once it is at or below
-/// the floor, so that is about `PROCESSING_CHUNK_SIZE / floor`, i.e. ~4000 at
-/// [`MSD_FLOOR_MIN`] and fewer at any coarser floor. Roughly 5 MB of
-/// descriptors at the worst floor, comfortably below the gigabyte above.
+/// **The unit here is one worker batch, not one launch batch.** Each item a
+/// worker sends is a [`WorkerBatch`]: the output of several consecutive
+/// chunks, flushed once it holds [`WORKER_BATCH_RANGES`] descriptors or
+/// [`WORKER_BATCH_CHUNKS`] chunks' worth. [`LAUNCH_BATCH_RANGES`] is the
+/// consumer's flush threshold and never bounds what sits in the channel. A
+/// batch is at most `WORKER_BATCH_RANGES` plus one chunk's output — the
+/// recursion returns a range whole once it is at or below the floor, so a chunk
+/// yields about `PROCESSING_CHUNK_SIZE / floor` ranges, ~4000 at
+/// [`MSD_FLOOR_MIN`] — call it 8200 descriptors, 20 bytes apiece. So the cap
+/// is about 10 MB of queued descriptors at the worst floor, comfortably below
+/// the gigabyte above.
 const PIPELINE_DEPTH: usize = 64;
+
+/// Descriptors a worker accumulates before sending one batch to the consumer.
+///
+/// Workers used to send every chunk's output as its own message. That is one
+/// channel operation per chunk, and with many producers hammering a bounded
+/// channel the cost is dominated by parking and waking threads rather than by
+/// the MSD work: at the no-MSD bypass floor (one descriptor per chunk) the same
+/// 1e6 chunks took 0.22 s on one thread, 0.96 s on six and 1.6 s on twelve, and
+/// on Anvil's 32-core node a 1e13 field spent 36 s producing 1e7 descriptors
+/// the device then checked in well under a second. Batching cuts the message
+/// count by two to three orders of magnitude at every floor.
+const WORKER_BATCH_RANGES: usize = 4096;
+
+/// Chunks a worker folds into one batch before sending, whatever its size.
+///
+/// Bounds the latency of a batch at coarse floors, where chunks yield one
+/// descriptor each and [`WORKER_BATCH_RANGES`] alone would hold back 4096
+/// chunks' worth of device work.
+const WORKER_BATCH_CHUNKS: usize = 256;
 
 /// Minimum MSD recursion floor (matches the CPU client's default).
 /// Below this the GPU receives virtually the same candidates as the CPU would
@@ -308,6 +330,40 @@ fn descriptors_for_chunk(
     Ok((offsets, lens, masks))
 }
 
+/// Descriptors one MSD worker has accumulated since its last send.
+#[derive(Default)]
+struct WorkerBatch {
+    offsets: Vec<u64>,
+    lens: Vec<u32>,
+    masks: Vec<u64>,
+    chunks: usize,
+}
+
+impl WorkerBatch {
+    /// Fold one chunk's descriptors in. Empty chunks still count toward the
+    /// chunk bound so a run of rejected chunks cannot delay a pending batch.
+    fn absorb(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) {
+        self.offsets.extend_from_slice(offsets);
+        self.lens.extend_from_slice(lens);
+        self.masks.extend_from_slice(masks);
+        self.chunks += 1;
+    }
+
+    fn is_ready(&self) -> bool {
+        self.offsets.len() >= WORKER_BATCH_RANGES || self.chunks >= WORKER_BATCH_CHUNKS
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    /// Hand the accumulated descriptors over and start a fresh batch.
+    fn take(&mut self) -> (Vec<u64>, Vec<u32>, Vec<u64>) {
+        let batch = std::mem::take(self);
+        (batch.offsets, batch.lens, batch.masks)
+    }
+}
+
 /// Run one niceonly field: MSD workers stream surviving-range descriptors
 /// through a channel while the calling thread batches them into dispatches, so
 /// the CPU filter and the device checks overlap instead of running as
@@ -357,23 +413,34 @@ pub fn run_range_pipeline<S: RangeSink>(
         for _ in 0..num_threads {
             let tx = tx.clone();
             scope.spawn(move || {
+                let mut batch = WorkerBatch::default();
                 loop {
                     let i = next_chunk.fetch_add(1, Ordering::Relaxed);
                     let Some(chunk) = chunks.get(i) else { break };
                     match descriptors_for_chunk(*chunk, base, floor, range.start()) {
-                        Ok((offsets, lens, masks)) if !offsets.is_empty() => {
-                            // A closed channel means the consumer gave up on a
-                            // launch error; the remaining chunks are moot.
-                            if tx.send((offsets, lens, masks)).is_err() {
-                                break;
-                            }
+                        Ok((offsets, lens, masks)) => {
+                            batch.absorb(&offsets, &lens, &masks);
                         }
-                        Ok(_) => {}
                         Err(e) => {
                             *worker_error.lock().unwrap() = Some(e);
                             return;
                         }
                     }
+                    if batch.is_ready() {
+                        if batch.is_empty() {
+                            // A run of rejected chunks: nothing to send, but
+                            // start the chunk count over.
+                            batch = WorkerBatch::default();
+                        } else if tx.send(batch.take()).is_err() {
+                            // A closed channel means the consumer gave up on a
+                            // launch error; the remaining chunks are moot.
+                            return;
+                        }
+                    }
+                }
+                if !batch.is_empty() {
+                    // Nothing to do about a closed channel here either.
+                    let _ = tx.send(batch.take());
                 }
             });
         }
@@ -621,8 +688,9 @@ mod tests {
     /// `send` at that moment only wakes when the receiver is dropped, and
     /// `thread::scope` will not return until they do — so getting this wrong is
     /// a deadlock, not a leak. The field has to be big enough to reach a flush
-    /// (`LAUNCH_BATCH_RANGES`) and then fill `PIPELINE_DEPTH` behind it, which
-    /// is why this is not a toy range.
+    /// (`LAUNCH_BATCH_RANGES`) and then fill `PIPELINE_DEPTH` worker batches
+    /// (`WORKER_BATCH_RANGES` each) behind it, which is why this is not a toy
+    /// range.
     ///
     /// Run under a timeout so a regression fails the test instead of hanging
     /// the suite.
@@ -630,22 +698,60 @@ mod tests {
     fn a_failing_sink_unblocks_the_workers_instead_of_deadlocking() {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            // Base 40 from its band start: ~2e5 surviving ranges over 5e10,
-            // so the consumer reaches several flushes with the workers still
-            // going. Base 50 is no good here — MSD prunes its band start to
-            // nothing, and nothing is ever launched.
+            // Base 40 from its band start: ~2e6 surviving ranges over 5e11 at
+            // the seeded floor, i.e. hundreds of worker batches, so the
+            // consumer reaches its first flush with far more than
+            // `PIPELINE_DEPTH` batches still to come. Base 50 is no good here
+            // — MSD prunes its band start to nothing, and nothing is ever
+            // launched.
             let base = 40;
             let start = crate::base_range::get_base_range_u128(base)
                 .unwrap()
                 .unwrap()
                 .range_start;
-            let field = FieldSize::new(start, start + 50_000_000_000);
+            let field = FieldSize::new(start, start + 500_000_000_000);
             let _ = tx.send(run_range_pipeline(&mut Failing, &field, base).is_err());
         });
         let errored = rx
             .recv_timeout(Duration::from_secs(120))
             .expect("run_range_pipeline did not return: the workers are deadlocked");
         assert!(errored, "the launch failure must reach the caller");
+    }
+
+    /// A worker batch flushes on either bound and never sends an empty one.
+    #[test]
+    fn worker_batch_flushes_on_either_bound() {
+        // Descriptor bound: one big chunk's worth tips it over.
+        let mut batch = WorkerBatch::default();
+        let big = vec![0u64; WORKER_BATCH_RANGES - 1];
+        batch.absorb(&big, &vec![1u32; big.len()], &vec![0u64; big.len()]);
+        assert!(!batch.is_ready());
+        batch.absorb(&[7], &[1], &[0]);
+        assert!(batch.is_ready());
+        let (offsets, lens, masks) = batch.take();
+        assert_eq!(offsets.len(), WORKER_BATCH_RANGES);
+        assert_eq!(lens.len(), WORKER_BATCH_RANGES);
+        assert_eq!(masks.len(), WORKER_BATCH_RANGES);
+        assert_eq!(*offsets.last().unwrap(), 7);
+        // `take` leaves a fresh batch behind.
+        assert!(batch.is_empty() && !batch.is_ready());
+
+        // Chunk bound: bypass-style single descriptors, 256 of them.
+        let mut batch = WorkerBatch::default();
+        for i in 0..WORKER_BATCH_CHUNKS {
+            assert!(!batch.is_ready(), "ready after only {i} chunks");
+            batch.absorb(&[i as u64], &[1], &[0]);
+        }
+        assert!(batch.is_ready());
+        assert_eq!(batch.take().0.len(), WORKER_BATCH_CHUNKS);
+
+        // Rejected chunks count toward the chunk bound but leave it empty, so
+        // the worker resets it instead of sending nothing.
+        let mut batch = WorkerBatch::default();
+        for _ in 0..WORKER_BATCH_CHUNKS {
+            batch.absorb(&[], &[], &[]);
+        }
+        assert!(batch.is_ready() && batch.is_empty());
     }
 
     /// At the bypass floor, a chunk becomes exactly one descriptor with no
