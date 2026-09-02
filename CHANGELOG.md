@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Ship the CUDA runtime headers in the `-gpu` docker image. NVRTC could not find `cuda_runtime.h` in the runtime-only base, so the `cubecl-cuda` backend failed to compile every kernel and `--gpu-backend auto` silently fell through to the hand-written CUDA backend. CI now checks the header is present in the built image.
+- GPU niceonly: MSD workers now send descriptors to the dispatch thread in batches (4096 ranges or 256 chunks) instead of one message per chunk.
 
 ## Nice v3.4.2
 
