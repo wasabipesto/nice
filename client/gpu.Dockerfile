@@ -13,9 +13,10 @@
 
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS runtime
 
-# Install runtime dependencies (TLS certs for HTTPS, etc.)
+# Install runtime dependencies: TLS certs for HTTPS, and the CUDA runtime headers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    cuda-cudart-dev-12-8 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the prebuilt binary from the build context.
