@@ -724,7 +724,7 @@ mod tests {
             let _ = tx.send(run_range_pipeline(&mut Failing, &field, base).is_err());
         });
         let errored = rx
-            .recv_timeout(Duration::from_secs(120))
+            .recv_timeout(Duration::from_mins(2))
             .expect("run_range_pipeline did not return: the workers are deadlocked");
         assert!(errored, "the launch failure must reach the caller");
     }
@@ -755,6 +755,7 @@ mod tests {
         floor.floor = MSD_FLOOR_MAX * 0.99;
         floor.update(5.0, 5.0);
         assert!((floor.floor - MSD_FLOOR_MAX).abs() < f64::EPSILON);
+    }
 
     /// A worker batch flushes on either bound and never sends an empty one.
     #[test]
