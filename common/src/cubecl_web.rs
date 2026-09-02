@@ -87,8 +87,8 @@ pub fn near_miss_capacity() -> usize {
 // kernel and the generated WGSL, so the three review side by side.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn detailed_kernel_u32(
-    hist: &Array<Atomic<u32>>,
-    miss_count: &Array<Atomic<u32>>,
+    hist: &mut Array<Atomic<u32>>,
+    miss_count: &mut Array<Atomic<u32>>,
     miss_data: &mut Array<u32>,
     s0: u32,
     s1: u32,

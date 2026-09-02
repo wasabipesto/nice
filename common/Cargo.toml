@@ -21,6 +21,11 @@ gpu = ["cuda", "cubecl", "cubecl-cuda"]
 vulkan = ["dep:ash", "dep:naga"]
 cubecl = ["dep:cubecl", "dep:getrandom", "dep:cubecl-common", "dep:web-time"]
 cubecl-cuda = ["cubecl", "cubecl/cuda"]
+# Direct compilers inside the wgpu runtime (experimental, 2026-09): SPIR-V
+# emitted by cubecl-spirv on Vulkan, MSL emitted by cubecl-cpp on Metal,
+# instead of WGSL through naga. Build-time selection; see scratchpad/2026-09-cubecl-explore.
+cubecl-spirv = ["cubecl", "cubecl/vulkan"]
+cubecl-metal = ["cubecl", "cubecl/metal"]
 
 [dependencies]
 # Pinned exactly: CubeCL is pre-1.0 and its host API drifts between

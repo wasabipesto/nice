@@ -212,6 +212,7 @@ There are some feature flags that enable specific dependencies:
   - `nice_client/cuda` is the hand-written CUDA backend (NVIDIA only). It requires the CUDA toolkit at runtime for NVRTC kernel compilation.
   - `nice_client/vulkan` is the hand-written WGSL backend (**experimental — not part of the `gpu` umbrella**); it runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe, and MoltenVK on macOS). Every platform it serves is also covered by `cubecl`, which beats it in detailed mode on all vendors measured, so standard builds omit it; build with `--features gpu,vulkan` to include it.
   - `nice_client/cubecl` is the [CubeCL](https://github.com/tracel-ai/cubecl) backend (kernels written in Rust), running over wgpu: Vulkan on Linux/Windows, Metal on macOS. `nice_client/cubecl-cuda` adds its native CUDA runtime. Both modes run on the GPU.
+  - `nice_client/cubecl-spirv` and `nice_client/cubecl-metal` (experimental, opt-in) switch the `cubecl` backend's shader compiler from naga (WGSL) to CubeCL's own SPIR-V or MSL codegen on Vulkan or Metal respectively. `cubecl-spirv` pulls in `ash`; neither is part of the `gpu` umbrella. Results are identical (device parity tests cover both); `NICE_CUBECL_WIDE=1` additionally opts into the 64-bit chunk scan on devices that expose `u64`, which is slower on every wgpu device measured so far.
 
 Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack/).
 

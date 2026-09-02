@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add opt-in `cubecl-spirv` and `cubecl-metal` build features that route the `cubecl` backend through CubeCL's direct SPIR-V/MSL compilers instead of naga. Fix the kernels' atomic buffers being bound as read-only inputs, which the Metal compiler rejects. The wgpu device name reported in benchmarks and telemetry now includes the shader compiler (`wgpu<wgsl>`, `wgpu<spirv>`, `wgpu<msl>`).
+- The chunk-scan flavor is now chosen per device: CUDA keeps the 64-bit scan, wgpu keeps the 32-bit split scan (measured 1.4-4.6x faster than the 64-bit scan on AMD RDNA4 and Apple M4). `NICE_CUBECL_WIDE=0|1` forces either for A/B runs.
+
 ## Nice v3.4.1
 
 - Add a new sound cross-end residue filter to the CPU and GPU niceonly paths. The MSD interval-domain analysis now returns a certificate of digits that provably occupy high output positions for every n in a surviving range, and the stride iteration skips any residue whose exact low output digits intersect it.

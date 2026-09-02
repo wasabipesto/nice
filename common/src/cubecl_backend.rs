@@ -76,8 +76,8 @@ const NEAR_MISS_CAPACITY: usize = 1 << 20;
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn detailed_kernel(
-    hist: &Array<Atomic<u32>>,
-    miss_count: &Array<Atomic<u32>>,
+    hist: &mut Array<Atomic<u32>>,
+    miss_count: &mut Array<Atomic<u32>>,
     miss_data: &mut Array<u32>,
     s0: u32,
     s1: u32,
@@ -376,7 +376,7 @@ fn candidate_check(
     sv_s: &mut SharedMemory<u32>,
     svb: u32,
     nice_out: &mut Array<u32>,
-    nice_count: &Array<Atomic<u32>>,
+    nice_count: &mut Array<Atomic<u32>>,
     nice_cap: u32,
     #[comptime] base: u32,
     #[comptime] limbs: u32,
@@ -841,7 +841,7 @@ fn niceonly_kernel(
     range_offsets: &Array<u32>, // lo, hi pairs
     range_lens: &Array<u32>,
     nice_out: &mut Array<u32>,
-    nice_count: &Array<Atomic<u32>>,
+    nice_count: &mut Array<Atomic<u32>>,
     low_masks: &Array<u32>, // per residue: lo,hi words of its exact low-digit mask
     range_masks: &Array<u32>, // per range: lo,hi words of its certificate
     fs0: u32,
@@ -1297,8 +1297,13 @@ impl CubeclContext {
             // DX12 on Windows, and reports comparing this backend against
             // the hand-Vulkan one need to know which API actually ran.
             let info = setup.adapter.get_info();
-            let device_name = format!("{} ({:?})", info.name, info.backend);
             let client = cubecl::wgpu::WgpuRuntime::client(&device);
+            let device_name = format!(
+                "{} ({:?}, {})",
+                info.name,
+                info.backend,
+                <cubecl::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::name(&client)
+            );
             (client, device_name)
         });
         Ok(Self::Wgpu {
@@ -1327,8 +1332,13 @@ impl CubeclContext {
             )
             .await;
             let info = setup.adapter.get_info();
-            let device_name = format!("{} ({:?})", info.name, info.backend);
             let client = cubecl::wgpu::WgpuRuntime::client(&device);
+            let device_name = format!(
+                "{} ({:?}, {})",
+                info.name,
+                info.backend,
+                <cubecl::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::name(&client)
+            );
             // A racing initializer winning this set is fine: both describe
             // the same process-wide runtime registration.
             let _ = WGPU_DEFAULT.set((client, device_name));
@@ -1443,10 +1453,51 @@ pub async fn process_range_detailed_cubecl_async(
     }
 
     match ctx {
-        CubeclContext::Wgpu { client, .. } => detailed_impl(client, range, base, false).await,
+        CubeclContext::Wgpu { client, .. } => {
+            detailed_impl(client, range, base, wide_chunk_for(client)).await
+        }
         #[cfg(feature = "cubecl-cuda")]
-        CubeclContext::Cuda { client, .. } => detailed_impl(client, range, base, true).await,
+        CubeclContext::Cuda { client, .. } => {
+            detailed_impl(client, range, base, wide_chunk_for(client)).await
+        }
     }
+}
+
+/// Which chunk-scan flavor a client should run.
+///
+/// The wide flavor divides limb pairs with 64-bit arithmetic and is the
+/// CUDA-native form. On wgpu it is *legal* wherever the device exposes
+/// `u64` and the shader goes through one of `CubeCL`'s direct compilers
+/// (`wgpu<spirv>` / `wgpu<msl>`; naga's MSL backend miscompiles its checked
+/// u64 division), but legal is not fast: on an Apple M4 under `wgpu<msl>`
+/// the wide flavor measured 4.6x *slower* than split16 (64-bit integer
+/// division is emulated on Apple GPUs). So wgpu defaults to split16 and
+/// `NICE_CUBECL_WIDE=1` opts in for A/B runs on devices where it is legal;
+/// `NICE_CUBECL_WIDE=0` forces split16 anywhere. A forced wide flavor on a
+/// device without u64 fails at shader compile time, loudly.
+fn wide_chunk_for<R: cubecl::prelude::Runtime>(client: &cubecl::prelude::ComputeClient<R>) -> bool {
+    let name = R::name(client);
+    let cuda = name.contains("cuda");
+    let direct = name.contains("spirv") || name.contains("msl");
+    let u64_ok = client
+        .properties()
+        .features
+        .supports_type(cubecl::ir::Type::scalar(cubecl::ir::ElemType::UInt(
+            cubecl::ir::UIntKind::U64,
+        )));
+    let wide = match std::env::var("NICE_CUBECL_WIDE").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => cuda,
+    };
+    if wide && !cuda && !(direct && u64_ok) {
+        warn!(
+            "NICE_CUBECL_WIDE=1 on {name} (direct compiler {direct}, u64 {u64_ok}): \
+             the wide chunk scan is not expected to compile here"
+        );
+    }
+    debug!("CubeCL chunk flavor on {name}: wide {wide} (direct compiler {direct}, u64 {u64_ok})");
+    wide
 }
 
 /// Read one histogram buffer and fold its bins into the accumulator.
@@ -1584,7 +1635,7 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
     // hint does too: a CUDA runtime without NVRTC, or a wgpu device the
     // driver's watchdog reset.
     let counted: u128 = histogram.iter().sum();
-    let hint = if wide_chunk {
+    let hint = if R::name(client).contains("cuda") {
         "is the CUDA toolkit, including NVRTC, installed?"
     } else {
         "was the device reset by the driver's watchdog? check the kernel log"
@@ -1688,7 +1739,7 @@ pub fn process_range_niceonly_cubecl(
             cached_plan(niceonly_plans, client, base)?,
             range,
             base,
-            false,
+            wide_chunk_for(client),
         ),
         #[cfg(feature = "cubecl-cuda")]
         CubeclContext::Cuda {
@@ -1700,7 +1751,7 @@ pub fn process_range_niceonly_cubecl(
             cached_plan(niceonly_plans, client, base)?,
             range,
             base,
-            true,
+            wide_chunk_for(client),
         ),
     }
 }

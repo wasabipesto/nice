@@ -27,6 +27,9 @@ cubecl = ["nice_common/cubecl"]
 # Must also enable this crate's own cubecl gate: feature cfgs do not
 # propagate upward from nice_common.
 cubecl-cuda = ["cubecl", "nice_common/cubecl-cuda"]
+# Experimental direct compilers for the cubecl (wgpu) backend; see nice_common.
+cubecl-spirv = ["cubecl", "nice_common/cubecl-spirv"]
+cubecl-metal = ["cubecl", "nice_common/cubecl-metal"]
 
 [dependencies]
 nice_common = { workspace = true }
