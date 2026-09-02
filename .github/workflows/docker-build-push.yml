@@ -149,6 +149,10 @@ jobs:
               run: |
                   docker build -t nice_client:smoke /tmp/docker-context-gpu
                   docker run --rm nice_client:smoke --version
+                  # The cubecl-cuda backend needs the CUDA runtime headers at
+                  # NVRTC's include path; the -runtime base does not ship them.
+                  docker run --rm --entrypoint test nice_client:smoke \
+                      -f /usr/local/cuda/include/cuda_runtime.h
 
             - name: Build and push arch image (amd64, GPU)
               uses: docker/build-push-action@v7

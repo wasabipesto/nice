@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Ship the CUDA runtime headers in the `-gpu` docker image. NVRTC could not find `cuda_runtime.h` in the runtime-only base, so the `cubecl-cuda` backend failed to compile every kernel and `--gpu-backend auto` silently fell through to the hand-written CUDA backend (observed on Anvil, job 20330913). CI now checks the header is present in the built image.
+
 ## Nice v3.4.2
 
 - Fix the `-gpu` docker image failing to start with "version `GLIBC_2.38' not found": the binary is built on Ubuntu 24.04 (glibc 2.39) and the rustls crypto backend that #117 pulled in references glibc 2.38 symbols, but the image's Ubuntu 22.04 base only had 2.35. The base is now `nvidia/cuda:12.8.1-runtime-ubuntu24.04`, and CI runs the binary inside every image it builds before pushing.
