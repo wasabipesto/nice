@@ -68,6 +68,16 @@ jobs:
                   password: ${{ secrets.GITHUB_TOKEN }}
 
             # Per-arch tag. Manifest job will later create the multi-arch tags.
+            - name: Smoke-test the binary inside the image (amd64)
+              # Build the image locally and run the binary in it before pushing:
+              # a binary built on the runner can need a newer glibc than the
+              # base image ships (3.4.1-gpu failed on Anvil with
+              # "GLIBC_2.38 not found"), and only running it inside the
+              # container proves the pair is compatible.
+              run: |
+                  docker build -t nice_client:smoke /tmp/docker-context
+                  docker run --rm nice_client:smoke --version
+
             - name: Build and push arch image (amd64)
               uses: docker/build-push-action@v7
               with:
@@ -130,6 +140,16 @@ jobs:
                   password: ${{ secrets.GITHUB_TOKEN }}
 
             # Per-arch tag. Manifest job will later create the multi-arch tags.
+            - name: Smoke-test the binary inside the image (amd64, GPU)
+              # Build the image locally and run the binary in it before pushing:
+              # a binary built on the runner can need a newer glibc than the
+              # base image ships (3.4.1-gpu failed on Anvil with
+              # "GLIBC_2.38 not found"), and only running it inside the
+              # container proves the pair is compatible.
+              run: |
+                  docker build -t nice_client:smoke /tmp/docker-context-gpu
+                  docker run --rm nice_client:smoke --version
+
             - name: Build and push arch image (amd64, GPU)
               uses: docker/build-push-action@v7
               with:
@@ -189,6 +209,16 @@ jobs:
                   password: ${{ secrets.GITHUB_TOKEN }}
 
             # Per-arch tag. Manifest job will later create the multi-arch tags.
+            - name: Smoke-test the binary inside the image (arm64)
+              # Build the image locally and run the binary in it before pushing:
+              # a binary built on the runner can need a newer glibc than the
+              # base image ships (3.4.1-gpu failed on Anvil with
+              # "GLIBC_2.38 not found"), and only running it inside the
+              # container proves the pair is compatible.
+              run: |
+                  docker build -t nice_client:smoke /tmp/docker-context
+                  docker run --rm nice_client:smoke --version
+
             - name: Build and push arch image (arm64)
               uses: docker/build-push-action@v7
               with:

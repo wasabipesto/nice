@@ -2,9 +2,16 @@
 # CI should place the architecture-specific binary at the root of the build context
 # with the filename `nice_client`.
 #
-# This image includes CUDA 12.0 runtime libraries required for GPU acceleration.
+# This image includes the CUDA 12.8 runtime libraries (NVRTC for the CUDA
+# backends). The base must carry a glibc at least as new as the runner that
+# built the binary: CI builds on ubuntu-latest (24.04, glibc 2.39), and
+# since #117 the rustls crypto backend (aws-lc-sys) references GLIBC_2.38
+# symbols, so a 22.04 base (2.35) fails at load time with
+# "version `GLIBC_2.38' not found". The CPU image (debian trixie, 2.41)
+# was never affected. The workflow runs the binary inside the built image
+# to catch this class of mismatch before pushing.
 
-FROM nvidia/cuda:12.0.0-runtime-ubuntu22.04 AS runtime
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS runtime
 
 # Install runtime dependencies (TLS certs for HTTPS, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
