@@ -178,6 +178,7 @@ fn run_sweep(cli: &Arc<Cli>, gpu: &GpuCtx) -> (Vec<ScenarioResult>, HashMap<u32,
 
     // The niceonly GPU pipeline's MSD floor adapts per field; a benchmark
     // needs it fixed to be comparable across machines and scenario order.
+    #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
     if cli.gpu && cli.mode == SearchMode::Niceonly {
         nice_common::gpu_niceonly::pin_msd_floor_for_benchmark();
     }
@@ -423,8 +424,7 @@ fn build_report_json(
             "benchmark_secs": cli.benchmark_secs,
             // Only the niceonly GPU pipeline has an MSD floor; recorded so
             // reports can be compared across the floor policy change.
-            "gpu_msd_floor": (cli.gpu && cli.mode == SearchMode::Niceonly)
-                .then(|| nice_common::gpu_niceonly::msd_floor_in_use().to_string()),
+            "gpu_msd_floor": benchmark_msd_floor(cli),
         },
         "hardware": hardware,
         "environment": environment,
@@ -441,6 +441,20 @@ fn build_report_json(
         "scenarios": scenarios,
         "score": score,
     })
+}
+
+/// The MSD floor a niceonly GPU sweep ran at, as the report records it; `None`
+/// for every other configuration (and for CPU-only builds, which have no GPU
+/// pipeline to have a floor).
+#[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+fn benchmark_msd_floor(cli: &Cli) -> Option<String> {
+    (cli.gpu && cli.mode == SearchMode::Niceonly)
+        .then(|| nice_common::gpu_niceonly::msd_floor_in_use().to_string())
+}
+
+#[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
+fn benchmark_msd_floor(_cli: &Cli) -> Option<String> {
+    None
 }
 
 /// The constant part of a submission telemetry payload: hardware, scheduler
