@@ -1766,10 +1766,14 @@ fn wide_chunk_for<R: cubecl::prelude::Runtime>(client: &cubecl::prelude::Compute
         .supports_type(cubecl::ir::Type::scalar(cubecl::ir::ElemType::UInt(
             cubecl::ir::UIntKind::U64,
         )));
+    // HIP joins CUDA on the wide side: hipcc lowers the u64 constant
+    // divisions to multiply-high like nvcc does, and the wide flavor measured
+    // 1.04x (b40) / 1.24x (b50) over split16 in detailed mode on an
+    // RX 9070 XT — the opposite of the same card under SPIR-V.
     let wide = match std::env::var("NICE_CUBECL_WIDE").ok().as_deref() {
         Some("0") => false,
         Some(_) => true,
-        None => cuda,
+        None => cuda || name == "hip",
     };
     if wide && !cuda && !(direct && u64_ok) {
         warn!(
