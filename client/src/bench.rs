@@ -176,6 +176,12 @@ fn run_sweep(cli: &Arc<Cli>, gpu: &GpuCtx) -> (Vec<ScenarioResult>, HashMap<u32,
     .filter(|d| !(cli.gpu && d.single_thread))
     .collect();
 
+    // The niceonly GPU pipeline's MSD floor adapts per field; a benchmark
+    // needs it fixed to be comparable across machines and scenario order.
+    if cli.gpu && cli.mode == SearchMode::Niceonly {
+        nice_common::gpu_niceonly::pin_msd_floor_for_benchmark();
+    }
+
     #[allow(clippy::cast_precision_loss)]
     let share = cli.benchmark_secs / defs.len() as f64;
 
@@ -415,6 +421,10 @@ fn build_report_json(
             "gpu": cli.gpu,
             "threads": cli.threads,
             "benchmark_secs": cli.benchmark_secs,
+            // Only the niceonly GPU pipeline has an MSD floor; recorded so
+            // reports can be compared across the floor policy change.
+            "gpu_msd_floor": (cli.gpu && cli.mode == SearchMode::Niceonly)
+                .then(|| nice_common::gpu_niceonly::msd_floor_in_use().to_string()),
         },
         "hardware": hardware,
         "environment": environment,

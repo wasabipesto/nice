@@ -218,6 +218,50 @@ fn gpu_msd_floor() -> u128 {
     adaptive_floor().lock().unwrap().current()
 }
 
+/// The MSD floor a `--benchmark` run pins: the controller's cap.
+///
+/// A benchmark has to be comparable across machines and runs, and the
+/// adaptive controller is neither — it is process-global state that moves
+/// after every field, so with 4-8e9 windows it ratchets hundreds of times
+/// inside one sweep and every scenario's rate depends on where the previous
+/// ones left it (an A100 scored below an RTX 3060 this way). The cap is where
+/// a strong device settles in production, and it puts the benchmark's weight
+/// on the device rather than on this box's MSD cores, which is what a GPU
+/// benchmark is for.
+#[allow(clippy::cast_precision_loss)]
+pub const BENCHMARK_MSD_FLOOR: u128 = MSD_FLOOR_MAX as u128;
+
+/// Pin the MSD floor to [`BENCHMARK_MSD_FLOOR`] for the rest of the process.
+///
+/// Call before any niceonly field is processed. An explicit
+/// `NICE_GPU_MSD_FLOOR` still wins, so floor sweeps under `--benchmark`
+/// remain possible; that case just initialises the controller as usual. If
+/// the controller was already initialised the pin is refused with a warning
+/// rather than silently benchmarking a moving floor.
+pub fn pin_msd_floor_for_benchmark() {
+    if std::env::var_os("NICE_GPU_MSD_FLOOR").is_some() {
+        adaptive_floor();
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let pinned = Mutex::new(AdaptiveFloor {
+        floor: BENCHMARK_MSD_FLOOR as f64,
+        warmup: u32::MAX,
+    });
+    if ADAPTIVE_FLOOR.set(pinned).is_err() {
+        warn!("GPU MSD floor already in use; benchmark cannot pin it at {BENCHMARK_MSD_FLOOR}");
+    } else {
+        debug!("GPU MSD floor pinned at {BENCHMARK_MSD_FLOOR} for the benchmark");
+    }
+}
+
+/// The MSD floor currently in force, for reports. Initialises the controller
+/// if nothing has yet.
+#[must_use]
+pub fn msd_floor_in_use() -> u128 {
+    gpu_msd_floor()
+}
+
 /// Per-field statistics from the overlapped niceonly pipeline.
 pub struct NiceonlyStats {
     /// CPU time in the MSD filter, with time spent inside the sink removed.
