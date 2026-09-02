@@ -35,27 +35,51 @@ jobs:
             - name: Check formatting and lints
               run: just lint
 
+    # The Linux-x86_64 release build no longer tests the whole workspace (it
+    # is built inside a manylinux container that has no libpq), so the full
+    # workspace is tested natively here.
+    test-workspace:
+        name: Test workspace (native Linux-x86_64)
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - uses: dtolnay/rust-toolchain@stable
+            - name: Run tests
+              run: cargo test --locked --release --no-fail-fast
+
     build:
         name: Build ${{ matrix.platform.build_name }}
         runs-on: ${{ matrix.platform.runs_on }}
+        # The two glibc release binaries most people download are built inside
+        # PyPA's manylinux_2_28 images (AlmaLinux 8, glibc 2.28, current gcc
+        # from gcc-toolset), so their glibc floor is the container's name and
+        # is independent of what ubuntu-latest ships. Entries without
+        # `container` run on the runner as before.
+        container: ${{ matrix.platform.container }}
         strategy:
             fail-fast: false
             matrix:
                 platform:
                     - build_name: Linux-x86_64
                       runs_on: ubuntu-latest
+                      container: quay.io/pypa/manylinux_2_28_x86_64
                       rust_target: x86_64-unknown-linux-gnu
-                      packages: "" # Default to all packages
+                      packages: "-p nice_common -p nice_client"
+                      glibc: "2.28"
 
                     - build_name: Linux-x86_64-musl
                       runs_on: ubuntu-latest
                       rust_target: x86_64-unknown-linux-musl
                       packages: "-p nice_common -p nice_client"
 
+                    # The aarch64 manylinux image runs natively on the arm
+                    # runner: no qemu, no cross-compiler, native tests.
                     - build_name: Linux-aarch64
                       runs_on: ubuntu-24.04-arm
+                      container: quay.io/pypa/manylinux_2_28_aarch64
                       rust_target: aarch64-unknown-linux-gnu
                       packages: "-p nice_common -p nice_client"
+                      glibc: "2.28"
 
                     - build_name: Linux-aarch64-musl
                       runs_on: ubuntu-24.04-arm
@@ -110,28 +134,97 @@ jobs:
         steps:
             - uses: actions/checkout@v6
 
+            # ---- manylinux container entries -------------------------------------
+            # Plain cargo inside the container; the container's own glibc and
+            # gcc-toolset are the build environment.
+            - name: Install Rust toolchain (container)
+              if: matrix.platform.container
+              run: |
+                  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+                  echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+                  "$HOME/.cargo/bin/rustc" --version
+                  gcc --version | head -n1
+                  ldd --version | head -n1
+
+            - name: Run tests (container)
+              if: matrix.platform.container
+              run: cargo test --target ${{ matrix.platform.rust_target }} ${{ matrix.platform.packages }} --locked --release --no-fail-fast
+
+            - name: Build binaries (container)
+              if: matrix.platform.container
+              run: cargo build --target ${{ matrix.platform.rust_target }} ${{ matrix.platform.packages }} --locked --release
+
+            # The floor is a property of the build environment, not of the
+            # source, so assert it on the artifact: every GLIBC_x.y version the
+            # binary requires must be <= the floor.
+            - name: Assert glibc floor (<= ${{ matrix.platform.glibc }})
+              if: matrix.platform.glibc
+              env:
+                  GLIBC_MAX: ${{ matrix.platform.glibc }}
+              run: |
+                  bin=target/${{ matrix.platform.rust_target }}/release/nice_client
+                  need=$(readelf -V "$bin" | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n | uniq | tail -n1)
+                  echo "$bin requires up to $need (allowed: GLIBC_$GLIBC_MAX)"
+                  test -n "$need"
+                  test "$(printf '%s\n' "GLIBC_$GLIBC_MAX" "$need" | sort -t. -k2 -n | tail -n1)" = "GLIBC_$GLIBC_MAX"
+
+            # ---- everything else: as before ----------------------------------------
             # Test, using cross when needed. This action can also install required toolchains.
             - name: Run tests
               # Skip tests for targets that can't run on the host system (e.g. freebsd)
-              if: ${{ !contains(matrix.platform.rust_target, 'freebsd') }}
+              if: ${{ !matrix.platform.container && !contains(matrix.platform.rust_target, 'freebsd') }}
               # https://github.com/houseabsolute/actions-rust-cross
               uses: houseabsolute/actions-rust-cross@v1
               with:
                   command: test
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
+                  cross-version: "v0.2.5"
 
             # Build, using cross when needed. This will explicitly put the binaries in a stable location.
             - name: Build binaries
+              if: ${{ !matrix.platform.container }}
               # https://github.com/houseabsolute/actions-rust-cross
               uses: houseabsolute/actions-rust-cross@v1
               with:
                   command: build
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release"
+                  cross-version: "v0.2.5"
+
+            # actions-rust-release is a composite action that puts its own
+            # (host) path on PATH, which does not resolve inside a job
+            # container, so container entries package themselves the same
+            # way: <exe>-<OS>-<libc>-<cpu>.tar.gz holding the executable and
+            # the changelog, plus a sha256sum file, uploaded under the
+            # archive's name. The release job globs these by name.
+            - name: Create release artifacts (container)
+              if: matrix.platform.container
+              id: package-container
+              run: |
+                  case "${{ matrix.platform.rust_target }}" in
+                      x86_64-unknown-linux-gnu) name=nice_client-Linux-gnu-x86_64 ;;
+                      aarch64-unknown-linux-gnu) name=nice_client-Linux-gnu-arm64 ;;
+                      *) echo "no archive name mapping for ${{ matrix.platform.rust_target }}"; exit 1 ;;
+                  esac
+                  td=$(mktemp -d)
+                  cp target/${{ matrix.platform.rust_target }}/release/nice_client CHANGELOG.md "$td"/
+                  chmod 755 "$td/nice_client"
+                  tar -C "$td" -czf "$name.tar.gz" nice_client CHANGELOG.md
+                  sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+                  ls -l "$name.tar.gz"*
+                  echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+            - name: Publish release artifact for run (container)
+              if: matrix.platform.container
+              uses: actions/upload-artifact@v7
+              with:
+                  name: ${{ steps.package-container.outputs.archive }}
+                  path: ${{ steps.package-container.outputs.archive }}*
 
             # Package a single executable as a tarball/zip plus checksum for release upload.
             - name: Create release artifacts
+              if: ${{ !matrix.platform.container }}
               # https://github.com/houseabsolute/actions-rust-release
               uses: houseabsolute/actions-rust-release@v0
               with:
@@ -143,7 +236,7 @@ jobs:
     release:
         name: Publish GitHub Release
         runs-on: ubuntu-latest
-        needs: build
+        needs: [test-workspace, build]
         if: startsWith(github.ref, 'refs/tags/v')
 
         steps:
