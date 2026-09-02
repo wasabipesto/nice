@@ -35,100 +35,212 @@ jobs:
             - name: Check formatting and lints
               run: just lint
 
+    # The Linux-x86_64 release build no longer tests the whole workspace (it
+    # is built for a glibc floor with zig, and api/jobs need the host's libpq),
+    # so the full workspace is tested natively here.
+    test-workspace:
+        name: Test workspace (native Linux-x86_64)
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - uses: dtolnay/rust-toolchain@stable
+            - name: Run tests
+              run: cargo test --locked --release --no-fail-fast
+
     build:
         name: Build ${{ matrix.platform.build_name }}
         runs-on: ${{ matrix.platform.runs_on }}
         strategy:
             fail-fast: false
+            # `builder` selects how the target is built:
+            #   zig    cargo-zigbuild, with an explicit glibc floor for *-gnu
+            #          targets (`glibc`), asserted on the artifact. Tests run on
+            #          the runner when it can execute the target natively.
+            #   cross  cross-rs containers, kept only where a foreign
+            #          architecture's tests must run under qemu.
+            #   native plain cargo on the runner's own toolchain.
             matrix:
                 platform:
                     - build_name: Linux-x86_64
                       runs_on: ubuntu-latest
                       rust_target: x86_64-unknown-linux-gnu
-                      packages: "" # Default to all packages
+                      packages: "-p nice_common -p nice_client"
+                      builder: zig
+                      glibc: "2.28"
+                      run_tests: true
 
                     - build_name: Linux-x86_64-musl
                       runs_on: ubuntu-latest
                       rust_target: x86_64-unknown-linux-musl
                       packages: "-p nice_common -p nice_client"
+                      builder: native
+                      run_tests: true
 
+                    # Native arm runner: zig sets the floor, tests run natively
+                    # (no qemu, no container).
                     - build_name: Linux-aarch64
                       runs_on: ubuntu-24.04-arm
                       rust_target: aarch64-unknown-linux-gnu
                       packages: "-p nice_common -p nice_client"
+                      builder: zig
+                      glibc: "2.28"
+                      run_tests: true
 
                     - build_name: Linux-aarch64-musl
                       runs_on: ubuntu-24.04-arm
                       rust_target: aarch64-unknown-linux-musl
                       packages: "-p nice_common -p nice_client"
+                      builder: native
+                      run_tests: true
 
+                    # Foreign architectures whose tests we still want to run:
+                    # cross provides the qemu runner. Their glibc floor is not
+                    # a concern.
                     - build_name: Linux-armv7
                       runs_on: ubuntu-latest
                       rust_target: armv7-unknown-linux-gnueabihf
                       packages: "-p nice_common -p nice_client"
+                      builder: cross
+                      run_tests: true
 
                     - build_name: Linux-arm-musl
                       runs_on: ubuntu-latest
                       rust_target: arm-unknown-linux-musleabi
                       packages: "-p nice_common -p nice_client"
+                      builder: cross
+                      run_tests: true
 
                     - build_name: Linux-riscv64
                       runs_on: ubuntu-latest
                       rust_target: riscv64gc-unknown-linux-gnu
                       packages: "-p nice_common -p nice_client"
+                      builder: cross
+                      run_tests: true
 
                     - build_name: Linux-i686-gnu
                       runs_on: ubuntu-latest
                       rust_target: i686-unknown-linux-gnu
                       packages: "-p nice_common -p nice_client"
+                      builder: cross
+                      run_tests: true
 
+                    # No tests either way (cannot run on the host). Stays on
+                    # cross: zig 0.14 bundles no FreeBSD libc headers, so the
+                    # C in aws-lc-sys cannot compile through it (tried).
                     - build_name: FreeBSD-x86_64
                       runs_on: ubuntu-latest
                       rust_target: x86_64-unknown-freebsd
                       packages: "-p nice_common -p nice_client"
+                      builder: cross
+                      run_tests: false
 
                     - build_name: Windows-x86_64
                       runs_on: windows-latest
                       rust_target: x86_64-pc-windows-msvc
                       packages: "-p nice_common -p nice_client"
+                      builder: native
+                      run_tests: true
 
                     - build_name: Windows-aarch64
                       runs_on: windows-11-arm
                       rust_target: aarch64-pc-windows-msvc
                       packages: "-p nice_common -p nice_client"
+                      builder: native
+                      run_tests: true
 
                     - build_name: macOS-x86_64
                       runs_on: macOS-latest
                       rust_target: x86_64-apple-darwin
                       packages: "-p nice_common -p nice_client"
+                      builder: native
+                      run_tests: true
 
                     - build_name: macOS-aarch64
                       runs_on: macOS-latest
                       rust_target: aarch64-apple-darwin
                       packages: "-p nice_common -p nice_client"
+                      builder: native
+                      run_tests: true
 
         steps:
             - uses: actions/checkout@v6
 
-            # Test, using cross when needed. This action can also install required toolchains.
+            # ---- zig builder -------------------------------------------------
+            # cargo-zigbuild drives `zig cc` as the C compiler and linker, so
+            # the glibc a *-gnu artifact needs is whatever version is named in
+            # the target triple (`x86_64-unknown-linux-gnu.2.28`) — independent
+            # of the runner image. Both tools come as pinned PyPI wheels (the
+            # ziglang wheel bundles the zig toolchain), so there is nothing to
+            # apt-get or docker-pull.
+            - name: Install Rust toolchain (zig)
+              if: matrix.platform.builder == 'zig'
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.platform.rust_target }}
+
+            - name: Install zig and cargo-zigbuild
+              if: matrix.platform.builder == 'zig'
+              run: |
+                  python3 -m pip install --user "ziglang==0.14.1" "cargo-zigbuild==0.23.3"
+                  echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+                  "$HOME/.local/bin/cargo-zigbuild" --version
+                  python3 -m ziglang version
+
+            - name: Set zig target (with glibc floor)
+              if: matrix.platform.builder == 'zig'
+              run: |
+                  target="${{ matrix.platform.rust_target }}"
+                  if [ -n "${{ matrix.platform.glibc }}" ]; then target="$target.${{ matrix.platform.glibc }}"; fi
+                  echo "ZIG_TARGET=$target" >> "$GITHUB_ENV"
+                  echo "building for $target"
+
+            - name: Run tests (zig)
+              if: matrix.platform.builder == 'zig' && matrix.platform.run_tests
+              # The test binaries are linked the same way as the release
+              # artifact, so what runs here is what ships.
+              run: cargo-zigbuild test --target "$ZIG_TARGET" ${{ matrix.platform.packages }} --locked --release --no-fail-fast
+
+            - name: Build binaries (zig)
+              if: matrix.platform.builder == 'zig'
+              run: cargo zigbuild --target "$ZIG_TARGET" ${{ matrix.platform.packages }} --locked --release
+
+            # The floor is a property of the build environment, not of the
+            # source, so assert it on the artifact: every GLIBC_x.y version the
+            # binary requires must be <= the floor. readelf reads any ELF
+            # architecture, unlike the host objdump.
+            - name: Assert glibc floor (<= ${{ matrix.platform.glibc }})
+              if: matrix.platform.builder == 'zig' && matrix.platform.glibc
+              env:
+                  GLIBC_MAX: ${{ matrix.platform.glibc }}
+              run: |
+                  bin=target/${{ matrix.platform.rust_target }}/release/nice_client
+                  need=$(readelf -V "$bin" | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n | uniq | tail -n1)
+                  echo "$bin requires up to $need (allowed: GLIBC_$GLIBC_MAX)"
+                  test -n "$need"
+                  test "$(printf '%s\n' "GLIBC_$GLIBC_MAX" "$need" | sort -t. -k2 -n | tail -n1)" = "GLIBC_$GLIBC_MAX"
+
+            # ---- cross / native builders ---------------------------------------
+            # https://github.com/houseabsolute/actions-rust-cross installs the
+            # toolchain and, for `cross`, the pinned cross-rs release.
             - name: Run tests
-              # Skip tests for targets that can't run on the host system (e.g. freebsd)
-              if: ${{ !contains(matrix.platform.rust_target, 'freebsd') }}
-              # https://github.com/houseabsolute/actions-rust-cross
+              if: matrix.platform.builder != 'zig' && matrix.platform.run_tests
               uses: houseabsolute/actions-rust-cross@v1
               with:
                   command: test
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
+                  force-use-cross: ${{ matrix.platform.builder == 'cross' }}
+                  cross-version: "v0.2.5"
 
-            # Build, using cross when needed. This will explicitly put the binaries in a stable location.
             - name: Build binaries
-              # https://github.com/houseabsolute/actions-rust-cross
+              if: matrix.platform.builder != 'zig'
               uses: houseabsolute/actions-rust-cross@v1
               with:
                   command: build
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release"
+                  force-use-cross: ${{ matrix.platform.builder == 'cross' }}
+                  cross-version: "v0.2.5"
 
             # Package a single executable as a tarball/zip plus checksum for release upload.
             - name: Create release artifacts
@@ -143,7 +255,7 @@ jobs:
     release:
         name: Publish GitHub Release
         runs-on: ubuntu-latest
-        needs: build
+        needs: [test-workspace, build]
         if: startsWith(github.ref, 'refs/tags/v')
 
         steps:
