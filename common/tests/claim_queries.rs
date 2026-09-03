@@ -30,7 +30,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::sql_query;
-use nice_common::db_util::fields::{bulk_claim_fields, bulk_claim_thin_fields, try_claim_field};
+use nice_common::db_util::fields::{
+    bulk_claim_fields, bulk_claim_next_fields, bulk_claim_thin_fields, try_claim_field,
+};
 use nice_common::{FieldClaimStrategy, FieldRecord};
 
 const FIELDS_PER_CHUNK: i64 = 10;
@@ -436,6 +438,106 @@ fn unscoped_strategies_execute(conn: &mut PgConnection) {
     );
 }
 
+fn ids_of(fields: &[FieldRecord]) -> Vec<u128> {
+    fields.iter().map(|f| f.field_id).collect()
+}
+
+/// The bulk `Next` claim is the frontier in order: consecutive batches continue where
+/// the last one stopped, exactly as a sequence of single `Next` claims would.
+fn bulk_next_returns_the_frontier_in_order(conn: &mut PgConnection) {
+    reset_fixture(conn);
+
+    let first = bulk_claim_next_fields(conn, 4, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("bulk next should execute");
+    assert_eq!(ids_of(&first), vec![1, 2, 3, 4]);
+
+    let second = bulk_claim_next_fields(conn, 4, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("bulk next should execute");
+    assert_eq!(ids_of(&second), vec![5, 6, 7, 8]);
+
+    // A single claim slots in after the batches, not before them.
+    let single = try_claim_field(
+        conn,
+        FieldClaimStrategy::Next,
+        claim_cutoff(),
+        1,
+        FIELD_SIZE,
+    )
+    .expect("next claim should execute")
+    .expect("field 9 is free");
+    assert_eq!(single.field_id, 9);
+}
+
+/// A batch never spans chunks: at the end of the frontier chunk it comes up short, and
+/// the following batch starts the next chunk. Callers must not read a short batch as
+/// "nothing left".
+fn bulk_next_batches_do_not_span_chunks(conn: &mut PgConnection) {
+    reset_fixture(conn);
+
+    let first = bulk_claim_next_fields(conn, 7, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("bulk next should execute");
+    assert_eq!(ids_of(&first), vec![1, 2, 3, 4, 5, 6, 7]);
+
+    let short = bulk_claim_next_fields(conn, 7, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("bulk next should execute");
+    assert_eq!(
+        ids_of(&short),
+        vec![8, 9, 10],
+        "chunk 1 has three fields left"
+    );
+
+    let next_chunk = bulk_claim_next_fields(conn, 7, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("bulk next should execute");
+    assert_eq!(ids_of(&next_chunk), vec![11, 12, 13, 14, 15, 16, 17]);
+}
+
+/// Same frontier rules as the single `Next` claim: a completed chunk is skipped via
+/// `minimum_cl`, a saturated one via the `EXISTS`.
+fn bulk_next_skips_completed_and_saturated_chunks(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    complete_chunk(conn, 1);
+    saturate_chunk(conn, 2);
+
+    let claimed = bulk_claim_next_fields(conn, 5, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("bulk next should execute");
+    assert_eq!(chunk_ids_of(&claimed), vec![3]);
+    assert_eq!(ids_of(&claimed), vec![21, 22, 23, 24, 25]);
+}
+
+/// Expired claims are claimable again and keep their place in the frontier.
+fn bulk_next_reclaims_expired_fields(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    sql_query("UPDATE fields SET last_claim_time = NOW() - INTERVAL '2 hours' WHERE chunk_id = 1")
+        .execute(conn)
+        .expect("expire chunk 1 claims");
+
+    let claimed = bulk_claim_next_fields(conn, 3, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("bulk next should execute");
+    assert_eq!(ids_of(&claimed), vec![1, 2, 3]);
+}
+
+/// The recheck strategy (cl<=2) batches completed work from the lowest id up, like its
+/// single-claim counterpart.
+fn bulk_next_recheck_claims_completed_work(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    complete_chunk(conn, 1);
+
+    let claimed = bulk_claim_next_fields(conn, 3, claim_cutoff(), 2, FIELD_SIZE)
+        .expect("bulk recheck should execute");
+    assert_eq!(ids_of(&claimed), vec![1, 2, 3]);
+
+    // The cl<=1 frontier is untouched by it and still starts at chunk 2.
+    let frontier = bulk_claim_next_fields(conn, 1, claim_cutoff(), 1, FIELD_SIZE)
+        .expect("bulk next should execute");
+    assert_eq!(ids_of(&frontier), vec![11]);
+}
+
+/// The niceonly level has its own bulk path; asking this one for it is a caller bug.
+fn bulk_next_rejects_the_niceonly_level(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    assert!(bulk_claim_next_fields(conn, 3, claim_cutoff(), 0, FIELD_SIZE).is_err());
+}
+
 /// A claim must not be handed to two clients at once — the property the removed
 /// `maximum_timestamp = Utc::now()` fallback violated.
 fn claims_are_not_duplicated(conn: &mut PgConnection) {
@@ -463,6 +565,28 @@ fn claims_are_not_duplicated(conn: &mut PgConnection) {
         FIELDS_PER_CHUNK * 3,
         "every field should be claimable exactly once"
     );
+
+    // And the same for the bulk Next path, whose batches end short at chunk edges.
+    reset_fixture(conn);
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        let batch = bulk_claim_next_fields(conn, 4, claim_cutoff(), 1, FIELD_SIZE)
+            .expect("bulk next should execute");
+        seen.extend(batch.iter().map(|f| f.field_id));
+    }
+    let mut distinct = seen.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        seen.len(),
+        distinct.len(),
+        "bulk Next handed a field out twice"
+    );
+    assert_eq!(distinct.len() as i64, FIELDS_PER_CHUNK * 3);
+    assert_eq!(
+        seen, distinct,
+        "bulk Next must hand fields out in frontier order"
+    );
 }
 
 #[test]
@@ -478,6 +602,12 @@ fn claim_queries_against_postgres() {
     bulk_thin_reclaims_expired_fields(&mut conn);
     bulk_thin_skips_explored_chunk(&mut conn);
     bulk_thin_returns_empty_when_everything_is_claimed(&mut conn);
+    bulk_next_returns_the_frontier_in_order(&mut conn);
+    bulk_next_batches_do_not_span_chunks(&mut conn);
+    bulk_next_skips_completed_and_saturated_chunks(&mut conn);
+    bulk_next_reclaims_expired_fields(&mut conn);
+    bulk_next_recheck_claims_completed_work(&mut conn);
+    bulk_next_rejects_the_niceonly_level(&mut conn);
     try_claim_thin_advances_past_saturated_chunk(&mut conn);
     try_claim_thin_finds_the_last_free_field(&mut conn);
     try_claim_thin_returns_none_when_everything_is_claimed(&mut conn);
