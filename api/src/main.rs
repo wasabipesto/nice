@@ -116,12 +116,12 @@ fn ping() -> &'static str {
 
 #[get("/status")]
 fn status(queue: &State<FieldQueue>) -> Json<Value> {
-    let niceonly_queue_size = queue.niceonly_queue_size();
-    let detailed_thin_queue_size = queue.detailed_thin_queue_size();
     Json(json!({
         "status": "ok",
-        "niceonly_queue_size": niceonly_queue_size,
-        "detailed_thin_queue_size": detailed_thin_queue_size
+        "niceonly_queue_size": queue.niceonly_queue_size(),
+        "detailed_thin_queue_size": queue.detailed_thin_queue_size(),
+        "detailed_next_queue_size": queue.detailed_next_queue_size(),
+        "detailed_recheck_queue_size": queue.detailed_recheck_queue_size(),
     }))
 }
 
@@ -171,9 +171,12 @@ fn claim_helper(
     // This reduces latency from ~90ms (database query + locking + update) to <1ms (memory access).
     // The queue automatically refills by bulk-claiming fields at once when it drops below a threshold.
     //
-    // For detailed mode, the dominant (80%) `Thin` strategy also consults a pre-claimed queue;
-    // the rarer `Next`/`Random`/cl=2 strategies fall back to a direct database claim because they
-    // are inherently per-request stateful and not worth bulk-pre-claiming.
+    // For detailed mode, `Thin` (80%) and both `Next` strategies (15% at cl<=1, 4% recheck at
+    // cl<=2) are served from pre-claimed queues too. `Next` used to go straight to the
+    // database on the grounds that it is per-request stateful; but its state is just "the
+    // lowest-id claimable field", which a queue filled in frontier order reproduces exactly,
+    // and the direct query re-sorts the frontier chunk on every request — 14 ms alone, over
+    // 100 ms when sixteen clients ask at once. Only `Random` (1%) still claims directly.
     let search_field = if search_mode == SearchMode::Niceonly {
         // Try to get from queue first
         if let Some(queued_field) = queue.claim_niceonly(&mut conn) {
@@ -209,9 +212,19 @@ fn claim_helper(
             .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
             .ok_or_else(no_claimable_field)?
         }
+    } else if claim_strategy == FieldClaimStrategy::Next
+        && let Some(queued_field) = queue.claim_detailed_next(&mut conn, max_check_level)
+    {
+        queued_field
     } else {
-        // For the remaining detailed strategies (Next / Random / cl=2), claim directly
-        // from the database.
+        // `Random`, or a `Next` queue that is empty while its refill is in flight:
+        // claim directly from the database.
+        if claim_strategy == FieldClaimStrategy::Next {
+            tracing::warn!(
+                max_check_level,
+                "Detailed-next queue exhausted, falling back to direct database claim"
+            );
+        }
         let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
         try_claim_field(
             &mut conn,
@@ -572,8 +585,7 @@ fn rocket() -> _ {
 
     // Initialize field queue and pre-fill it
     let queue = FieldQueue::new(pool.clone());
-    queue.prefill_niceonly();
-    queue.prefill_detailed_thin();
+    queue.prefill_all();
 
     // Initialize the benchmark corpus cache for /estimate and pre-fill it
     let cache_ttl = std::env::var("ESTIMATE_CACHE_TTL_SECS")
