@@ -1876,7 +1876,7 @@ fn begin_impl<R: cubecl::prelude::Runtime>(
                 plans: plans.clone(),
                 wide_chunk: wide_chunk_for(client),
                 open: HashMap::new(),
-                launches_since_sync: 0,
+                inflight: std::collections::VecDeque::new(),
             },
         )
     });
@@ -1908,14 +1908,30 @@ fn finish_impl<R: cubecl::prelude::Runtime>(
     ))
 }
 
-/// Launches between the `CubeCL` sink's full syncs: a quarter of the CUDA
-/// ring depth. A full sync stalls the dispatch thread until the device has
-/// drained everything queued, and the descriptor channel holds about four
-/// launches' worth; syncing every sixteen let it fill and parked the MSD
-/// workers for most of each sync (measured on a 9070 XT: both sides idle
-/// half the time), so the stall is kept inside the channel's capacity.
-fn cubecl_sync_period() -> usize {
-    (batches_in_flight() / 4).max(1)
+/// A fence on one launched batch: the client's `sync` future taken right
+/// after the launch and polled once on the spot. The flush is eager, but on
+/// wgpu the submitted-work-done callback is registered inside the future's
+/// first poll, and such a callback covers everything submitted *at
+/// registration*; polling immediately pins it to the work queued up to this
+/// launch, so awaiting it later does not also wait for whatever was launched
+/// since.
+type LaunchFence = cubecl::future::DynFut<Result<(), cubecl::server::ServerError>>;
+
+/// Take a fence on everything the client has queued so far. `None` if it
+/// resolved on the spot (nothing pending).
+fn launch_fence<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+) -> Result<Option<LaunchFence>> {
+    use std::task::{Context, Poll, Waker};
+    let mut fence = client.sync();
+    let mut cx = Context::from_waker(Waker::noop());
+    match fence.as_mut().poll(&mut cx) {
+        Poll::Ready(r) => {
+            r.map_err(|e| anyhow::anyhow!("launch fence failed: {e:?}"))?;
+            Ok(None)
+        }
+        Poll::Pending => Ok(Some(fence)),
+    }
 }
 
 /// The device end of the niceonly pipeline for a `CubeCL` runtime: one
@@ -1926,11 +1942,17 @@ struct CubeclNiceonlySink<R: cubecl::prelude::Runtime> {
     plans: Arc<Mutex<HashMap<u32, Arc<NiceonlyPlan>>>>,
     wide_chunk: bool,
     open: HashMap<u64, CubeclNiceonlyRun<R>>,
-    /// `CubeCL` exposes no per-submission fence, so backpressure is a full
-    /// client sync every [`cubecl_sync_period`] launches. The device idles
-    /// only for the launch latency of the next batch after each sync, well
-    /// under a percent of a batch's work.
-    launches_since_sync: usize,
+    /// One fence per launched batch, oldest first: the `CubeCL` analogue of
+    /// the CUDA sink's event ring. Before the ring exceeds
+    /// [`batches_in_flight`] the oldest fence is awaited, so the dispatch
+    /// thread blocks for exactly one batch at a time and the descriptor
+    /// channel keeps draining. A full `client.sync()` every N launches was
+    /// tried first and is the wrong shape: it parks the dispatch thread for N
+    /// batches while the channel fills and the MSD workers park unseen, so
+    /// "device behind" reads as saturated and the floor controller drove
+    /// the floor to its minimum on a 9070 XT and an M4 (a third of the
+    /// pinned throughput).
+    inflight: std::collections::VecDeque<LaunchFence>,
 }
 
 impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlySink<R> {
@@ -1949,12 +1971,17 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlySink<R> {
             .open
             .get_mut(&field)
             .ok_or_else(|| anyhow::anyhow!("launch for a field that is not open ({field})"))?;
+        // Backpressure: wait for the oldest batch before adding another,
+        // once `batches_in_flight` are outstanding.
+        while self.inflight.len() >= batches_in_flight() {
+            if let Some(oldest) = self.inflight.pop_front() {
+                cubecl::future::block_on(oldest)
+                    .map_err(|e| anyhow::anyhow!("launch fence failed: {e:?}"))?;
+            }
+        }
         run.launch(field, offsets, lens, masks)?;
-        self.launches_since_sync += 1;
-        if self.launches_since_sync >= cubecl_sync_period() {
-            cubecl::future::block_on(self.client.sync())
-                .map_err(|e| anyhow::anyhow!("device sync failed: {e:?}"))?;
-            self.launches_since_sync = 0;
+        if let Some(fence) = launch_fence(&self.client)? {
+            self.inflight.push_back(fence);
         }
         Ok(())
     }
