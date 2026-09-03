@@ -757,6 +757,14 @@ pub fn bulk_claim_thin_fields(
     // Find the frontier chunk, then bulk-claim up to `count` fields within it. We do
     // this in a single statement by joining the eligible chunk back to fields and
     // limiting the candidate set.
+    //
+    // `ORDER BY f.chunk_id, f.id` for the same reason as the `Next` claim (see
+    // `try_claim_field`): with a bare `ORDER BY f.id` the generic plan walks the
+    // primary key from id 1 and filters every field below the frontier chunk —
+    // measured on a 3M-row model with the frontier 720k rows in: 254 ms and 480k
+    // rows read per refill, against 29 ms via `idx_fields_chunk_id` with the
+    // chunk-led ordering. Production's frontier is tens of millions of rows in.
+    // The two orderings return the same rows: the CTE yields exactly one chunk.
     let eligible_chunk = eligible_chunk_cte(check_level_predicate);
     let query = format!(
         "WITH {eligible_chunk}, candidates AS (
@@ -766,7 +774,7 @@ pub fn bulk_claim_thin_fields(
             WHERE {claimable}
               AND f.{check_level_predicate}
               AND f.range_size <= $3
-            ORDER BY f.id ASC
+            ORDER BY f.chunk_id, f.id ASC
             FOR UPDATE SKIP LOCKED
             LIMIT $5
         )
@@ -788,6 +796,83 @@ pub fn bulk_claim_thin_fields(
         .load::<FieldPrivate>(conn)
         .map_err(|e| anyhow!("{e}"))?;
 
+    results.into_iter().map(private_to_public).collect()
+}
+
+/// Bulk claim up to `count` fields in `Next` order — the global frontier: the
+/// lowest-id claimable fields at or below `maximum_check_level` — for queue
+/// pre-filling. Mirrors `try_claim_field`'s scoped `Next` branch (frontier chunk
+/// via `minimum_cl`, chunk-led ordering) but takes a batch from that chunk in one
+/// statement, so a queue can hand out the frontier in order at memory speed.
+///
+/// A batch never spans chunks: if the frontier chunk has fewer than `count`
+/// claimable fields left, the batch is short and the next refill's frontier CTE
+/// steps past the exhausted chunk. Callers must treat a short (or empty) batch as
+/// normal, not as "nothing left".
+///
+/// Only `maximum_check_level >= 1` is supported here; the niceonly (cl=0) bulk
+/// path is `bulk_claim_fields`, whose unscoped form has its own partial index.
+///
+/// Measured on a 3M-row model of production (30k-field chunks): 22 ms for a
+/// batch of 100 against 14-16 ms for one single `Next` claim, and unlike the
+/// single claim it is not repeated by every concurrent request — sixteen
+/// clients issuing single `Next` claims averaged 109 ms each, because each one
+/// re-sorts the frontier chunk before `SKIP LOCKED` picks its row.
+pub fn bulk_claim_next_fields(
+    conn: &mut PgConnection,
+    count: usize,
+    maximum_timestamp: DateTime<Utc>,
+    maximum_check_level: u8,
+    maximum_size: u128,
+) -> Result<Vec<FieldRecord>> {
+    use diesel::sql_query;
+    use diesel::sql_types::{BigInt, Integer, Numeric, Timestamptz};
+
+    if maximum_check_level == 0 {
+        return Err(anyhow!(
+            "bulk_claim_next_fields is for detailed claims (check level >= 1); use bulk_claim_fields for niceonly"
+        ));
+    }
+    let maximum_check_level = conversions::u8_to_i32(maximum_check_level)?;
+    let maximum_size = conversions::u128_to_bigdec(maximum_size)?;
+    let count_i64 = i64::try_from(count).map_err(|e| anyhow!("{e}"))?;
+
+    let check_level_predicate = check_level_predicate(maximum_check_level);
+    let frontier_chunk = frontier_chunk_cte(check_level_predicate);
+    let claimable = claimable_predicate("f.");
+
+    // `ORDER BY f.chunk_id, f.id` is load-bearing; see the `Next` branch of
+    // `try_claim_field`.
+    let query = format!(
+        "WITH {frontier_chunk}, candidates AS (
+            SELECT f.id
+            FROM fields f
+            JOIN frontier_chunk fc ON f.chunk_id = fc.id
+            WHERE {claimable}
+              AND f.{check_level_predicate}
+              AND f.range_size <= $3
+            ORDER BY f.chunk_id, f.id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT $4
+        )
+        UPDATE fields f
+        SET last_claim_time = NOW()
+        FROM candidates
+        WHERE f.id = candidates.id
+        RETURNING f.*;"
+    );
+
+    let mut results = sql_query(query)
+        .bind::<Timestamptz, _>(maximum_timestamp)
+        .bind::<Integer, _>(maximum_check_level)
+        .bind::<Numeric, _>(maximum_size)
+        .bind::<BigInt, _>(count_i64)
+        .load::<FieldPrivate>(conn)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    // `UPDATE ... FROM` does not promise to return rows in the CTE's order, and
+    // the queue hands them out front to back, so restore frontier order here.
+    results.sort_by_key(|f| f.id);
     results.into_iter().map(private_to_public).collect()
 }
 

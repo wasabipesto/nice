@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- API: serve the detailed `Next` claim strategies (15% of detailed claims at `check_level <= 1`, 4% rechecks at `check_level <= 2`) from pre-claimed in-memory queues, like `Thin` and niceonly already were. The direct `Next` query re-sorts the frontier chunk on every request, so it serialised under load: 14 ms alone but over 100 ms per request with sixteen concurrent clients on a 3M-row model of production. A queue refill is one 22 ms batch per 100 claims. Only `Random` (1%) still claims directly. `/status` reports the new queue sizes.
+- API: the detailed-thin queue refill ordered by field id alone, which let the generic plan walk the primary key from id 1 to the frontier chunk (254 ms and 480k rows read per refill on the model; production's frontier is tens of millions of rows deeper). It now orders by chunk then id, the same fix the `Next` claim received, and reads only the frontier chunk (29 ms).
+
 ## Nice v3.4.3
 
 - Ship the CUDA runtime headers in the `-gpu` docker image. NVRTC could not find `cuda_runtime.h` in the runtime-only base, so the `cubecl-cuda` backend failed to compile every kernel and `--gpu-backend auto` silently fell through to the hand-written CUDA backend. CI now checks the header is present in the built image.
