@@ -308,7 +308,12 @@ const FLOOR_WAIT_THRESHOLD: f64 = 0.15;
 pub struct FloorController {
     /// The floor as `f64` bits; workers read it per block, lock-free.
     floor_bits: AtomicU64,
-    pinned: bool,
+    /// No steering while set: pinned by the environment for the whole
+    /// process, or frozen by the benchmark for a measured window.
+    pinned: AtomicBool,
+    /// Pinned by `NICE_GPU_MSD_FLOOR`: the benchmark's freeze/thaw leave it
+    /// alone, so floor sweeps under `--benchmark` still work.
+    env_pinned: bool,
     state: Mutex<FloorState>,
 }
 
@@ -322,7 +327,8 @@ impl FloorController {
     fn new(floor: f64, pinned: bool) -> Self {
         Self {
             floor_bits: AtomicU64::new(floor.to_bits()),
-            pinned,
+            pinned: AtomicBool::new(pinned),
+            env_pinned: pinned,
             state: Mutex::new(FloorState {
                 interval_start: Instant::now(),
                 cpu_wait: Duration::ZERO,
@@ -340,7 +346,7 @@ impl FloorController {
     /// side was behind) or blocked handing work to a full device (the device
     /// side was behind), and steer once an interval has elapsed.
     fn observe(&self, cpu_wait: Duration, device_wait: Duration) {
-        if self.pinned {
+        if self.pinned.load(Ordering::Relaxed) {
             return;
         }
         let mut st = self.state.lock().unwrap();
@@ -387,6 +393,31 @@ impl FloorController {
     }
 }
 
+impl FloorController {
+    /// Stop steering and hold the current floor. Returns it. A floor pinned
+    /// by the environment is unaffected (it is already held).
+    fn freeze(&self) -> u128 {
+        self.pinned.store(true, Ordering::Relaxed);
+        self.floor()
+    }
+
+    /// Resume steering from `seed`, with the step and interval reset so the
+    /// run does not start with a stale direction. No-op under an
+    /// environment pin.
+    fn thaw(&self, seed: f64) {
+        if self.env_pinned {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        st.interval_start = Instant::now();
+        st.cpu_wait = Duration::ZERO;
+        st.device_wait = Duration::ZERO;
+        drop(st);
+        self.floor_bits.store(seed.to_bits(), Ordering::Relaxed);
+        self.pinned.store(false, Ordering::Relaxed);
+    }
+}
+
 static FLOOR: OnceLock<FloorController> = OnceLock::new();
 
 /// The process-wide floor controller, initialised on first use: pinned by
@@ -407,37 +438,29 @@ fn floor_controller() -> &'static FloorController {
     })
 }
 
-/// The MSD floor a `--benchmark` run pins: the controller's cap.
+/// Let the benchmark steer a scenario's floor from the production seed:
+/// resets the controller and resumes steering. Call before a scenario's
+/// warm-up; pair with [`benchmark_floor_freeze`] before its measured
+/// windows. An explicit `NICE_GPU_MSD_FLOOR` still wins, so floor sweeps
+/// under `--benchmark` remain possible: both calls are then no-ops.
 ///
-/// A benchmark has to be comparable across machines and runs, and a steered
-/// floor is neither: it is process-global state that moves with load, so
-/// every scenario's rate would depend on where the previous ones left it (an
-/// A100 scored below an RTX 3060 this way under the earlier controller). The
-/// cap is where a strong device settles in production, and it puts the
-/// benchmark's weight on the device rather than on this box's MSD cores,
-/// which is what a GPU benchmark is for.
-#[allow(clippy::cast_precision_loss)]
-pub const BENCHMARK_MSD_FLOOR: u128 = MSD_FLOOR_MAX as u128;
+/// Why not simply pin: a steered floor is what production runs at, and it
+/// differs by machine in both directions (measured: an RTX 4090 with six
+/// cores settles at the cap, an RTX 3060 with nineteen near 100k, and the
+/// pinned cap undersold the latter by a third). Why not steer through the
+/// measurement: the controller moves every half second and the windows are
+/// tens of milliseconds, so a moving floor would make the rate depend on
+/// where in the controller's cycle the window fell. Steer to convergence
+/// first, then hold.
+pub fn benchmark_floor_thaw() {
+    floor_controller().thaw(MSD_FLOOR_SEED);
+}
 
-/// Pin the MSD floor to [`BENCHMARK_MSD_FLOOR`] for the rest of the process.
-///
-/// Call before any niceonly field is processed. An explicit
-/// `NICE_GPU_MSD_FLOOR` still wins, so floor sweeps under `--benchmark`
-/// remain possible; that case just initialises the controller as usual. If
-/// the controller was already initialised the pin is refused with a warning
-/// rather than silently benchmarking a moving floor.
-pub fn pin_msd_floor_for_benchmark() {
-    if std::env::var_os("NICE_GPU_MSD_FLOOR").is_some() {
-        floor_controller();
-        return;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let pinned = FloorController::new(BENCHMARK_MSD_FLOOR as f64, true);
-    if FLOOR.set(pinned).is_err() {
-        warn!("GPU MSD floor already in use; benchmark cannot pin it at {BENCHMARK_MSD_FLOOR}");
-    } else {
-        debug!("GPU MSD floor pinned at {BENCHMARK_MSD_FLOOR} for the benchmark");
-    }
+/// Hold the floor where the warm-up left it for the measured windows, and
+/// report it. See [`benchmark_floor_thaw`].
+#[must_use]
+pub fn benchmark_floor_freeze() -> u128 {
+    floor_controller().freeze()
 }
 
 /// The MSD floor currently in force, for reports. Initialises the controller
@@ -1863,6 +1886,26 @@ mod tests {
         elapse(&c);
         c.observe(interval, Duration::ZERO);
         assert_eq!(c.floor(), 777);
+        // ...and an environment pin ignores the benchmark's thaw.
+        c.thaw(1000.0);
+        elapse(&c);
+        c.observe(interval, Duration::ZERO);
+        assert_eq!(c.floor(), 777);
+
+        // Freeze holds; thaw resumes from the seed with a fresh step.
+        let c = FloorController::new(100_000.0, false);
+        elapse(&c);
+        c.observe(interval, Duration::ZERO);
+        let frozen = c.freeze();
+        assert!(frozen > 100_000);
+        elapse(&c);
+        c.observe(interval, Duration::ZERO);
+        assert_eq!(c.floor(), frozen);
+        c.thaw(50_000.0);
+        assert_eq!(c.floor(), 50_000);
+        elapse(&c);
+        c.observe(interval, Duration::ZERO);
+        assert!((c.floor() as f64 - 50_000.0 * FLOOR_STEP).abs() < 5.0);
     }
 
     /// Blocks are power-of-two chunk counts covering the field exactly, the
