@@ -2525,6 +2525,57 @@ mod tests {
     /// `vulkan_matches_cpu_niceonly`. The GPU checks a *superset* of the CPU's
     /// candidates (its MSD floor is coarser), so the nice-number sets must
     /// still be identical.
+    /// Throughput of the continuous pipeline on a fixed run of fields on
+    /// the default wgpu device, so two configurations can be compared on
+    /// identical work. Env as in production (`NICE_GPU_FIELDS_IN_FLIGHT`,
+    /// `NICE_GPU_MSD_FLOOR`); `NICE_TEST_FIELDS` (default 12) fields of 1e13
+    /// in base 54 from the region the Anvil runs covered.
+    #[test]
+    #[ignore = "requires a wgpu device; prints throughput"]
+    #[allow(clippy::cast_precision_loss)]
+    fn pipeline_throughput_fixed_fields() {
+        use crate::gpu_niceonly::{NiceonlyStarted, fields_in_flight, msd_floor_in_use};
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        let base = 54;
+        let n: usize = std::env::var("NICE_TEST_FIELDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let start: u128 = 2_778_136_280_153_679_229;
+        let size: u128 = 10_000_000_000_000;
+        let fields: Vec<FieldSize> = (0..n as u128)
+            .map(|i| FieldSize::new(start + i * size, start + (i + 1) * size))
+            .collect();
+        let warm = FieldSize::new(start - size, start);
+        if let NiceonlyStarted::Queued = begin_niceonly_cubecl(&ctx, &warm, base).unwrap() {
+            finish_niceonly_cubecl(&ctx).unwrap();
+        }
+        let lookahead = fields_in_flight().saturating_sub(1);
+        let t = std::time::Instant::now();
+        let mut queued = 0usize;
+        let mut found = 0usize;
+        for f in &fields {
+            if let NiceonlyStarted::Queued = begin_niceonly_cubecl(&ctx, f, base).unwrap() {
+                queued += 1;
+            }
+            while queued > lookahead {
+                found += finish_niceonly_cubecl(&ctx).unwrap().0.nice_numbers.len();
+                queued -= 1;
+            }
+        }
+        while queued > 0 {
+            found += finish_niceonly_cubecl(&ctx).unwrap().0.nice_numbers.len();
+            queued -= 1;
+        }
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!(
+            "THROUGHPUT fields_in_flight={} floor_now={} fields={n} secs={secs:.2} rate={:.3e} n/s found={found}",
+            fields_in_flight(),
+            msd_floor_in_use(),
+            (n as f64) * (size as f64) / secs
+        );
+    }
+
     #[test]
     #[ignore = "requires a wgpu device"]
     fn cubecl_matches_cpu_niceonly() {
