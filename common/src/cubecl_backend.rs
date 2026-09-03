@@ -1908,6 +1908,16 @@ fn finish_impl<R: cubecl::prelude::Runtime>(
     ))
 }
 
+/// Launches between the `CubeCL` sink's full syncs: a quarter of the CUDA
+/// ring depth. A full sync stalls the dispatch thread until the device has
+/// drained everything queued, and the descriptor channel holds about four
+/// launches' worth; syncing every sixteen let it fill and parked the MSD
+/// workers for most of each sync (measured on a 9070 XT: both sides idle
+/// half the time), so the stall is kept inside the channel's capacity.
+fn cubecl_sync_period() -> usize {
+    (batches_in_flight() / 4).max(1)
+}
+
 /// The device end of the niceonly pipeline for a `CubeCL` runtime: one
 /// [`CubeclNiceonlyRun`] per open field, plus the launch count that bounds
 /// the work in flight.
@@ -1917,7 +1927,7 @@ struct CubeclNiceonlySink<R: cubecl::prelude::Runtime> {
     wide_chunk: bool,
     open: HashMap<u64, CubeclNiceonlyRun<R>>,
     /// `CubeCL` exposes no per-submission fence, so backpressure is a full
-    /// client sync every [`batches_in_flight`] launches. The device idles
+    /// client sync every [`cubecl_sync_period`] launches. The device idles
     /// only for the launch latency of the next batch after each sync, well
     /// under a percent of a batch's work.
     launches_since_sync: usize,
@@ -1941,7 +1951,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlySink<R> {
             .ok_or_else(|| anyhow::anyhow!("launch for a field that is not open ({field})"))?;
         run.launch(field, offsets, lens, masks)?;
         self.launches_since_sync += 1;
-        if self.launches_since_sync >= batches_in_flight() {
+        if self.launches_since_sync >= cubecl_sync_period() {
             cubecl::future::block_on(self.client.sync())
                 .map_err(|e| anyhow::anyhow!("device sync failed: {e:?}"))?;
             self.launches_since_sync = 0;

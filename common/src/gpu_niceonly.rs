@@ -249,15 +249,17 @@ const MSD_FLOOR_SEED: f64 = MSD_FLOOR_MAX / 2.0;
 
 /// How often the controller reconsiders the floor.
 const FLOOR_ADJUST_INTERVAL: Duration = Duration::from_millis(500);
-/// Largest multiplicative step per adjustment, either direction. The step
-/// shrinks toward [`FLOOR_STEP_MIN`] on every reversal and grows back while
-/// the controller keeps moving the same way, so a balance point between two
-/// steps is settled on rather than hopped across: measured on an RTX 3060
-/// with 19 cores, a fixed 1.25x step alternated 82k↔128k every interval,
-/// each side waiting >90% in turn.
+/// Largest multiplicative step per adjustment, either direction: taken when
+/// one side waited the whole interval and the other not at all. The step is
+/// proportional to how one-sided the waits were, so near the balance point
+/// the controller inches ("57% vs 42%" moves 4%) and a regime change still
+/// moves it fast. A fixed step hopped across the balance point instead:
+/// measured on an RTX 3060 with 19 cores, 1.25x alternated 82k↔128k every
+/// interval with each side waiting >90% in turn, and a reversal-damped
+/// variant still hopped 200k↔280k on a 9070 XT for 40 s before settling.
 const FLOOR_STEP: f64 = 1.25;
-/// Smallest step the damping shrinks to.
-const FLOOR_STEP_MIN: f64 = 1.03;
+/// Smallest step taken once the controller decides to move at all.
+const FLOOR_STEP_MIN: f64 = 1.02;
 /// Fraction of an interval one side must spend waiting on the other before
 /// the floor moves. Below this the pipeline is called balanced.
 const FLOOR_WAIT_THRESHOLD: f64 = 0.15;
@@ -299,10 +301,6 @@ struct FloorState {
     interval_start: Instant,
     cpu_wait: Duration,
     device_wait: Duration,
-    /// Current multiplicative step; see [`FLOOR_STEP`].
-    step: f64,
-    /// Direction of the last move: +1 up, -1 down, 0 none yet.
-    last_direction: i8,
 }
 
 impl FloorController {
@@ -314,8 +312,6 @@ impl FloorController {
                 interval_start: Instant::now(),
                 cpu_wait: Duration::ZERO,
                 device_wait: Duration::ZERO,
-                step: FLOOR_STEP,
-                last_direction: 0,
             }),
         }
     }
@@ -354,16 +350,10 @@ impl FloorController {
         if direction == 0 {
             return;
         }
-        // Damping: a reversal means the balance point was crossed, so take
-        // smaller steps; the same direction again means it is further off.
-        st.step = if direction == -st.last_direction {
-            st.step.sqrt().max(FLOOR_STEP_MIN)
-        } else {
-            (st.step * st.step).min(FLOOR_STEP)
-        };
-        st.last_direction = direction;
-        let step = st.step;
         drop(st);
+        // Proportional: the more one-sided the waiting, the bigger the step.
+        let imbalance = (device_frac - cpu_frac).abs().min(1.0);
+        let step = (1.0 + (FLOOR_STEP - 1.0) * imbalance).max(FLOOR_STEP_MIN);
         let floor = f64::from_bits(self.floor_bits.load(Ordering::Relaxed));
         let new_floor = if direction < 0 {
             (floor / step).max(MSD_FLOOR_MIN)
@@ -1805,42 +1795,38 @@ mod tests {
     fn floor_controller_steers_toward_the_waiting_side() {
         let interval = FLOOR_ADJUST_INTERVAL;
         // Force an adjustment: pretend the interval has elapsed.
+        // Pretend exactly one interval (plus a hair) has elapsed, so a wait
+        // of `interval` reads as "the whole interval".
         let elapse = |c: &FloorController| {
-            c.state.lock().unwrap().interval_start =
-                Instant::now().checked_sub(interval * 2).unwrap();
+            c.state.lock().unwrap().interval_start = Instant::now()
+                .checked_sub(interval + Duration::from_micros(10))
+                .unwrap();
         };
         let c = FloorController::new(100_000.0, false);
         // The device waited (launch blocked) for most of the interval: down.
         elapse(&c);
         c.observe(Duration::ZERO, interval);
-        assert!((c.floor() as f64 - 100_000.0 / FLOOR_STEP).abs() < 1.0);
-        // The CPU waited (recv blocked): up — a reversal, so a damped step.
+        assert!((c.floor() as f64 - 100_000.0 / FLOOR_STEP).abs() < 5.0);
+        // The CPU waited (recv blocked) the whole interval: up, full step.
         let before = c.floor() as f64;
         elapse(&c);
         c.observe(interval, Duration::ZERO);
-        assert!((c.floor() as f64 - before * FLOOR_STEP.sqrt()).abs() < 1.0);
+        assert!((c.floor() as f64 - before * FLOOR_STEP).abs() < 5.0);
         // Neither waited enough: hold.
         let before = c.floor();
         elapse(&c);
         c.observe(interval.mul_f64(0.05), interval.mul_f64(0.05));
         assert_eq!(c.floor(), before);
-        // Both waited, device more: down.
+        // Both waited, device a little more: down, but only a little — the
+        // step is proportional to the imbalance (0.2 here → 5%).
         elapse(&c);
         c.observe(interval.mul_f64(0.3), interval.mul_f64(0.5));
-        assert!(c.floor() < before);
-
-        // Repeated moves the same way grow the step back to the maximum.
-        let c = FloorController::new(10_000.0, false);
-        elapse(&c);
-        c.observe(interval, Duration::ZERO);
-        elapse(&c);
-        c.observe(Duration::ZERO, interval);
-        assert!(c.state.lock().unwrap().step < FLOOR_STEP);
-        for _ in 0..4 {
-            elapse(&c);
-            c.observe(Duration::ZERO, interval);
-        }
-        assert!((c.state.lock().unwrap().step - FLOOR_STEP).abs() < 1e-9);
+        let expected = before as f64 / (1.0 + (FLOOR_STEP - 1.0) * 0.2);
+        assert!(
+            (c.floor() as f64 - expected).abs() < 2.0,
+            "{} vs {expected}",
+            c.floor()
+        );
 
         // Clamped at both ends, never into the bypass.
         let c = FloorController::new(MSD_FLOOR_MAX * 0.9, false);
