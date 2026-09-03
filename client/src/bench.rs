@@ -472,11 +472,19 @@ pub fn telemetry_base(cli: &Cli, gpu: &GpuCtx) -> Value {
 }
 
 /// Stamp the constant telemetry base with this field's processing time
-/// (client-side wall time, unlike the server's claim-to-submit elapsed).
-pub fn field_telemetry(base: &Value, processing_secs: f64) -> Value {
+/// (client-side wall time, unlike the server's claim-to-submit elapsed) and,
+/// for GPU niceonly fields, the pipeline's per-field accounting: the MSD
+/// floor, how long each side waited on the other, and the device's busy
+/// time where the backend can measure it. That is what says whether a
+/// machine is CPU-bound or GPU-bound, which the hardware fields alone do
+/// not.
+pub fn field_telemetry(base: &Value, processing_secs: f64, pipeline: Option<&Value>) -> Value {
     let mut value = base.clone();
     if let Value::Object(map) = &mut value {
         map.insert("processing_secs".to_string(), json!(processing_secs));
+        if let Some(pipeline) = pipeline {
+            map.insert("pipeline".to_string(), pipeline.clone());
+        }
     }
     value
 }
@@ -703,7 +711,7 @@ mod tests {
     #[test]
     fn field_telemetry_stamps_timing() {
         let base = json!({"schema_version": TELEMETRY_SCHEMA_VERSION, "hardware": {}});
-        let stamped = field_telemetry(&base, 12.5);
+        let stamped = field_telemetry(&base, 12.5, None);
         assert_eq!(stamped["processing_secs"], json!(12.5));
         assert_eq!(stamped["schema_version"], json!(TELEMETRY_SCHEMA_VERSION));
         // The base is not mutated; every field gets a fresh stamp.

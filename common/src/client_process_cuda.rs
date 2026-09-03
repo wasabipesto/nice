@@ -40,8 +40,8 @@ use crate::gpu_config::{
     MAX_GPU_DIGIT_MASK_BASE, chunk_constants, gpu_supports_base, prefilter_params,
 };
 use crate::gpu_niceonly::{
-    NiceonlyPipeline, NiceonlyStarted, PendingField, RangeSink, batches_in_flight,
-    residue_empty_result,
+    DeviceResult, NiceonlyPipeline, NiceonlyStarted, NiceonlyStats, PendingField, RangeSink,
+    batches_in_flight, residue_empty_result,
 };
 use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
@@ -395,7 +395,7 @@ pub fn begin_niceonly_cuda(
 ///
 /// # Panics
 /// Panics if the pipeline mutex was poisoned by an earlier panic.
-pub fn finish_niceonly_cuda(ctx: &CudaContext) -> Result<FieldResults> {
+pub fn finish_niceonly_cuda(ctx: &CudaContext) -> Result<(FieldResults, NiceonlyStats)> {
     let mut guard = ctx.niceonly_pipeline.lock().unwrap();
     let pipeline = guard
         .as_mut()
@@ -407,10 +407,13 @@ pub fn finish_niceonly_cuda(ctx: &CudaContext) -> Result<FieldResults> {
         stats.launches,
         nice_numbers.len()
     );
-    Ok(FieldResults {
-        distribution: Vec::new(),
-        nice_numbers,
-    })
+    Ok((
+        FieldResults {
+            distribution: Vec::new(),
+            nice_numbers,
+        },
+        stats,
+    ))
 }
 
 /// One field, begun and finished: the synchronous form, for callers that
@@ -428,7 +431,7 @@ pub fn process_range_niceonly_cuda(
 ) -> Result<FieldResults> {
     match begin_niceonly_cuda(ctx, range, base)? {
         NiceonlyStarted::Immediate(results) => Ok(results),
-        NiceonlyStarted::Queued => finish_niceonly_cuda(ctx),
+        NiceonlyStarted::Queued => finish_niceonly_cuda(ctx).map(|(results, _)| results),
     }
 }
 
@@ -451,6 +454,11 @@ struct CudaOpenField {
     d_nice_out: CudaSlice<u64>,
     d_nice_count: CudaSlice<u32>,
     start: Option<CudaEvent>,
+    /// (before, after) events around each batch's kernel: the stream is
+    /// in-order, so `before` completes when the kernel can start and `after`
+    /// when it is done, and their elapsed time is the device's busy time on
+    /// that batch whether or not the queue ran dry in between batches.
+    batches: Vec<(CudaEvent, CudaEvent)>,
 }
 
 /// A closed field's device work: the events bracketing it and the buffers
@@ -462,10 +470,11 @@ pub struct CudaPendingField {
     d_nice_count: CudaSlice<u32>,
     start: Option<CudaEvent>,
     end: CudaEvent,
+    batches: Vec<(CudaEvent, CudaEvent)>,
 }
 
 impl PendingField for CudaPendingField {
-    fn wait(self: Box<Self>) -> Result<Vec<NiceNumberSimple>> {
+    fn wait(self: Box<Self>) -> Result<DeviceResult> {
         self.end.synchronize()?;
         if let Some(start) = &self.start
             && let Ok(ms) = start.elapsed_ms(&self.end)
@@ -475,6 +484,11 @@ impl PendingField for CudaPendingField {
                 f64::from(ms) / 1000.0
             );
         }
+        let mut busy_ms = 0.0f64;
+        for (before, after) in &self.batches {
+            busy_ms += f64::from(before.elapsed_ms(after)?);
+        }
+        let device_busy_secs = Some(busy_ms / 1000.0);
         let nice_count = self.stream.clone_dtoh(&self.d_nice_count)?[0] as usize;
         if nice_count > NICE_OUT_CAPACITY {
             bail!(
@@ -493,7 +507,10 @@ impl PendingField for CudaPendingField {
             }
             nice_numbers.sort_by_key(|n| n.number);
         }
-        Ok(nice_numbers)
+        Ok(DeviceResult {
+            nice_numbers,
+            device_busy_secs,
+        })
     }
 }
 
@@ -517,6 +534,7 @@ impl RangeSink for CudaNiceonlySink {
                 d_nice_out: stream.alloc_zeros::<u64>(2 * NICE_OUT_CAPACITY)?,
                 d_nice_count: stream.alloc_zeros::<u32>(1)?,
                 start: None,
+                batches: Vec::new(),
             },
         );
         Ok(())
@@ -589,10 +607,13 @@ impl RangeSink for CudaNiceonlySink {
                     .expect("range masks uploaded whenever the kernel has CROSS_FILTER");
                 launch_args.arg(d_masks);
             }
+            let before = stream.record_event(None)?;
             unsafe {
                 launch_args.launch(cfg)?;
             }
+            let after = stream.record_event(None)?;
             self.inflight.push_back(stream.record_event(None)?);
+            open.batches.push((before, after));
         }
         Ok(())
     }
@@ -610,6 +631,7 @@ impl RangeSink for CudaNiceonlySink {
             d_nice_count: open.d_nice_count,
             start: open.start,
             end,
+            batches: open.batches,
         })
     }
 }
@@ -821,12 +843,12 @@ mod tests {
                 queued += 1;
             }
             while queued > lookahead {
-                found += finish_niceonly_cuda(&ctx).unwrap().nice_numbers.len();
+                found += finish_niceonly_cuda(&ctx).unwrap().0.nice_numbers.len();
                 queued -= 1;
             }
         }
         while queued > 0 {
-            found += finish_niceonly_cuda(&ctx).unwrap().nice_numbers.len();
+            found += finish_niceonly_cuda(&ctx).unwrap().0.nice_numbers.len();
             queued -= 1;
         }
         let secs = t.elapsed().as_secs_f64();

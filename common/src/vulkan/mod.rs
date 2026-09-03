@@ -21,7 +21,7 @@
 
 pub mod codegen;
 
-use crate::gpu_niceonly::{GPU_LSD_K, PendingField, RangeSink};
+use crate::gpu_niceonly::{DeviceResult, GPU_LSD_K, PendingField, RangeSink};
 use crate::stride_filter::StrideTable;
 use crate::{FieldSize, NiceNumberSimple};
 use anyhow::{Context as _, Result, bail};
@@ -1087,8 +1087,11 @@ impl<'a> NiceonlyRun<'a> {
 pub struct VulkanPendingField(Vec<NiceNumberSimple>);
 
 impl PendingField for VulkanPendingField {
-    fn wait(self: Box<Self>) -> Result<Vec<NiceNumberSimple>> {
-        Ok(self.0)
+    fn wait(self: Box<Self>) -> Result<DeviceResult> {
+        Ok(DeviceResult {
+            nice_numbers: self.0,
+            device_busy_secs: None,
+        })
     }
 }
 

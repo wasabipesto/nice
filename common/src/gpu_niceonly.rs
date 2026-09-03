@@ -466,6 +466,45 @@ pub struct NiceonlyStats {
     pub num_ranges: usize,
     pub valid_numbers: u64,
     pub launches: u32,
+    /// Time the dispatch thread spent waiting for descriptors while this was
+    /// the oldest open field: the CPU side was behind.
+    pub cpu_wait_secs: f64,
+    /// Time the dispatch thread spent blocked handing this field's batches to
+    /// a full device queue: the device side was behind.
+    pub device_wait_secs: f64,
+    /// Device time actually spent on this field's batches, where the backend
+    /// can measure it (CUDA, from per-batch events); `None` elsewhere.
+    pub device_busy_secs: Option<f64>,
+}
+
+impl NiceonlyStats {
+    /// The per-field pipeline telemetry, as submitted alongside results.
+    /// Seconds are raw so consumers can divide by whichever wall time they
+    /// mean (the submission's `processing_secs` is the field's share of
+    /// throughput); `floor` is a string like the other u128 fields.
+    #[must_use]
+    pub fn telemetry_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "msd_floor": self.floor.to_string(),
+            "fields_in_flight": fields_in_flight(),
+            "batches_in_flight": batches_in_flight(),
+            "msd_secs": self.msd_secs,
+            "total_secs": self.total_secs,
+            "cpu_wait_secs": self.cpu_wait_secs,
+            "device_wait_secs": self.device_wait_secs,
+            "device_busy_secs": self.device_busy_secs,
+            "num_ranges": self.num_ranges,
+            "valid_numbers": self.valid_numbers,
+            "launches": self.launches,
+        })
+    }
+}
+
+/// What waiting for a field's device work yields.
+pub struct DeviceResult {
+    pub nice_numbers: Vec<NiceNumberSimple>,
+    /// Device time spent on the field, if the backend measured it.
+    pub device_busy_secs: Option<f64>,
 }
 
 /// What a backend's `begin` returns: either the field was handled on the
@@ -481,7 +520,7 @@ pub enum NiceonlyStarted {
 pub trait PendingField {
     /// # Errors
     /// Returns the device's error, or an overflowed output buffer.
-    fn wait(self: Box<Self>) -> Result<Vec<NiceNumberSimple>>;
+    fn wait(self: Box<Self>) -> Result<DeviceResult>;
 }
 
 /// A backend's device-side end of the pipeline.
@@ -861,7 +900,8 @@ struct OpenField {
     num_ranges: usize,
     valid_numbers: u64,
     launches: u32,
-    range_size: u128,
+    cpu_wait: Duration,
+    device_wait: Duration,
 }
 
 impl<S: RangeSink> Dispatcher<'_, S> {
@@ -879,6 +919,7 @@ impl<S: RangeSink> Dispatcher<'_, S> {
         if let Some(open) = self.open.get_mut(&field) {
             open.first_launch.get_or_insert(t);
             open.launches += 1;
+            open.device_wait += waited;
         }
         if let Err(e) = outcome
             && self.first_error.is_none()
@@ -908,7 +949,8 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                         num_ranges: 0,
                         valid_numbers: 0,
                         launches: 0,
-                        range_size: range.size(),
+                        cpu_wait: Duration::ZERO,
+                        device_wait: Duration::ZERO,
                     },
                 );
                 None
@@ -944,7 +986,6 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                     Some(e) => Err(e),
                     None => self.sink.end_field(seq),
                 };
-                let _ = open.range_size;
                 Some(FieldReady {
                     seq,
                     pending,
@@ -956,6 +997,9 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                         num_ranges: open.num_ranges,
                         valid_numbers: open.valid_numbers,
                         launches: open.launches,
+                        cpu_wait_secs: open.cpu_wait.as_secs_f64(),
+                        device_wait_secs: open.device_wait.as_secs_f64(),
+                        device_busy_secs: None,
                     },
                     pushed_at: open.pushed_at,
                 })
@@ -974,8 +1018,12 @@ impl<S: RangeSink> Dispatcher<'_, S> {
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 let t = Instant::now();
                 let m = self.rx.recv().ok();
-                if !self.open.is_empty() {
-                    self.controller.observe(t.elapsed(), Duration::ZERO);
+                let waited = t.elapsed();
+                if let Some(oldest) = self.open.keys().min().copied() {
+                    self.controller.observe(waited, Duration::ZERO);
+                    if let Some(open) = self.open.get_mut(&oldest) {
+                        open.cpu_wait += waited;
+                    }
                 }
                 m
             }
@@ -1054,9 +1102,11 @@ fn complete_field<P: PendingField>(
 ) -> Result<(NiceonlyStats, Vec<NiceNumberSimple>)> {
     let mut stats = ready.stats;
     let pending = ready.pending?;
-    let device_wait = Instant::now();
-    let results = Box::new(pending).wait()?;
-    let _ = device_wait;
+    let DeviceResult {
+        nice_numbers: results,
+        device_busy_secs,
+    } = Box::new(pending).wait()?;
+    stats.device_busy_secs = device_busy_secs;
     stats.total_secs = ready.pushed_at.elapsed().as_secs_f64();
     // The device span is not directly observable here without device
     // timestamps; report the time from the End marker to results being
@@ -1260,7 +1310,7 @@ impl<P: PendingField> Drop for NiceonlyPipeline<P> {
 #[allow(clippy::cast_precision_loss)]
 pub fn report_field(backend: &str, base: u32, stats: NiceonlyStats) {
     debug!(
-        "{backend} niceonly b{base}: floor {} msd {:.3}s -> {} ranges ({:.3e} numbers), gpu {:.3}s, total {:.3}s, {} launches",
+        "{backend} niceonly b{base}: floor {} msd {:.3}s -> {} ranges ({:.3e} numbers), gpu {:.3}s, total {:.3}s, {} launches, waited cpu {:.3}s device {:.3}s, device busy {}",
         stats.floor,
         stats.msd_secs,
         stats.num_ranges,
@@ -1268,6 +1318,11 @@ pub fn report_field(backend: &str, base: u32, stats: NiceonlyStats) {
         stats.device_secs,
         stats.total_secs,
         stats.launches,
+        stats.cpu_wait_secs,
+        stats.device_wait_secs,
+        stats
+            .device_busy_secs
+            .map_or_else(|| "n/a".to_string(), |b| format!("{b:.3}s")),
     );
 }
 
@@ -1403,8 +1458,11 @@ mod tests {
     struct NoResults;
 
     impl PendingField for NoResults {
-        fn wait(self: Box<Self>) -> Result<Vec<NiceNumberSimple>> {
-            Ok(Vec::new())
+        fn wait(self: Box<Self>) -> Result<DeviceResult> {
+            Ok(DeviceResult {
+                nice_numbers: Vec::new(),
+                device_busy_secs: None,
+            })
         }
     }
 
@@ -1516,7 +1574,7 @@ mod tests {
     }
 
     impl PendingField for MockPending {
-        fn wait(self: Box<Self>) -> Result<Vec<NiceNumberSimple>> {
+        fn wait(self: Box<Self>) -> Result<DeviceResult> {
             // Encode "how many descriptors this field had" as a fake hit.
             let n = self
                 .device
@@ -1525,10 +1583,13 @@ mod tests {
                 .ranges
                 .get(&self.seq)
                 .map_or(0, Vec::len);
-            Ok(vec![NiceNumberSimple {
-                number: n as u128,
-                num_uniques: self.seq as u32,
-            }])
+            Ok(DeviceResult {
+                nice_numbers: vec![NiceNumberSimple {
+                    number: n as u128,
+                    num_uniques: self.seq as u32,
+                }],
+                device_busy_secs: None,
+            })
         }
     }
 

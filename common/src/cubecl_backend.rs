@@ -31,8 +31,9 @@ use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
 use crate::gpu_niceonly::{
-    GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline, NiceonlyStarted, PendingField, RangeSink,
-    batches_in_flight, lane_shift_for, residue_empty_result, stride_chunk_bits,
+    DeviceResult, GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline, NiceonlyStarted, NiceonlyStats,
+    PendingField, RangeSink, batches_in_flight, lane_shift_for, residue_empty_result,
+    stride_chunk_bits,
 };
 use crate::number_stats::get_near_miss_cutoff;
 use crate::stride_filter::StrideTable;
@@ -1827,7 +1828,7 @@ pub fn begin_niceonly_cubecl(
 ///
 /// # Panics
 /// Panics if the pipeline mutex was poisoned by an earlier panic.
-pub fn finish_niceonly_cubecl(ctx: &CubeclContext) -> Result<FieldResults> {
+pub fn finish_niceonly_cubecl(ctx: &CubeclContext) -> Result<(FieldResults, NiceonlyStats)> {
     match ctx {
         CubeclContext::Wgpu {
             niceonly_pipeline, ..
@@ -1854,7 +1855,7 @@ pub fn process_range_niceonly_cubecl(
 ) -> Result<FieldResults> {
     match begin_niceonly_cubecl(ctx, range, base)? {
         NiceonlyStarted::Immediate(results) => Ok(results),
-        NiceonlyStarted::Queued => finish_niceonly_cubecl(ctx),
+        NiceonlyStarted::Queued => finish_niceonly_cubecl(ctx).map(|(results, _)| results),
     }
 }
 
@@ -1886,7 +1887,7 @@ fn begin_impl<R: cubecl::prelude::Runtime>(
 /// Runtime-generic body of [`finish_niceonly_cubecl`].
 fn finish_impl<R: cubecl::prelude::Runtime>(
     pipeline: &Mutex<Option<NiceonlyPipeline<CubeclPendingField<R>>>>,
-) -> Result<FieldResults> {
+) -> Result<(FieldResults, NiceonlyStats)> {
     let mut guard = pipeline.lock().unwrap();
     let pipeline = guard
         .as_mut()
@@ -1898,10 +1899,13 @@ fn finish_impl<R: cubecl::prelude::Runtime>(
         stats.launches,
         nice_numbers.len()
     );
-    Ok(FieldResults {
-        distribution: Vec::new(),
-        nice_numbers,
-    })
+    Ok((
+        FieldResults {
+            distribution: Vec::new(),
+            nice_numbers,
+        },
+        stats,
+    ))
 }
 
 /// The device end of the niceonly pipeline for a `CubeCL` runtime: one
@@ -2230,8 +2234,18 @@ pub struct CubeclPendingField<R: cubecl::prelude::Runtime> {
 }
 
 impl<R: cubecl::prelude::Runtime> PendingField for CubeclPendingField<R> {
-    fn wait(self: Box<Self>) -> Result<Vec<NiceNumberSimple>> {
-        read_niceonly_hits(&self.client, &self.nice_count, &self.nice_out, self.base)
+    fn wait(self: Box<Self>) -> Result<DeviceResult> {
+        Ok(DeviceResult {
+            nice_numbers: read_niceonly_hits(
+                &self.client,
+                &self.nice_count,
+                &self.nice_out,
+                self.base,
+            )?,
+            // No per-submission timing on this runtime without device
+            // timestamp queries.
+            device_busy_secs: None,
+        })
     }
 }
 

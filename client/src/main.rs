@@ -737,11 +737,19 @@ fn begin_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Field
     FieldStage::Done(process_field_sync(claim_data, cli, gpu, None))
 }
 
+/// Per-field pipeline telemetry from the GPU niceonly path, already as the
+/// JSON object that goes into the submission; `None` on every other path.
+type PipelineTelemetry = Option<serde_json::Value>;
+
 /// Finish a field begun with `begin_field_sync`: for a queued one, wait for
 /// the GPU pipeline's next result (fields come back in order).
-fn finish_field_sync(stage: FieldStage, cli: &Cli, gpu: &GpuCtx) -> Vec<FieldResults> {
+fn finish_field_sync(
+    stage: FieldStage,
+    cli: &Cli,
+    gpu: &GpuCtx,
+) -> (Vec<FieldResults>, PipelineTelemetry) {
     match stage {
-        FieldStage::Done(results) => results,
+        FieldStage::Done(results) => (results, None),
         FieldStage::Queued => {
             #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
             {
@@ -756,7 +764,7 @@ fn finish_field_sync(stage: FieldStage, cli: &Cli, gpu: &GpuCtx) -> Vec<FieldRes
                     GpuHandle::Vulkan(_) => unreachable!("Vulkan fields are never queued"),
                 };
                 match finished {
-                    Ok(results) => vec![results],
+                    Ok((results, stats)) => (vec![results], Some(stats.telemetry_json())),
                     Err(e) => {
                         error!("GPU processing error: {e:?}");
                         std::process::exit(1);
@@ -790,7 +798,11 @@ async fn begin_field(
 }
 
 /// Finish one field on the blocking pool.
-async fn finish_field(stage: FieldStage, cli: &Arc<Cli>, gpu: &GpuCtx) -> Vec<FieldResults> {
+async fn finish_field(
+    stage: FieldStage,
+    cli: &Arc<Cli>,
+    gpu: &GpuCtx,
+) -> (Vec<FieldResults>, PipelineTelemetry) {
     let cli = Arc::clone(cli);
     let gpu = gpu.clone();
     tokio::task::spawn_blocking(move || finish_field_sync(stage, &cli, &gpu))
@@ -809,7 +821,7 @@ async fn process_field(
 ) -> (DataToClient, Vec<FieldResults>, Duration) {
     let start_time = Instant::now();
     let (claim_data, stage) = begin_field(claim_data, cli, gpu).await;
-    let results = finish_field(stage, cli, gpu).await;
+    let (results, _) = finish_field(stage, cli, gpu).await;
     (claim_data, results, start_time.elapsed())
 }
 
@@ -1148,7 +1160,7 @@ async fn run_pipelined_fields(
         // the last round.
         while in_flight.len() > lookahead || (!cli.repeat && !in_flight.is_empty()) {
             let field = in_flight.pop_front().expect("checked non-empty");
-            let results = finish_field(field.stage, cli, gpu).await;
+            let (results, pipeline) = finish_field(field.stage, cli, gpu).await;
             let now = Instant::now();
             let measured_from = last_finished.map_or(field.begun_at, |t| t.max(field.begun_at));
             let elapsed = now.duration_since(measured_from);
@@ -1157,6 +1169,7 @@ async fn run_pipelined_fields(
                 field.claim,
                 results,
                 elapsed,
+                pipeline,
                 cli,
                 client,
                 submits,
@@ -1179,6 +1192,7 @@ async fn complete_field(
     claim_data: DataToClient,
     results: Vec<FieldResults>,
     elapsed: Duration,
+    pipeline: PipelineTelemetry,
     cli: &Arc<Cli>,
     client: &Client,
     submits: &mut JoinSet<Result<()>>,
@@ -1195,7 +1209,8 @@ async fn complete_field(
     });
 
     // Compile results for submission
-    let telemetry = telemetry_base.map(|base| bench::field_telemetry(base, elapsed_secs));
+    let telemetry =
+        telemetry_base.map(|base| bench::field_telemetry(base, elapsed_secs, pipeline.as_ref()));
     let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode, telemetry);
 
     // Submit without blocking the next field on the round trip.
