@@ -811,19 +811,23 @@ mod tests {
     /// configurations can be compared on identical work (production claims
     /// hand every run different regions, whose MSD character varies 2x).
     /// Env: `NICE_GPU_FIELDS_IN_FLIGHT`, `NICE_GPU_MSD_FLOOR` as in
-    /// production; `NICE_TEST_FIELDS` (default 12) fields of 1e13 in base 54
-    /// from the region the Anvil runs covered.
+    /// production; `NICE_TEST_FIELDS` (required: it is also the opt-in) fields
+    /// of 1e13 in base 54 from the region the Anvil runs covered.
     #[test]
     #[ignore = "requires an NVIDIA device; prints throughput"]
     #[allow(clippy::cast_precision_loss)]
     fn pipeline_throughput_fixed_fields() {
         use crate::gpu_niceonly::{NiceonlyStarted, fields_in_flight, msd_floor_in_use};
+        // The parity workflow runs every ignored test in this module on a
+        // software rasterizer; a throughput run there is hours of nothing.
+        // Only run when asked for by name.
+        let Ok(n) = std::env::var("NICE_TEST_FIELDS") else {
+            eprintln!("skipping: set NICE_TEST_FIELDS to run the throughput harness");
+            return;
+        };
         let ctx = CudaContext::new(0).expect("CUDA context");
         let base = 54;
-        let n: usize = std::env::var("NICE_TEST_FIELDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(12);
+        let n: usize = n.parse().expect("NICE_TEST_FIELDS must be a count");
         let start: u128 = 2_778_136_280_153_679_229;
         let size: u128 = 10_000_000_000_000;
         let fields: Vec<FieldSize> = (0..n as u128)
