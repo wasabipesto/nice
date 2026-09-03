@@ -460,7 +460,8 @@ pub struct NiceonlyStats {
     /// read back. With two fields in flight this exceeds the field's share of
     /// throughput; see the client's rate accounting.
     pub total_secs: f64,
-    /// The MSD floor the field's first block was filtered at.
+    /// The MSD floor in force when the field was opened; blocks later in the
+    /// field may have been filtered at a floor the controller had moved to.
     pub floor: u128,
     pub num_ranges: usize,
     pub valid_numbers: u64,
@@ -724,10 +725,6 @@ struct FieldWork {
     base: u32,
     range: FieldSize,
     tiling: BlockTiling,
-    /// The floor this field is filtered at, sampled when it was pushed so a
-    /// field is uniform (a block filtered at another floor is fine for
-    /// correctness — every floor is sound — but the stats name one floor).
-    floor: u128,
     next_block: AtomicUsize,
     /// Workers that have run out of blocks here and moved on.
     exited: AtomicUsize,
@@ -781,7 +778,14 @@ fn msd_worker(shared: &Shared, tx: &SyncSender<Msg>, error: &Mutex<Option<anyhow
             if i == 0 {
                 *work.started.lock().unwrap() = Some(Instant::now());
             }
-            match descriptors_for_block(block, work.base, work.floor, work.range.start()) {
+            // The floor is read per block, not per field: the controller
+            // steps every half second, and a field on a slow device can take
+            // far longer than that. Sampling it once per field would let a
+            // whole field's worth of "device behind" pile up unobserved and
+            // slam the floor to its minimum for the next one. Every floor is
+            // sound, so mixing them within a field only changes the work.
+            let floor = floor_controller().floor();
+            match descriptors_for_block(block, work.base, floor, work.range.start()) {
                 Ok((offsets, lens, masks)) => {
                     if batch.feed(work.seq, &offsets, &lens, &masks, tx).is_err() {
                         return;
@@ -959,7 +963,10 @@ impl<S: RangeSink> Dispatcher<'_, S> {
         }
     }
 
-    /// Block for the next message, charging the wait to the CPU side.
+    /// Block for the next message, charging the wait to the CPU side — but
+    /// only while a field is open. With nothing open the pipeline is idle for
+    /// an outside reason (the client waiting on a claim), and calling that
+    /// "the CPU is behind" would ratchet the floor up during every API stall.
     fn recv(&mut self) -> Option<Msg> {
         match self.rx.try_recv() {
             Ok(m) => Some(m),
@@ -967,7 +974,9 @@ impl<S: RangeSink> Dispatcher<'_, S> {
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 let t = Instant::now();
                 let m = self.rx.recv().ok();
-                self.controller.observe(t.elapsed(), Duration::ZERO);
+                if !self.open.is_empty() {
+                    self.controller.observe(t.elapsed(), Duration::ZERO);
+                }
                 m
             }
         }
@@ -1011,13 +1020,11 @@ fn push_field(
     base: u32,
     range: &FieldSize,
 ) -> Result<()> {
-    let floor = floor_controller().floor();
     let work = Arc::new(FieldWork {
         seq,
         base,
         range: *range,
         tiling: BlockTiling::new(range, 2 * shared.workers),
-        floor,
         next_block: AtomicUsize::new(0),
         exited: AtomicUsize::new(0),
         started: Mutex::new(None),
