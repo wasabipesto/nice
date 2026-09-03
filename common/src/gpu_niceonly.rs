@@ -209,10 +209,25 @@ fn msd_blocks(range: &FieldSize, min_blocks: usize) -> Vec<FieldSize> {
     (0..tiling.len()).filter_map(|i| tiling.get(i)).collect()
 }
 
-/// Minimum MSD recursion floor (matches the CPU client's default).
-/// Below this the GPU receives virtually the same candidates as the CPU would
-/// check itself, so there is no point going lower.
-const MSD_FLOOR_MIN: f64 = 250.0;
+/// Minimum MSD recursion floor the controller may reach: a sixteenth of a
+/// [`PROCESSING_CHUNK_SIZE`] chunk.
+///
+/// Below roughly this, a finer floor stops paying: survivors barely
+/// decrease (the recursion already stops where the analysis rejects, so
+/// leaves are a few tens of thousands of numbers regardless) while the
+/// number of descriptors keeps growing, and each range costs the device
+/// setup work and the host 20 bytes of traffic. Measured with pinned floors
+/// on fixed base-54 fields: a 9070 XT does 6.7e12 n/s at 250-350k, 5.2e12
+/// at 125k and 1.7e12 at 60k; an M4 does 6.3e11 at 250k, 7.9e11 at 60k and
+/// 4.5e11 at 30k. The wait-balance controller cannot see that cliff — a
+/// device that is behind stays behind when the floor drops — and on the M4
+/// it steered to 20k and a third of the throughput before this clamp.
+/// Every optimum measured (M4 60k, RTX 3060 ~100k, 9070 XT 250k, 4090 and
+/// A100 at the cap) is at or above this value.
+///
+/// An explicit `NICE_GPU_MSD_FLOOR` pin is not clamped.
+#[allow(clippy::cast_precision_loss)]
+const MSD_FLOOR_MIN: f64 = (PROCESSING_CHUNK_SIZE / 16) as f64;
 
 /// Maximum MSD recursion floor the controller may reach: half a
 /// [`PROCESSING_CHUNK_SIZE`] chunk, i.e. one level of subdivision below the
