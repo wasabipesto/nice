@@ -31,8 +31,8 @@ use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
 use crate::gpu_niceonly::{
-    GPU_LSD_K, MAX_STRIDE_MODULUS, RangeSink, lane_shift_for, report_field, residue_empty_result,
-    run_range_pipeline, stride_chunk_bits,
+    GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline, NiceonlyStarted, PendingField, RangeSink,
+    batches_in_flight, lane_shift_for, residue_empty_result, stride_chunk_bits,
 };
 use crate::number_stats::get_near_miss_cutoff;
 use crate::stride_filter::StrideTable;
@@ -1240,14 +1240,22 @@ pub enum CubeclContext {
         client: cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime>,
         device_name: String,
         /// Per-base niceonly plans, cached across fields — see [`NiceonlyPlan`].
-        niceonly_plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
+        /// Shared with the niceonly pipeline's dispatch thread.
+        niceonly_plans: Arc<Mutex<HashMap<u32, Arc<NiceonlyPlan>>>>,
+        /// The continuous niceonly pipeline, started on the first niceonly field.
+        niceonly_pipeline:
+            Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::wgpu::WgpuRuntime>>>>,
     },
     #[cfg(feature = "cubecl-cuda")]
     Cuda {
         client: cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
         device_name: String,
         /// Per-base niceonly plans, cached across fields — see [`NiceonlyPlan`].
-        niceonly_plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
+        /// Shared with the niceonly pipeline's dispatch thread.
+        niceonly_plans: Arc<Mutex<HashMap<u32, Arc<NiceonlyPlan>>>>,
+        /// The continuous niceonly pipeline, started on the first niceonly field.
+        niceonly_pipeline:
+            Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::cuda::CudaRuntime>>>>,
     },
 }
 
@@ -1360,7 +1368,8 @@ impl CubeclContext {
         Ok(Self::Wgpu {
             client: client.clone(),
             device_name: device_name.clone(),
-            niceonly_plans: Mutex::new(HashMap::new()),
+            niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
+            niceonly_pipeline: Mutex::new(None),
         })
     }
 
@@ -1400,7 +1409,8 @@ impl CubeclContext {
         Ok(Self::Wgpu {
             client: client.clone(),
             device_name: device_name.clone(),
-            niceonly_plans: Mutex::new(HashMap::new()),
+            niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
+            niceonly_pipeline: Mutex::new(None),
         })
     }
 
@@ -1444,7 +1454,8 @@ impl CubeclContext {
         Ok(Self::Cuda {
             client,
             device_name: cuda_device_name(device_index),
-            niceonly_plans: Mutex::new(HashMap::new()),
+            niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
+            niceonly_pipeline: Mutex::new(None),
         })
     }
 
@@ -1766,44 +1777,180 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
 ///
 /// # Errors
 /// Returns an error on any device failure or if the output buffer overflows.
+/// Start one niceonly field: hand it to the continuous pipeline, or answer
+/// it on the spot for a base the device cannot take. Pair with
+/// [`finish_niceonly_cubecl`], which returns fields in the order they were
+/// begun.
+///
+/// # Errors
+/// Returns an error if the pipeline's dispatch thread has died.
+///
+/// # Panics
+/// Panics if the pipeline mutex was poisoned by an earlier panic.
+pub fn begin_niceonly_cubecl(
+    ctx: &CubeclContext,
+    range: &FieldSize,
+    base: u32,
+) -> Result<NiceonlyStarted> {
+    if let Some(empty) = residue_empty_result(base) {
+        return Ok(NiceonlyStarted::Immediate(empty));
+    }
+    if !gpu_supports_base(base) {
+        warn!("base {base} not supported on GPU, falling back to CPU for this field");
+        let table = StrideTable::new(base, GPU_LSD_K);
+        return Ok(NiceonlyStarted::Immediate(process_range_niceonly(
+            range, base, &table,
+        )));
+    }
+    match ctx {
+        CubeclContext::Wgpu {
+            client,
+            niceonly_plans,
+            niceonly_pipeline,
+            ..
+        } => begin_impl(client, niceonly_plans, niceonly_pipeline, range, base),
+        #[cfg(feature = "cubecl-cuda")]
+        CubeclContext::Cuda {
+            client,
+            niceonly_plans,
+            niceonly_pipeline,
+            ..
+        } => begin_impl(client, niceonly_plans, niceonly_pipeline, range, base),
+    }
+}
+
+/// Wait for the oldest field begun with [`begin_niceonly_cubecl`] that went
+/// into the pipeline, and return its results.
+///
+/// # Errors
+/// The field's device error, or an output buffer overflow.
+///
+/// # Panics
+/// Panics if the pipeline mutex was poisoned by an earlier panic.
+pub fn finish_niceonly_cubecl(ctx: &CubeclContext) -> Result<FieldResults> {
+    match ctx {
+        CubeclContext::Wgpu {
+            niceonly_pipeline, ..
+        } => finish_impl(niceonly_pipeline),
+        #[cfg(feature = "cubecl-cuda")]
+        CubeclContext::Cuda {
+            niceonly_pipeline, ..
+        } => finish_impl(niceonly_pipeline),
+    }
+}
+
+/// One field, begun and finished: the synchronous form, for callers that
+/// process a single field at a time (the benchmark sweep, tests).
+///
+/// # Errors
+/// See [`begin_niceonly_cubecl`] and [`finish_niceonly_cubecl`].
+///
+/// # Panics
+/// Panics if the pipeline mutex was poisoned by an earlier panic.
 pub fn process_range_niceonly_cubecl(
     ctx: &CubeclContext,
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
-    if let Some(empty) = residue_empty_result(base) {
-        return Ok(empty);
+    match begin_niceonly_cubecl(ctx, range, base)? {
+        NiceonlyStarted::Immediate(results) => Ok(results),
+        NiceonlyStarted::Queued => finish_niceonly_cubecl(ctx),
     }
-    if !gpu_supports_base(base) {
-        warn!("base {base} not supported on GPU, falling back to CPU for this field");
-        let table = StrideTable::new(base, GPU_LSD_K);
-        return Ok(process_range_niceonly(range, base, &table));
+}
+
+/// Runtime-generic body of [`begin_niceonly_cubecl`].
+fn begin_impl<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    plans: &Arc<Mutex<HashMap<u32, Arc<NiceonlyPlan>>>>,
+    pipeline: &Mutex<Option<NiceonlyPipeline<CubeclPendingField<R>>>>,
+    range: &FieldSize,
+    base: u32,
+) -> Result<NiceonlyStarted> {
+    let mut guard = pipeline.lock().unwrap();
+    let pipeline = guard.get_or_insert_with(|| {
+        NiceonlyPipeline::start(
+            "CubeCL",
+            CubeclNiceonlySink {
+                client: client.clone(),
+                plans: plans.clone(),
+                wide_chunk: wide_chunk_for(client),
+                open: HashMap::new(),
+                launches_since_sync: 0,
+            },
+        )
+    });
+    pipeline.push(base, range)?;
+    Ok(NiceonlyStarted::Queued)
+}
+
+/// Runtime-generic body of [`finish_niceonly_cubecl`].
+fn finish_impl<R: cubecl::prelude::Runtime>(
+    pipeline: &Mutex<Option<NiceonlyPipeline<CubeclPendingField<R>>>>,
+) -> Result<FieldResults> {
+    let mut guard = pipeline.lock().unwrap();
+    let pipeline = guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("no niceonly field has been begun"))?;
+    let (stats, nice_numbers) = pipeline.next_result()?;
+    debug!(
+        "CubeCL niceonly pipeline: {} ranges in {} dispatches, found {}",
+        stats.num_ranges,
+        stats.launches,
+        nice_numbers.len()
+    );
+    Ok(FieldResults {
+        distribution: Vec::new(),
+        nice_numbers,
+    })
+}
+
+/// The device end of the niceonly pipeline for a `CubeCL` runtime: one
+/// [`CubeclNiceonlyRun`] per open field, plus the launch count that bounds
+/// the work in flight.
+struct CubeclNiceonlySink<R: cubecl::prelude::Runtime> {
+    client: cubecl::prelude::ComputeClient<R>,
+    plans: Arc<Mutex<HashMap<u32, Arc<NiceonlyPlan>>>>,
+    wide_chunk: bool,
+    open: HashMap<u64, CubeclNiceonlyRun<R>>,
+    /// `CubeCL` exposes no per-submission fence, so backpressure is a full
+    /// client sync every [`batches_in_flight`] launches. The device idles
+    /// only for the launch latency of the next batch after each sync, well
+    /// under a percent of a batch's work.
+    launches_since_sync: usize,
+}
+
+impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlySink<R> {
+    type Pending = CubeclPendingField<R>;
+
+    fn begin_field(&mut self, seq: u64, base: u32, range: &FieldSize) -> Result<()> {
+        let plan = cached_plan(&self.plans, &self.client, base)?;
+        let run =
+            CubeclNiceonlyRun::from_plan(&self.client, plan, base, range.start(), self.wide_chunk)?;
+        self.open.insert(seq, run);
+        Ok(())
     }
 
-    match ctx {
-        CubeclContext::Wgpu {
-            client,
-            niceonly_plans,
-            ..
-        } => niceonly_impl(
-            client,
-            cached_plan(niceonly_plans, client, base)?,
-            range,
-            base,
-            wide_chunk_for(client),
-        ),
-        #[cfg(feature = "cubecl-cuda")]
-        CubeclContext::Cuda {
-            client,
-            niceonly_plans,
-            ..
-        } => niceonly_impl(
-            client,
-            cached_plan(niceonly_plans, client, base)?,
-            range,
-            base,
-            wide_chunk_for(client),
-        ),
+    fn launch(&mut self, field: u64, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+        let run = self
+            .open
+            .get_mut(&field)
+            .ok_or_else(|| anyhow::anyhow!("launch for a field that is not open ({field})"))?;
+        run.launch(field, offsets, lens, masks)?;
+        self.launches_since_sync += 1;
+        if self.launches_since_sync >= batches_in_flight() {
+            cubecl::future::block_on(self.client.sync())
+                .map_err(|e| anyhow::anyhow!("device sync failed: {e:?}"))?;
+            self.launches_since_sync = 0;
+        }
+        Ok(())
+    }
+
+    fn end_field(&mut self, seq: u64) -> Result<Self::Pending> {
+        let mut run = self
+            .open
+            .remove(&seq)
+            .ok_or_else(|| anyhow::anyhow!("end of a field that is not open ({seq})"))?;
+        run.end_field(seq)
     }
 }
 
@@ -1824,33 +1971,6 @@ fn cached_plan<R: cubecl::prelude::Runtime>(
     // A racing build of the same base wastes one table walk, harmlessly.
     let plan = Arc::new(NiceonlyPlan::build(client, base)?);
     Ok(plans.lock().unwrap().entry(base).or_insert(plan).clone())
-}
-
-/// Runtime-generic body of [`process_range_niceonly_cubecl`].
-fn niceonly_impl<R: cubecl::prelude::Runtime>(
-    client: &cubecl::prelude::ComputeClient<R>,
-    plan: Arc<NiceonlyPlan>,
-    range: &FieldSize,
-    base: u32,
-    wide_chunk: bool,
-) -> Result<FieldResults> {
-    let mut run = CubeclNiceonlyRun::from_plan(client, plan, base, range.start(), wide_chunk)?;
-    let stats = run_range_pipeline(&mut run, range, base)?;
-    let nice_numbers = run.finish()?;
-    debug!(
-        "CubeCL niceonly pipeline: {} ranges in {} dispatches, M={}, R={}, found {}",
-        stats.num_ranges,
-        stats.launches,
-        run.plan.stride_m,
-        run.plan.stride_r,
-        nice_numbers.len()
-    );
-    report_field("CubeCL", base, range, &stats);
-
-    Ok(FieldResults {
-        distribution: Vec::new(),
-        nice_numbers,
-    })
 }
 
 /// Per-base niceonly state that survives across fields: the stride-table
@@ -1939,8 +2059,8 @@ impl NiceonlyPlan {
 
 /// The `CubeCL` end of the niceonly range pipeline: the base's cached plan
 /// plus this field's output buffers, kept across every dispatch of a field.
-struct CubeclNiceonlyRun<'a, R: cubecl::prelude::Runtime> {
-    client: &'a cubecl::prelude::ComputeClient<R>,
+struct CubeclNiceonlyRun<R: cubecl::prelude::Runtime> {
+    client: cubecl::prelude::ComputeClient<R>,
     plan: Arc<NiceonlyPlan>,
     nice_out: cubecl::server::Handle,
     nice_count: cubecl::server::Handle,
@@ -1961,11 +2081,11 @@ struct CubeclNiceonlyRun<'a, R: cubecl::prelude::Runtime> {
     compact_override: Option<bool>,
 }
 
-impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
+impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
     /// Build a fresh, uncached plan and wrap a run around it (device tests).
     #[cfg(test)]
     fn new(
-        client: &'a cubecl::prelude::ComputeClient<R>,
+        client: &cubecl::prelude::ComputeClient<R>,
         base: u32,
         field_start: u128,
         wide_chunk: bool,
@@ -1979,7 +2099,7 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
     /// # Errors
     /// Returns an error for a base with no u128 range.
     fn from_plan(
-        client: &'a cubecl::prelude::ComputeClient<R>,
+        client: &cubecl::prelude::ComputeClient<R>,
         plan: Arc<NiceonlyPlan>,
         base: u32,
         field_start: u128,
@@ -2002,7 +2122,7 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
         #[allow(clippy::cast_possible_truncation)]
         let fs_mod_m = (field_start % u128::from(plan.stride_m)) as u32;
         Ok(Self {
-            client,
+            client: client.clone(),
             plan,
             nice_out,
             nice_count,
@@ -2020,47 +2140,54 @@ impl<'a, R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'a, R> {
         })
     }
 
-    /// Collect the nice numbers found across the whole field.
-    ///
-    /// The blocking reads double as the device wait: a dispatch still in
-    /// flight has simply not written its hits yet, and the failure mode is
-    /// *silently missing solutions* — so the read path orders after every
-    /// launch on the client's queue.
-    ///
-    /// # Errors
-    /// Returns an error if the kernel tried to write more hits than the buffer
-    /// holds — which, given how rare nice numbers are, means a kernel bug
-    /// rather than a genuine flood.
+    /// Collect the nice numbers found across the whole field (device tests).
+    #[cfg(test)]
     fn finish(&self) -> Result<Vec<NiceNumberSimple>> {
-        let bytes = self
-            .client
-            .read_one(self.nice_count.clone())
-            .map_err(|e| anyhow::anyhow!("nice count read failed: {e:?}"))?;
-        let written = u32::from_bytes(&bytes)[0] as usize;
-        ensure!(
-            written <= NICEONLY_OUT_CAPACITY,
-            "niceonly output buffer overflow: {written} > {NICEONLY_OUT_CAPACITY} \
-             (this strongly suggests a kernel bug)"
-        );
-        let bytes = self
-            .client
-            .read_one(self.nice_out.clone())
-            .map_err(|e| anyhow::anyhow!("nice out read failed: {e:?}"))?;
-        let words = u32::from_bytes(&bytes);
-        let mut hits: Vec<NiceNumberSimple> = (0..written)
-            .map(|i| {
-                let o = i * NICEONLY_STRIDE as usize;
-                let lo = u128::from(words[o]) | (u128::from(words[o + 1]) << 32);
-                let hi = u128::from(words[o + 2]) | (u128::from(words[o + 3]) << 32);
-                NiceNumberSimple {
-                    number: (hi << 64) | lo,
-                    num_uniques: self.base,
-                }
-            })
-            .collect();
-        hits.sort_by_key(|n| n.number);
-        Ok(hits)
+        read_niceonly_hits(&self.client, &self.nice_count, &self.nice_out, self.base)
     }
+}
+
+/// Read a field's hits back. The blocking reads double as the device wait: a
+/// dispatch still in flight has simply not written its hits yet, and the
+/// failure mode is *silently missing solutions* — so the read path orders
+/// after every launch on the client's queue.
+///
+/// # Errors
+/// Returns an error if the kernel tried to write more hits than the buffer
+/// holds — which, given how rare nice numbers are, means a kernel bug rather
+/// than a genuine flood.
+fn read_niceonly_hits<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    nice_count: &cubecl::server::Handle,
+    nice_out: &cubecl::server::Handle,
+    base: u32,
+) -> Result<Vec<NiceNumberSimple>> {
+    let bytes = client
+        .read_one(nice_count.clone())
+        .map_err(|e| anyhow::anyhow!("nice count read failed: {e:?}"))?;
+    let written = u32::from_bytes(&bytes)[0] as usize;
+    ensure!(
+        written <= NICEONLY_OUT_CAPACITY,
+        "niceonly output buffer overflow: {written} > {NICEONLY_OUT_CAPACITY} \
+         (this strongly suggests a kernel bug)"
+    );
+    let bytes = client
+        .read_one(nice_out.clone())
+        .map_err(|e| anyhow::anyhow!("nice out read failed: {e:?}"))?;
+    let words = u32::from_bytes(&bytes);
+    let mut hits: Vec<NiceNumberSimple> = (0..written)
+        .map(|i| {
+            let o = i * NICEONLY_STRIDE as usize;
+            let lo = u128::from(words[o]) | (u128::from(words[o + 1]) << 32);
+            let hi = u128::from(words[o + 2]) | (u128::from(words[o + 3]) << 32);
+            NiceNumberSimple {
+                number: (hi << 64) | lo,
+                num_uniques: base,
+            }
+        })
+        .collect();
+    hits.sort_by_key(|n| n.number);
+    Ok(hits)
 }
 
 /// Certificates as (lo, hi) u32 words, matching the offset encoding; a
@@ -2077,7 +2204,7 @@ fn certificate_words(masks: &[u64], cross: bool) -> Vec<u32> {
     }
 }
 
-impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'_, R> {
+impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
     /// Whether this dispatch should use the compacted specialization. The
     /// no-MSD bypass ships all-zero certificates; the compacted kernel can
     /// only cost there (queue traffic and two barriers per iteration for a
@@ -2092,8 +2219,40 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<'_, R> {
     }
 }
 
-impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
-    fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+/// A closed field's device work on a `CubeCL` runtime: the handles its hits
+/// land in. Waited for on the client's thread; the blocking reads order after
+/// every launch on the client's queue.
+pub struct CubeclPendingField<R: cubecl::prelude::Runtime> {
+    client: cubecl::prelude::ComputeClient<R>,
+    nice_out: cubecl::server::Handle,
+    nice_count: cubecl::server::Handle,
+    base: u32,
+}
+
+impl<R: cubecl::prelude::Runtime> PendingField for CubeclPendingField<R> {
+    fn wait(self: Box<Self>) -> Result<Vec<NiceNumberSimple>> {
+        read_niceonly_hits(&self.client, &self.nice_count, &self.nice_out, self.base)
+    }
+}
+
+impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
+    type Pending = CubeclPendingField<R>;
+
+    /// A run is one field; opening is what constructing it did.
+    fn begin_field(&mut self, _seq: u64, _base: u32, _range: &FieldSize) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_field(&mut self, _seq: u64) -> Result<Self::Pending> {
+        Ok(CubeclPendingField {
+            client: self.client.clone(),
+            nice_out: self.nice_out.clone(),
+            nice_count: self.nice_count.clone(),
+            base: self.base,
+        })
+    }
+
+    fn launch(&mut self, _field: u64, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
         ensure!(
             offsets.len() == lens.len() && offsets.len() == masks.len(),
             "range descriptor slices have mismatched lengths ({}/{}/{})",
@@ -2162,7 +2321,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
         #[allow(clippy::cast_possible_truncation)]
         unsafe {
             niceonly_kernel::launch_unchecked::<R>(
-                self.client,
+                &self.client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(WORKGROUP_SIZE),
                 ArrayArg::from_raw_parts(self.plan.residues.clone(), self.plan.stride_r as usize),
@@ -2207,11 +2366,6 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<'_, R> {
             );
         }
         Ok(())
-    }
-
-    fn sync(&mut self) -> Result<()> {
-        cubecl::future::block_on(self.client.sync())
-            .map_err(|e| anyhow::anyhow!("device sync failed: {e:?}"))
     }
 }
 
@@ -2491,8 +2645,7 @@ mod tests {
                     CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
                 run.probe = true;
                 run.compact_override = Some(forced_compact);
-                run.launch(&[0], &[len], &[mask]).expect("dispatch");
-                run.sync().expect("sync");
+                run.launch(0, &[0], &[len], &[mask]).expect("dispatch");
                 let mut got: Vec<u128> = run
                     .finish()
                     .expect("results")
@@ -2542,8 +2695,7 @@ mod tests {
                 );
                 run.probe = true;
                 run.lane_shift_override = Some(shift);
-                run.launch(&[0], &[len], &[0]).expect("dispatch");
-                run.sync().expect("sync");
+                run.launch(0, &[0], &[len], &[0]).expect("dispatch");
                 per_width.push(
                     run.finish()
                         .expect("results")

@@ -21,9 +21,9 @@
 
 pub mod codegen;
 
-use crate::NiceNumberSimple;
-use crate::gpu_niceonly::{GPU_LSD_K, RangeSink};
+use crate::gpu_niceonly::{GPU_LSD_K, PendingField, RangeSink};
 use crate::stride_filter::StrideTable;
+use crate::{FieldSize, NiceNumberSimple};
 use anyhow::{Context as _, Result, bail};
 use ash::vk;
 use codegen::{
@@ -1082,8 +1082,29 @@ impl<'a> NiceonlyRun<'a> {
     }
 }
 
+/// A Vulkan field's results, already read back: every dispatch blocked on
+/// its fence inside `launch`, so closing the field is the wait.
+pub struct VulkanPendingField(Vec<NiceNumberSimple>);
+
+impl PendingField for VulkanPendingField {
+    fn wait(self: Box<Self>) -> Result<Vec<NiceNumberSimple>> {
+        Ok(self.0)
+    }
+}
+
 impl RangeSink for NiceonlyRun<'_> {
-    fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+    type Pending = VulkanPendingField;
+
+    /// A run is one field; opening is what constructing it did.
+    fn begin_field(&mut self, _seq: u64, _base: u32, _range: &FieldSize) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_field(&mut self, _seq: u64) -> Result<Self::Pending> {
+        Ok(VulkanPendingField(self.finish()?))
+    }
+
+    fn launch(&mut self, _field: u64, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
         anyhow::ensure!(
             offsets.len() == lens.len() && offsets.len() == masks.len(),
             "range descriptor slices have mismatched lengths ({}/{}/{})",
@@ -1161,13 +1182,6 @@ impl RangeSink for NiceonlyRun<'_> {
             )?;
         }
         Ok(())
-    }
-
-    /// Wait for every dispatch of this field. The pipeline calls this inside
-    /// its timed region, which is what keeps `device_secs` honest now that
-    /// `launch` returns before the device is done.
-    fn sync(&mut self) -> Result<()> {
-        self.ctx.wait_all()
     }
 }
 
@@ -1413,7 +1427,7 @@ mod tests {
                 let mut run =
                     NiceonlyRun::from_pipeline(&ctx, pipe.clone(), start).expect("probe run");
                 run.lane_shift = Some(shift);
-                run.launch(&[0], &[len], &[0]).expect("dispatch");
+                run.launch(0, &[0], &[len], &[0]).expect("dispatch");
                 per_width.push(
                     run.finish()
                         .expect("results")

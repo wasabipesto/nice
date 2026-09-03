@@ -11,7 +11,7 @@
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::gpu_config::gpu_supports_base;
-use crate::gpu_niceonly::{GPU_LSD_K, report_field, residue_empty_result, run_range_pipeline};
+use crate::gpu_niceonly::{GPU_LSD_K, residue_empty_result, run_range_pipeline};
 use crate::stride_filter::StrideTable;
 use crate::vulkan::{DetailedRun, NiceonlyRun, VulkanContext};
 use crate::{
@@ -119,8 +119,7 @@ pub fn process_range_niceonly_vulkan(
     // Build (or fetch cached) the pipeline and device residue table up front,
     // so the pipeline's timings reflect per-field work only.
     let mut run = NiceonlyRun::new(ctx, base, range.start())?;
-    let stats = run_range_pipeline(&mut run, range, base)?;
-    let nice_numbers = run.finish()?;
+    let (stats, nice_numbers) = run_range_pipeline("Vulkan", &mut run, range, base)?;
     debug!(
         "Vulkan niceonly pipeline: {} ranges in {} dispatches, M={}, R={}, found {}",
         stats.num_ranges,
@@ -129,7 +128,6 @@ pub fn process_range_niceonly_vulkan(
         run.config().stride_r,
         nice_numbers.len()
     );
-    report_field("Vulkan", base, range, &stats);
 
     Ok(FieldResults {
         distribution: Vec::new(),

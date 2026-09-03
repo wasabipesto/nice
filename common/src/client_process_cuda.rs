@@ -39,19 +39,23 @@ use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::gpu_config::{
     MAX_GPU_DIGIT_MASK_BASE, chunk_constants, gpu_supports_base, prefilter_params,
 };
-use crate::gpu_niceonly::{RangeSink, report_field, run_range_pipeline};
+use crate::gpu_niceonly::{
+    NiceonlyPipeline, NiceonlyStarted, PendingField, RangeSink, batches_in_flight,
+    residue_empty_result,
+};
 use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
 };
-use crate::{base_range, number_stats, residue_filter, stride_filter};
+use crate::{base_range, number_stats, stride_filter};
 use anyhow::{Context as _, Result, bail, ensure};
 use cudarc::driver::{
-    CudaContext as DriverContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext as DriverContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use log::{debug, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -91,12 +95,65 @@ struct NiceonlyPlan {
     low_masks: Option<CudaSlice<u64>>,
 }
 
+impl CudaNiceonlyShared {
+    /// Get or build the compiled niceonly kernel + device residue table for a base.
+    fn niceonly_plan(&self, base: u32) -> Result<Arc<NiceonlyPlan>> {
+        if let Some(plan) = self.plans.lock().unwrap().get(&base) {
+            return Ok(plan.clone());
+        }
+
+        let build_start = Instant::now();
+        let (defines, table) = niceonly_defines(base)?;
+        let modulus = table.modulus as u32;
+        let residues_host: Vec<u32> = table.valid_residues.clone();
+        let num_residues = residues_host.len() as u32;
+
+        let ptx = compile_kernel_ptx(&defines)
+            .with_context(|| format!("compiling niceonly kernel for base {base}"))?;
+        let module = self.device.load_module(ptx)?;
+        let func = module.load_function("niceonly_ranges_kernel")?;
+        let residues = self.stream.clone_htod(&residues_host)?;
+        let low_masks = if defines.iter().any(|d| d == "CROSS_FILTER") {
+            Some(self.stream.clone_htod(&table.low_digit_masks)?)
+        } else {
+            None
+        };
+
+        debug!(
+            "GPU niceonly plan for base {base}: M={modulus}, R={num_residues}, built in {:.2}s",
+            build_start.elapsed().as_secs_f64()
+        );
+
+        let plan = Arc::new(NiceonlyPlan {
+            base,
+            func,
+            residues,
+            modulus,
+            num_residues,
+            low_masks,
+        });
+        self.plans.lock().unwrap().insert(base, plan.clone());
+        Ok(plan)
+    }
+}
+
 /// GPU context: CUDA device handle plus caches of per-base compiled kernels.
 pub struct CudaContext {
     device: Arc<DriverContext>,
     stream: Arc<CudaStream>,
-    niceonly_plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
+    /// What the niceonly pipeline's device thread needs: shared with it.
+    niceonly: Arc<CudaNiceonlyShared>,
+    /// The continuous niceonly pipeline, started on the first niceonly field.
+    niceonly_pipeline: Mutex<Option<NiceonlyPipeline<CudaPendingField>>>,
     detailed_kernels: Mutex<HashMap<u32, CudaFunction>>,
+}
+
+/// The device handles and per-base niceonly plans, shared between the
+/// context and the pipeline's dispatch thread.
+struct CudaNiceonlyShared {
+    device: Arc<DriverContext>,
+    stream: Arc<CudaStream>,
+    plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
 }
 
 impl CudaContext {
@@ -135,54 +192,16 @@ impl CudaContext {
         );
 
         Ok(CudaContext {
+            niceonly: Arc::new(CudaNiceonlyShared {
+                device: device.clone(),
+                stream: stream.clone(),
+                plans: Mutex::new(HashMap::new()),
+            }),
+            niceonly_pipeline: Mutex::new(None),
             device,
             stream,
-            niceonly_plans: Mutex::new(HashMap::new()),
             detailed_kernels: Mutex::new(HashMap::new()),
         })
-    }
-
-    /// Get or build the compiled niceonly kernel + device residue table for a base.
-    fn niceonly_plan(&self, base: u32) -> Result<Arc<NiceonlyPlan>> {
-        if let Some(plan) = self.niceonly_plans.lock().unwrap().get(&base) {
-            return Ok(plan.clone());
-        }
-
-        let build_start = Instant::now();
-        let (defines, table) = niceonly_defines(base)?;
-        let modulus = table.modulus as u32;
-        let residues_host: Vec<u32> = table.valid_residues.clone();
-        let num_residues = residues_host.len() as u32;
-
-        let ptx = compile_kernel_ptx(&defines)
-            .with_context(|| format!("compiling niceonly kernel for base {base}"))?;
-        let module = self.device.load_module(ptx)?;
-        let func = module.load_function("niceonly_ranges_kernel")?;
-        let residues = self.stream.clone_htod(&residues_host)?;
-        let low_masks = if defines.iter().any(|d| d == "CROSS_FILTER") {
-            Some(self.stream.clone_htod(&table.low_digit_masks)?)
-        } else {
-            None
-        };
-
-        debug!(
-            "GPU niceonly plan for base {base}: M={modulus}, R={num_residues}, built in {:.2}s",
-            build_start.elapsed().as_secs_f64()
-        );
-
-        let plan = Arc::new(NiceonlyPlan {
-            base,
-            func,
-            residues,
-            modulus,
-            num_residues,
-            low_masks,
-        });
-        self.niceonly_plans
-            .lock()
-            .unwrap()
-            .insert(base, plan.clone());
-        Ok(plan)
     }
 
     /// Get or build the compiled detailed kernel for a base.
@@ -326,74 +345,137 @@ fn combine_u64(lo: u64, hi: u64) -> u128 {
 ///
 /// # Errors
 /// Returns an error on any CUDA failure or if the output buffer overflows.
-pub fn process_range_niceonly_cuda(
+/// Start one niceonly field: hand it to the continuous pipeline, or answer it
+/// on the spot for a base the device cannot take. Pair with
+/// [`finish_niceonly_cuda`], which returns fields in the order they were
+/// begun.
+///
+/// # Errors
+/// Returns an error if the pipeline's dispatch thread has died.
+///
+/// # Panics
+/// Panics if the pipeline mutex was poisoned by an earlier panic.
+pub fn begin_niceonly_cuda(
     ctx: &CudaContext,
     range: &FieldSize,
     base: u32,
-) -> Result<FieldResults> {
+) -> Result<NiceonlyStarted> {
     if !gpu_supports_base(base) {
         warn!("base {base} not supported on GPU, falling back to CPU for this field");
         let stride_table = stride_filter::StrideTable::new(base, GPU_LSD_K);
-        return Ok(process_range_niceonly(range, base, &stride_table));
+        return Ok(NiceonlyStarted::Immediate(process_range_niceonly(
+            range,
+            base,
+            &stride_table,
+        )));
     }
-    if residue_filter::get_residue_filter_u128(&base).is_empty() {
-        debug!("base {base} is residue-empty; no candidates to check");
-        return Ok(FieldResults {
-            distribution: Vec::new(),
-            nice_numbers: Vec::new(),
-        });
+    if let Some(empty) = residue_empty_result(base) {
+        return Ok(NiceonlyStarted::Immediate(empty));
     }
+    let mut guard = ctx.niceonly_pipeline.lock().unwrap();
+    let pipeline = guard.get_or_insert_with(|| {
+        NiceonlyPipeline::start(
+            "GPU",
+            CudaNiceonlySink {
+                shared: ctx.niceonly.clone(),
+                open: HashMap::new(),
+                inflight: VecDeque::new(),
+            },
+        )
+    });
+    pipeline.push(base, range)?;
+    Ok(NiceonlyStarted::Queued)
+}
 
-    // Build (or fetch cached) the compiled kernel and device residue table up
-    // front, so the timings below reflect per-field work only.
-    let plan = ctx.niceonly_plan(base)?;
-
-    let mut launcher = NiceonlyLauncher::new(ctx, &plan, range)?;
-    let stats = run_range_pipeline(&mut launcher, range, base)?;
-    let nice_numbers = launcher.finish()?;
+/// Wait for the oldest field begun with [`begin_niceonly_cuda`] that went
+/// into the pipeline, and return its results.
+///
+/// # Errors
+/// The field's device error, or an output buffer overflow.
+///
+/// # Panics
+/// Panics if the pipeline mutex was poisoned by an earlier panic.
+pub fn finish_niceonly_cuda(ctx: &CudaContext) -> Result<FieldResults> {
+    let mut guard = ctx.niceonly_pipeline.lock().unwrap();
+    let pipeline = guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("no niceonly field has been begun"))?;
+    let (stats, nice_numbers) = pipeline.next_result()?;
     debug!(
-        "GPU niceonly pipeline: {} ranges in {} launches, M={}, R={}, found {}",
+        "GPU niceonly pipeline: {} ranges in {} launches, found {}",
         stats.num_ranges,
         stats.launches,
-        plan.modulus,
-        plan.num_residues,
         nice_numbers.len()
     );
-    report_field("GPU", base, range, &stats);
-
     Ok(FieldResults {
         distribution: Vec::new(),
         nice_numbers,
     })
 }
 
-/// Holds the per-field output buffers and issues asynchronous niceonly
-/// kernel launches over batches of range descriptors.
-struct NiceonlyLauncher<'a> {
-    ctx: &'a CudaContext,
-    plan: &'a NiceonlyPlan,
+/// One field, begun and finished: the synchronous form, for callers that
+/// process a single field at a time (the benchmark sweep, tests).
+///
+/// # Errors
+/// See [`begin_niceonly_cuda`] and [`finish_niceonly_cuda`].
+///
+/// # Panics
+/// Panics if the pipeline mutex was poisoned by an earlier panic.
+pub fn process_range_niceonly_cuda(
+    ctx: &CudaContext,
+    range: &FieldSize,
+    base: u32,
+) -> Result<FieldResults> {
+    match begin_niceonly_cuda(ctx, range, base)? {
+        NiceonlyStarted::Immediate(results) => Ok(results),
+        NiceonlyStarted::Queued => finish_niceonly_cuda(ctx),
+    }
+}
+
+/// The device end of the niceonly pipeline: owns the stream on the dispatch
+/// thread, keeps each open field's output buffers, and bounds the launches in
+/// flight with a ring of events.
+struct CudaNiceonlySink {
+    shared: Arc<CudaNiceonlyShared>,
+    open: HashMap<u64, CudaOpenField>,
+    /// One event per launched batch, oldest first. Before a launch, if the
+    /// ring is full, the oldest is waited for: that is the backpressure the
+    /// pipeline's floor controller reads as "the device is behind".
+    inflight: VecDeque<CudaEvent>,
+}
+
+struct CudaOpenField {
+    plan: Arc<NiceonlyPlan>,
     field_start_lo: u64,
     field_start_hi: u64,
     d_nice_out: CudaSlice<u64>,
     d_nice_count: CudaSlice<u32>,
+    start: Option<CudaEvent>,
 }
 
-impl<'a> NiceonlyLauncher<'a> {
-    fn new(ctx: &'a CudaContext, plan: &'a NiceonlyPlan, range: &FieldSize) -> Result<Self> {
-        let (field_start_lo, field_start_hi) = split_u128(range.start());
-        Ok(NiceonlyLauncher {
-            ctx,
-            plan,
-            field_start_lo,
-            field_start_hi,
-            d_nice_out: ctx.stream.alloc_zeros::<u64>(2 * NICE_OUT_CAPACITY)?,
-            d_nice_count: ctx.stream.alloc_zeros::<u32>(1)?,
-        })
-    }
+/// A closed field's device work: the events bracketing it and the buffers
+/// its results land in. Waited for on the client's thread.
+pub struct CudaPendingField {
+    stream: Arc<CudaStream>,
+    base: u32,
+    d_nice_out: CudaSlice<u64>,
+    d_nice_count: CudaSlice<u32>,
+    start: Option<CudaEvent>,
+    end: CudaEvent,
+}
 
-    /// Synchronize and collect the found nice numbers.
-    fn finish(self) -> Result<Vec<NiceNumberSimple>> {
-        let nice_count = self.ctx.stream.clone_dtoh(&self.d_nice_count)?[0] as usize;
+impl PendingField for CudaPendingField {
+    fn wait(self: Box<Self>) -> Result<Vec<NiceNumberSimple>> {
+        self.end.synchronize()?;
+        if let Some(start) = &self.start
+            && let Ok(ms) = start.elapsed_ms(&self.end)
+        {
+            debug!(
+                "GPU niceonly field device span {:.3}s",
+                f64::from(ms) / 1000.0
+            );
+        }
+        let nice_count = self.stream.clone_dtoh(&self.d_nice_count)?[0] as usize;
         if nice_count > NICE_OUT_CAPACITY {
             bail!(
                 "niceonly output buffer overflow: {nice_count} > {NICE_OUT_CAPACITY} \
@@ -402,11 +484,11 @@ impl<'a> NiceonlyLauncher<'a> {
         }
         let mut nice_numbers = Vec::with_capacity(nice_count);
         if nice_count > 0 {
-            let out = self.ctx.stream.clone_dtoh(&self.d_nice_out)?;
+            let out = self.stream.clone_dtoh(&self.d_nice_out)?;
             for i in 0..nice_count {
                 nice_numbers.push(NiceNumberSimple {
                     number: combine_u64(out[2 * i], out[2 * i + 1]),
-                    num_uniques: self.plan.base,
+                    num_uniques: self.base,
                 });
             }
             nice_numbers.sort_by_key(|n| n.number);
@@ -415,11 +497,35 @@ impl<'a> NiceonlyLauncher<'a> {
     }
 }
 
-impl RangeSink for NiceonlyLauncher<'_> {
+impl RangeSink for CudaNiceonlySink {
+    type Pending = CudaPendingField;
+
+    fn begin_field(&mut self, seq: u64, base: u32, range: &FieldSize) -> Result<()> {
+        let plan = self.shared.niceonly_plan(base)?;
+        debug!(
+            "GPU niceonly field {seq}: base {base}, M={}, R={}",
+            plan.modulus, plan.num_residues
+        );
+        let (field_start_lo, field_start_hi) = split_u128(range.start());
+        let stream = &self.shared.stream;
+        self.open.insert(
+            seq,
+            CudaOpenField {
+                plan,
+                field_start_lo,
+                field_start_hi,
+                d_nice_out: stream.alloc_zeros::<u64>(2 * NICE_OUT_CAPACITY)?,
+                d_nice_count: stream.alloc_zeros::<u32>(1)?,
+                start: None,
+            },
+        );
+        Ok(())
+    }
+
     /// Upload a batch of range descriptors and launch the kernel on them.
     /// Launches are asynchronous on the stream; results accumulate in the
-    /// shared output buffers until [`NiceonlyLauncher::finish`].
-    fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+    /// field's output buffers until it is closed.
+    fn launch(&mut self, field: u64, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
         ensure!(
             offsets.len() == lens.len() && offsets.len() == masks.len(),
             "range descriptor slices have mismatched lengths ({}/{}/{})",
@@ -427,16 +533,31 @@ impl RangeSink for NiceonlyLauncher<'_> {
             lens.len(),
             masks.len()
         );
+        let stream = self.shared.stream.clone();
+        let open = self
+            .open
+            .get_mut(&field)
+            .ok_or_else(|| anyhow::anyhow!("launch for a field that is not open ({field})"))?;
+        if open.start.is_none() {
+            open.start = Some(stream.record_event(None)?);
+        }
         let nice_capacity = NICE_OUT_CAPACITY as u32;
+        let max_inflight = batches_in_flight();
         for ((batch_offsets, batch_lens), batch_masks) in offsets
             .chunks(RANGES_PER_LAUNCH)
             .zip(lens.chunks(RANGES_PER_LAUNCH))
             .zip(masks.chunks(RANGES_PER_LAUNCH))
         {
-            let d_offsets = self.ctx.stream.clone_htod(batch_offsets)?;
-            let d_lens = self.ctx.stream.clone_htod(batch_lens)?;
-            let d_masks = if self.plan.low_masks.is_some() {
-                Some(self.ctx.stream.clone_htod(batch_masks)?)
+            // Backpressure: no more than `max_inflight` batches outstanding.
+            while self.inflight.len() >= max_inflight {
+                if let Some(oldest) = self.inflight.pop_front() {
+                    oldest.synchronize()?;
+                }
+            }
+            let d_offsets = stream.clone_htod(batch_offsets)?;
+            let d_lens = stream.clone_htod(batch_lens)?;
+            let d_masks = if open.plan.low_masks.is_some() {
+                Some(stream.clone_htod(batch_masks)?)
             } else {
                 None
             };
@@ -451,17 +572,17 @@ impl RangeSink for NiceonlyLauncher<'_> {
                 shared_mem_bytes: 0,
             };
 
-            let mut launch_args = self.ctx.stream.launch_builder(&self.plan.func);
-            launch_args.arg(&self.field_start_lo);
-            launch_args.arg(&self.field_start_hi);
+            let mut launch_args = stream.launch_builder(&open.plan.func);
+            launch_args.arg(&open.field_start_lo);
+            launch_args.arg(&open.field_start_hi);
             launch_args.arg(&d_offsets);
             launch_args.arg(&d_lens);
             launch_args.arg(&num_ranges);
-            launch_args.arg(&self.plan.residues);
-            launch_args.arg(&self.d_nice_out);
-            launch_args.arg(&mut self.d_nice_count);
+            launch_args.arg(&open.plan.residues);
+            launch_args.arg(&open.d_nice_out);
+            launch_args.arg(&mut open.d_nice_count);
             launch_args.arg(&nice_capacity);
-            if let Some(low_masks) = &self.plan.low_masks {
+            if let Some(low_masks) = &open.plan.low_masks {
                 launch_args.arg(low_masks);
                 let d_masks = d_masks
                     .as_ref()
@@ -471,15 +592,25 @@ impl RangeSink for NiceonlyLauncher<'_> {
             unsafe {
                 launch_args.launch(cfg)?;
             }
+            self.inflight.push_back(stream.record_event(None)?);
         }
         Ok(())
     }
 
-    /// Launches are asynchronous, so the pipeline's `total_secs` would
-    /// otherwise stop before the device had done the work.
-    fn sync(&mut self) -> Result<()> {
-        self.ctx.stream.synchronize()?;
-        Ok(())
+    fn end_field(&mut self, seq: u64) -> Result<Self::Pending> {
+        let open = self
+            .open
+            .remove(&seq)
+            .ok_or_else(|| anyhow::anyhow!("end of a field that is not open ({seq})"))?;
+        let end = self.shared.stream.record_event(None)?;
+        Ok(CudaPendingField {
+            stream: self.shared.stream.clone(),
+            base: open.plan.base,
+            d_nice_out: open.d_nice_out,
+            d_nice_count: open.d_nice_count,
+            start: open.start,
+            end,
+        })
     }
 }
 
@@ -651,6 +782,7 @@ mod tests {
     use super::*;
     use crate::client_process;
     use crate::gpu_config::PrefilterParams;
+    use crate::residue_filter;
     use crate::stride_filter::StrideTable;
 
     /// Bases used for CPU-side mirror tests: a mix of small, u64-range,
@@ -1252,7 +1384,8 @@ mod tests {
             ctx.detailed_kernel(base)
                 .unwrap_or_else(|e| panic!("detailed kernel failed for base {base}: {e:?}"));
             if !residue_filter::get_residue_filter_u128(&base).is_empty() {
-                ctx.niceonly_plan(base)
+                ctx.niceonly
+                    .niceonly_plan(base)
                     .unwrap_or_else(|e| panic!("niceonly kernel failed for base {base}: {e:?}"));
             }
         }
