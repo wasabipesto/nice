@@ -1251,6 +1251,57 @@ pub enum CubeclContext {
     },
 }
 
+/// The device's real name from the CUDA driver, e.g. `NVIDIA A100-SXM4-40GB`.
+///
+/// `CubeCL`'s CUDA runtime does not expose one — its `Runtime::name` is the
+/// static string `"cuda"` — so this asks the driver directly. That matters
+/// well beyond cosmetics: this string is `hardware.gpu_model` in every
+/// benchmark report and every `--telemetry` submission, and both the API's
+/// `/estimate` and the fleet controller match offers against it. A
+/// `gpu_models_match` against a placeholder fails for every real GPU, which
+/// drops the estimate to the `floor` stage and makes the sample unusable. And
+/// since #133 fixed the runtime headers, `cubecl-cuda` is the backend
+/// `--gpu-backend auto` picks for detailed mode on NVIDIA, so a placeholder
+/// here would silently blank the GPU identity of the entire detailed corpus.
+///
+/// Asked at *device* level (`cuDeviceGet` + `cuDeviceGetName`), which touches
+/// no context and so cannot disturb the one `CubeCL` has just built. `cuInit`
+/// is idempotent and has already run inside `CudaRuntime::client`; it is
+/// repeated here only so the helper does not depend on call order.
+///
+/// The backend itself is *not* folded into this string — the hand-CUDA arm
+/// reports the bare driver name too, and `hardware.gpu_backend` already
+/// distinguishes the two. Keeping them identical is what lets a `cuda` and a
+/// `cubecl-cuda` report of the same card land in the same estimator bucket.
+///
+/// Falls back to the old placeholder if the driver refuses, which is the only
+/// case a caller can still see. cudarc *panics* rather than erroring when
+/// `libcuda` cannot be loaded (the same trap the NVRTC probe in
+/// `client_process_cuda` documents), so the driver calls run under
+/// `catch_unwind` — a name for a report is never worth taking the process down.
+#[cfg(feature = "cubecl-cuda")]
+fn cuda_device_name(device_index: usize) -> String {
+    let name = std::panic::catch_unwind(|| {
+        use cudarc::driver::result::{device, init};
+        // Idempotent, and `CudaRuntime::client` has already run it; repeated
+        // here only so this helper does not depend on call order.
+        init().ok()?;
+        let ordinal = i32::try_from(device_index).ok()?;
+        let dev = device::get(ordinal).ok()?;
+        device::get_name(dev).ok()
+    });
+    match name {
+        Ok(Some(name)) if !name.trim().is_empty() => name,
+        _ => {
+            warn!(
+                "CUDA driver did not name device {device_index}; \
+                 benchmark and telemetry reports will carry a placeholder"
+            );
+            format!("cubecl-cuda device {device_index}")
+        }
+    }
+}
+
 impl CubeclContext {
     /// Runtime options for the wgpu backend.
     ///
@@ -1392,7 +1443,7 @@ impl CubeclContext {
 
         Ok(Self::Cuda {
             client,
-            device_name: format!("cubecl-cuda device {device_index}"),
+            device_name: cuda_device_name(device_index),
             niceonly_plans: Mutex::new(HashMap::new()),
         })
     }
@@ -2240,6 +2291,40 @@ mod tests {
             );
             println!("base {base}: {count} candidates match the CPU exactly (CUDA runtime)");
         }
+    }
+
+    /// The placeholder is only ever reached when the driver cannot answer.
+    /// Runs everywhere: an out-of-range ordinal fails before any driver call,
+    /// so this pins the fallback contract without needing NVIDIA silicon.
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    fn cuda_device_name_falls_back_when_the_driver_cannot_answer() {
+        assert_eq!(
+            cuda_device_name(usize::MAX),
+            format!("cubecl-cuda device {}", usize::MAX),
+        );
+    }
+
+    /// On real silicon the reported model must be the driver's name, not the
+    /// placeholder — a placeholder is what made every v3.4.3 detailed report
+    /// unmatchable for the estimator. Asserting "not the placeholder" rather
+    /// than a specific string keeps this runnable on any NVIDIA card.
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_reports_the_real_device_name() {
+        let name = cuda_device_name(0);
+        assert_ne!(
+            name, "cubecl-cuda device 0",
+            "driver did not name the device; reports would be unattributable"
+        );
+        assert!(!name.trim().is_empty(), "empty device name");
+        // The context must carry the same string the helper resolved, since
+        // that is what reaches `hardware.gpu_model`.
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        assert_eq!(ctx.device_name(), name);
+        assert_eq!(ctx.backend_name(), "cubecl-cuda");
+        println!("cubecl-cuda device 0 reports as {name:?}");
     }
 
     /// The known solution: 69 is nice in base 10.

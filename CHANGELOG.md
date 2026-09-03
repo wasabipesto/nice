@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Report the real GPU name when the `cubecl-cuda` backend is in use. It was reporting the placeholder `cubecl-cuda device 0` (CubeCL's CUDA runtime has no device-name API), and since v3.4.3 made `cubecl-cuda` the backend `--gpu-backend auto` selects for detailed mode on NVIDIA, every detailed benchmark report and `--telemetry` submission from an NVIDIA machine carried that placeholder as `hardware.gpu_model`. The estimator matches offers on that string, so those samples could not match any GPU and fell through to the low-confidence `floor` stage — which the fleet controller refuses to buy on. The name now comes from the CUDA driver (`cuDeviceGetName`), matching what the hand-written `cuda` backend already reports.
+
 ## Nice v3.4.3
 
 - Ship the CUDA runtime headers in the `-gpu` docker image. NVRTC could not find `cuda_runtime.h` in the runtime-only base, so the `cubecl-cuda` backend failed to compile every kernel and `--gpu-backend auto` silently fell through to the hand-written CUDA backend. CI now checks the header is present in the built image.
