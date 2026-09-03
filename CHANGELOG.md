@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- GPU niceonly: the MSD filter now starts at blocks of 64 chunks instead of one chunk at a time, so a single analysis can reject 64 chunks at once. Blocks are always a power of two of chunks, which makes the recursion land on chunk boundaries and produce bit-identical descriptors to the chunk start (asserted by a test); only the work changes. On the base-54 regions from the Anvil runs the MSD phase of a 1e12 field went from 0.34 s to 0.18-0.29 s at floor 500k and from 0.49-0.54 s to 0.35-0.45 s at 250k (four cores); where nothing rejects above the chunk it is a wash.
+
 ## Nice v3.4.3
 
 - Ship the CUDA runtime headers in the `-gpu` docker image. NVRTC could not find `cuda_runtime.h` in the runtime-only base, so the `cubecl-cuda` backend failed to compile every kernel and `--gpu-backend auto` silently fell through to the hand-written CUDA backend. CI now checks the header is present in the built image.

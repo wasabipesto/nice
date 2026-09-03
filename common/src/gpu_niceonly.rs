@@ -59,14 +59,12 @@ pub const LAUNCH_BATCH_RANGES: usize = 1 << 16;
 ///
 /// **The unit here is one worker batch, not one launch batch.** Each item a
 /// worker sends is a [`WorkerBatch`]: the output of several consecutive
-/// chunks, flushed once it holds [`WORKER_BATCH_RANGES`] descriptors or
-/// [`WORKER_BATCH_CHUNKS`] chunks' worth. [`LAUNCH_BATCH_RANGES`] is the
+/// work units, flushed once it holds [`WORKER_BATCH_RANGES`] descriptors or
+/// [`WORKER_BATCH_CHUNKS`] units' worth. [`LAUNCH_BATCH_RANGES`] is the
 /// consumer's flush threshold and never bounds what sits in the channel. A
-/// batch is at most `WORKER_BATCH_RANGES` plus one chunk's output — the
-/// recursion returns a range whole once it is at or below the floor, so a chunk
-/// yields about `PROCESSING_CHUNK_SIZE / floor` ranges, ~4000 at
-/// [`MSD_FLOOR_MIN`] — call it 8200 descriptors, 20 bytes apiece. So the cap
-/// is about 10 MB of queued descriptors at the worst floor, comfortably below
+/// unit's output is fed in at most `WORKER_BATCH_RANGES` at a time, so a
+/// batch is at most twice that — 8192 descriptors, 20 bytes apiece. So the
+/// cap is about 10 MB of queued descriptors at any floor, comfortably below
 /// the gigabyte above.
 const PIPELINE_DEPTH: usize = 64;
 
@@ -82,12 +80,68 @@ const PIPELINE_DEPTH: usize = 64;
 /// count by two to three orders of magnitude at every floor.
 const WORKER_BATCH_RANGES: usize = 4096;
 
-/// Chunks a worker folds into one batch before sending, whatever its size.
+/// Work units a worker folds into one batch before sending, whatever its size.
 ///
-/// Bounds the latency of a batch at coarse floors, where chunks yield one
-/// descriptor each and [`WORKER_BATCH_RANGES`] alone would hold back 4096
-/// chunks' worth of device work.
+/// Bounds the latency of a batch at coarse floors, where a unit yields one
+/// descriptor per chunk and [`WORKER_BATCH_RANGES`] alone would hold back
+/// thousands of chunks' worth of device work.
 const WORKER_BATCH_CHUNKS: usize = 256;
+
+/// Log2 of the number of chunks one MSD work unit (a *block*) spans.
+///
+/// The MSD recursion used to start at [`PROCESSING_CHUNK_SIZE`], so a 1e13
+/// field paid ten million top-level analyses even where the filter rejects
+/// whole swaths at once. Starting at a block of chunks lets one analysis
+/// reject 2^k chunks together. Because the recursion halves, a block of
+/// exactly 2^k chunks reaches chunk boundaries after k halvings and from
+/// there on runs the very same recursion as before — and a rejection of a
+/// wider interval implies rejection of every narrower one inside it (fewer
+/// fixed leading digits is a weaker premise), while ancestor certificates
+/// only ever add digits the chunk-level analysis fixes too. So the leaves,
+/// their order and their masks are bit-identical to the chunk-level start;
+/// only the work changes ([`msd_blocks`] keeps every block a power of two of
+/// chunks for exactly this reason, and the test below checks it).
+///
+/// Measured with the no-op pipeline on the Anvil base-54 regions (1e12, four
+/// cores), chunk start → 64-chunk blocks: floor 500k 0.33 s → 0.23 s and
+/// 0.36 s → 0.19 s; floor 250k 0.53 s → 0.44 s and 0.49 s → 0.36 s. Where
+/// nothing rejects above the chunk (base 40, 40% survival) it is a wash
+/// (0.9-1.0x); at an MSD-strong band start it is 40x. Larger blocks gain
+/// little more and cost parallelism on small fields.
+const MSD_BLOCK_CHUNKS_LOG2: u32 = 6;
+
+/// Split a field into MSD work units: blocks of `2^k` whole chunks, `k` as
+/// large as [`MSD_BLOCK_CHUNKS_LOG2`] allows while still leaving at least
+/// `min_blocks` units to spread over the workers. The field's chunk count is
+/// rarely a multiple of `2^k`; the remainder is covered by ever-smaller
+/// power-of-two blocks, so every block except possibly the very last (a
+/// partial chunk) halves down onto chunk boundaries. See
+/// [`MSD_BLOCK_CHUNKS_LOG2`] for why that alignment matters.
+fn msd_blocks(range: &FieldSize, min_blocks: usize) -> Vec<FieldSize> {
+    let full_chunks = range.size() / PROCESSING_CHUNK_SIZE;
+    let mut log2 = MSD_BLOCK_CHUNKS_LOG2;
+    while log2 > 0 && (full_chunks >> log2) < min_blocks as u128 {
+        log2 -= 1;
+    }
+    let mut blocks = Vec::new();
+    let mut start = range.start();
+    let mut remaining_chunks = full_chunks;
+    let mut block_chunks = 1u128 << log2;
+    while remaining_chunks > 0 {
+        while block_chunks > remaining_chunks {
+            block_chunks >>= 1;
+        }
+        let end = start + block_chunks * PROCESSING_CHUNK_SIZE;
+        blocks.push(FieldSize::new(start, end));
+        start = end;
+        remaining_chunks -= block_chunks;
+    }
+    // A partial last chunk is its own block, exactly as `chunks()` made it.
+    if start < range.end() {
+        blocks.push(FieldSize::new(start, range.end()));
+    }
+    blocks
+}
 
 /// Minimum MSD recursion floor (matches the CPU client's default).
 /// Below this the GPU receives virtually the same candidates as the CPU would
@@ -404,6 +458,37 @@ impl WorkerBatch {
         self.chunks += 1;
     }
 
+    /// Fold one work unit's descriptors in, sending full batches on the way.
+    /// A unit can yield far more than one batch's worth at a fine floor, so
+    /// this feeds it through in [`WORKER_BATCH_RANGES`] slices and never lets
+    /// a message outgrow the `PIPELINE_DEPTH` memory budget. The last slice
+    /// is left in the batch for the caller's ready check. `Err` means the
+    /// channel is closed.
+    fn feed(
+        &mut self,
+        offsets: &[u64],
+        lens: &[u32],
+        masks: &[u64],
+        tx: &std::sync::mpsc::SyncSender<(Vec<u64>, Vec<u32>, Vec<u64>)>,
+    ) -> Result<(), ()> {
+        if offsets.is_empty() {
+            self.absorb(&[], &[], &[]);
+            return Ok(());
+        }
+        let mut slices = offsets
+            .chunks(WORKER_BATCH_RANGES)
+            .zip(lens.chunks(WORKER_BATCH_RANGES))
+            .zip(masks.chunks(WORKER_BATCH_RANGES))
+            .peekable();
+        while let Some(((o, l), m)) = slices.next() {
+            self.absorb(o, l, m);
+            if slices.peek().is_some() && self.is_ready() && tx.send(self.take()).is_err() {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
     fn is_ready(&self) -> bool {
         self.offsets.len() >= WORKER_BATCH_RANGES || self.chunks >= WORKER_BATCH_CHUNKS
     }
@@ -417,6 +502,30 @@ impl WorkerBatch {
         let batch = std::mem::take(self);
         (batch.offsets, batch.lens, batch.masks)
     }
+}
+
+/// MSD-filter one block of chunks (see [`msd_blocks`]) into descriptors. At
+/// the no-MSD bypass floor this is chunk by chunk, since the bypass's unit is
+/// the chunk; below it the recursion starts at the block.
+fn descriptors_for_block(
+    block: FieldSize,
+    base: u32,
+    floor: u128,
+    field_start: u128,
+) -> Result<(Vec<u64>, Vec<u32>, Vec<u64>)> {
+    if floor >= PROCESSING_CHUNK_SIZE {
+        let mut offsets = Vec::new();
+        let mut lens = Vec::new();
+        let mut masks = Vec::new();
+        for chunk in block.chunks(PROCESSING_CHUNK_SIZE) {
+            let (o, l, m) = descriptors_for_chunk(chunk, base, floor, field_start)?;
+            offsets.extend(o);
+            lens.extend(l);
+            masks.extend(m);
+        }
+        return Ok((offsets, lens, masks));
+    }
+    descriptors_for_chunk(block, base, floor, field_start)
 }
 
 /// Run one niceonly field: MSD workers stream surviving-range descriptors
@@ -438,11 +547,10 @@ pub fn run_range_pipeline<S: RangeSink>(
     base: u32,
 ) -> Result<NiceonlyStats> {
     let start_time = Instant::now();
-    let chunks = range.chunks(PROCESSING_CHUNK_SIZE);
     let floor = gpu_msd_floor();
-    let num_threads = std::thread::available_parallelism()
-        .map_or(4, std::num::NonZeroUsize::get)
-        .min(chunks.len().max(1));
+    let num_threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let chunks = msd_blocks(range, 2 * num_threads);
+    let num_threads = num_threads.min(chunks.len().max(1));
 
     let next_chunk = AtomicUsize::new(0);
     let worker_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -471,10 +579,12 @@ pub fn run_range_pipeline<S: RangeSink>(
                 let mut batch = WorkerBatch::default();
                 loop {
                     let i = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks.get(i) else { break };
-                    match descriptors_for_chunk(*chunk, base, floor, range.start()) {
+                    let Some(block) = chunks.get(i) else { break };
+                    match descriptors_for_block(*block, base, floor, range.start()) {
                         Ok((offsets, lens, masks)) => {
-                            batch.absorb(&offsets, &lens, &masks);
+                            if batch.feed(&offsets, &lens, &masks, &tx).is_err() {
+                                return;
+                            }
                         }
                         Err(e) => {
                             *worker_error.lock().unwrap() = Some(e);
@@ -799,6 +909,101 @@ mod tests {
         floor.floor = MSD_FLOOR_MAX * 0.99;
         floor.update(5.0, 5.0);
         assert!((floor.floor - MSD_FLOOR_MAX).abs() < f64::EPSILON);
+    }
+
+    /// Blocks are power-of-two chunk counts covering the field exactly, the
+    /// remainder in descending powers of two, and small fields still get
+    /// enough units to keep the workers busy.
+    #[test]
+    fn msd_blocks_cover_the_field_in_power_of_two_chunk_counts() {
+        let c = PROCESSING_CHUNK_SIZE;
+        // 1e7 chunks (a 1e13 field) is exactly 156 250 blocks of 64; a hundred
+        // more chunks add 64 + 32 + 4.
+        let field = FieldSize::new(1000, 1000 + 10_000_100 * c);
+        let blocks = msd_blocks(&field, 64);
+        assert_eq!(blocks[0].size(), 64 * c);
+        assert_eq!(blocks.len(), 156_250 + 3);
+        assert_eq!(blocks[156_250].size(), 64 * c);
+        assert_eq!(blocks[156_251].size(), 32 * c);
+        assert_eq!(blocks[156_252].size(), 4 * c);
+        let mut cursor = field.start();
+        for b in &blocks {
+            assert_eq!(b.start(), cursor, "blocks must tile the field");
+            let chunks = b.size() / c;
+            assert!(chunks.is_power_of_two() && b.size() % c == 0);
+            cursor = b.end();
+        }
+        assert_eq!(cursor, field.end());
+
+        // 100 chunks: 64 + 32 + 4.
+        let sizes: Vec<u128> = msd_blocks(&FieldSize::new(0, 100 * c), 1)
+            .iter()
+            .map(|b| b.size() / c)
+            .collect();
+        assert_eq!(sizes, vec![64, 32, 4]);
+
+        // A partial last chunk is its own (sub-chunk) block.
+        let blocks = msd_blocks(&FieldSize::new(0, 3 * c + 500), 1);
+        assert_eq!(
+            blocks.iter().map(FieldSize::size).collect::<Vec<_>>(),
+            vec![2 * c, c, 500]
+        );
+
+        // Small field, many workers: the block shrinks so there are at least
+        // `min_blocks` units (here 1000 chunks for 64 wanted → 8-chunk blocks).
+        let blocks = msd_blocks(&FieldSize::new(0, 1000 * c), 64);
+        assert_eq!(blocks[0].size(), 8 * c);
+        assert!(blocks.len() >= 64);
+    }
+
+    /// The block start must not change what the device is asked to check: the
+    /// leaves, their order and their certificate masks must equal the chunk
+    /// start's, on a region where the filter both rejects and subdivides.
+    #[test]
+    fn block_start_yields_the_same_descriptors_as_the_chunk_start() {
+        let base = 40;
+        let start = crate::base_range::get_base_range_u128(base)
+            .unwrap()
+            .unwrap()
+            .range_start;
+        // 300 chunks: blocks of 64+64+64+64+32+8 and a fine floor, so the
+        // recursion runs many levels above and below the chunk. The band start
+        // is MSD-strong and rejects everything, so walk forward to the first
+        // window that both keeps and rejects.
+        let floor = 4000;
+        let span = 300 * PROCESSING_CHUNK_SIZE;
+        let field = (0u128..1000)
+            .map(|i| FieldSize::new(start + i * span, start + (i + 1) * span))
+            .find(|f| {
+                let n: usize = f
+                    .chunks(PROCESSING_CHUNK_SIZE)
+                    .into_iter()
+                    .map(|c| {
+                        descriptors_for_chunk(c, base, floor, f.start())
+                            .unwrap()
+                            .0
+                            .len()
+                    })
+                    .sum();
+                n > 0 && n < 300 * (PROCESSING_CHUNK_SIZE / floor) as usize
+            })
+            .expect("a mixed window inside the first 3e11 of base 40");
+
+        let mut by_chunk = (Vec::new(), Vec::new(), Vec::new());
+        for chunk in field.chunks(PROCESSING_CHUNK_SIZE) {
+            let (o, l, m) = descriptors_for_chunk(chunk, base, floor, field.start()).unwrap();
+            by_chunk.0.extend(o);
+            by_chunk.1.extend(l);
+            by_chunk.2.extend(m);
+        }
+        let mut by_block = (Vec::new(), Vec::new(), Vec::new());
+        for block in msd_blocks(&field, 1) {
+            let (o, l, m) = descriptors_for_block(block, base, floor, field.start()).unwrap();
+            by_block.0.extend(o);
+            by_block.1.extend(l);
+            by_block.2.extend(m);
+        }
+        assert_eq!(by_block, by_chunk);
     }
 
     /// A worker batch flushes on either bound and never sends an empty one.
