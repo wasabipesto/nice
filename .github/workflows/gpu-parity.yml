@@ -52,6 +52,16 @@ jobs:
                   vulkaninfo --summary | grep -A3 deviceName || true
                   cargo test --release --features vulkan,cubecl -p nice_common -- --ignored --nocapture
 
+            - name: Run device parity tests (CubeCL direct SPIR-V compiler)
+              # The `gpu` umbrella ships cubecl-spirv on Linux, so the shipped
+              # Vulkan path is CubeCL's own SPIR-V codegen, not naga. Same
+              # tests, second compiler. (The plane-scoped compaction variant
+              # is skipped on llvmpipe by the test itself — see
+              # is_software_rasterizer.)
+              run: |
+                  export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)"
+                  cargo test --release --features cubecl-spirv -p nice_common -- --ignored --nocapture cubecl_
+
     metal:
         name: vulkan (MoltenVK) + cubecl (Metal) on macOS
         runs-on: macos-latest

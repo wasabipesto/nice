@@ -17,7 +17,12 @@ cuda = ["nice_common/cuda", "dep:cudarc"]
 # release recipe is two builds: default features = lightweight CPU-only,
 # `--features gpu` = CPU + every backend, selected at runtime by
 # `--gpu-backend` (auto picks the fastest available).
-gpu = ["cuda", "cubecl", "cubecl-cuda"]
+# `cubecl-spirv` is in the umbrella since 2026-09: on Vulkan devices the
+# cubecl backend then compiles through CubeCL's own SPIR-V codegen, which is
+# what makes plane-scoped compaction available (+11-13% niceonly on an
+# RX 9070 XT over the naga path). It only affects the Vulkan backend of
+# wgpu; Metal and DX12 keep naga.
+gpu = ["cuda", "cubecl", "cubecl-cuda", "cubecl-spirv"]
 # Experimental: the hand-written WGSL backend. Not part of the `gpu`
 # umbrella — every platform it serves is covered by `cubecl`, which beats it
 # in detailed mode on all vendors measured. Kept for opt-in builds while its
@@ -27,7 +32,7 @@ cubecl = ["nice_common/cubecl"]
 # Must also enable this crate's own cubecl gate: feature cfgs do not
 # propagate upward from nice_common.
 cubecl-cuda = ["cubecl", "nice_common/cubecl-cuda"]
-# Experimental direct compilers for the cubecl (wgpu) backend; see nice_common.
+# Direct compilers for the cubecl (wgpu) backend; see nice_common.
 cubecl-spirv = ["cubecl", "nice_common/cubecl-spirv"]
 cubecl-metal = ["cubecl", "nice_common/cubecl-metal"]
 
