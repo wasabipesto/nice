@@ -6,7 +6,7 @@
 #[macro_use]
 extern crate rocket;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
     PgPool, benchmarks::insert_benchmark, claims::get_claim_by_id, claims::insert_claim,
@@ -43,6 +43,9 @@ const ESTIMATE_SAMPLE_LIMIT: i64 = 2000;
 /// long a *deletion* (e.g. manual cleanup of junk rows) can go unnoticed.
 /// Overridable via `ESTIMATE_CACHE_TTL_SECS`.
 const ESTIMATE_CACHE_TTL_SECS: u64 = 60;
+
+struct StartTime(DateTime<Utc>);
+
 use rand::RngExt;
 use rocket::State;
 use rocket::http::Status;
@@ -115,9 +118,23 @@ fn ping() -> &'static str {
 }
 
 #[get("/status")]
-fn status(queue: &State<FieldQueue>) -> Json<Value> {
+fn status(
+    queue: &State<FieldQueue>,
+    pool: &State<PgPool>,
+    started: &State<StartTime>,
+) -> Json<Value> {
+    let pool_state = pool.state();
+    let active_connections = pool_state
+        .connections
+        .saturating_sub(pool_state.idle_connections);
+
     Json(json!({
         "status": "ok",
+        "build_version": env!("CARGO_PKG_VERSION"),
+        "start_time": started.0.to_rfc3339(),
+        "pool_connections_active": active_connections,
+        "pool_connections_idle": pool_state.idle_connections,
+        "pool_connections_max": pool.max_size(),
         "niceonly_queue_size": queue.niceonly_queue_size(),
         "detailed_thin_queue_size": queue.detailed_thin_queue_size(),
         "detailed_next_queue_size": queue.detailed_next_queue_size(),
@@ -610,6 +627,7 @@ fn rocket() -> _ {
         .manage(pool)
         .manage(queue)
         .manage(cache)
+        .manage(StartTime(Utc::now()))
         .mount(
             "/",
             routes![
