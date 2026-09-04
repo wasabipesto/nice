@@ -14,6 +14,11 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Build application
 COPY . .
 RUN cargo test
+# The commit this image was built from, surfaced by /status. `.dockerignore`
+# keeps `.git` out of the build context, so it has to come in as an argument:
+#   docker build --build-arg NICE_BUILD_COMMIT=$(git rev-parse --short HEAD) ...
+# Builds that omit it report a null commit.
+ARG NICE_BUILD_COMMIT
 RUN cargo build -r -p nice_api
 
 FROM debian:bookworm-slim

@@ -6,7 +6,7 @@
 #[macro_use]
 extern crate rocket;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use nice_common::client_process::get_num_unique_digits;
 use nice_common::db_util::{
     PgPool, benchmarks::insert_benchmark, claims::get_claim_by_id, claims::insert_claim,
@@ -114,10 +114,39 @@ fn ping() -> &'static str {
     "pong"
 }
 
+/// Identity of this build, fixed at compile time. The commit is optional:
+/// only builds given `NICE_BUILD_COMMIT` (the image passes it as a build
+/// argument, since `.dockerignore` keeps `.git` out of the build context)
+/// can report one, and the rest report `null`.
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_COMMIT: Option<&str> = option_env!("NICE_BUILD_COMMIT");
+
+/// When this process started, captured once at launch. Distinguishes a
+/// long-running server from one that has been quietly restarting.
+struct StartTime(DateTime<Utc>);
+
 #[get("/status")]
-fn status(queue: &State<FieldQueue>) -> Json<Value> {
+fn status(
+    queue: &State<FieldQueue>,
+    pool: &State<PgPool>,
+    started: &State<StartTime>,
+) -> Json<Value> {
+    // Pool occupancy comes from r2d2's own bookkeeping, so this stays a
+    // pure in-memory endpoint: no connection is checked out to report it.
+    // `connections` counts the pool's whole population, idle ones included.
+    let pool_state = pool.state();
+    let active_connections = pool_state
+        .connections
+        .saturating_sub(pool_state.idle_connections);
+
     Json(json!({
         "status": "ok",
+        "build_version": BUILD_VERSION,
+        "build_commit": BUILD_COMMIT,
+        "start_time": started.0.to_rfc3339(),
+        "pool_connections_active": active_connections,
+        "pool_connections_idle": pool_state.idle_connections,
+        "pool_connections_max": pool.max_size(),
         "niceonly_queue_size": queue.niceonly_queue_size(),
         "detailed_thin_queue_size": queue.detailed_thin_queue_size(),
         "detailed_next_queue_size": queue.detailed_next_queue_size(),
@@ -610,6 +639,7 @@ fn rocket() -> _ {
         .manage(pool)
         .manage(queue)
         .manage(cache)
+        .manage(StartTime(Utc::now()))
         .mount(
             "/",
             routes![
