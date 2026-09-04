@@ -156,9 +156,10 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
 /// browser scoring 550 where the native client scores 1000 on the same box
 /// is information, not a bug.
 ///
-/// The GPU niceonly references predate the benchmark pinning its MSD floor
-/// (`gpu_niceonly::BENCHMARK_MSD_FLOOR`); they were measured under the
-/// adaptive floor and are due for re-pinning at the next reference bump.
+/// The GPU niceonly references predate the benchmark steering the MSD floor
+/// to convergence before each scenario (`gpu_niceonly::benchmark_floor_thaw`);
+/// they were measured under the earlier per-field controller and are due for
+/// re-pinning at the next reference bump.
 pub const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
     ("b40_msd_strong", false, 1.0e12),
     ("b40_msd_weak", false, 1.6e9),

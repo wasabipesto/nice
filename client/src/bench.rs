@@ -79,7 +79,16 @@ struct ScenarioResult {
     seconds: f64,
     rate: f64,
     warmup_seconds: f64,
+    /// The MSD floor the GPU niceonly pipeline was held at for the measured
+    /// windows, after steering to it in the warm-up; `None` elsewhere.
+    msd_floor: Option<u128>,
 }
+
+/// Seconds a GPU niceonly scenario steers its MSD floor before the floor is
+/// frozen and the windows are timed. The controller steps every half
+/// second, so this is six steps: enough to go from the seed to either clamp.
+#[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+const STEER_WARMUP_SECS: f64 = 3.0;
 
 /// Print a human-facing line: to stdout normally, to stderr under
 /// `--benchmark-json`, where stdout is reserved for the JSON document.
@@ -176,13 +185,6 @@ fn run_sweep(cli: &Arc<Cli>, gpu: &GpuCtx) -> (Vec<ScenarioResult>, HashMap<u32,
     .filter(|d| !(cli.gpu && d.single_thread))
     .collect();
 
-    // The niceonly GPU pipeline's MSD floor adapts per field; a benchmark
-    // needs it fixed to be comparable across machines and scenario order.
-    #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
-    if cli.gpu && cli.mode == SearchMode::Niceonly {
-        nice_common::gpu_niceonly::pin_msd_floor_for_benchmark();
-    }
-
     #[allow(clippy::cast_precision_loss)]
     let share = cli.benchmark_secs / defs.len() as f64;
 
@@ -232,6 +234,12 @@ fn run_scenario(
     let warmup_window = if cli.gpu { window } else { (window / 8).max(1) };
     let warmup_t0 = Instant::now();
     run_window(cli, gpu, def, start, warmup_window, table.as_ref());
+
+    // GPU niceonly: steer the MSD floor to where this machine balances on
+    // this base, then hold it there for the timed windows. Every scenario
+    // starts from the same seed, so the result does not depend on the
+    // scenario before it. See `gpu_niceonly::benchmark_floor_thaw`.
+    let msd_floor = steer_floor(cli, gpu, def, start, window, table.as_ref());
     let warmup_seconds = warmup_t0.elapsed().as_secs_f64();
 
     let scenario_start = Instant::now();
@@ -258,7 +266,43 @@ fn run_scenario(
         seconds: total_secs,
         rate,
         warmup_seconds,
+        msd_floor,
     }
+}
+
+/// Run windows with the floor steering for `STEER_WARMUP_SECS`, then freeze
+/// it and return it. `None` unless this is a GPU niceonly scenario.
+#[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+fn steer_floor(
+    cli: &Arc<Cli>,
+    gpu: &GpuCtx,
+    def: &ScenarioDef,
+    start: u128,
+    window: u128,
+    table: Option<&Arc<StrideTable>>,
+) -> Option<u128> {
+    use nice_common::gpu_niceonly::{benchmark_floor_freeze, benchmark_floor_thaw};
+    if !(cli.gpu && cli.mode == SearchMode::Niceonly) {
+        return None;
+    }
+    benchmark_floor_thaw();
+    let t0 = Instant::now();
+    while t0.elapsed().as_secs_f64() < STEER_WARMUP_SECS {
+        run_window(cli, gpu, def, start, window, table);
+    }
+    Some(benchmark_floor_freeze())
+}
+
+#[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
+fn steer_floor(
+    _cli: &Arc<Cli>,
+    _gpu: &GpuCtx,
+    _def: &ScenarioDef,
+    _start: u128,
+    _window: u128,
+    _table: Option<&Arc<StrideTable>>,
+) -> Option<u128> {
+    None
 }
 
 /// Process one window through the production path and return elapsed seconds.
@@ -334,12 +378,20 @@ fn print_report(
 ) {
     println!();
     println!(
-        "{:<20} {:>4} {:<14} {:>7} {:>10} {:>6} {:>8} {:>12}",
-        "scenario", "base", "character", "threads", "window", "reps", "secs", "numbers/sec"
+        "{:<20} {:>4} {:<14} {:>7} {:>10} {:>6} {:>8} {:>12} {:>8}",
+        "scenario",
+        "base",
+        "character",
+        "threads",
+        "window",
+        "reps",
+        "secs",
+        "numbers/sec",
+        "floor"
     );
     for r in results {
         println!(
-            "{:<20} {:>4} {:<14} {:>7} {:>10.1e} {:>6} {:>8.3} {:>12.3e}",
+            "{:<20} {:>4} {:<14} {:>7} {:>10.1e} {:>6} {:>8.3} {:>12.3e} {:>8}",
             r.key,
             r.base,
             r.character,
@@ -347,7 +399,9 @@ fn print_report(
             approx_f64(r.window_size),
             r.repetitions,
             r.seconds,
-            r.rate
+            r.rate,
+            r.msd_floor
+                .map_or_else(|| "-".to_string(), |f| f.to_string())
         );
     }
 
@@ -401,6 +455,7 @@ fn build_report_json(
                 "seconds": r.seconds,
                 "rate": r.rate,
                 "warmup_seconds": r.warmup_seconds,
+                "msd_floor": r.msd_floor.map(|f| f.to_string()),
             })
         })
         .collect();
@@ -422,9 +477,6 @@ fn build_report_json(
             "gpu": cli.gpu,
             "threads": cli.threads,
             "benchmark_secs": cli.benchmark_secs,
-            // Only the niceonly GPU pipeline has an MSD floor; recorded so
-            // reports can be compared across the floor policy change.
-            "gpu_msd_floor": benchmark_msd_floor(cli),
         },
         "hardware": hardware,
         "environment": environment,
@@ -441,20 +493,6 @@ fn build_report_json(
         "scenarios": scenarios,
         "score": score,
     })
-}
-
-/// The MSD floor a niceonly GPU sweep ran at, as the report records it; `None`
-/// for every other configuration (and for CPU-only builds, which have no GPU
-/// pipeline to have a floor).
-#[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
-fn benchmark_msd_floor(cli: &Cli) -> Option<String> {
-    (cli.gpu && cli.mode == SearchMode::Niceonly)
-        .then(|| nice_common::gpu_niceonly::msd_floor_in_use().to_string())
-}
-
-#[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
-fn benchmark_msd_floor(_cli: &Cli) -> Option<String> {
-    None
 }
 
 /// The constant part of a submission telemetry payload: hardware, scheduler
