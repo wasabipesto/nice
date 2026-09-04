@@ -1,30 +1,39 @@
 //! Backend-neutral host pipeline for GPU niceonly fields.
 //!
-//! Both GPU backends run niceonly the same way: the CPU runs the real MSD
+//! Every GPU backend runs niceonly the same way: the CPU runs the real MSD
 //! prefix filter across all cores with a coarser recursion floor than the CPU
-//! client uses (see [`AdaptiveFloor`]), and ships only compact *range
+//! client uses (see [`FloorController`]), and ships only compact *range
 //! descriptors* — 20 bytes per surviving range (offset, length, cross-end
-//! certificate mask) — to the device, which
-//! reconstructs the stride filter's candidates itself. No per-candidate data
-//! ever crosses the bus.
+//! certificate mask) — to the device, which reconstructs the stride filter's
+//! candidates itself. No per-candidate data ever crosses the bus.
 //!
-//! Everything in that sentence is independent of CUDA and Vulkan, so it lives
-//! here rather than being written twice. The backends supply a [`RangeSink`]:
-//! CUDA enqueues asynchronous launches on its stream, Vulkan records and
-//! submits a dispatch. This is the same split as [`crate::gpu_config`], which
-//! holds the per-base kernel constants for the same reason —
-//! [`crate::client_process_cuda`] is `#![cfg(feature = "cuda")]` and unreachable
-//! from a Vulkan-only build.
+//! The pipeline is continuous across fields ([`NiceonlyPipeline`]): the MSD
+//! workers start on the next field while the device is still draining the
+//! previous one, and the device never waits for a field boundary either. The
+//! floor is steered by which side is behind — see [`FloorController`] — so
+//! neither side idles in steady state. [`run_range_pipeline`] is the one-field
+//! synchronous form of the same machinery, for backends whose device handle
+//! cannot leave the calling thread and for tests.
+//!
+//! Everything here is independent of the device API, so it lives here rather
+//! than being written per backend. The backends supply a [`RangeSink`]: CUDA
+//! enqueues asynchronous launches on its stream, `CubeCL` submits to its
+//! client, Vulkan records and submits a dispatch. This is the same split as
+//! [`crate::gpu_config`], which holds the per-base kernel constants for the
+//! same reason — [`crate::client_process_cuda`] is `#![cfg(feature = "cuda")]`
+//! and unreachable from a Vulkan-only build.
 
 #![cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use crate::{FieldResults, FieldSize, msd_prefix_filter, residue_filter};
-use anyhow::Result;
+use crate::{FieldResults, FieldSize, NiceNumberSimple, msd_prefix_filter, residue_filter};
+use anyhow::{Result, anyhow};
 use log::{debug, warn};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Numbers per MSD filter work unit handed to a CPU worker.
 pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
@@ -110,60 +119,129 @@ const WORKER_BATCH_CHUNKS: usize = 256;
 /// little more and cost parallelism on small fields.
 const MSD_BLOCK_CHUNKS_LOG2: u32 = 6;
 
-/// Split a field into MSD work units: blocks of `2^k` whole chunks, `k` as
-/// large as [`MSD_BLOCK_CHUNKS_LOG2`] allows while still leaving at least
-/// `min_blocks` units to spread over the workers. The field's chunk count is
-/// rarely a multiple of `2^k`; the remainder is covered by ever-smaller
-/// power-of-two blocks, so every block except possibly the very last (a
-/// partial chunk) halves down onto chunk boundaries. See
+/// The tiling of a field into MSD work units: blocks of `2^k` whole chunks,
+/// `k` as large as [`MSD_BLOCK_CHUNKS_LOG2`] allows while still leaving at
+/// least `min_blocks` units to spread over the workers. The field's chunk
+/// count is rarely a multiple of `2^k`; the remainder is covered by
+/// ever-smaller power-of-two blocks, so every block except possibly the very
+/// last (a partial chunk) halves down onto chunk boundaries. See
 /// [`MSD_BLOCK_CHUNKS_LOG2`] for why that alignment matters.
-fn msd_blocks(range: &FieldSize, min_blocks: usize) -> Vec<FieldSize> {
-    let full_chunks = range.size() / PROCESSING_CHUNK_SIZE;
-    let mut log2 = MSD_BLOCK_CHUNKS_LOG2;
-    while log2 > 0 && (full_chunks >> log2) < min_blocks as u128 {
-        log2 -= 1;
-    }
-    let mut blocks = Vec::new();
-    let mut start = range.start();
-    let mut remaining_chunks = full_chunks;
-    let mut block_chunks = 1u128 << log2;
-    while remaining_chunks > 0 {
-        while block_chunks > remaining_chunks {
-            block_chunks >>= 1;
-        }
-        let end = start + block_chunks * PROCESSING_CHUNK_SIZE;
-        blocks.push(FieldSize::new(start, end));
-        start = end;
-        remaining_chunks -= block_chunks;
-    }
-    // A partial last chunk is its own block, exactly as `chunks()` made it.
-    if start < range.end() {
-        blocks.push(FieldSize::new(start, range.end()));
-    }
-    blocks
+///
+/// Blocks are computed on demand from their index rather than materialised:
+/// a 1e13 field is 156 250 of them, and the pipeline keeps two fields open.
+#[derive(Clone, Copy, Debug)]
+struct BlockTiling {
+    start: u128,
+    end: u128,
+    /// Whole chunks in the field.
+    full_chunks: u128,
+    /// Chunks per full-size block.
+    block_chunks: u128,
+    /// Full-size blocks; the tail after them is `full_chunks % block_chunks`
+    /// chunks in descending powers of two, then a partial chunk if any.
+    n_full: u128,
+    /// Total number of blocks.
+    len: usize,
 }
 
-/// Minimum MSD recursion floor (matches the CPU client's default).
-/// Below this the GPU receives virtually the same candidates as the CPU would
-/// check itself, so there is no point going lower.
-const MSD_FLOOR_MIN: f64 = 250.0;
+impl BlockTiling {
+    fn new(range: &FieldSize, min_blocks: usize) -> Self {
+        let full_chunks = range.size() / PROCESSING_CHUNK_SIZE;
+        let mut log2 = MSD_BLOCK_CHUNKS_LOG2;
+        while log2 > 0 && (full_chunks >> log2) < min_blocks as u128 {
+            log2 -= 1;
+        }
+        let block_chunks = 1u128 << log2;
+        let n_full = full_chunks / block_chunks;
+        let tail_chunks = full_chunks % block_chunks;
+        let tail_blocks = tail_chunks.count_ones() as usize;
+        let partial = usize::from(!range.size().is_multiple_of(PROCESSING_CHUNK_SIZE));
+        Self {
+            start: range.start(),
+            end: range.end(),
+            full_chunks,
+            block_chunks,
+            n_full,
+            len: n_full as usize + tail_blocks + partial,
+        }
+    }
 
-/// Maximum MSD recursion floor the adaptive controller may reach: half a
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The `i`-th block, or `None` past the end.
+    fn get(&self, i: usize) -> Option<FieldSize> {
+        if i >= self.len {
+            return None;
+        }
+        let i = i as u128;
+        let c = PROCESSING_CHUNK_SIZE;
+        if i < self.n_full {
+            let s = self.start + i * self.block_chunks * c;
+            return Some(FieldSize::new(s, s + self.block_chunks * c));
+        }
+        // Walk the tail: descending powers of two of the remainder, then the
+        // partial chunk.
+        let mut chunk_cursor = self.n_full * self.block_chunks;
+        let mut remaining = self.full_chunks - chunk_cursor;
+        let mut idx = self.n_full;
+        while remaining > 0 {
+            let take = 1u128 << remaining.ilog2();
+            if idx == i {
+                let s = self.start + chunk_cursor * c;
+                return Some(FieldSize::new(s, s + take * c));
+            }
+            chunk_cursor += take;
+            remaining -= take;
+            idx += 1;
+        }
+        // Partial last chunk.
+        Some(FieldSize::new(self.start + chunk_cursor * c, self.end))
+    }
+}
+
+/// [`BlockTiling`] materialised, for tests.
+#[cfg(test)]
+fn msd_blocks(range: &FieldSize, min_blocks: usize) -> Vec<FieldSize> {
+    let tiling = BlockTiling::new(range, min_blocks);
+    (0..tiling.len()).filter_map(|i| tiling.get(i)).collect()
+}
+
+/// Minimum MSD recursion floor the controller may reach: a sixteenth of a
+/// [`PROCESSING_CHUNK_SIZE`] chunk.
+///
+/// Below roughly this, a finer floor stops paying: survivors barely
+/// decrease (the recursion already stops where the analysis rejects, so
+/// leaves are a few tens of thousands of numbers regardless) while the
+/// number of descriptors keeps growing, and each range costs the device
+/// setup work and the host 20 bytes of traffic. Measured with pinned floors
+/// on fixed base-54 fields: a 9070 XT does 6.7e12 n/s at 250-350k, 5.2e12
+/// at 125k and 1.7e12 at 60k; an M4 does 6.3e11 at 250k, 7.9e11 at 60k and
+/// 4.5e11 at 30k. The wait-balance controller cannot see that cliff — a
+/// device that is behind stays behind when the floor drops — and on the M4
+/// it steered to 20k and a third of the throughput before this clamp.
+/// Every optimum measured (M4 60k, RTX 3060 ~100k, 9070 XT 250k, 4090 and
+/// A100 at the cap) is at or above this value.
+///
+/// An explicit `NICE_GPU_MSD_FLOOR` pin is not clamped.
+#[allow(clippy::cast_precision_loss)]
+const MSD_FLOOR_MIN: f64 = (PROCESSING_CHUNK_SIZE / 16) as f64;
+
+/// Maximum MSD recursion floor the controller may reach: half a
 /// [`PROCESSING_CHUNK_SIZE`] chunk, i.e. one level of subdivision below the
 /// whole-chunk check ([`msd_prefix_filter::MSD_RECURSIVE_SUBDIVISION_FACTOR`]
 /// is 2).
 ///
-/// The controller used to be allowed all the way up to one whole chunk, the
-/// explicit no-MSD bypass ([`descriptors_for_chunk`] ships every chunk as one
-/// descriptor with no endpoint analysis), on the theory that a strong device
-/// paired with a weak CPU would want it. In practice the controller reached
-/// it on a strong CPU too and stuck there: its only signal is the device
-/// *tail* after the workers finish, which is small whenever the device keeps
-/// pace, so the floor ratchets up every field until nothing pulls it back.
-///
-/// The bypass itself is still there for the one configuration it was meant
-/// for: pin it explicitly with `NICE_GPU_MSD_FLOOR=1000000`, which bypasses
-/// this clamp.
+/// One whole chunk is the explicit no-MSD bypass ([`descriptors_for_chunk`]
+/// ships every chunk as one descriptor with no endpoint analysis). At the
+/// bypass every candidate survives and the device checks the whole field —
+/// measured on Anvil (A100 + 32 EPYC cores, base 54, 1e13 fields) at 2.5e11
+/// n/s against 1.2-6.3e12 n/s at floors between 100k and 900k — so the
+/// controller is not allowed there; pin `NICE_GPU_MSD_FLOOR=1000000` for the
+/// one configuration it was meant for (a single-core host with a strong
+/// device), which bypasses this clamp.
 ///
 /// Survival data (b52, per 1e12, single core):
 ///
@@ -176,112 +254,168 @@ const MSD_FLOOR_MIN: f64 = 250.0;
 #[allow(clippy::cast_precision_loss)]
 const MSD_FLOOR_MAX: f64 = (PROCESSING_CHUNK_SIZE / 2) as f64;
 
-/// Adaptive MSD recursion floor for the niceonly GPU pipeline.
+/// Where the controller starts: half the cap. On a many-core host paired with
+/// a strong device the balance point measured on Anvil sits right about here
+/// (250k), and on a weak host the controller raises it within seconds. Not
+/// derived from the core count: a low seed costs whole fields (a 1e13 field
+/// at 16k takes 10 s on 32 cores against 1 s at 250k), a high one costs a
+/// few seconds of device idling.
+const MSD_FLOOR_SEED: f64 = MSD_FLOOR_MAX / 2.0;
+
+/// How often the controller reconsiders the floor.
+const FLOOR_ADJUST_INTERVAL: Duration = Duration::from_millis(500);
+/// Largest multiplicative step per adjustment, either direction: taken when
+/// one side waited the whole interval and the other not at all. The step is
+/// proportional to how one-sided the waits were, so near the balance point
+/// the controller inches ("57% vs 42%" moves 4%) and a regime change still
+/// moves it fast. A fixed step hopped across the balance point instead:
+/// measured on an RTX 3060 with 19 cores, 1.25x alternated 82k↔128k every
+/// interval with each side waiting >90% in turn, and a reversal-damped
+/// variant still hopped 200k↔280k on a 9070 XT for 40 s before settling.
+const FLOOR_STEP: f64 = 1.25;
+/// Smallest step taken once the controller decides to move at all.
+const FLOOR_STEP_MIN: f64 = 1.02;
+/// Fraction of an interval one side must spend waiting on the other before
+/// the floor moves. Below this the pipeline is called balanced.
+const FLOOR_WAIT_THRESHOLD: f64 = 0.15;
+
+/// Steers the MSD recursion floor so that neither the CPU nor the device
+/// waits for the other.
 ///
-/// Goal: keep `msd_time ≈ gpu_tail_time` so the overlapped pipeline is
-/// balanced.  The floor is seeded from the CPU count (fewer cores → coarser
-/// floor, because MSD is the bottleneck) and then nudged ≤ 1.5× per field
-/// toward that balance.  Setting `NICE_GPU_MSD_FLOOR` in the environment
-/// pins the floor and disables adaptation.
-struct AdaptiveFloor {
-    floor: f64,
-    /// Fields remaining in warmup (skip adaptation); `u32::MAX` = permanently
-    /// fixed via env-var override.
-    warmup: u32,
+/// The floor trades CPU work for device work: a finer floor filters harder
+/// (more CPU time per number, fewer survivors for the device), a coarser one
+/// the reverse. The right setting depends on the host's cores, the device,
+/// the base and even the region of the base — an MSD-strong region rejects
+/// nearly everything at any floor — so it is steered at run time.
+///
+/// The signal is *who is waiting*, measured where the two halves meet: the
+/// dispatch thread records how long it spends blocked pulling descriptors
+/// from the workers (the CPU is behind) and how long it spends blocked in
+/// `launch` because the device has all the work it may hold in flight (the
+/// device is behind). Every [`FLOOR_ADJUST_INTERVAL`] the floor moves one
+/// [`FLOOR_STEP`] toward the side that was waiting, if either waited more
+/// than [`FLOOR_WAIT_THRESHOLD`] of the interval; otherwise it holds. No
+/// device timing is needed on any backend, and a regime change shows up
+/// within an interval rather than a field.
+///
+/// The earlier controller compared the CPU phase against the device *tail*
+/// after the workers finished. Under an overlapped pipeline that tail is one
+/// batch whenever the device keeps pace, so it always said "raise", and on
+/// Anvil it ratcheted to the bypass and stayed there.
+///
+/// `NICE_GPU_MSD_FLOOR` pins the floor and disables steering (floor sweeps,
+/// benchmarks); see [`pin_msd_floor_for_benchmark`].
+pub struct FloorController {
+    /// The floor as `f64` bits; workers read it per block, lock-free.
+    floor_bits: AtomicU64,
+    pinned: bool,
+    state: Mutex<FloorState>,
 }
 
-/// Fields to observe before adapting, so shader/kernel JIT one-time costs
-/// don't skew the first measurement.
-const ADAPT_WARMUP: u32 = 3;
+struct FloorState {
+    interval_start: Instant,
+    cpu_wait: Duration,
+    device_wait: Duration,
+}
 
-/// Maximum multiplicative step per field in either direction.
-const ADAPT_MAX_STEP: f64 = 1.5;
-
-/// Ignore a phase if it took less than this many seconds — the measurement
-/// noise would dominate the ratio.
-const ADAPT_MIN_SECS: f64 = 0.002;
-
-/// Floor value calibrated for 32 cores. Derived value for N cores:
-/// `ADAPT_BASE_CORE_PRODUCT / N`, clamped to `[MSD_FLOOR_MIN, MSD_FLOOR_MAX]`.
-const ADAPT_BASE_CORE_PRODUCT: f64 = 512_000.0;
-
-impl AdaptiveFloor {
-    fn current(&self) -> u128 {
-        self.floor as u128
+impl FloorController {
+    fn new(floor: f64, pinned: bool) -> Self {
+        Self {
+            floor_bits: AtomicU64::new(floor.to_bits()),
+            pinned,
+            state: Mutex::new(FloorState {
+                interval_start: Instant::now(),
+                cpu_wait: Duration::ZERO,
+                device_wait: Duration::ZERO,
+            }),
+        }
     }
 
-    fn update(&mut self, msd_secs: f64, total_secs: f64) {
-        if self.warmup == u32::MAX {
+    /// The floor in force right now.
+    pub fn floor(&self) -> u128 {
+        f64::from_bits(self.floor_bits.load(Ordering::Relaxed)) as u128
+    }
+
+    /// Record time the dispatch thread spent waiting for descriptors (the CPU
+    /// side was behind) or blocked handing work to a full device (the device
+    /// side was behind), and steer once an interval has elapsed.
+    fn observe(&self, cpu_wait: Duration, device_wait: Duration) {
+        if self.pinned {
             return;
         }
-        if self.warmup > 0 {
-            self.warmup -= 1;
+        let mut st = self.state.lock().unwrap();
+        st.cpu_wait += cpu_wait;
+        st.device_wait += device_wait;
+        let elapsed = st.interval_start.elapsed();
+        if elapsed < FLOOR_ADJUST_INTERVAL {
             return;
         }
-        // `msd_secs` already has the sink's time subtracted, so this is exactly
-        // `NiceonlyStats::device_secs` — the device's share, on either backend.
-        let gpu_tail = (total_secs - msd_secs).max(0.0);
-        let ratio = if gpu_tail < ADAPT_MIN_SECS {
-            ADAPT_MAX_STEP
-        } else if msd_secs < ADAPT_MIN_SECS {
-            1.0 / ADAPT_MAX_STEP
+        let cpu_frac = st.cpu_wait.as_secs_f64() / elapsed.as_secs_f64();
+        let device_frac = st.device_wait.as_secs_f64() / elapsed.as_secs_f64();
+        st.interval_start = Instant::now();
+        st.cpu_wait = Duration::ZERO;
+        st.device_wait = Duration::ZERO;
+        let direction: i8 = if device_frac > FLOOR_WAIT_THRESHOLD && device_frac >= cpu_frac {
+            // The device has more than it can take: filter harder.
+            -1
         } else {
-            msd_secs / gpu_tail
+            // The device is starved: filter less (or hold if nobody waited).
+            i8::from(cpu_frac > FLOOR_WAIT_THRESHOLD)
         };
-        let factor = ratio.clamp(1.0 / ADAPT_MAX_STEP, ADAPT_MAX_STEP);
-        let new_floor = (self.floor * factor).clamp(MSD_FLOOR_MIN, MSD_FLOOR_MAX);
-        if (new_floor - self.floor).abs() > self.floor * 0.05 {
-            debug!(
-                "GPU MSD floor: {:.0} → {:.0} (msd {:.3}s, gpu_tail {:.3}s)",
-                self.floor, new_floor, msd_secs, gpu_tail,
-            );
+        if direction == 0 {
+            return;
         }
-        self.floor = new_floor;
+        drop(st);
+        // Proportional: the more one-sided the waiting, the bigger the step.
+        let imbalance = (device_frac - cpu_frac).abs().min(1.0);
+        let step = (1.0 + (FLOOR_STEP - 1.0) * imbalance).max(FLOOR_STEP_MIN);
+        let floor = f64::from_bits(self.floor_bits.load(Ordering::Relaxed));
+        let new_floor = if direction < 0 {
+            (floor / step).max(MSD_FLOOR_MIN)
+        } else {
+            (floor * step).min(MSD_FLOOR_MAX)
+        };
+        if (new_floor - floor).abs() > f64::EPSILON {
+            debug!(
+                "GPU MSD floor: {floor:.0} → {new_floor:.0} (cpu waited {:.0}%, device waited {:.0}%, step {step:.3})",
+                100.0 * cpu_frac,
+                100.0 * device_frac
+            );
+            self.floor_bits
+                .store(new_floor.to_bits(), Ordering::Relaxed);
+        }
     }
 }
 
-static ADAPTIVE_FLOOR: OnceLock<Mutex<AdaptiveFloor>> = OnceLock::new();
+static FLOOR: OnceLock<FloorController> = OnceLock::new();
 
-fn adaptive_floor() -> &'static Mutex<AdaptiveFloor> {
-    ADAPTIVE_FLOOR.get_or_init(|| {
+/// The process-wide floor controller, initialised on first use: pinned by
+/// `NICE_GPU_MSD_FLOOR` if set, otherwise steering from [`MSD_FLOOR_SEED`].
+fn floor_controller() -> &'static FloorController {
+    FLOOR.get_or_init(|| {
         if let Ok(v) = std::env::var("NICE_GPU_MSD_FLOOR") {
             match v.parse::<f64>() {
                 Ok(f) if f >= 1.0 => {
                     debug!("GPU MSD floor fixed at {f:.0} via NICE_GPU_MSD_FLOOR");
-                    return Mutex::new(AdaptiveFloor {
-                        floor: f,
-                        warmup: u32::MAX,
-                    });
+                    return FloorController::new(f, true);
                 }
-                _ => warn!("ignoring invalid NICE_GPU_MSD_FLOOR '{v}'; using adaptive floor"),
+                _ => warn!("ignoring invalid NICE_GPU_MSD_FLOOR '{v}'; steering the floor"),
             }
         }
-        #[allow(clippy::cast_precision_loss)]
-        let cpu_count =
-            std::thread::available_parallelism().map_or(32, std::num::NonZeroUsize::get) as f64;
-        let seed = (ADAPT_BASE_CORE_PRODUCT / cpu_count).clamp(MSD_FLOOR_MIN, MSD_FLOOR_MAX);
-        debug!("GPU MSD floor: adaptive, seed {seed:.0} ({cpu_count:.0} logical cores)");
-        Mutex::new(AdaptiveFloor {
-            floor: seed,
-            warmup: ADAPT_WARMUP,
-        })
+        debug!("GPU MSD floor: steered, seed {MSD_FLOOR_SEED:.0}");
+        FloorController::new(MSD_FLOOR_SEED, false)
     })
-}
-
-fn gpu_msd_floor() -> u128 {
-    adaptive_floor().lock().unwrap().current()
 }
 
 /// The MSD floor a `--benchmark` run pins: the controller's cap.
 ///
-/// A benchmark has to be comparable across machines and runs, and the
-/// adaptive controller is neither — it is process-global state that moves
-/// after every field, so with 4-8e9 windows it ratchets hundreds of times
-/// inside one sweep and every scenario's rate depends on where the previous
-/// ones left it (an A100 scored below an RTX 3060 this way). The cap is where
-/// a strong device settles in production, and it puts the benchmark's weight
-/// on the device rather than on this box's MSD cores, which is what a GPU
-/// benchmark is for.
+/// A benchmark has to be comparable across machines and runs, and a steered
+/// floor is neither: it is process-global state that moves with load, so
+/// every scenario's rate would depend on where the previous ones left it (an
+/// A100 scored below an RTX 3060 this way under the earlier controller). The
+/// cap is where a strong device settles in production, and it puts the
+/// benchmark's weight on the device rather than on this box's MSD cores,
+/// which is what a GPU benchmark is for.
 #[allow(clippy::cast_precision_loss)]
 pub const BENCHMARK_MSD_FLOOR: u128 = MSD_FLOOR_MAX as u128;
 
@@ -294,15 +428,12 @@ pub const BENCHMARK_MSD_FLOOR: u128 = MSD_FLOOR_MAX as u128;
 /// rather than silently benchmarking a moving floor.
 pub fn pin_msd_floor_for_benchmark() {
     if std::env::var_os("NICE_GPU_MSD_FLOOR").is_some() {
-        adaptive_floor();
+        floor_controller();
         return;
     }
     #[allow(clippy::cast_precision_loss)]
-    let pinned = Mutex::new(AdaptiveFloor {
-        floor: BENCHMARK_MSD_FLOOR as f64,
-        warmup: u32::MAX,
-    });
-    if ADAPTIVE_FLOOR.set(pinned).is_err() {
+    let pinned = FloorController::new(BENCHMARK_MSD_FLOOR as f64, true);
+    if FLOOR.set(pinned).is_err() {
         warn!("GPU MSD floor already in use; benchmark cannot pin it at {BENCHMARK_MSD_FLOOR}");
     } else {
         debug!("GPU MSD floor pinned at {BENCHMARK_MSD_FLOOR} for the benchmark");
@@ -313,61 +444,155 @@ pub fn pin_msd_floor_for_benchmark() {
 /// if nothing has yet.
 #[must_use]
 pub fn msd_floor_in_use() -> u128 {
-    gpu_msd_floor()
+    floor_controller().floor()
 }
 
-/// Per-field statistics from the overlapped niceonly pipeline.
+/// Fields the client keeps open in the pipeline at once: with two, the next
+/// field's MSD work overlaps the device's tail on the current one. One is the
+/// old field-serial behaviour, for A/B runs. `NICE_GPU_FIELDS_IN_FLIGHT`.
+#[must_use]
+pub fn fields_in_flight() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("NICE_GPU_FIELDS_IN_FLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(2)
+    })
+}
+
+/// Launched batches a backend keeps in flight before it blocks the dispatch
+/// thread. This is the device-side queue depth: deep enough that the device
+/// never runs dry between batches, shallow enough that a backed-up device is
+/// felt as `launch` blocking within a fraction of a second, which is the
+/// controller's "device is behind" signal. `NICE_GPU_BATCHES_IN_FLIGHT`.
+#[must_use]
+pub fn batches_in_flight() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("NICE_GPU_BATCHES_IN_FLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(16)
+    })
+}
+
+/// Per-field statistics from the pipeline.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct NiceonlyStats {
-    /// CPU time in the MSD filter, with time spent inside the sink removed.
-    ///
-    /// Not simply "wall time until the workers finished". On a backend whose
-    /// `launch` returns immediately (CUDA) the two are the same, but Vulkan
-    /// blocks on a fence inside `launch`, so that wall time would charge every
-    /// dispatch to the MSD phase — and [`AdaptiveFloor`] would then see a
-    /// device that costs nothing and raise the floor until the GPU was doing
-    /// all the work at the worst possible granularity. Measured: on a 1e13
-    /// base-50 field, floor 4000 finishes in 116 s and floor 256 000 in over
-    /// ten minutes, so drifting upward is not a small mistake.
+    /// Wall time the MSD workers spent on this field, from the first block
+    /// taken to the last finished. Overlaps neighbouring fields' device time.
     pub msd_secs: f64,
-    /// Wall time in `launch` + `sync`, i.e. everything the device cost that the
-    /// host could observe.
+    /// Wall time from this field's first launch to its results being ready
+    /// on the device. Overlaps the next field's MSD time and, on the device,
+    /// its early batches.
     pub device_secs: f64,
-    /// Wall time until every dispatch had completed on the device.
+    /// Wall time from the field entering the pipeline to its results being
+    /// read back. With two fields in flight this exceeds the field's share of
+    /// throughput; see the client's rate accounting.
     pub total_secs: f64,
+    /// The MSD floor in force when the field was opened; blocks later in the
+    /// field may have been filtered at a floor the controller had moved to.
+    pub floor: u128,
     pub num_ranges: usize,
     pub valid_numbers: u64,
     pub launches: u32,
+    /// Time the dispatch thread spent waiting for descriptors while this was
+    /// the oldest open field: the CPU side was behind.
+    pub cpu_wait_secs: f64,
+    /// Time the dispatch thread spent blocked handing this field's batches to
+    /// a full device queue: the device side was behind.
+    pub device_wait_secs: f64,
+    /// Device time actually spent on this field's batches, where the backend
+    /// can measure it (CUDA, from per-batch events); `None` elsewhere.
+    pub device_busy_secs: Option<f64>,
+}
+
+impl NiceonlyStats {
+    /// The per-field pipeline telemetry, as submitted alongside results.
+    /// Seconds are raw so consumers can divide by whichever wall time they
+    /// mean (the submission's `processing_secs` is the field's share of
+    /// throughput); `floor` is a string like the other u128 fields.
+    #[must_use]
+    pub fn telemetry_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "msd_floor": self.floor.to_string(),
+            "fields_in_flight": fields_in_flight(),
+            "batches_in_flight": batches_in_flight(),
+            "msd_secs": self.msd_secs,
+            "total_secs": self.total_secs,
+            "cpu_wait_secs": self.cpu_wait_secs,
+            "device_wait_secs": self.device_wait_secs,
+            "device_busy_secs": self.device_busy_secs,
+            "num_ranges": self.num_ranges,
+            "valid_numbers": self.valid_numbers,
+            "launches": self.launches,
+        })
+    }
+}
+
+/// What waiting for a field's device work yields.
+pub struct DeviceResult {
+    pub nice_numbers: Vec<NiceNumberSimple>,
+    /// Device time spent on the field, if the backend measured it.
+    pub device_busy_secs: Option<f64>,
+}
+
+/// What a backend's `begin` returns: either the field was handled on the
+/// spot (a base the device cannot take, or a residue-empty one) or it went
+/// into the pipeline and its results come out of the backend's `finish`.
+pub enum NiceonlyStarted {
+    Immediate(FieldResults),
+    Queued,
+}
+
+/// The device-side result of a field, not yet waited for: launched, results
+/// still on the device. `wait` blocks until they are there and reads them.
+pub trait PendingField {
+    /// # Errors
+    /// Returns the device's error, or an overflowed output buffer.
+    fn wait(self: Box<Self>) -> Result<DeviceResult>;
 }
 
 /// A backend's device-side end of the pipeline.
 ///
-/// The pipeline hands over batches of MSD-surviving range descriptors and, at
-/// the end, waits for the device. Collecting the results is deliberately *not*
-/// part of this trait: the two backends read their nice numbers out of very
-/// different buffers, and doing it after [`run_range_pipeline`] returns keeps
-/// the object-safe surface down to the two calls the pipeline actually makes.
+/// The pipeline opens a field, hands over batches of MSD-surviving range
+/// descriptors for it, and closes it. Fields are opened in order, but a
+/// field is opened while the previous one may still have batches in flight
+/// and is closed only once every one of its batches has been handed over; up
+/// to [`fields_in_flight`] fields are open at a time, and a batch always
+/// names its field. Closing returns a [`PendingField`] that is waited for on
+/// another thread, so it must own whatever the wait needs.
+///
+/// `launch` is the backpressure point: a backend keeps at most
+/// [`batches_in_flight`] launched batches outstanding and blocks in `launch`
+/// until the oldest completes. That blocking is what the pipeline measures
+/// as "the device is behind"; a backend whose launches are synchronous
+/// (Vulkan) blocks naturally.
 pub trait RangeSink {
-    /// Dispatch one batch. `offsets` are relative to the field start, `lens`
-    /// are candidate counts, and `masks` are the ranges' cross-end
-    /// certificates (digits certainly occupying output positions >= k for
-    /// every n in the range — see `msd_prefix_filter::MsdAnalysis`); the
-    /// three slices are the same length. A backend that has no device-side
-    /// mask test yet may ignore `masks` — the filter is an optimization,
-    /// never required for correctness.
-    ///
-    /// # Errors
-    /// Returns an error on any device failure.
-    fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()>;
+    type Pending: PendingField;
 
-    /// Wait for everything launched so far to finish on the device. Called
-    /// once, inside the timed region, so `total_secs` covers real device work
-    /// on a backend whose launches are asynchronous.
+    /// Open a field: allocate its output slot, fetch its base's plan.
     ///
     /// # Errors
-    /// Returns an error on any device failure.
-    fn sync(&mut self) -> Result<()> {
-        Ok(())
-    }
+    /// Device allocation or kernel build errors.
+    fn begin_field(&mut self, seq: u64, base: u32, range: &FieldSize) -> Result<()>;
+
+    /// Hand over one batch of `field`'s descriptors: offsets from the field's
+    /// start (`u64`), lengths (`u32`), certificate masks (`u64`), one triple
+    /// per range.
+    ///
+    /// # Errors
+    /// Device errors, or a batch for a field that is not open.
+    fn launch(&mut self, field: u64, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()>;
+
+    /// Close a field: everything for it has been launched.
+    ///
+    /// # Errors
+    /// Device errors, or a field that is not open.
+    fn end_field(&mut self, seq: u64) -> Result<Self::Pending>;
 }
 
 /// MSD-filter one chunk into descriptors relative to `field_start`.
@@ -439,72 +664,7 @@ fn descriptors_for_chunk(
     Ok((offsets, lens, masks))
 }
 
-/// Descriptors one MSD worker has accumulated since its last send.
-#[derive(Default)]
-struct WorkerBatch {
-    offsets: Vec<u64>,
-    lens: Vec<u32>,
-    masks: Vec<u64>,
-    chunks: usize,
-}
-
-impl WorkerBatch {
-    /// Fold one chunk's descriptors in. Empty chunks still count toward the
-    /// chunk bound so a run of rejected chunks cannot delay a pending batch.
-    fn absorb(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) {
-        self.offsets.extend_from_slice(offsets);
-        self.lens.extend_from_slice(lens);
-        self.masks.extend_from_slice(masks);
-        self.chunks += 1;
-    }
-
-    /// Fold one work unit's descriptors in, sending full batches on the way.
-    /// A unit can yield far more than one batch's worth at a fine floor, so
-    /// this feeds it through in [`WORKER_BATCH_RANGES`] slices and never lets
-    /// a message outgrow the `PIPELINE_DEPTH` memory budget. The last slice
-    /// is left in the batch for the caller's ready check. `Err` means the
-    /// channel is closed.
-    fn feed(
-        &mut self,
-        offsets: &[u64],
-        lens: &[u32],
-        masks: &[u64],
-        tx: &std::sync::mpsc::SyncSender<(Vec<u64>, Vec<u32>, Vec<u64>)>,
-    ) -> Result<(), ()> {
-        if offsets.is_empty() {
-            self.absorb(&[], &[], &[]);
-            return Ok(());
-        }
-        let mut slices = offsets
-            .chunks(WORKER_BATCH_RANGES)
-            .zip(lens.chunks(WORKER_BATCH_RANGES))
-            .zip(masks.chunks(WORKER_BATCH_RANGES))
-            .peekable();
-        while let Some(((o, l), m)) = slices.next() {
-            self.absorb(o, l, m);
-            if slices.peek().is_some() && self.is_ready() && tx.send(self.take()).is_err() {
-                return Err(());
-            }
-        }
-        Ok(())
-    }
-
-    fn is_ready(&self) -> bool {
-        self.offsets.len() >= WORKER_BATCH_RANGES || self.chunks >= WORKER_BATCH_CHUNKS
-    }
-
-    fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
-    }
-
-    /// Hand the accumulated descriptors over and start a fresh batch.
-    fn take(&mut self) -> (Vec<u64>, Vec<u32>, Vec<u64>) {
-        let batch = std::mem::take(self);
-        (batch.offsets, batch.lens, batch.masks)
-    }
-}
-
-/// MSD-filter one block of chunks (see [`msd_blocks`]) into descriptors. At
+/// MSD-filter one block of chunks (see [`BlockTiling`]) into descriptors. At
 /// the no-MSD bypass floor this is chunk by chunk, since the bypass's unit is
 /// the chunk; below it the recursion starts at the block.
 fn descriptors_for_block(
@@ -528,166 +688,675 @@ fn descriptors_for_block(
     descriptors_for_chunk(block, base, floor, field_start)
 }
 
-/// Run one niceonly field: MSD workers stream surviving-range descriptors
-/// through a channel while the calling thread batches them into dispatches, so
-/// the CPU filter and the device checks overlap instead of running as
-/// sequential phases.
+/// One message from an MSD worker to the dispatch thread.
+enum Msg {
+    /// A field entered the pipeline. Sent by `push` before any worker can see
+    /// the field, so it precedes every descriptor for it.
+    Begin {
+        seq: u64,
+        base: u32,
+        range: FieldSize,
+    },
+    /// Descriptors for `field`.
+    Ranges {
+        field: u64,
+        offsets: Vec<u64>,
+        lens: Vec<u32>,
+        masks: Vec<u64>,
+    },
+    /// Every descriptor for `seq` has been sent: each worker sends its last
+    /// batch for a field before counting itself out, and the last worker out
+    /// sends this, so on the channel's FIFO it follows them all.
+    End { seq: u64, msd_secs: f64 },
+}
+
+/// Descriptors one MSD worker has accumulated since its last send.
+#[derive(Default)]
+struct WorkerBatch {
+    offsets: Vec<u64>,
+    lens: Vec<u32>,
+    masks: Vec<u64>,
+    units: usize,
+}
+
+impl WorkerBatch {
+    /// Fold one unit's descriptors in. Empty units still count toward the
+    /// unit bound so a run of rejected blocks cannot delay a pending batch.
+    fn absorb(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) {
+        self.offsets.extend_from_slice(offsets);
+        self.lens.extend_from_slice(lens);
+        self.masks.extend_from_slice(masks);
+        self.units += 1;
+    }
+
+    fn is_ready(&self) -> bool {
+        self.offsets.len() >= WORKER_BATCH_RANGES || self.units >= WORKER_BATCH_CHUNKS
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    /// Hand the accumulated descriptors over as a message for `field`.
+    fn take(&mut self, field: u64) -> Msg {
+        let batch = std::mem::take(self);
+        Msg::Ranges {
+            field,
+            offsets: batch.offsets,
+            lens: batch.lens,
+            masks: batch.masks,
+        }
+    }
+
+    /// Fold one unit's descriptors in, sending full batches on the way.
+    /// A unit can yield far more than one batch's worth at a fine floor, so
+    /// this feeds it through in [`WORKER_BATCH_RANGES`] slices and never lets
+    /// a message outgrow the `PIPELINE_DEPTH` memory budget. The last slice
+    /// is left in the batch for the caller's ready check. `Err` means the
+    /// channel is closed.
+    fn feed(
+        &mut self,
+        field: u64,
+        offsets: &[u64],
+        lens: &[u32],
+        masks: &[u64],
+        tx: &SyncSender<Msg>,
+    ) -> Result<(), ()> {
+        if offsets.is_empty() {
+            self.absorb(&[], &[], &[]);
+            return Ok(());
+        }
+        let mut slices = offsets
+            .chunks(WORKER_BATCH_RANGES)
+            .zip(lens.chunks(WORKER_BATCH_RANGES))
+            .zip(masks.chunks(WORKER_BATCH_RANGES))
+            .peekable();
+        while let Some(((o, l), m)) = slices.next() {
+            self.absorb(o, l, m);
+            if slices.peek().is_some() && self.is_ready() && tx.send(self.take(field)).is_err() {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Send whatever is left (a batch that is ready, or the field's last
+    /// partial one). `Err` means the channel is closed.
+    fn flush(&mut self, field: u64, tx: &SyncSender<Msg>) -> Result<(), ()> {
+        if self.is_empty() {
+            *self = Self::default();
+            return Ok(());
+        }
+        tx.send(self.take(field)).map_err(|_| ())
+    }
+}
+
+/// One field's MSD work, shared by the workers.
+struct FieldWork {
+    seq: u64,
+    base: u32,
+    range: FieldSize,
+    tiling: BlockTiling,
+    next_block: AtomicUsize,
+    /// Workers that have run out of blocks here and moved on.
+    exited: AtomicUsize,
+    started: Mutex<Option<Instant>>,
+}
+
+/// State shared between the pipeline's threads.
+struct Shared {
+    fields: Mutex<FieldQueueState>,
+    field_added: Condvar,
+    /// Set when the pipeline is dropped; workers exit at their next look.
+    closed: AtomicBool,
+    workers: usize,
+}
+
+struct FieldQueueState {
+    /// Fields still being filtered, by sequence number. A field leaves once
+    /// every worker has exited it.
+    open: HashMap<u64, Arc<FieldWork>>,
+}
+
+impl Shared {
+    /// The field with sequence number `seq`, waiting for it to be pushed.
+    /// `None` once the pipeline has been closed.
+    fn wait_for_field(&self, seq: u64) -> Option<Arc<FieldWork>> {
+        let mut st = self.fields.lock().unwrap();
+        loop {
+            if let Some(f) = st.open.get(&seq) {
+                return Some(f.clone());
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            st = self.field_added.wait(st).unwrap();
+        }
+    }
+}
+
+/// The MSD worker loop: walk every field in sequence, filtering its blocks
+/// into descriptors for the dispatch thread. See [`Msg::End`] for the
+/// ordering this maintains.
+fn msd_worker(shared: &Shared, tx: &SyncSender<Msg>, error: &Mutex<Option<anyhow::Error>>) {
+    let mut seq = 0u64;
+    let mut batch = WorkerBatch::default();
+    while let Some(work) = shared.wait_for_field(seq) {
+        loop {
+            let i = work.next_block.fetch_add(1, Ordering::Relaxed);
+            let Some(block) = work.tiling.get(i) else {
+                break;
+            };
+            if i == 0 {
+                *work.started.lock().unwrap() = Some(Instant::now());
+            }
+            // The floor is read per block, not per field: the controller
+            // steps every half second, and a field on a slow device can take
+            // far longer than that. Sampling it once per field would let a
+            // whole field's worth of "device behind" pile up unobserved and
+            // slam the floor to its minimum for the next one. Every floor is
+            // sound, so mixing them within a field only changes the work.
+            let floor = floor_controller().floor();
+            match descriptors_for_block(block, work.base, floor, work.range.start()) {
+                Ok((offsets, lens, masks)) => {
+                    if batch.feed(work.seq, &offsets, &lens, &masks, tx).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    *error.lock().unwrap() = Some(e);
+                    // Leave the field as if finished so the pipeline reports
+                    // the error rather than waiting for descriptors forever.
+                    break;
+                }
+            }
+            if batch.is_ready() && batch.flush(work.seq, tx).is_err() {
+                return;
+            }
+        }
+        // Out of blocks: send our last batch for this field *before*
+        // counting ourselves out, so it precedes the End marker.
+        if batch.flush(work.seq, tx).is_err() {
+            return;
+        }
+        if work.exited.fetch_add(1, Ordering::AcqRel) + 1 == shared.workers {
+            let msd_secs = work
+                .started
+                .lock()
+                .unwrap()
+                .map_or(0.0, |t| t.elapsed().as_secs_f64());
+            shared.fields.lock().unwrap().open.remove(&work.seq);
+            if tx
+                .send(Msg::End {
+                    seq: work.seq,
+                    msd_secs,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+        seq += 1;
+    }
+}
+
+/// A field whose device work has been issued: what the pipeline hands back.
+pub struct FieldReady<P> {
+    pub seq: u64,
+    pub pending: Result<P>,
+    pub stats: NiceonlyStats,
+    pushed_at: Instant,
+}
+
+/// The dispatch side: consumes the workers' messages, batches descriptors
+/// into launches, and closes fields as their markers arrive. Generic over
+/// the sink so it serves both the threaded pipeline and the one-field
+/// synchronous form.
+struct Dispatcher<'a, S: RangeSink> {
+    sink: &'a mut S,
+    rx: &'a Receiver<Msg>,
+    controller: &'static FloorController,
+    /// Fields opened on the sink, with what has been launched for them.
+    open: HashMap<u64, OpenField>,
+    buf_offsets: Vec<u64>,
+    buf_lens: Vec<u32>,
+    buf_masks: Vec<u64>,
+    /// The field the launch buffer belongs to; a batch never mixes fields.
+    buf_field: Option<u64>,
+    first_error: Option<anyhow::Error>,
+}
+
+struct OpenField {
+    pushed_at: Instant,
+    floor: u128,
+    first_launch: Option<Instant>,
+    num_ranges: usize,
+    valid_numbers: u64,
+    launches: u32,
+    cpu_wait: Duration,
+    device_wait: Duration,
+}
+
+impl<S: RangeSink> Dispatcher<'_, S> {
+    fn flush_launch(&mut self) {
+        if self.buf_offsets.is_empty() {
+            return;
+        }
+        let Some(field) = self.buf_field else { return };
+        let t = Instant::now();
+        let outcome = self
+            .sink
+            .launch(field, &self.buf_offsets, &self.buf_lens, &self.buf_masks);
+        let waited = t.elapsed();
+        self.controller.observe(Duration::ZERO, waited);
+        if let Some(open) = self.open.get_mut(&field) {
+            open.first_launch.get_or_insert(t);
+            open.launches += 1;
+            open.device_wait += waited;
+        }
+        if let Err(e) = outcome
+            && self.first_error.is_none()
+        {
+            self.first_error = Some(e);
+        }
+        self.buf_offsets.clear();
+        self.buf_lens.clear();
+        self.buf_masks.clear();
+    }
+
+    /// Handle one message. Returns the field closed by it, if any.
+    fn handle(&mut self, msg: Msg) -> Option<FieldReady<S::Pending>> {
+        match msg {
+            Msg::Begin { seq, base, range } => {
+                if let Err(e) = self.sink.begin_field(seq, base, &range)
+                    && self.first_error.is_none()
+                {
+                    self.first_error = Some(e);
+                }
+                self.open.insert(
+                    seq,
+                    OpenField {
+                        pushed_at: Instant::now(),
+                        floor: floor_controller().floor(),
+                        first_launch: None,
+                        num_ranges: 0,
+                        valid_numbers: 0,
+                        launches: 0,
+                        cpu_wait: Duration::ZERO,
+                        device_wait: Duration::ZERO,
+                    },
+                );
+                None
+            }
+            Msg::Ranges {
+                field,
+                offsets,
+                lens,
+                masks,
+            } => {
+                if self.buf_field != Some(field) {
+                    self.flush_launch();
+                    self.buf_field = Some(field);
+                }
+                if let Some(open) = self.open.get_mut(&field) {
+                    open.num_ranges += offsets.len();
+                    open.valid_numbers += lens.iter().map(|&l| u64::from(l)).sum::<u64>();
+                }
+                self.buf_offsets.extend_from_slice(&offsets);
+                self.buf_lens.extend_from_slice(&lens);
+                self.buf_masks.extend_from_slice(&masks);
+                if self.buf_offsets.len() >= LAUNCH_BATCH_RANGES {
+                    self.flush_launch();
+                }
+                None
+            }
+            Msg::End { seq, msd_secs } => {
+                if self.buf_field == Some(seq) {
+                    self.flush_launch();
+                }
+                let open = self.open.remove(&seq)?;
+                let pending = match self.first_error.take() {
+                    Some(e) => Err(e),
+                    None => self.sink.end_field(seq),
+                };
+                Some(FieldReady {
+                    seq,
+                    pending,
+                    stats: NiceonlyStats {
+                        msd_secs,
+                        device_secs: 0.0,
+                        total_secs: 0.0,
+                        floor: open.floor,
+                        num_ranges: open.num_ranges,
+                        valid_numbers: open.valid_numbers,
+                        launches: open.launches,
+                        cpu_wait_secs: open.cpu_wait.as_secs_f64(),
+                        device_wait_secs: open.device_wait.as_secs_f64(),
+                        device_busy_secs: None,
+                    },
+                    pushed_at: open.pushed_at,
+                })
+            }
+        }
+    }
+
+    /// Block for the next message, charging the wait to the CPU side — but
+    /// only while a field is open. With nothing open the pipeline is idle for
+    /// an outside reason (the client waiting on a claim), and calling that
+    /// "the CPU is behind" would ratchet the floor up during every API stall.
+    fn recv(&mut self) -> Option<Msg> {
+        match self.rx.try_recv() {
+            Ok(m) => Some(m),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                let t = Instant::now();
+                let m = self.rx.recv().ok();
+                let waited = t.elapsed();
+                if let Some(oldest) = self.open.keys().min().copied() {
+                    self.controller.observe(waited, Duration::ZERO);
+                    if let Some(open) = self.open.get_mut(&oldest) {
+                        open.cpu_wait += waited;
+                    }
+                }
+                m
+            }
+        }
+    }
+}
+
+fn new_dispatcher<'a, S: RangeSink>(sink: &'a mut S, rx: &'a Receiver<Msg>) -> Dispatcher<'a, S> {
+    Dispatcher {
+        sink,
+        rx,
+        controller: floor_controller(),
+        open: HashMap::new(),
+        buf_offsets: Vec::new(),
+        buf_lens: Vec::new(),
+        buf_masks: Vec::new(),
+        buf_field: None,
+        first_error: None,
+    }
+}
+
+fn new_shared(workers: usize) -> Shared {
+    Shared {
+        fields: Mutex::new(FieldQueueState {
+            open: HashMap::new(),
+        }),
+        field_added: Condvar::new(),
+        closed: AtomicBool::new(false),
+        workers,
+    }
+}
+
+fn worker_count() -> usize {
+    std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+}
+
+/// Push a field into the shared state, after announcing it on the channel.
+fn push_field(
+    shared: &Shared,
+    tx: &SyncSender<Msg>,
+    seq: u64,
+    base: u32,
+    range: &FieldSize,
+) -> Result<()> {
+    let work = Arc::new(FieldWork {
+        seq,
+        base,
+        range: *range,
+        tiling: BlockTiling::new(range, 2 * shared.workers),
+        next_block: AtomicUsize::new(0),
+        exited: AtomicUsize::new(0),
+        started: Mutex::new(None),
+    });
+    // The announcement must precede every descriptor for the field on the
+    // channel: send it before the workers can see the field.
+    tx.send(Msg::Begin {
+        seq,
+        base,
+        range: *range,
+    })
+    .map_err(|_| anyhow!("niceonly pipeline dispatch thread is gone"))?;
+    let mut st = shared.fields.lock().unwrap();
+    st.open.insert(seq, work);
+    drop(st);
+    shared.field_added.notify_all();
+    Ok(())
+}
+
+/// Finish a closed field: wait for the device, read back, fill in the
+/// timings, log the summary line.
+fn complete_field<P: PendingField>(
+    backend: &str,
+    base: u32,
+    ready: FieldReady<P>,
+    error: &Mutex<Option<anyhow::Error>>,
+) -> Result<(NiceonlyStats, Vec<NiceNumberSimple>)> {
+    let mut stats = ready.stats;
+    let pending = ready.pending?;
+    let DeviceResult {
+        nice_numbers: results,
+        device_busy_secs,
+    } = Box::new(pending).wait()?;
+    stats.device_busy_secs = device_busy_secs;
+    stats.total_secs = ready.pushed_at.elapsed().as_secs_f64();
+    // The device span is not directly observable here without device
+    // timestamps; report the time from the End marker to results being
+    // ready, which is the tail the host actually waited on.
+    stats.device_secs = (stats.total_secs - stats.msd_secs).max(0.0);
+    if let Some(e) = error.lock().unwrap().take() {
+        return Err(e);
+    }
+    report_field(backend, base, stats);
+    Ok((stats, results))
+}
+
+/// Run one niceonly field on the calling thread: MSD workers stream
+/// descriptors while this thread batches them into launches, then the
+/// field's results are waited for and returned. This is the one-field form
+/// of [`NiceonlyPipeline`], for a sink that cannot leave the calling thread
+/// (Vulkan) and for tests; it has no cross-field overlap.
 ///
 /// **Range semantics**: half-open [`range_start`, `range_end`).
 ///
 /// # Errors
-/// Returns an error if a descriptor does not fit its 12-byte encoding, or on
-/// any device failure reported by the sink.
+/// Returns an error if a descriptor does not fit its encoding, or on any
+/// device failure reported by the sink.
 ///
 /// # Panics
 /// Panics if an MSD worker panicked while holding the error slot.
 pub fn run_range_pipeline<S: RangeSink>(
+    backend: &str,
     sink: &mut S,
     range: &FieldSize,
     base: u32,
-) -> Result<NiceonlyStats> {
-    let start_time = Instant::now();
-    let floor = gpu_msd_floor();
-    let num_threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    let chunks = msd_blocks(range, 2 * num_threads);
-    let num_threads = num_threads.min(chunks.len().max(1));
-
-    let next_chunk = AtomicUsize::new(0);
+) -> Result<(NiceonlyStats, Vec<NiceNumberSimple>)> {
+    let shared = new_shared(worker_count());
+    let (tx, rx) = sync_channel::<Msg>(PIPELINE_DEPTH);
     let worker_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u64>, Vec<u32>, Vec<u64>)>(PIPELINE_DEPTH);
+    push_field(&shared, &tx, 0, base, range)?;
+    // Closing right away makes the workers exit after this one field.
+    shared.closed.store(true, Ordering::Release);
 
-    let mut stats = NiceonlyStats {
-        msd_secs: 0.0,
-        device_secs: 0.0,
-        total_secs: 0.0,
-        num_ranges: 0,
-        valid_numbers: 0,
-        launches: 0,
-    };
-    let mut buf_offsets: Vec<u64> = Vec::new();
-    let mut buf_lens: Vec<u32> = Vec::new();
-    let mut buf_masks: Vec<u64> = Vec::new();
-    let mut launch_error: Option<anyhow::Error> = None;
-
-    std::thread::scope(|scope| {
-        let chunks = &chunks;
-        let next_chunk = &next_chunk;
+    let ready = std::thread::scope(|scope| {
+        let shared = &shared;
         let worker_error = &worker_error;
-        for _ in 0..num_threads {
+        for _ in 0..shared.workers {
             let tx = tx.clone();
-            scope.spawn(move || {
-                let mut batch = WorkerBatch::default();
-                loop {
-                    let i = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    let Some(block) = chunks.get(i) else { break };
-                    match descriptors_for_block(*block, base, floor, range.start()) {
-                        Ok((offsets, lens, masks)) => {
-                            if batch.feed(&offsets, &lens, &masks, &tx).is_err() {
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            *worker_error.lock().unwrap() = Some(e);
-                            return;
-                        }
-                    }
-                    if batch.is_ready() {
-                        if batch.is_empty() {
-                            // A run of rejected chunks: nothing to send, but
-                            // start the chunk count over.
-                            batch = WorkerBatch::default();
-                        } else if tx.send(batch.take()).is_err() {
-                            // A closed channel means the consumer gave up on a
-                            // launch error; the remaining chunks are moot.
-                            return;
-                        }
-                    }
-                }
-                if !batch.is_empty() {
-                    // Nothing to do about a closed channel here either.
-                    let _ = tx.send(batch.take());
-                }
-            });
+            scope.spawn(move || msd_worker(shared, &tx, worker_error));
         }
-        // The consumer runs on this thread while the workers produce. The
-        // clone of `tx` held by each worker keeps the channel open; dropping
-        // ours lets `recv` disconnect once they all finish.
         drop(tx);
-
-        while let Ok((offsets, lens, masks)) = rx.recv() {
-            stats.num_ranges += offsets.len();
-            stats.valid_numbers += lens.iter().map(|&l| u64::from(l)).sum::<u64>();
-            buf_offsets.extend_from_slice(&offsets);
-            buf_lens.extend_from_slice(&lens);
-            buf_masks.extend_from_slice(&masks);
-            if buf_offsets.len() >= LAUNCH_BATCH_RANGES {
-                let t = Instant::now();
-                let outcome = sink.launch(&buf_offsets, &buf_lens, &buf_masks);
-                stats.device_secs += t.elapsed().as_secs_f64();
-                if let Err(e) = outcome {
-                    launch_error = Some(e);
-                    break;
-                }
-                stats.launches += 1;
-                buf_offsets.clear();
-                buf_lens.clear();
-                buf_masks.clear();
+        let mut d = new_dispatcher(sink, &rx);
+        let mut ready = None;
+        while let Some(msg) = d.recv() {
+            if let Some(r) = d.handle(msg) {
+                ready = Some(r);
             }
         }
-        // Break out of the consume loop and the workers are still producing
-        // into a *bounded* channel. Dropping the receiver here is what unblocks
-        // the ones already parked in `send`; without it the scope below would
-        // wait for threads that are waiting for us, forever.
+        // Workers may still be parked in `send` if a launch failed and we
+        // stopped consuming; dropping the receiver wakes them.
+        drop(d);
         drop(rx);
-
-        // Workers are done (or the launch failed); either way this marks the
-        // end of the CPU-side phase. Time already spent inside the sink is not
-        // MSD time, however synchronous that sink happens to be.
-        stats.msd_secs = (start_time.elapsed().as_secs_f64() - stats.device_secs).max(0.0);
+        ready
     });
-
-    if let Some(e) = launch_error {
-        return Err(e);
-    }
-    if let Some(e) = worker_error.into_inner().unwrap() {
-        return Err(e);
-    }
-    let tail = Instant::now();
-    if !buf_offsets.is_empty() {
-        sink.launch(&buf_offsets, &buf_lens, &buf_masks)?;
-        stats.launches += 1;
-    }
-    sink.sync()?;
-    stats.device_secs += tail.elapsed().as_secs_f64();
-    stats.total_secs = start_time.elapsed().as_secs_f64();
-
-    debug!(
-        "GPU niceonly pipeline b{base}: {} ranges in {} dispatches, {} candidates",
-        stats.num_ranges, stats.launches, stats.valid_numbers,
-    );
-    Ok(stats)
+    let ready = ready.ok_or_else(|| anyhow!("pipeline ended without closing the field"))?;
+    complete_field(backend, base, ready, &worker_error)
 }
 
-/// Log the per-field summary and feed the measurement back into the adaptive
-/// MSD floor. Both backends report the same line.
+/// A continuous niceonly pipeline over one device: fields go in with
+/// [`NiceonlyPipeline::push`] and come out, in order, from
+/// [`NiceonlyPipeline::next_result`]. The MSD workers move on to the next
+/// pushed field the moment they run out of blocks on the current one, and
+/// the dispatch thread launches each field's batches as they arrive, so with
+/// two fields open the device drains one while the CPU filters the next.
 ///
-/// # Panics
-/// Panics if the adaptive-floor mutex was poisoned by an earlier panic.
+/// Threads: [`worker_count`] MSD workers, one dispatch thread owning the
+/// sink, and the caller, who waits for results. Dropping the pipeline stops
+/// the workers and dispatcher; fields still open are abandoned.
+pub struct NiceonlyPipeline<P: PendingField> {
+    backend: &'static str,
+    shared: Arc<Shared>,
+    /// `Option` only so `Drop` can release it before joining the threads:
+    /// the dispatcher exits when every sender is gone.
+    tx: Option<SyncSender<Msg>>,
+    /// Likewise: a dispatcher blocked handing over a result must be released.
+    results: Option<Receiver<FieldReady<P>>>,
+    worker_error: Arc<Mutex<Option<anyhow::Error>>>,
+    next_seq: u64,
+    /// `(seq, base)` of fields pushed and not yet returned, in order.
+    outstanding: VecDeque<(u64, u32)>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl<P: PendingField + Send + 'static> NiceonlyPipeline<P> {
+    /// Start the workers and the dispatch thread over `sink`.
+    pub fn start<S: RangeSink<Pending = P> + Send + 'static>(
+        backend: &'static str,
+        mut sink: S,
+    ) -> Self {
+        let workers = worker_count();
+        let shared = Arc::new(new_shared(workers));
+        let (tx, rx) = sync_channel::<Msg>(PIPELINE_DEPTH);
+        let (results_tx, results) = sync_channel::<FieldReady<P>>(fields_in_flight() + 1);
+        let worker_error = Arc::new(Mutex::new(None));
+        let mut threads = Vec::with_capacity(workers + 1);
+        for _ in 0..workers {
+            let shared = shared.clone();
+            let tx = tx.clone();
+            let worker_error = worker_error.clone();
+            threads.push(std::thread::spawn(move || {
+                msd_worker(&shared, &tx, &worker_error);
+            }));
+        }
+        threads.push(std::thread::spawn(move || {
+            let mut d = new_dispatcher(&mut sink, &rx);
+            while let Some(msg) = d.recv() {
+                if let Some(ready) = d.handle(msg)
+                    && results_tx.send(ready).is_err()
+                {
+                    // The caller is gone; nothing to deliver to.
+                    return;
+                }
+            }
+        }));
+        Self {
+            backend,
+            shared,
+            tx: Some(tx),
+            results: Some(results),
+            worker_error,
+            next_seq: 0,
+            outstanding: VecDeque::new(),
+            threads,
+        }
+    }
+
+    /// Enter a field. Returns immediately; the workers pick it up as soon as
+    /// they finish the fields before it.
+    ///
+    /// # Errors
+    /// Returns an error if the dispatch thread has exited.
+    ///
+    /// # Panics
+    /// Panics if the shared field-queue mutex was poisoned by an earlier panic.
+    pub fn push(&mut self, base: u32, range: &FieldSize) -> Result<()> {
+        let seq = self.next_seq;
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("niceonly pipeline is shut down"))?;
+        push_field(&self.shared, tx, seq, base, range)?;
+        self.outstanding.push_back((seq, base));
+        self.next_seq += 1;
+        Ok(())
+    }
+
+    /// Fields pushed and not yet returned.
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        self.outstanding.len()
+    }
+
+    /// Wait for the oldest outstanding field: blocks until its device work is
+    /// done and its results are read back.
+    ///
+    /// # Errors
+    /// The field's error (device failure, descriptor overflow), or the
+    /// pipeline having stopped.
+    ///
+    /// # Panics
+    /// Panics if an MSD worker's error slot mutex was poisoned by an earlier panic.
+    pub fn next_result(&mut self) -> Result<(NiceonlyStats, Vec<NiceNumberSimple>)> {
+        let (seq, base) = self
+            .outstanding
+            .pop_front()
+            .ok_or_else(|| anyhow!("no field outstanding in the niceonly pipeline"))?;
+        let ready = self
+            .results
+            .as_ref()
+            .ok_or_else(|| anyhow!("niceonly pipeline is shut down"))?
+            .recv()
+            .map_err(|_| anyhow!("niceonly pipeline dispatch thread is gone"))?;
+        debug_assert_eq!(ready.seq, seq);
+        complete_field(self.backend, base, ready, &self.worker_error)
+    }
+}
+
+impl<P: PendingField> Drop for NiceonlyPipeline<P> {
+    fn drop(&mut self) {
+        // Workers parked waiting for a field exit once they see `closed`.
+        self.shared.closed.store(true, Ordering::Release);
+        self.shared.field_added.notify_all();
+        // The dispatcher exits when the last sender is gone — ours must go
+        // before the join, and the workers' go with them. A dispatcher parked
+        // handing over a result is released by dropping the receiver.
+        drop(self.tx.take());
+        drop(self.results.take());
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Log the per-field summary. Both backends report the same line.
 #[allow(clippy::cast_precision_loss)]
-pub fn report_field(backend: &str, base: u32, range: &FieldSize, stats: &NiceonlyStats) {
+pub fn report_field(backend: &str, base: u32, stats: NiceonlyStats) {
     debug!(
-        "{backend} niceonly b{base}: msd {:.3}s -> {} ranges ({:.2}% of field), gpu {:.3}s, total {:.3}s, {:.2e} n/s overall",
+        "{backend} niceonly b{base}: floor {} msd {:.3}s -> {} ranges ({:.3e} numbers), gpu {:.3}s, total {:.3}s, {} launches, waited cpu {:.3}s device {:.3}s, device busy {}",
+        stats.floor,
         stats.msd_secs,
         stats.num_ranges,
-        100.0 * stats.valid_numbers as f64 / range.size() as f64,
+        stats.valid_numbers as f64,
         stats.device_secs,
         stats.total_secs,
-        range.size() as f64 / stats.total_secs,
+        stats.launches,
+        stats.cpu_wait_secs,
+        stats.device_wait_secs,
+        stats
+            .device_busy_secs
+            .map_or_else(|| "n/a".to_string(), |b| format!("{b:.3}s")),
     );
-    adaptive_floor()
-        .lock()
-        .unwrap()
-        .update(stats.msd_secs, stats.total_secs);
 }
 
 /// The answer for a residue-empty base, if this is one.
@@ -818,22 +1487,44 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    /// Nothing to wait for: the test sinks have no device.
+    struct NoResults;
+
+    impl PendingField for NoResults {
+        fn wait(self: Box<Self>) -> Result<DeviceResult> {
+            Ok(DeviceResult {
+                nice_numbers: Vec::new(),
+                device_busy_secs: None,
+            })
+        }
+    }
+
     /// A sink that records what it was handed instead of touching a device.
     #[derive(Default)]
     struct Recorder {
         batches: Vec<(Vec<u64>, Vec<u32>, Vec<u64>)>,
-        synced: bool,
+        closed: bool,
     }
 
     impl RangeSink for Recorder {
-        fn launch(&mut self, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
+        type Pending = NoResults;
+        fn begin_field(&mut self, _seq: u64, _base: u32, _range: &FieldSize) -> Result<()> {
+            Ok(())
+        }
+        fn launch(
+            &mut self,
+            _field: u64,
+            offsets: &[u64],
+            lens: &[u32],
+            masks: &[u64],
+        ) -> Result<()> {
             self.batches
                 .push((offsets.to_vec(), lens.to_vec(), masks.to_vec()));
             Ok(())
         }
-        fn sync(&mut self) -> Result<()> {
-            self.synced = true;
-            Ok(())
+        fn end_field(&mut self, _seq: u64) -> Result<Self::Pending> {
+            self.closed = true;
+            Ok(NoResults)
         }
     }
 
@@ -841,8 +1532,21 @@ mod tests {
     struct Failing;
 
     impl RangeSink for Failing {
-        fn launch(&mut self, _offsets: &[u64], _lens: &[u32], _masks: &[u64]) -> Result<()> {
+        type Pending = NoResults;
+        fn begin_field(&mut self, _seq: u64, _base: u32, _range: &FieldSize) -> Result<()> {
+            Ok(())
+        }
+        fn launch(
+            &mut self,
+            _field: u64,
+            _offsets: &[u64],
+            _lens: &[u32],
+            _masks: &[u64],
+        ) -> Result<()> {
             anyhow::bail!("simulated device failure")
+        }
+        fn end_field(&mut self, _seq: u64) -> Result<Self::Pending> {
+            Ok(NoResults)
         }
     }
 
@@ -875,7 +1579,7 @@ mod tests {
                 .unwrap()
                 .range_start;
             let field = FieldSize::new(start, start + 500_000_000_000);
-            let _ = tx.send(run_range_pipeline(&mut Failing, &field, base).is_err());
+            let _ = tx.send(run_range_pipeline("test", &mut Failing, &field, base).is_err());
         });
         let errored = rx
             .recv_timeout(Duration::from_mins(2))
@@ -883,32 +1587,282 @@ mod tests {
         assert!(errored, "the launch failure must reach the caller");
     }
 
-    /// The controller's ratchet must stop short of the no-MSD bypass, however
-    /// many fields report a negligible device tail. Only an explicit
-    /// `NICE_GPU_MSD_FLOOR` pin may reach it.
-    #[test]
-    fn adaptive_floor_never_ratchets_into_the_bypass() {
-        let mut floor = AdaptiveFloor {
-            floor: ADAPT_BASE_CORE_PRODUCT / 32.0,
-            warmup: 0,
-        };
-        for _ in 0..100 {
-            // A field where the workers took a while and the device tail was
-            // nothing: the strongest possible "raise the floor" signal.
-            floor.update(5.0, 5.0);
+    /// A sink for the threaded pipeline: records every launch by field,
+    /// checks the protocol (a field is opened before its first launch, and
+    /// nothing arrives for it after it is closed), and hands the field's
+    /// descriptor count back as its "result".
+    #[derive(Default)]
+    struct MockDevice {
+        opened: Vec<u64>,
+        closed: Vec<u64>,
+        ranges: HashMap<u64, Vec<(u64, u32, u64)>>,
+        launches: HashMap<u64, u32>,
+    }
+
+    struct MockSink(Arc<Mutex<MockDevice>>);
+
+    struct MockPending {
+        device: Arc<Mutex<MockDevice>>,
+        seq: u64,
+    }
+
+    impl PendingField for MockPending {
+        fn wait(self: Box<Self>) -> Result<DeviceResult> {
+            // Encode "how many descriptors this field had" as a fake hit.
+            let n = self
+                .device
+                .lock()
+                .unwrap()
+                .ranges
+                .get(&self.seq)
+                .map_or(0, Vec::len);
+            Ok(DeviceResult {
+                nice_numbers: vec![NiceNumberSimple {
+                    number: n as u128,
+                    num_uniques: self.seq as u32,
+                }],
+                device_busy_secs: None,
+            })
         }
-        #[allow(clippy::cast_precision_loss)]
-        let bypass = PROCESSING_CHUNK_SIZE as f64;
-        assert!(
-            floor.floor < bypass,
-            "floor {} reached the bypass",
-            floor.floor
+    }
+
+    impl RangeSink for MockSink {
+        type Pending = MockPending;
+        fn begin_field(&mut self, seq: u64, _base: u32, _range: &FieldSize) -> Result<()> {
+            let mut d = self.0.lock().unwrap();
+            assert!(!d.opened.contains(&seq), "field {seq} opened twice");
+            d.opened.push(seq);
+            Ok(())
+        }
+        fn launch(
+            &mut self,
+            field: u64,
+            offsets: &[u64],
+            lens: &[u32],
+            masks: &[u64],
+        ) -> Result<()> {
+            let mut d = self.0.lock().unwrap();
+            assert!(
+                d.opened.contains(&field),
+                "launch for field {field} before it was opened"
+            );
+            assert!(
+                !d.closed.contains(&field),
+                "launch for field {field} after it was closed"
+            );
+            let entry = d.ranges.entry(field).or_default();
+            for ((&o, &l), &m) in offsets.iter().zip(lens).zip(masks) {
+                entry.push((o, l, m));
+            }
+            *d.launches.entry(field).or_default() += 1;
+            Ok(())
+        }
+        fn end_field(&mut self, seq: u64) -> Result<Self::Pending> {
+            let mut d = self.0.lock().unwrap();
+            assert!(d.opened.contains(&seq));
+            d.closed.push(seq);
+            Ok(MockPending {
+                device: self.0.clone(),
+                seq,
+            })
+        }
+    }
+
+    /// Windows of base 40 that both keep and reject, for the pipeline tests.
+    fn mixed_windows(n: usize) -> Vec<FieldSize> {
+        let base = 40;
+        let start = crate::base_range::get_base_range_u128(base)
+            .unwrap()
+            .unwrap()
+            .range_start;
+        let span = 300 * PROCESSING_CHUNK_SIZE;
+        (0u128..2000)
+            .map(|i| FieldSize::new(start + i * span, start + (i + 1) * span))
+            .filter(|f| {
+                let n: usize = f
+                    .chunks(PROCESSING_CHUNK_SIZE)
+                    .into_iter()
+                    .map(|c| {
+                        descriptors_for_chunk(c, base, 4000, f.start())
+                            .unwrap()
+                            .0
+                            .len()
+                    })
+                    .sum();
+                n > 0
+            })
+            .take(n)
+            .collect()
+    }
+
+    /// The threaded pipeline returns fields in push order, each with exactly
+    /// the descriptors the one-field form produces for it, keeps the sink's
+    /// open/launch/close protocol, and lets several fields be open at once.
+    #[test]
+    fn threaded_pipeline_matches_the_one_field_form_field_by_field() {
+        let base = 40;
+        let fields = mixed_windows(3);
+        assert_eq!(fields.len(), 3, "need three mixed windows in base 40");
+        let device = Arc::new(Mutex::new(MockDevice::default()));
+        let mut pipeline = NiceonlyPipeline::start("test", MockSink(device.clone()));
+
+        // Two open at once, like the client runs it.
+        pipeline.push(base, &fields[0]).unwrap();
+        pipeline.push(base, &fields[1]).unwrap();
+        assert_eq!(pipeline.outstanding(), 2);
+        let (stats0, hits0) = pipeline.next_result().unwrap();
+        pipeline.push(base, &fields[2]).unwrap();
+        let (stats1, hits1) = pipeline.next_result().unwrap();
+        let (stats2, hits2) = pipeline.next_result().unwrap();
+        assert_eq!(pipeline.outstanding(), 0);
+        assert_eq!(
+            (
+                hits0[0].num_uniques,
+                hits1[0].num_uniques,
+                hits2[0].num_uniques
+            ),
+            (0, 1, 2),
+            "results must come back in push order"
         );
-        assert!((floor.floor - MSD_FLOOR_MAX).abs() < f64::EPSILON);
-        // And the clamp is a real cap, not a coincidence of the step size.
-        floor.floor = MSD_FLOOR_MAX * 0.99;
-        floor.update(5.0, 5.0);
-        assert!((floor.floor - MSD_FLOOR_MAX).abs() < f64::EPSILON);
+
+        let d = device.lock().unwrap();
+        assert_eq!(d.opened, vec![0, 1, 2]);
+        assert_eq!(d.closed, vec![0, 1, 2]);
+        for (seq, (field, stats)) in fields.iter().zip([stats0, stats1, stats2]).enumerate() {
+            let seq = seq as u64;
+            let mut sink = Recorder::default();
+            let (ref_stats, _) = run_range_pipeline("test", &mut sink, field, base).unwrap();
+            let mut expected: Vec<(u64, u32, u64)> = sink
+                .batches
+                .iter()
+                .flat_map(|(o, l, m)| {
+                    o.iter()
+                        .zip(l)
+                        .zip(m)
+                        .map(|((&o, &l), &m)| (o, l, m))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            expected.sort_unstable();
+            let mut got = d.ranges.get(&seq).cloned().unwrap_or_default();
+            got.sort_unstable();
+            assert_eq!(
+                got, expected,
+                "field {seq}: descriptors differ from the one-field form"
+            );
+            assert_eq!(stats.num_ranges, ref_stats.num_ranges);
+            assert_eq!(stats.valid_numbers, ref_stats.valid_numbers);
+            assert_eq!(stats.launches, d.launches[&seq]);
+            assert!(stats.total_secs > 0.0);
+        }
+    }
+
+    /// A device failure surfaces from `next_result` for the field it hit,
+    /// and neither that nor dropping the pipeline with work outstanding
+    /// hangs.
+    #[test]
+    fn threaded_pipeline_reports_errors_and_drops_cleanly() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let base = 40;
+            let fields = mixed_windows(2);
+            let mut pipeline = NiceonlyPipeline::start("test", Failing);
+            pipeline.push(base, &fields[0]).unwrap();
+            pipeline.push(base, &fields[1]).unwrap();
+            let first = pipeline.next_result();
+            // Drop with a field still outstanding.
+            drop(pipeline);
+            let _ = tx.send(first.is_err());
+        });
+        let errored = rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("the pipeline hung on error or on drop");
+        assert!(errored, "the launch failure must reach next_result");
+    }
+
+    /// A field the filter rejects entirely still comes back, promptly and
+    /// empty: the End marker must not depend on any descriptor having flowed.
+    #[test]
+    fn threaded_pipeline_returns_fully_rejected_fields() {
+        let base = 50;
+        // Base 50's band start is MSD-strong: everything is rejected.
+        let start = crate::base_range::get_base_range_u128(base)
+            .unwrap()
+            .unwrap()
+            .range_start;
+        let field = FieldSize::new(start, start + 100 * PROCESSING_CHUNK_SIZE);
+        let device = Arc::new(Mutex::new(MockDevice::default()));
+        let mut pipeline = NiceonlyPipeline::start("test", MockSink(device.clone()));
+        pipeline.push(base, &field).unwrap();
+        let (stats, _) = pipeline.next_result().unwrap();
+        assert_eq!(stats.num_ranges, 0);
+        assert_eq!(stats.launches, 0);
+        let d = device.lock().unwrap();
+        assert_eq!(d.opened, vec![0]);
+        assert_eq!(d.closed, vec![0]);
+    }
+
+    /// The controller moves toward whichever side waited, holds when neither
+    /// did, never leaves `[MSD_FLOOR_MIN, MSD_FLOOR_MAX]`, and ignores
+    /// everything when pinned.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn floor_controller_steers_toward_the_waiting_side() {
+        let interval = FLOOR_ADJUST_INTERVAL;
+        // Force an adjustment: pretend the interval has elapsed.
+        // Pretend exactly one interval (plus a hair) has elapsed, so a wait
+        // of `interval` reads as "the whole interval".
+        let elapse = |c: &FloorController| {
+            c.state.lock().unwrap().interval_start = Instant::now()
+                .checked_sub(interval + Duration::from_micros(10))
+                .unwrap();
+        };
+        let c = FloorController::new(100_000.0, false);
+        // The device waited (launch blocked) for most of the interval: down.
+        elapse(&c);
+        c.observe(Duration::ZERO, interval);
+        assert!((c.floor() as f64 - 100_000.0 / FLOOR_STEP).abs() < 5.0);
+        // The CPU waited (recv blocked) the whole interval: up, full step.
+        let before = c.floor() as f64;
+        elapse(&c);
+        c.observe(interval, Duration::ZERO);
+        assert!((c.floor() as f64 - before * FLOOR_STEP).abs() < 5.0);
+        // Neither waited enough: hold.
+        let before = c.floor();
+        elapse(&c);
+        c.observe(interval.mul_f64(0.05), interval.mul_f64(0.05));
+        assert_eq!(c.floor(), before);
+        // Both waited, device a little more: down, but only a little — the
+        // step is proportional to the imbalance (0.2 here → 5%).
+        elapse(&c);
+        c.observe(interval.mul_f64(0.3), interval.mul_f64(0.5));
+        let expected = before as f64 / (1.0 + (FLOOR_STEP - 1.0) * 0.2);
+        assert!(
+            (c.floor() as f64 - expected).abs() < 2.0,
+            "{} vs {expected}",
+            c.floor()
+        );
+
+        // Clamped at both ends, never into the bypass.
+        let c = FloorController::new(MSD_FLOOR_MAX * 0.9, false);
+        for _ in 0..10 {
+            elapse(&c);
+            c.observe(interval, Duration::ZERO);
+        }
+        assert_eq!(c.floor(), MSD_FLOOR_MAX as u128);
+        assert!(c.floor() < PROCESSING_CHUNK_SIZE);
+        let c = FloorController::new(MSD_FLOOR_MIN * 1.1, false);
+        for _ in 0..10 {
+            elapse(&c);
+            c.observe(Duration::ZERO, interval);
+        }
+        assert_eq!(c.floor(), MSD_FLOOR_MIN as u128);
+
+        // Pinned: nothing moves.
+        let c = FloorController::new(777.0, true);
+        elapse(&c);
+        c.observe(interval, Duration::ZERO);
+        assert_eq!(c.floor(), 777);
     }
 
     /// Blocks are power-of-two chunk counts covering the field exactly, the
@@ -1016,7 +1970,15 @@ mod tests {
         assert!(!batch.is_ready());
         batch.absorb(&[7], &[1], &[0]);
         assert!(batch.is_ready());
-        let (offsets, lens, masks) = batch.take();
+        let Msg::Ranges {
+            offsets,
+            lens,
+            masks,
+            ..
+        } = batch.take(0)
+        else {
+            panic!("take yields a Ranges message")
+        };
         assert_eq!(offsets.len(), WORKER_BATCH_RANGES);
         assert_eq!(lens.len(), WORKER_BATCH_RANGES);
         assert_eq!(masks.len(), WORKER_BATCH_RANGES);
@@ -1031,7 +1993,10 @@ mod tests {
             batch.absorb(&[i as u64], &[1], &[0]);
         }
         assert!(batch.is_ready());
-        assert_eq!(batch.take().0.len(), WORKER_BATCH_CHUNKS);
+        let Msg::Ranges { offsets, .. } = batch.take(0) else {
+            panic!("take yields a Ranges message")
+        };
+        assert_eq!(offsets.len(), WORKER_BATCH_CHUNKS);
 
         // Rejected chunks count toward the chunk bound but leave it empty, so
         // the worker resets it instead of sending nothing.
@@ -1090,8 +2055,8 @@ mod tests {
         let field = FieldSize::new(range.range_start, range.range_end);
 
         let mut sink = Recorder::default();
-        let stats = run_range_pipeline(&mut sink, &field, base).expect("pipeline");
-        assert!(sink.synced, "the pipeline must sync the sink");
+        let (stats, _) = run_range_pipeline("test", &mut sink, &field, base).expect("pipeline");
+        assert!(sink.closed, "the pipeline must close the field on the sink");
         assert_eq!(
             stats.num_ranges,
             sink.batches.iter().map(|(o, _, _)| o.len()).sum::<usize>()
