@@ -35,6 +35,8 @@ cubecl-cuda = ["cubecl", "nice_common/cubecl-cuda"]
 # Direct compilers for the cubecl (wgpu) backend; see nice_common.
 cubecl-spirv = ["cubecl", "nice_common/cubecl-spirv"]
 cubecl-metal = ["cubecl", "nice_common/cubecl-metal"]
+# CubeCL over ROCm/HIP (AMD, needs ROCm at build and run time; not in `gpu`).
+cubecl-hip = ["cubecl", "nice_common/cubecl-hip"]
 
 [dependencies]
 nice_common = { workspace = true }

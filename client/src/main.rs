@@ -75,6 +75,10 @@ enum GpuBackend {
     /// `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda`
     /// feature and, like `cuda`, the CUDA toolkit at runtime for NVRTC).
     CubeclCuda,
+    /// `CubeCL` over its native HIP runtime (AMD; needs the `cubecl-hip`
+    /// feature, which links against `ROCm` at build time). Never chosen by
+    /// `auto`.
+    CubeclHip,
 }
 
 /// An initialized GPU backend.
@@ -319,6 +323,12 @@ fn compiled_backends() -> String {
     if cfg!(feature = "cubecl") {
         have.push("cubecl");
     }
+    if cfg!(feature = "cubecl-cuda") {
+        have.push("cubecl-cuda");
+    }
+    if cfg!(feature = "cubecl-hip") {
+        have.push("cubecl-hip");
+    }
     if have.is_empty() {
         "none".to_string()
     } else {
@@ -490,6 +500,27 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 }
                 info!("CUDA unavailable; trying the next backend");
                 debug!("  CUDA init failed: {e:#}");
+            }
+        }
+    }
+
+    // Explicit only: the HIP runtime is an evaluation arm, not part of auto.
+    #[cfg(feature = "cubecl-hip")]
+    if want == GpuBackend::CubeclHip {
+        let attempt = guarded_init("the CubeCL HIP runtime could not be started", || {
+            CubeclContext::new_hip(cli.gpu_device)
+        });
+        match attempt {
+            Ok(ctx) => {
+                info!(
+                    "GPU initialized: CubeCL HIP device {}, batch size {}",
+                    cli.gpu_device, CUBECL_BATCH_SIZE
+                );
+                return Some(Arc::new(GpuHandle::Cubecl(ctx)));
+            }
+            Err(e) => {
+                error!("Failed to initialize CubeCL HIP runtime: {e:?}");
+                std::process::exit(1);
             }
         }
     }
