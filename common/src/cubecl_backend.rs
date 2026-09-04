@@ -1430,7 +1430,11 @@ pub enum CubeclContext {
         client: cubecl::prelude::ComputeClient<cubecl::hip::HipRuntime>,
         device_name: String,
         /// Per-base niceonly plans, cached across fields — see [`NiceonlyPlan`].
-        niceonly_plans: Mutex<HashMap<u32, Arc<NiceonlyPlan>>>,
+        /// Shared with the niceonly pipeline's dispatch thread.
+        niceonly_plans: Arc<Mutex<HashMap<u32, Arc<NiceonlyPlan>>>>,
+        /// The continuous niceonly pipeline, started on the first niceonly field.
+        niceonly_pipeline:
+            Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::hip::HipRuntime>>>>,
     },
 }
 
@@ -1666,7 +1670,8 @@ impl CubeclContext {
         Ok(Self::Hip {
             client,
             device_name: format!("cubecl-hip device {device_index}"),
-            niceonly_plans: Mutex::new(HashMap::new()),
+            niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
+            niceonly_pipeline: Mutex::new(None),
         })
     }
 
@@ -2058,13 +2063,15 @@ pub fn begin_niceonly_cubecl(
         CubeclContext::Hip {
             client,
             niceonly_plans,
+            niceonly_pipeline,
             ..
-        } => niceonly_impl(
+        } => begin_impl(
             client,
-            cached_plan(niceonly_plans, client, base, software)?,
+            niceonly_plans,
+            niceonly_pipeline,
+            software,
             range,
             base,
-            wide_chunk_for(client),
         ),
     }
 }
@@ -2084,6 +2091,10 @@ pub fn finish_niceonly_cubecl(ctx: &CubeclContext) -> Result<(FieldResults, Nice
         } => finish_impl(niceonly_pipeline),
         #[cfg(feature = "cubecl-cuda")]
         CubeclContext::Cuda {
+            niceonly_pipeline, ..
+        } => finish_impl(niceonly_pipeline),
+        #[cfg(feature = "cubecl-hip")]
+        CubeclContext::Hip {
             niceonly_pipeline, ..
         } => finish_impl(niceonly_pipeline),
     }
