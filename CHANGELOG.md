@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix every NVIDIA niceonly field failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field in v3.4.4: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure can no longer fail a field (it only drops `device_busy_secs`), and a GPU test runs a field through the pipeline and checks the busy time comes back.
+
 ## Nice v3.4.4
 
 - Make the GPU niceonly pipeline hand off results from the CPU MSD filter on an adaptive time basis instead of by size. This should ensure that the GPU and CPU are both utilized to their max. Times are recorded and saved in telemetry, if enabled. See environment knobs `NICE_GPU_MSD_FLOOR`, `NICE_GPU_FIELDS_IN_FLIGHT`, and `NICE_GPU_BATCHES_IN_FLIGHT` for control, though these may be removed in the future.
