@@ -49,6 +49,7 @@ use crate::{
 };
 use crate::{base_range, number_stats, stride_filter};
 use anyhow::{Context as _, Result, bail, ensure};
+use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{
     CudaContext as DriverContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig,
     PushKernelArg,
@@ -461,6 +462,20 @@ struct CudaOpenField {
     batches: Vec<(CudaEvent, CudaEvent)>,
 }
 
+/// Record an event that can be timed against another. cudarc's
+/// `record_event(None)` creates events with `CU_EVENT_DISABLE_TIMING`, and
+/// `cuEventElapsedTime` on such an event fails with
+/// `CUDA_ERROR_INVALID_HANDLE` — which is what took down every niceonly
+/// field's `wait` in v3.4.4. The backpressure ring keeps the cheaper
+/// timing-disabled events; only the pairs that are ever subtracted use this.
+fn record_timing_event(stream: &CudaStream) -> Result<CudaEvent> {
+    let event = stream
+        .context()
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+    event.record(stream)?;
+    Ok(event)
+}
+
 /// A closed field's device work: the events bracketing it and the buffers
 /// its results land in. Waited for on the client's thread.
 pub struct CudaPendingField {
@@ -476,19 +491,32 @@ pub struct CudaPendingField {
 impl PendingField for CudaPendingField {
     fn wait(self: Box<Self>) -> Result<DeviceResult> {
         self.end.synchronize()?;
-        if let Some(start) = &self.start
-            && let Ok(ms) = start.elapsed_ms(&self.end)
-        {
-            debug!(
-                "GPU niceonly field device span {:.3}s",
-                f64::from(ms) / 1000.0
-            );
+        if let Some(start) = &self.start {
+            match start.elapsed_ms(&self.end) {
+                Ok(ms) => debug!(
+                    "GPU niceonly field device span {:.3}s",
+                    f64::from(ms) / 1000.0
+                ),
+                Err(e) => warn!("GPU niceonly field span timing failed: {e:?}"),
+            }
         }
-        let mut busy_ms = 0.0f64;
+        // Telemetry only: a timing failure must never fail the field.
+        let mut busy_ms = Some(0.0f64);
         for (before, after) in &self.batches {
-            busy_ms += f64::from(before.elapsed_ms(after)?);
+            match before.elapsed_ms(after) {
+                Ok(ms) => {
+                    if let Some(b) = busy_ms.as_mut() {
+                        *b += f64::from(ms);
+                    }
+                }
+                Err(e) => {
+                    if busy_ms.take().is_some() {
+                        warn!("GPU niceonly batch timing failed, device_busy_secs dropped: {e:?}");
+                    }
+                }
+            }
         }
-        let device_busy_secs = Some(busy_ms / 1000.0);
+        let device_busy_secs = busy_ms.map(|ms| ms / 1000.0);
         let nice_count = self.stream.clone_dtoh(&self.d_nice_count)?[0] as usize;
         if nice_count > NICE_OUT_CAPACITY {
             bail!(
@@ -557,7 +585,7 @@ impl RangeSink for CudaNiceonlySink {
             .get_mut(&field)
             .ok_or_else(|| anyhow::anyhow!("launch for a field that is not open ({field})"))?;
         if open.start.is_none() {
-            open.start = Some(stream.record_event(None)?);
+            open.start = Some(record_timing_event(&stream)?);
         }
         let nice_capacity = NICE_OUT_CAPACITY as u32;
         let max_inflight = batches_in_flight();
@@ -607,11 +635,11 @@ impl RangeSink for CudaNiceonlySink {
                     .expect("range masks uploaded whenever the kernel has CROSS_FILTER");
                 launch_args.arg(d_masks);
             }
-            let before = stream.record_event(None)?;
+            let before = record_timing_event(&stream)?;
             unsafe {
                 launch_args.launch(cfg)?;
             }
-            let after = stream.record_event(None)?;
+            let after = record_timing_event(&stream)?;
             self.inflight.push_back(stream.record_event(None)?);
             open.batches.push((before, after));
         }
@@ -623,7 +651,7 @@ impl RangeSink for CudaNiceonlySink {
             .open
             .remove(&seq)
             .ok_or_else(|| anyhow::anyhow!("end of a field that is not open ({seq})"))?;
-        let end = self.shared.stream.record_event(None)?;
+        let end = record_timing_event(&self.shared.stream)?;
         Ok(CudaPendingField {
             stream: self.shared.stream.clone(),
             base: open.plan.base,
@@ -836,7 +864,11 @@ mod tests {
         // Warm up: plan build and first-field effects.
         let warm = FieldSize::new(start - size, start);
         if let NiceonlyStarted::Queued = begin_niceonly_cuda(&ctx, &warm, base).unwrap() {
-            finish_niceonly_cuda(&ctx).unwrap();
+            let (_, stats) = finish_niceonly_cuda(&ctx).unwrap();
+            assert!(
+                stats.device_busy_secs.is_some_and(|s| s > 0.0),
+                "device busy time missing from the pipeline stats: {stats:?}"
+            );
         }
         let lookahead = fields_in_flight().saturating_sub(1);
         let t = Instant::now();
@@ -1527,6 +1559,46 @@ mod tests {
                 "niceonly mismatch at base {base}"
             );
         }
+    }
+
+    /// The pipeline sink's per-batch events must be timing-capable: v3.4.4
+    /// recorded them with `CU_EVENT_DISABLE_TIMING`, so the first field's
+    /// `wait` died in `cuEventElapsedTime` with `CUDA_ERROR_INVALID_HANDLE`
+    /// on every NVIDIA niceonly client. Runs a field through the real
+    /// pipeline and checks the busy time comes back and is sane.
+    #[test_log::test]
+    #[ignore = "requires GPU"]
+    fn gpu_pipeline_reports_device_busy_time() {
+        let Some(ctx) = try_init_cuda() else {
+            println!("GPU not available, skipping test");
+            return;
+        };
+        let base = 40;
+        let base_range = base_range::get_base_range_u128(base)
+            .expect("base range")
+            .expect("base 40 has a range");
+        let start = base_range.range_start;
+        let range = FieldSize::new(start, start + 2_000_000_000);
+        let NiceonlyStarted::Queued = begin_niceonly_cuda(&ctx, &range, base).expect("begin")
+        else {
+            panic!("CUDA niceonly fields go through the pipeline");
+        };
+        let (results, stats) = finish_niceonly_cuda(&ctx).expect("the field must finish");
+        let stride_table = StrideTable::new(base, GPU_LSD_K);
+        let mut cpu = process_range_niceonly(&range, base, &stride_table).nice_numbers;
+        cpu.sort_by_key(|n| n.number);
+        assert_eq!(
+            cpu, results.nice_numbers,
+            "niceonly mismatch through the pipeline"
+        );
+        let busy = stats
+            .device_busy_secs
+            .expect("device busy time is reported for every CUDA field");
+        assert!(
+            busy > 0.0 && busy <= stats.total_secs + 1.0,
+            "device busy time out of range: {busy} s of {} s total",
+            stats.total_secs
+        );
     }
 
     #[test_log::test]
