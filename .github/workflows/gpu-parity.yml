@@ -11,6 +11,11 @@
 #                          "GPU development"); result parity is validated
 #                          manually on real hardware.
 #   cubecl-cuda          — NOT CI-testable: needs NVIDIA silicon, same as cuda.
+#   cubecl-spirv         — lavapipe on Linux (the direct SPIR-V compiler). Not
+#                          on macOS: wgpu always selects Metal there, so the
+#                          feature can't engage.
+#   cubecl-metal         — Metal on the macOS arm64 runner (the direct MSL
+#                          compiler; the one a Mac can actually use).
 name: GPU Device Parity
 
 on:
@@ -80,3 +85,10 @@ jobs:
                   export VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
                   export DYLD_LIBRARY_PATH=/opt/homebrew/lib
                   cargo test --release --features vulkan,cubecl -p nice_common -- --ignored --nocapture
+
+            - name: Run device parity tests (CubeCL direct MSL compiler)
+              # cubecl-metal is the direct compiler a Mac can actually use.
+              # cubecl-spirv can't engage here (wgpu picks Metal), which is
+              # why the Linux job tests spirv and this one tests msl.
+              run: |
+                  cargo test --release --features cubecl-metal -p nice_common -- --ignored --nocapture cubecl_

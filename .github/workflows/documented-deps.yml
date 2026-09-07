@@ -1,0 +1,174 @@
+# Are the README's build instructions sufficient?
+#
+# The other workflows run on GitHub's hosted images, which carry far more
+# than the README asks for (ubuntu-latest has dozens of -dev packages,
+# macos-latest has Xcode and Homebrew). A green build there proves the code
+# compiles, not that someone following the README can compile it — which is
+# how `--features gpu` was unbuildable on a stock mac for a while without
+# anything noticing (#145, #146).
+#
+# Two strengths of check, stated per job:
+#   linux        — a bare debian container, installing exactly the README's
+#                  package line and nothing else. Proves the README.
+#   stock-image  — the hosted macOS/Windows image with NO install steps and
+#                  VULKAN_SDK unset. Proves "nothing beyond the stock image",
+#                  a weaker claim, but the stock image lacks the things that
+#                  have bitten (the Vulkan SDK), so it catches that class.
+#   macos-spirv  — pins the one documented macOS build requirement in both
+#                  directions, so a change in cubecl-wgpu's gate shows up here
+#                  rather than in a user's terminal.
+#
+# Deliberately not covered: cubecl-hip. It needs ROCm at build time, there
+# are no AMD runners, and a ROCm install is multi-GB. The README and the
+# nice_common build-script warning are its coverage.
+name: Documented build dependencies
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+    # Build checks, not benchmarks: debug profile, no incremental state to cache.
+    CARGO_INCREMENTAL: 0
+
+concurrency:
+    group: documented-deps-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    linux:
+        name: README package list only (debian container)
+        runs-on: ubuntu-latest
+        container: debian:bookworm
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Install exactly what the README says
+              # README "Client Quickstart": `apt install build-essential curl git`
+              # then rustup. ca-certificates is what makes curl able to fetch
+              # rustup at all and is pulled in by curl on a normal system.
+              run: |
+                  apt-get update -qq
+                  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+                      build-essential curl git ca-certificates
+                  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+                  echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: documented-deps-linux
+
+            - name: Client, default features (rustls, nothing external)
+              run: cargo build --locked -p nice_client
+
+            - name: Client, openssl-tls
+              # Vendored OpenSSL. Needs a C toolchain and perl; build-essential
+              # brings both (perl via dpkg-dev).
+              run: cargo build --locked -p nice_client --no-default-features --features openssl-tls
+
+            - name: Client, gpu umbrella
+              # The umbrella's contract: builds with no GPU libraries installed.
+              run: cargo build --locked -p nice_client --features gpu
+
+            - name: Client, what the -gpu docker image ships
+              run: cargo build --locked -p nice_client --features gpu,cubecl-spirv
+
+            - name: Client, cubecl-metal
+              # Inert off macOS (the build script says so) but must still build.
+              run: cargo build --locked -p nice_client --features cubecl-metal
+
+            - name: Daemon
+              run: cargo build --locked -p nice_daemon
+
+            - name: api and jobs must fail without libpq-dev
+              # The README says the database feature needs libpq-dev. Keep that
+              # true: if diesel ever stops needing the system library, this
+              # trips and the note gets removed rather than going stale.
+              run: |
+                  if cargo build --locked -p nice_api 2>/tmp/api.log; then
+                      echo "nice_api built without libpq-dev; the README's libpq-dev note is stale"
+                      exit 1
+                  fi
+                  if ! grep -q -- "-lpq" /tmp/api.log; then
+                      echo "nice_api failed, but not on -lpq:"
+                      tail -40 /tmp/api.log
+                      exit 1
+                  fi
+
+            - name: Install the one extra package the README names for api/jobs
+              run: DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends libpq-dev
+
+            - name: api and jobs
+              # Note: no pkg-config. libpq-dev alone is enough, as documented.
+              run: cargo build --locked -p nice_api -p nice_jobs
+
+            - name: wasm client, via the documented wasm-pack installer
+              # Mirrors the justfile's wasm-build recipe and browser-client.yml.
+              # wasm-pack adds the wasm32 target itself and fetches wasm-bindgen
+              # and wasm-opt, so "requires wasm-pack" is the whole instruction.
+              run: |
+                  curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+                  cd wasm-client && wasm-pack build --target web --out-dir /tmp/pkg
+
+    stock-image:
+        name: gpu umbrella on the stock image, nothing installed (${{ matrix.os }})
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [macos-latest, windows-latest]
+        runs-on: ${{ matrix.os }}
+        steps:
+            - uses: actions/checkout@v6
+            - uses: dtolnay/rust-toolchain@stable
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: documented-deps-gpu
+
+            - name: gpu umbrella must build with nothing installed
+              # This is also the first place `cuda`/`cubecl-cuda` are ever
+              # compiled on macOS or Windows in CI; the parity jobs only build
+              # vulkan/cubecl there. A failure here is a finding, not a flake.
+              #
+              # `env -u`, not `VULKAN_SDK=`: cubecl-wgpu's gate checks that the
+              # variable *exists*, so an empty one would satisfy it and mask a
+              # regression of #146.
+              shell: bash
+              run: env -u VULKAN_SDK cargo build --locked -p nice_client --features gpu
+
+    macos-spirv:
+        name: cubecl-spirv on macOS needs VULKAN_SDK (pin both directions)
+        runs-on: macos-latest
+        steps:
+            - uses: actions/checkout@v6
+            - uses: dtolnay/rust-toolchain@stable
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: documented-deps-spirv
+
+            - name: Fails without VULKAN_SDK, and for that reason
+              # Everything below cubecl-wgpu compiles before its build script
+              # panics, so the passing build in the next step reuses nearly
+              # all of this work.
+              run: |
+                  if env -u VULKAN_SDK cargo build --locked -p nice_client --features cubecl-spirv 2>/tmp/spirv.log; then
+                      echo "cubecl-spirv built on macOS without VULKAN_SDK: cubecl-wgpu's gate is gone; update the README and the build-script warning"
+                      exit 1
+                  fi
+                  if ! grep -q "Vulkan SDK" /tmp/spirv.log; then
+                      echo "failed, but not on the Vulkan SDK gate:"
+                      tail -40 /tmp/spirv.log
+                      exit 1
+                  fi
+
+            - name: Builds with VULKAN_SDK set
+              # The gate checks only that the variable is set, and ash is built
+              # in `loaded` mode, so nothing links against the loader. Point it
+              # at Homebrew's prefix, which is where a real Vulkan install on a
+              # Mac lives anyway (the README's molten-vk/vulkan-loader line).
+              run: |
+                  brew install --quiet vulkan-loader
+                  VULKAN_SDK="$(brew --prefix)" cargo build --locked -p nice_client --features cubecl-spirv
