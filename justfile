@@ -69,6 +69,9 @@ lint:
     cargo clippy -p "*" --all-targets -- -D warnings
     # The GPU/vulkan/spirv code only exists under these features, so lint it too.
     cargo clippy -p "*" --all-targets --features nice_client/gpu,nice_client/vulkan,nice_client/cubecl-spirv -- -D warnings
+    # vulkan on its own: the one combination where the GPU match in the
+    # client has a single (unreachable) arm. It regressed once (E0282).
+    cargo clippy -p "*" --all-targets --features nice_client/vulkan -- -D warnings
 
 # Build all packages, run all tests, and then run the client
 test:
