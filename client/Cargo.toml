@@ -16,13 +16,11 @@ cuda = ["nice_common/cuda", "dep:cudarc"]
 # Umbrella: one binary that runs on any supported GPU (or plain CPU). The
 # release recipe is two builds: default features = lightweight CPU-only,
 # `--features gpu` = CPU + every backend, selected at runtime by
-# `--gpu-backend` (auto picks the fastest available).
-# `cubecl-spirv` is in the umbrella since 2026-09: on Vulkan devices the
-# cubecl backend then compiles through CubeCL's own SPIR-V codegen, which is
-# what makes plane-scoped compaction available (+11-13% niceonly on an
-# RX 9070 XT over the naga path). It only affects the Vulkan backend of
-# wgpu; Metal and DX12 keep naga.
-gpu = ["cuda", "cubecl", "cubecl-cuda", "cubecl-spirv"]
+# `--gpu-backend` (auto picks the fastest available). Everything in here
+# builds on every platform with no GPU libraries installed — each backend
+# dlopens its driver at runtime — and that is the contract: a feature that
+# needs an SDK to compile does not belong in the umbrella.
+gpu = ["cuda", "cubecl", "cubecl-cuda"]
 # Experimental: the hand-written WGSL backend. Not part of the `gpu`
 # umbrella — every platform it serves is covered by `cubecl`, which beats it
 # in detailed mode on all vendors measured. Kept for opt-in builds while its
@@ -32,7 +30,15 @@ cubecl = ["nice_common/cubecl"]
 # Must also enable this crate's own cubecl gate: feature cfgs do not
 # propagate upward from nice_common.
 cubecl-cuda = ["cubecl", "nice_common/cubecl-cuda"]
-# Direct compilers for the cubecl (wgpu) backend; see nice_common.
+# Direct compilers for the cubecl (wgpu) backend; see nice_common. Both
+# opt-in. `cubecl-spirv` is the one worth adding on Linux/Windows: on Vulkan
+# devices the cubecl backend then compiles through CubeCL's own SPIR-V
+# codegen, which is what makes plane-scoped compaction available (+11-13%
+# niceonly on an RX 9070 XT over the naga path); the `-gpu` docker image is
+# built with it. It was in the umbrella from 2026-09 until it turned out to
+# need the Vulkan SDK to *build* on macOS (cubecl-wgpu's build script panics
+# without `VULKAN_SDK` there) for a compiler that never runs on macOS, where
+# the wgpu backend always selects Metal. Metal and DX12 keep naga.
 cubecl-spirv = ["cubecl", "nice_common/cubecl-spirv"]
 cubecl-metal = ["cubecl", "nice_common/cubecl-metal"]
 # CubeCL over ROCm/HIP (AMD, needs ROCm at build and run time; not in `gpu`).

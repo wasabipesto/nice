@@ -28,6 +28,8 @@ cubecl-cuda = ["cubecl", "cubecl/cuda", "dep:cudarc"]
 # Direct compilers inside the wgpu runtime (experimental, 2026-09): SPIR-V
 # emitted by cubecl-spirv on Vulkan, MSL emitted by cubecl-cpp on Metal,
 # instead of WGSL through naga. Build-time selection; see scratchpad/2026-09-cubecl-explore.
+# Neither is in `gpu`: `cubecl-spirv` needs the Vulkan SDK to build on macOS
+# (and is inert there — wgpu selects Metal). See the client manifest.
 cubecl-spirv = ["cubecl", "cubecl/vulkan"]
 cubecl-metal = ["cubecl", "cubecl/metal"]
 # CubeCL over its native HIP runtime (AMD). Links libamdhip64/libhiprtc at
