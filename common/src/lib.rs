@@ -35,6 +35,12 @@ use std::env;
 use std::fmt;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The git commit this build comes from (full SHA), or `unknown` when the
+/// build script could find neither `NICE_BUILD_SHA` in the environment nor a
+/// git checkout. Stamped into benchmark reports, submission telemetry and the
+/// API's `/status` so that two builds carrying the same package version can
+/// be told apart.
+pub const BUILD_SHA: &str = env!("NICE_BUILD_SHA");
 pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 pub const DOWNSAMPLE_CUTOFF_PERCENT: f32 = 0.2;
 pub const CLAIM_DURATION_HOURS: i64 = 1;

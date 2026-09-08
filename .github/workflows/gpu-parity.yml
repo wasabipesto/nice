@@ -27,6 +27,8 @@ on:
 
 env:
     CARGO_TERM_COLOR: always
+    # Stamped into the binaries by nice_common's build script (see BUILD_SHA).
+    NICE_BUILD_SHA: ${{ github.sha }}
     RUST_BACKTRACE: 1
 
 concurrency:

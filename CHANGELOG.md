@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Record the build commit alongside the version. `nice_common` now exposes `BUILD_SHA`, set by its build script from `NICE_BUILD_SHA` (CI passes `github.sha`; `api/Dockerfile` takes it as a build-arg) or else `git rev-parse HEAD` on the checkout, falling back to `unknown`. It is stamped into benchmark reports and submission telemetry as `build_sha`, reported by the API's `/status`, and exported from the wasm client so browser benchmark reports carry it too. Two builds of the same package version can now be told apart in the benchmark corpus.
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.

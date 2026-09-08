@@ -11,7 +11,10 @@ COPY --from=planner /usr/src/nice/recipe.json recipe.json
 # Build dependencies - this is the caching Docker layer!
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Build application
+# Build application. .git is not in the docker context, so the build commit
+# has to come in as an argument: `docker build --build-arg NICE_BUILD_SHA=$(git rev-parse HEAD) ...`
+ARG NICE_BUILD_SHA=unknown
+ENV NICE_BUILD_SHA=$NICE_BUILD_SHA
 COPY . .
 RUN cargo test
 RUN cargo build -r -p nice_api

@@ -60,6 +60,7 @@ class WorkerPool {
         // Reported by each worker at init (they read it from the wasm
         // build); stamped onto the aggregated submission.
         this.clientVersion = "unknown";
+        this.buildSha = "unknown";
     }
 
     async initialize() {
@@ -126,6 +127,9 @@ class WorkerPool {
                             initializedCount++;
                             if (e.data.version) {
                                 this.clientVersion = e.data.version;
+                            }
+                            if (e.data.buildSha) {
+                                this.buildSha = e.data.buildSha;
                             }
                             checkInitialization();
                         } else {

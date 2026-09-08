@@ -20,6 +20,8 @@ on:
 
 env:
     CARGO_TERM_COLOR: always
+    # Stamped into the binaries by nice_common's build script (see BUILD_SHA).
+    NICE_BUILD_SHA: ${{ github.sha }}
     # Build checks, not benchmarks: debug profile, no incremental state to cache.
     CARGO_INCREMENTAL: 0
 

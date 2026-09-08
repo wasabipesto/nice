@@ -22,7 +22,7 @@ use nice_common::bench_defs::{
 };
 use nice_common::client_api_async::Client;
 use nice_common::stride_filter::StrideTable;
-use nice_common::{BenchmarkToServer, CLIENT_VERSION, DataToClient, SearchMode};
+use nice_common::{BUILD_SHA, BenchmarkToServer, CLIENT_VERSION, DataToClient, SearchMode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -469,6 +469,7 @@ fn build_report_json(
     json!({
         "schema_version": BENCH_SCHEMA_VERSION,
         "client_version": CLIENT_VERSION,
+        "build_sha": BUILD_SHA,
         "timestamp_epoch": SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
@@ -500,6 +501,7 @@ fn build_report_json(
 pub fn telemetry_base(cli: &Cli, gpu: &GpuCtx) -> Value {
     json!({
         "schema_version": TELEMETRY_SCHEMA_VERSION,
+        "build_sha": BUILD_SHA,
         "hardware": collect_hardware(cli, gpu),
         "environment": collect_environment(),
         "config": {
