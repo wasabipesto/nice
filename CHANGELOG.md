@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking:** `--threads 0` (and `NICE_THREADS=0`) now means every logical CPU the process can see, resolved once at startup. Previously the zero was handed straight to rayon, which treated it as "automatic" (`RAYON_NUM_THREADS` if set, else all CPUs) while the startup banner, benchmark reports and telemetry still recorded `0`; the estimator then read that as one thread, so a `--threads 0` benchmark upload was mis-anchored. `RAYON_NUM_THREADS` no longer influences the client's pool size. The default stays at 4.
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.
