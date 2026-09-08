@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Remove the `nice_daemon` crate. It was a standalone CPU-idle babysitter that spawned the client with a computed `--threads`; it has not changed functionally since it was added, nothing in the repo referenced it, and its niche is covered by the client's own `--threads` and `--repeat` options (and the fleet controller for orchestration).
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.

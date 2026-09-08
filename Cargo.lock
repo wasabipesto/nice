@@ -855,7 +855,7 @@ dependencies = [
  "log",
  "paste",
  "serde",
- "sysinfo 0.38.4",
+ "sysinfo",
  "tracel-llvm",
  "tracel-llvm-bundler",
 ]
@@ -2945,16 +2945,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nice_daemon"
-version = "3.4.5"
-dependencies = [
- "clap",
- "num_cpus",
- "sysinfo 0.39.6",
- "tokio",
-]
-
-[[package]]
 name = "nice_jobs"
 version = "3.4.5"
 dependencies = [
@@ -3150,17 +3140,6 @@ dependencies = [
  "bitflags 2.13.1",
  "block2",
  "objc2",
- "objc2-foundation",
-]
-
-[[package]]
-name = "objc2-open-directory"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb82bed227edf5201dfedf072bba4015a33d3d4a98519837295a90f0a23f676d"
-dependencies = [
- "objc2",
- "objc2-core-foundation",
  "objc2-foundation",
 ]
 
@@ -4476,21 +4455,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sysinfo"
-version = "0.39.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2071df9448915b71c4fe6d25deaf1c22f12bd234f01540b77312bb8e41361e6"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "objc2-open-directory",
- "windows 0.62.2",
-]
-
-[[package]]
 name = "tar"
 version = "0.4.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4648,7 +4612,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.5",
