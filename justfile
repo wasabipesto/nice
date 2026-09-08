@@ -98,13 +98,26 @@ cargo-upgrades:
 client *args:
     cargo run -r --bin nice_client -- {{ args }}
 
-# Run benchmark
-benchmark size='large':
-    just client --benchmark {{ size }}
+# Run the basic GPU client with given options
+client-gpu *args:
+    cargo run -r --bin nice_client --features nice_client/gpu -- {{ args }}
 
-# Run the daemon
-daemon *args:
-    cargo run -r -p nice_daemon -- {{ args }}
+# Run the all-backend GPU client with given options
+client-gpu-all *args:
+    cargo run -r --bin nice_client \
+        --features nice_client/gpu,nice_client/cubecl-spirv,nice_client/vulkan \
+        -- {{ args }}
+
+# Run benchmark
+benchmark *args:
+    just client --benchmark {{ args }}
+
+# Run benchmark sweep for all available modes
+benchmark-sweep *args:
+    just client-gpu-all detailed --benchmark-secs 30 --benchmark-upload {{ args }}
+    just client-gpu-all niceonly --benchmark-secs 30 --benchmark-upload {{ args }}
+    just client-gpu-all detailed --benchmark-secs 30 --benchmark-upload --gpu {{ args }}
+    just client-gpu-all niceonly --benchmark-secs 30 --benchmark-upload --gpu {{ args }}
 
 # Run API server
 server:
