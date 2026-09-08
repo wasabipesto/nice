@@ -65,6 +65,12 @@ jobs:
             - name: Client, what the -gpu docker image ships
               run: cargo build --locked -p nice_client --features gpu,cubecl-spirv
 
+            - name: Client, vulkan alone
+              # Not in any umbrella and the one combination where the client's
+              # GPU match has a single (unreachable) arm; it regressed once
+              # (E0282) because every other job pairs it with cubecl.
+              run: cargo build --locked -p nice_client --features vulkan
+
             - name: Client, cubecl-metal
               run: cargo build --locked -p nice_client --features cubecl-metal
 

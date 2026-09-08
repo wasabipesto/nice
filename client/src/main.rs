@@ -824,7 +824,12 @@ fn finish_field_sync(
     match stage {
         FieldStage::Done(results) => (results, None),
         FieldStage::Queued => {
-            #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+            // Gated on the backends that queue, not on every GPU feature:
+            // Vulkan processes fields synchronously and never produces
+            // `Queued`. With `vulkan` alone the old gate left a match whose
+            // only arm was `unreachable!`, which has no type (E0282), and
+            // everything after it dead.
+            #[cfg(any(feature = "cuda", feature = "cubecl"))]
             {
                 let _ = cli;
                 let handle = gpu.as_ref().expect("GPU context failed to initialize");
@@ -844,10 +849,10 @@ fn finish_field_sync(
                     }
                 }
             }
-            #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
+            #[cfg(not(any(feature = "cuda", feature = "cubecl")))]
             {
                 let _ = (cli, gpu);
-                unreachable!("no GPU backend compiled in, so nothing is ever queued")
+                unreachable!("no queuing GPU backend compiled in, so nothing is ever queued")
             }
         }
     }
