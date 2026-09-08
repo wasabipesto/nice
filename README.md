@@ -27,6 +27,9 @@ docker run -it --init ghcr.io/wasabipesto/nice_client:3
 # Run with 12 threads
 ./nice_client --threads 12
 
+# Run with every available thread
+./nice_client --threads 0
+
 # Run forever
 ./nice_client --repeat
 
@@ -104,7 +107,7 @@ Options:
           [env: NICE_NO_PROGRESS=]
 
   -t, --threads <THREADS>
-          Run parallel with this many threads
+          Run parallel with this many threads. 0 means every logical CPU the process can see
           
           [env: NICE_THREADS=]
           [default: 4]
