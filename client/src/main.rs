@@ -329,11 +329,33 @@ fn compiled_backends() -> String {
     if cfg!(feature = "cubecl-hip") {
         have.push("cubecl-hip");
     }
+    // Shader compilers rather than backends, but they change which code the
+    // cubecl backend runs, and that matters when reading a user's report.
+    if cfg!(feature = "cubecl-spirv") {
+        have.push("cubecl-spirv");
+    }
+    if cfg!(feature = "cubecl-metal") {
+        have.push("cubecl-metal");
+    }
     if have.is_empty() {
         "none".to_string()
     } else {
         have.join(", ")
     }
+}
+
+/// Whether a CUDA-family init failure means "driver loaded, toolkit missing".
+///
+/// Both CUDA backends smoke-test NVRTC at init and name it in their error;
+/// cudarc's own panic payload for a missing libnvrtc ("Unable to dynamically
+/// load the \"nvrtc\" shared library") also survives `guarded_init`. A box
+/// with no NVIDIA driver fails differently ("driver library could not be
+/// loaded", or the cubecl runtime's worker dying) and is the ordinary `auto`
+/// fall-through, which stays quiet.
+#[cfg(any(feature = "cuda", feature = "cubecl-cuda"))]
+fn cuda_toolkit_missing(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}").to_ascii_lowercase();
+    text.contains("nvrtc") || text.contains("cuda toolkit")
 }
 
 /// Try to bring up CUDA, turning `cudarc`'s panics into errors.
@@ -461,8 +483,19 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 std::process::exit(1);
             }
             Err(e) => {
-                info!("CubeCL CUDA unavailable; trying the next backend");
-                debug!("  CubeCL CUDA init failed: {e:#}");
+                // No NVIDIA driver is the ordinary fall-through and stays at
+                // info. A driver that loaded but no toolkit is actionable:
+                // this box could be running the faster backend.
+                if cuda_toolkit_missing(&e) {
+                    warn!(
+                        "CubeCL CUDA unavailable, falling back to wgpu: {e:#}. This machine \
+                         has an NVIDIA driver; installing the CUDA toolkit (NVRTC) would \
+                         enable the faster backend"
+                    );
+                } else {
+                    info!("CubeCL CUDA unavailable; trying the next backend");
+                    debug!("  CubeCL CUDA init failed: {e:#}");
+                }
             }
         }
     }
@@ -498,8 +531,17 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                     }
                     std::process::exit(1);
                 }
-                info!("CUDA unavailable; trying the next backend");
-                debug!("  CUDA init failed: {e:#}");
+                // Same distinction as the CubeCL CUDA arm above.
+                if cuda_toolkit_missing(&e) {
+                    warn!(
+                        "CUDA unavailable, falling back to the next backend: {e:#}. This \
+                         machine has an NVIDIA driver; installing the CUDA toolkit (NVRTC) \
+                         would enable the faster backend"
+                    );
+                } else {
+                    info!("CUDA unavailable; trying the next backend");
+                    debug!("  CUDA init failed: {e:#}");
+                }
             }
         }
     }

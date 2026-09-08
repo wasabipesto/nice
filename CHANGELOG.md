@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Under `--gpu-backend auto`, a CUDA-family backend that is skipped because the NVIDIA driver loaded but the CUDA toolkit (NVRTC) is missing now logs a warning saying so, since that machine could be running the faster backend. A machine with no NVIDIA driver at all still falls through quietly. The fatal "no usable GPU backend" message now also lists the compiled-in shader compilers (`cubecl-spirv`, `cubecl-metal`).
 - Print warnings up front about specific feature combinations: `cubecl-hip` without `hipconfig` on PATH and `openssl-tls` together with `rustls-tls`.
 - Take `cubecl-spirv` out of the `gpu` umbrella. On macOS it needs the Vulkan SDK (`VULKAN_SDK` set) just to build, for a compiler that never runs there, which made `--features gpu` fail on a stock mac. `gpu` now builds on every platform with no GPU libraries installed. `cubecl-spirv` is opt-in (`--features gpu,cubecl-spirv`) and the `-gpu` docker image is still built with it, so Linux Vulkan users keep plane-scoped compaction.
 - Fix every NVIDIA niceonly field failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field in v3.4.4: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure can no longer fail a field (it only drops `device_busy_secs`), and a GPU test runs a field through the pipeline and checks the busy time comes back.
