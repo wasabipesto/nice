@@ -117,14 +117,8 @@ jobs:
 
             - name: Build nice_client (release, GPU-enabled)
               run: |
-                  # `gpu` is the umbrella feature: this image's binary carries every
-                  # backend that builds with no GPU libraries installed (cuda,
-                  # cubecl, cubecl-cuda), selected at runtime by --gpu-backend.
-                  # `cubecl-spirv` is added here on purpose: it is opt-in rather
-                  # than in the umbrella because it needs the Vulkan SDK to build
-                  # on macOS, but on Linux it costs nothing and gives Vulkan users
-                  # plane-scoped compaction (+11-13% niceonly on an RX 9070 XT).
-                  # This is the only artifact built with it.
+                  # `gpu` is the umbrella feature: this image's binary carries most
+                  # non-experimental backends (cuda, cubecl, cubecl-cuda, cubecl-spirv)
                   cargo build --release --locked -p nice_client --features gpu,cubecl-spirv
 
             - name: Stage Docker build context

@@ -212,9 +212,9 @@ There are some feature flags that enable specific dependencies:
   - `nice_client/cuda` is the hand-written CUDA backend (NVIDIA only). It requires the CUDA toolkit at runtime for NVRTC kernel compilation.
   - `nice_client/vulkan` is the hand-written WGSL backend (**experimental — not part of the `gpu` umbrella**); it runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe, and MoltenVK on macOS). Every platform it serves is also covered by `cubecl`, which beats it in detailed mode on all vendors measured, so standard builds omit it; build with `--features gpu,vulkan` to include it.
   - `nice_client/cubecl` is the [CubeCL](https://github.com/tracel-ai/cubecl) backend (kernels written in Rust), running over wgpu: Vulkan on Linux/Windows, Metal on macOS. `nice_client/cubecl-cuda` adds its native CUDA runtime. Both modes run on the GPU.
-  - `nice_client/cubecl-spirv` and `nice_client/cubecl-metal` switch the `cubecl` backend's shader compiler from naga (WGSL) to CubeCL's own SPIR-V or MSL codegen on Vulkan or Metal respectively. Both are opt-in; neither is part of the `gpu` umbrella. Results are identical (device parity tests cover both); `NICE_CUBECL_WIDE=1` additionally opts into the 64-bit chunk scan on devices that expose `u64`, which is slower on every wgpu device measured so far.
-    - `cubecl-spirv` is worth enabling on Linux/Windows Vulkan devices: it is what makes plane-scoped compaction available (+11-13% niceonly on an RX 9070 XT over the naga path), and it needs nothing installed to build there. Build with `--features gpu,cubecl-spirv`; the `-gpu` docker image is built this way. It pulls in `ash`.
-    - On macOS `cubecl-spirv` is inert — the `cubecl` backend always selects Metal there, so the SPIR-V compiler never runs — and it still needs the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home#mac) at build time: `cubecl-wgpu`'s build script panics whenever the target is macOS, the `spirv` feature is on, and `VULKAN_SDK` is unset. The check is on the variable alone, not on anything inside it, and `ash` is built in `loaded` mode so nothing links against the loader — pointing `VULKAN_SDK` at an existing Vulkan install is enough to get past the panic. `brew install molten-vk vulkan-loader` on its own is *not* enough, because Homebrew never sets `VULKAN_SDK`. There is no reason to do any of this: `--features gpu` (or `cubecl-metal`, for the direct MSL compiler) builds on macOS with nothing installed.
+  - `nice_client/cubecl-spirv` and `nice_client/cubecl-metal` switch the `cubecl` backend's shader compiler from naga (WGSL) to CubeCL's own SPIR-V or MSL codegen on Vulkan or Metal respectively. Both are opt-in; neither is part of the `gpu` umbrella.
+    - `cubecl-spirv` is worth enabling on Linux/Windows Vulkan devices since it enables plane-scoped compaction, build it with `--features gpu,cubecl-spirv`.
+    - On macOS `cubecl-spirv` is inert since the `cubecl` backend always selects Metal there, so the SPIR-V compiler never runs but it still needs the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home#mac) at build time and the `VULKAN_SDK` variable pointed at an existing Vulkan install.
   - `nice_client/cubecl-hip` runs the `cubecl` backend over CubeCL's native HIP runtime (AMD). **It needs ROCm at build time**, not just at runtime: `cubecl-hip-sys` shells out to `hipconfig` to locate `libamdhip64`/`libhiprtc`. It is opt-in and not part of the `gpu` umbrella. Without ROCm the sys crate does not fail — it silently skips emitting its link directives — and the build instead dies at final link with a wall of `undefined symbol: hipSetDevice` and friends that never mentions HIP or ROCm.
 
 Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack/).
@@ -225,17 +225,17 @@ If you want to run a copy of this server yourself, a SQL schema file has been pr
 
 ## GPU backends
 
-The GPU-enabled client (`--features gpu`, or the `-gpu` docker tag) carries multiple backends in one binary and picks one at runtime; the CPU path is always available as a fallback and for verification. Kernels are JIT-compiled per base at first use, so the first field on a new base takes a few extra seconds. The `-gpu` docker image is built with `--features gpu,cubecl-spirv`, so its Vulkan path goes through CubeCL's SPIR-V compiler; a plain `--features gpu` build goes through naga.
+The GPU-enabled client (`--features gpu`, or the `-gpu` docker tag) carries multiple backends in one binary and picks one at runtime; the CPU path is always available as a fallback and for verification. Kernels are JIT-compiled per base at first use, so the first field on a new base takes a few extra seconds.
 
-`--features gpu` needs nothing installed to build on any platform — every backend in it loads its driver at runtime. Only two opt-in features need something, and both fail in ways that don't name the missing dependency, so check here before debugging a build error.
+The `gpu` umbrella feature needs nothing installed to build on any platform, since every included backend loads its driver at runtime. Some opt-in features have additional dependencies listed below.
 
 | backend | runs on | needs to build | needs at runtime |
 |---|---|---|---|
 | `cubecl` | any GPU via wgpu — Vulkan on Linux/Windows (CubeCL's SPIR-V compiler with `cubecl-spirv`, naga otherwise), Metal on macOS | nothing | a graphics driver |
 | `cubecl-cuda` | NVIDIA | nothing | CUDA toolkit (NVRTC) |
 | `cuda` | NVIDIA | nothing | CUDA toolkit (NVRTC) |
-| `cubecl-spirv` (opt-in build; in the `-gpu` docker image) | Vulkan devices, via the `cubecl` backend | nothing on Linux/Windows; **on macOS the Vulkan SDK, with `VULKAN_SDK` set** — and it is inert there | same as `cubecl` |
-| `cubecl-hip` (opt-in build) | AMD via ROCm | **ROCm (`hipconfig` on `PATH`)** | ROCm |
+| `cubecl-spirv` (opt-in build) | Vulkan devices, via the `cubecl` backend | nothing on Linux/Windows; on macOS the Vulkan SDK, with `VULKAN_SDK` set | same as `cubecl` |
+| `cubecl-hip` (opt-in build) | AMD via ROCm | ROCm (`hipconfig` on `PATH`) | ROCm |
 | `vulkan` (experimental, opt-in build) | any Vulkan 1.2 device with `shaderInt64` | nothing | a Vulkan driver; on macOS also MoltenVK + the Vulkan loader (`brew install molten-vk vulkan-loader`) |
 
 ## Why are you writing this from scratch for like the tenth time

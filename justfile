@@ -75,8 +75,7 @@ test:
     just lint
     cargo build -p "*"
     cargo build -p "*" --features nice_client/gpu
-    # What the -gpu docker image ships. spirv is opt-in because it needs the
-    # Vulkan SDK to build on macOS, not because it needs anything on Linux.
+    # What the -gpu docker image ships.
     cargo build -p "*" --features nice_client/gpu,nice_client/cubecl-spirv
     cargo build -p "*" --features nice_client/vulkan
     # One binary carrying both backends; neither library is needed to build.
