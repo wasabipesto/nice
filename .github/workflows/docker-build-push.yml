@@ -11,6 +11,8 @@ on:
 env:
     REGISTRY: ghcr.io
     IMAGE_NAME: nice_client
+    # Stamped into the binaries by nice_common's build script (see BUILD_SHA).
+    NICE_BUILD_SHA: ${{ github.sha }}
     # Push policy: branch/tag builds and same-repo PRs push images (PRs get
     # pullable :pr-xx tags via the manifest jobs). Fork PRs build for
     # validation only — their tokens are read-only by platform rule, and
