@@ -67,14 +67,16 @@ build:
 lint:
     cargo fmt --all --check
     cargo clippy -p "*" --all-targets -- -D warnings
-    # The GPU/vulkan code only exists under these features, so lint it too.
-    cargo clippy -p "*" --all-targets --features nice_client/gpu,nice_client/vulkan -- -D warnings
+    # The GPU/vulkan/spirv code only exists under these features, so lint it too.
+    cargo clippy -p "*" --all-targets --features nice_client/gpu,nice_client/vulkan,nice_client/cubecl-spirv -- -D warnings
 
 # Build all packages, run all tests, and then run the client
 test:
     just lint
     cargo build -p "*"
     cargo build -p "*" --features nice_client/gpu
+    # What the -gpu docker image ships.
+    cargo build -p "*" --features nice_client/gpu,nice_client/cubecl-spirv
     cargo build -p "*" --features nice_client/vulkan
     # One binary carrying both backends; neither library is needed to build.
     cargo build -p "*" --features nice_client/gpu,nice_client/vulkan
