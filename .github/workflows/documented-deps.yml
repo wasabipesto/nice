@@ -1,0 +1,102 @@
+# Are the README's build instructions sufficient?
+#
+# The other workflows run on GitHub's hosted images, which carry far more
+# than the README asks for (ubuntu-latest has dozens of -dev packages,
+# macos-latest has Xcode and Homebrew). A green build there proves the code
+# compiles, not that someone following the README can compile it.
+#
+# Deliberately not covered: cubecl-hip. It needs ROCm at build time, there
+# are no AMD runners, and a ROCm install is multi-GB. The README and the
+# nice_common build-script warning are its coverage.
+
+name: Documented build dependencies
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+    # Build checks, not benchmarks: debug profile, no incremental state to cache.
+    CARGO_INCREMENTAL: 0
+
+concurrency:
+    group: documented-deps-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    linux:
+        name: README package list only (debian container)
+        runs-on: ubuntu-latest
+        container: debian:bookworm
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Install exactly what the README says
+              # README "Client Quickstart": `apt install build-essential curl git`
+              # then rustup. ca-certificates is what makes curl able to fetch
+              # rustup at all and is pulled in by curl on a normal system.
+              run: |
+                  apt-get update -qq
+                  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+                      build-essential curl git ca-certificates
+                  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+                  echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: documented-deps-linux
+
+            - name: Client, default features (rustls, nothing external)
+              run: cargo build --locked -p nice_client
+
+            - name: Client, openssl-tls
+              # Vendored OpenSSL. Needs a C toolchain and perl; build-essential
+              # brings both (perl via dpkg-dev).
+              run: cargo build --locked -p nice_client --no-default-features --features openssl-tls
+
+            - name: Client, gpu umbrella
+              # The umbrella's contract: builds with no GPU libraries installed.
+              run: cargo build --locked -p nice_client --features gpu
+
+            - name: Client, what the -gpu docker image ships
+              run: cargo build --locked -p nice_client --features gpu,cubecl-spirv
+
+            - name: Client, cubecl-metal
+              run: cargo build --locked -p nice_client --features cubecl-metal
+
+            - name: Install the one extra package the README names for api/jobs
+              run: DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends libpq-dev
+
+            - name: api and jobs
+              # Note: no pkg-config. libpq-dev alone is enough, as documented.
+              run: cargo build --locked -p nice_api -p nice_jobs
+
+            - name: wasm client, via the documented wasm-pack installer
+              # Mirrors the justfile's wasm-build recipe and browser-client.yml.
+              # wasm-pack adds the wasm32 target itself and fetches wasm-bindgen
+              # and wasm-opt, so "requires wasm-pack" is the whole instruction.
+              run: |
+                  curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+                  cd wasm-client && wasm-pack build --target web --out-dir /tmp/pkg
+
+    stock-image:
+        name: gpu umbrella on the stock image, nothing installed (${{ matrix.os }})
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [macos-latest, windows-latest]
+        runs-on: ${{ matrix.os }}
+        steps:
+            - uses: actions/checkout@v6
+            - uses: dtolnay/rust-toolchain@stable
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: documented-deps-gpu
+
+            - name: gpu umbrella must build with nothing installed
+              shell: bash
+              run: env -u VULKAN_SDK cargo build --locked -p nice_client --features gpu
