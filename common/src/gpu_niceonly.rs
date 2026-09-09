@@ -26,7 +26,9 @@
 #![cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use crate::{FieldResults, FieldSize, NiceNumberSimple, msd_prefix_filter, residue_filter};
+use crate::{
+    FieldResults, FieldSize, NiceNumberSimple, msd_prefix_filter, progress, residue_filter,
+};
 use anyhow::{Result, anyhow};
 use log::{debug, warn};
 use std::collections::{HashMap, VecDeque};
@@ -166,9 +168,13 @@ impl BlockTiling {
         }
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.len
+    }
+
+    /// Numbers in a full-size block.
+    fn block_numbers(&self) -> u128 {
+        self.block_chunks * PROCESSING_CHUNK_SIZE
     }
 
     /// The `i`-th block, or `None` past the end.
@@ -821,6 +827,8 @@ struct FieldWork {
     range: FieldSize,
     tiling: BlockTiling,
     next_block: AtomicUsize,
+    /// Blocks whose descriptors have been produced, for the progress bar.
+    done_blocks: AtomicUsize,
     /// Workers that have run out of blocks here and moved on.
     exited: AtomicUsize,
     started: Mutex<Option<Instant>>,
@@ -885,6 +893,8 @@ fn msd_worker(shared: &Shared, tx: &SyncSender<Msg>, error: &Mutex<Option<anyhow
                     if batch.feed(work.seq, &offsets, &lens, &masks, tx).is_err() {
                         return;
                     }
+                    let done = work.done_blocks.fetch_add(1, Ordering::Relaxed) + 1;
+                    progress::advance(&work.range, done as u64);
                 }
                 Err(e) => {
                     *error.lock().unwrap() = Some(e);
@@ -929,6 +939,7 @@ pub struct FieldReady<P> {
     pub pending: Result<P>,
     pub stats: NiceonlyStats,
     pushed_at: Instant,
+    range: FieldSize,
 }
 
 /// The dispatch side: consumes the workers' messages, batches descriptors
@@ -951,6 +962,7 @@ struct Dispatcher<'a, S: RangeSink> {
 
 struct OpenField {
     pushed_at: Instant,
+    range: FieldSize,
     floor: u128,
     first_launch: Option<Instant>,
     num_ranges: usize,
@@ -1000,6 +1012,7 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                     seq,
                     OpenField {
                         pushed_at: Instant::now(),
+                        range,
                         floor: floor_controller().floor(),
                         first_launch: None,
                         num_ranges: 0,
@@ -1058,6 +1071,7 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                         device_busy_secs: None,
                     },
                     pushed_at: open.pushed_at,
+                    range: open.range,
                 })
             }
         }
@@ -1124,12 +1138,15 @@ fn push_field(
     base: u32,
     range: &FieldSize,
 ) -> Result<()> {
+    let tiling = BlockTiling::new(range, 2 * shared.workers);
+    progress::begin(range, tiling.len() as u64, tiling.block_numbers());
     let work = Arc::new(FieldWork {
         seq,
         base,
         range: *range,
-        tiling: BlockTiling::new(range, 2 * shared.workers),
+        tiling,
         next_block: AtomicUsize::new(0),
+        done_blocks: AtomicUsize::new(0),
         exited: AtomicUsize::new(0),
         started: Mutex::new(None),
     });
@@ -1157,11 +1174,13 @@ fn complete_field<P: PendingField>(
     error: &Mutex<Option<anyhow::Error>>,
 ) -> Result<(NiceonlyStats, Vec<NiceNumberSimple>)> {
     let mut stats = ready.stats;
-    let pending = ready.pending?;
+    let waited = ready.pending.and_then(|p| Box::new(p).wait());
+    // Done or failed, the field is off the device.
+    progress::finish(&ready.range);
     let DeviceResult {
         nice_numbers: results,
         device_busy_secs,
-    } = Box::new(pending).wait()?;
+    } = waited?;
     stats.device_busy_secs = device_busy_secs;
     stats.total_secs = ready.pushed_at.elapsed().as_secs_f64();
     // The device span is not directly observable here without device

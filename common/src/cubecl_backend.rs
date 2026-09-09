@@ -1851,6 +1851,10 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
     // bins; WGSL has no u64 atomics, and this host loop serves both.)
     let mut hist_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; hist_bins]));
     let mut undrained = 0usize;
+    // Ticks on submission: without a per-batch sync there is nothing cheap
+    // to wait on here, so the bar runs ahead of the device by however many
+    // batches the runtime queues. It still shows the field is moving.
+    let mut progress = crate::progress::FieldProgress::begin(range, CUBECL_BATCH_SIZE);
 
     for batch in range.chunks(CUBECL_BATCH_SIZE) {
         let start = batch.start();
@@ -1916,6 +1920,7 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
             hist_handle = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; hist_bins]));
             undrained = 0;
         }
+        progress.tick();
     }
     drain(client, hist_handle, &mut histogram).await?;
 

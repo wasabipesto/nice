@@ -2906,6 +2906,7 @@ dependencies = [
  "clap",
  "cudarc",
  "env_logger",
+ "indicatif",
  "log",
  "nice_common",
  "rayon",

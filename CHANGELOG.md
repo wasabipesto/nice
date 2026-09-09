@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Show a progress bar on GPU runs, like the CPU path has. Detailed fields tick per launched batch (on completion for the hand-CUDA and Vulkan backends, on submission for CubeCL, whose runtime offers no cheap per-batch fence); niceonly fields tick per MSD block filtered on the host, then hold at full while the device drains. The niceonly pipeline's two in-flight fields each get a line. A finished field's bar is cleared and the "✓ Processed" log line stays as the record. Bars are only drawn when stderr is a terminal and `--no-progress` is not set; log lines print above the bars instead of through them.
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.

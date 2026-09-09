@@ -668,6 +668,9 @@ impl RangeSink for CudaNiceonlySink {
 // Detailed
 // ============================================================================
 
+/// Detailed-mode launches kept queued ahead of the progress bar's wait.
+const DETAILED_INFLIGHT: usize = 4;
+
 /// GPU implementation of `process_range_detailed`.
 ///
 /// Each GPU thread derives its own candidate (no input transfer); the
@@ -698,7 +701,21 @@ pub fn process_range_detailed_cuda(
     let mut d_miss_count = ctx.stream.alloc_zeros::<u32>(1)?;
     let miss_capacity = NEAR_MISS_CAPACITY as u32;
 
+    // Launches are asynchronous, so the progress bar ticks on completion:
+    // each batch records an event, and the loop waits for the batch
+    // `DETAILED_INFLIGHT` launches back before adding another. With that
+    // many queued the device never starves, and the wait is what keeps the
+    // bar honest.
+    let mut progress = crate::progress::FieldProgress::begin(range, CUDA_BATCH_SIZE as u128);
+    let mut inflight: VecDeque<CudaEvent> = VecDeque::with_capacity(DETAILED_INFLIGHT);
+
     for batch in range.chunks(CUDA_BATCH_SIZE as u128) {
+        if inflight.len() == DETAILED_INFLIGHT
+            && let Some(oldest) = inflight.pop_front()
+        {
+            oldest.synchronize()?;
+            progress.tick();
+        }
         let (start_lo, start_hi) = split_u128(batch.start());
         let count = batch.size() as u64;
 
@@ -722,9 +739,14 @@ pub fn process_range_detailed_cuda(
         unsafe {
             launch_args.launch(cfg)?;
         }
+        inflight.push_back(ctx.stream.record_event(None)?);
     }
 
     let histogram = ctx.stream.clone_dtoh(&d_hist)?;
+    // The blocking read above drained the stream, so the tail is done too.
+    for _ in inflight.drain(..) {
+        progress.tick();
+    }
     let miss_count = ctx.stream.clone_dtoh(&d_miss_count)?[0] as usize;
     if miss_count > NEAR_MISS_CAPACITY {
         bail!("near-miss buffer overflow: {miss_count} > {NEAR_MISS_CAPACITY}");

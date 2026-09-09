@@ -49,11 +49,13 @@ pub fn process_range_detailed_vulkan(
     let start_time = Instant::now();
     let run = DetailedRun::new(ctx, base, NEAR_MISS_CAPACITY)?;
     let mut histogram = vec![0u128; run.config().hist_bins() as usize];
+    let mut progress = crate::progress::FieldProgress::begin(range, VULKAN_BATCH_SIZE);
 
     for batch in range.chunks(VULKAN_BATCH_SIZE) {
         #[allow(clippy::cast_possible_truncation)]
         run.dispatch(batch.start(), batch.size() as u64)?;
         run.drain_histogram(&mut histogram);
+        progress.tick();
     }
 
     let mut nice_numbers: Vec<NiceNumberSimple> = run

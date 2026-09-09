@@ -24,6 +24,7 @@ pub mod gpu_niceonly;
 pub mod lsd_filter;
 pub mod msd_prefix_filter;
 pub mod number_stats;
+pub mod progress;
 pub mod residue_filter;
 pub mod stride_filter;
 pub mod vulkan;
