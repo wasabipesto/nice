@@ -35,6 +35,7 @@ const DEFAULT_PREFETCH_CONCURRENCY: usize = 4;
 const MAX_SUBMITS_IN_FLIGHT: usize = 8;
 
 mod bench;
+mod gpu_progress;
 
 #[cfg(feature = "cuda")]
 use nice_common::client_process_cuda::{
@@ -1435,7 +1436,21 @@ async fn main() -> Result<()> {
     if let Some(level) = cli.log_level {
         builder.filter_level(level.into());
     }
+    // The GPU paths report progress through nice_common::progress; give them
+    // bars, and route the log above the bars so the two don't collide. The
+    // benchmark sweep goes without, like the CPU bar it silences.
+    let gpu_progress = if cli.gpu && !cli.no_progress && !cli.benchmark {
+        gpu_progress::GpuProgress::new()
+    } else {
+        None
+    };
+    if let Some(p) = &gpu_progress {
+        builder.target(env_logger::Target::Pipe(p.log_writer()));
+    }
     builder.init();
+    if let Some(p) = gpu_progress {
+        nice_common::progress::install(p);
+    }
 
     if gpu_implied {
         debug!("--gpu implied by an explicit --gpu-* option");
