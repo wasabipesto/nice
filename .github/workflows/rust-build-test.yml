@@ -58,12 +58,16 @@ jobs:
                     # Cross.toml) so they run on hosts as old as glibc 2.23;
                     # built natively on ubuntu-latest they would need 2.38+.
                     # `glibc_max` is asserted after the build.
+                    # `gpu_features` entries also build and release a GPU
+                    # binary as `gpu_archive`; see the GPU steps below.
                     - build_name: Linux-x86_64
                       runs_on: ubuntu-latest
                       rust_target: x86_64-unknown-linux-gnu
                       packages: "-p nice_common -p nice_client"
                       force_cross: true
                       glibc_max: "2.28"
+                      gpu_features: "nice_client/gpu,nice_client/cubecl-spirv"
+                      gpu_archive: nice_client-gpu-Linux-gnu-x86_64
 
                     - build_name: Linux-x86_64-musl
                       runs_on: ubuntu-latest
@@ -78,6 +82,8 @@ jobs:
                       packages: "-p nice_common -p nice_client"
                       force_cross: true
                       glibc_max: "2.28"
+                      gpu_features: "nice_client/gpu,nice_client/cubecl-spirv"
+                      gpu_archive: nice_client-gpu-Linux-gnu-arm64
 
                     - build_name: Linux-aarch64-musl
                       runs_on: ubuntu-24.04-arm
@@ -113,24 +119,30 @@ jobs:
                       runs_on: windows-latest
                       rust_target: x86_64-pc-windows-msvc
                       packages: "-p nice_common -p nice_client"
-                      gpu_features: "nice_client/gpu"
+                      gpu_features: "nice_client/gpu,nice_client/cubecl-spirv"
+                      gpu_archive: nice_client-gpu-Windows-msvc-x86_64
 
                     - build_name: Windows-aarch64
                       runs_on: windows-11-arm
                       rust_target: aarch64-pc-windows-msvc
                       packages: "-p nice_common -p nice_client"
 
+                    # Build-only: proves the umbrella still compiles for
+                    # Intel macs, which no longer get a GPU release.
                     - build_name: macOS-x86_64
                       runs_on: macOS-latest
                       rust_target: x86_64-apple-darwin
                       packages: "-p nice_common -p nice_client"
                       gpu_features: "nice_client/gpu"
 
+                    # `gpu` only: cubecl-spirv needs the Vulkan SDK to build
+                    # on macOS and is inert there (wgpu picks Metal).
                     - build_name: macOS-aarch64
                       runs_on: macOS-latest
                       rust_target: aarch64-apple-darwin
                       packages: "-p nice_common -p nice_client"
                       gpu_features: "nice_client/gpu"
+                      gpu_archive: nice_client-gpu-macOS-arm64
 
         steps:
             - uses: actions/checkout@v6
@@ -148,12 +160,13 @@ jobs:
                   force-use-cross: ${{ matrix.platform.force_cross == true }}
                   cross-version: "v0.2.5"
 
-            # Not released (yet): prove the GPU umbrella builds on the release
-            # targets where it plausibly can, so that decision can be made on
-            # evidence. Cross-built entries stay CPU-only (pinned 16.04 images
-            # and non-mainstream arches). Runs before the release build so the
-            # CPU binary is what ends up at the artifact path.
-            - name: Build binaries (GPU featureset, not released)
+            # The GPU binary. Every backend in the `gpu` umbrella loads its
+            # driver at runtime, so this needs nothing the CPU build doesn't,
+            # and the cross entries keep their glibc floor. Built, checked and
+            # packaged first, because the CPU build below overwrites the
+            # binary at the artifact path. Entries with `gpu_features` but no
+            # `gpu_archive` are build-only.
+            - name: Build binaries (GPU featureset)
               if: ${{ matrix.platform.gpu_features }}
               uses: houseabsolute/actions-rust-cross@v1
               with:
@@ -162,6 +175,22 @@ jobs:
                   args: "${{ matrix.platform.packages }} --locked --release --features ${{ matrix.platform.gpu_features }}"
                   force-use-cross: ${{ matrix.platform.force_cross == true }}
                   cross-version: "v0.2.5"
+
+            - name: Assert glibc floor on the GPU binary (<= ${{ matrix.platform.glibc_max }})
+              if: ${{ matrix.platform.glibc_max && matrix.platform.gpu_archive }}
+              run: .github/scripts/assert-glibc-floor.sh target/${{ matrix.platform.rust_target }}/release/nice_client "${{ matrix.platform.glibc_max }}"
+
+            # Same packaging as the CPU artifact, under an explicit name so the
+            # two archives (and their upload-artifact names) don't collide.
+            - name: Create release artifacts (GPU)
+              if: ${{ matrix.platform.gpu_archive }}
+              uses: houseabsolute/actions-rust-release@v0
+              with:
+                  executable-name: nice_client
+                  target: ${{ matrix.platform.rust_target }}
+                  archive-name: ${{ matrix.platform.gpu_archive }}
+                  changes-file: CHANGELOG.md
+                  release-tag-prefix: "dont-make-releases"
 
             # Build, using cross when needed. This will explicitly put the binaries in a stable location.
             - name: Build binaries
@@ -175,19 +204,10 @@ jobs:
                   cross-version: "v0.2.5"
 
             # The floor is a property of the build environment, not of the
-            # source, so assert it on the artifact: every GLIBC_x.y version the
-            # binary requires must be <= glibc_max. readelf reads any ELF
-            # architecture, unlike the host objdump.
+            # source, so assert it on the artifact (see the script).
             - name: Assert glibc floor (<= ${{ matrix.platform.glibc_max }})
               if: ${{ matrix.platform.glibc_max }}
-              env:
-                  GLIBC_MAX: ${{ matrix.platform.glibc_max }}
-              run: |
-                  bin=target/${{ matrix.platform.rust_target }}/release/nice_client
-                  need=$(readelf -V "$bin" | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n | uniq | tail -n1)
-                  echo "$bin requires up to $need (allowed: GLIBC_$GLIBC_MAX)"
-                  test -n "$need"
-                  test "$(printf '%s\n' "GLIBC_$GLIBC_MAX" "$need" | sort -t. -k2 -n | tail -n1)" = "GLIBC_$GLIBC_MAX"
+              run: .github/scripts/assert-glibc-floor.sh target/${{ matrix.platform.rust_target }}/release/nice_client "${{ matrix.platform.glibc_max }}"
 
             # Package a single executable as a tarball/zip plus checksum for release upload.
             - name: Create release artifacts

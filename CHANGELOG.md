@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Release GPU-enabled binaries alongside the CPU ones: `nice_client-gpu-Linux-gnu-x86_64`, `nice_client-gpu-Linux-gnu-arm64`, `nice_client-gpu-Windows-msvc-x86_64` and `nice_client-gpu-macOS-arm64`. Linux and Windows are built with `gpu,cubecl-spirv` like the `-gpu` docker image; macOS with `gpu`. The Linux binaries come out of the same pinned `cross` containers as the CPU ones and CI asserts the same glibc 2.28 floor on them. The CUDA backends still need the CUDA toolkit on the host; without it the client falls back to Vulkan through `cubecl`.
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.
