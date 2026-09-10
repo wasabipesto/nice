@@ -148,39 +148,39 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
 ];
 
 /// Reference rates (numbers/sec) for the synthetic score, pinned per client
-/// version: (scenario key, gpu, reference rate). CPU references were measured
-/// on a 4-core `x86_64` dev box, GPU references on an RTX 3060; a score of 1000
-/// means "matches the reference machine on the geometric mean".
+/// version: (scenario key, gpu, reference rate). A score of 1000 means
+/// "matches every reference rate on the geometric mean".
+///
+/// The references are arbitrary anchors, not a description of any machine:
+/// they are re-pinned whenever the maintainers decide the scale has drifted,
+/// which changes every score at once. Compare scores within a client version
+/// only; the per-scenario rates in the report are what to use across
+/// versions.
 ///
 /// The browser suite scores against these same references deliberately: a
 /// browser scoring 550 where the native client scores 1000 on the same box
 /// is information, not a bug.
-///
-/// The GPU niceonly references predate the benchmark steering the MSD floor
-/// to convergence before each scenario (`gpu_niceonly::benchmark_floor_thaw`);
-/// they were measured under the earlier per-field controller and are due for
-/// re-pinning at the next reference bump.
 pub const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
-    ("b40_msd_strong", false, 1.0e12),
-    ("b40_msd_weak", false, 1.6e9),
-    ("b50_residue_dense", false, 1.1e9),
-    ("b50_msd_weak", false, 9.4e8),
-    ("b52_msd_weak", false, 3.2e9),
-    ("b50_msd_weak_1t", false, 2.0e8),
-    ("b40_detailed", false, 1.4e7),
-    ("b50_detailed", false, 8.9e6),
-    ("b50_detailed_1t", false, 2.2e6),
-    ("b40_msd_strong", true, 2.3e11),
-    ("b40_msd_weak", true, 1.5e11),
-    ("b50_residue_dense", true, 1.3e11),
-    ("b50_msd_weak", true, 1.3e11),
-    ("b52_msd_weak", true, 1.6e11),
-    ("b40_detailed", true, 4.5e9),
-    ("b50_detailed", true, 3.2e9),
+    ("b40_msd_strong", false, 2.3e12),
+    ("b40_msd_weak", false, 1.8e10),
+    ("b50_residue_dense", false, 1.1e10),
+    ("b50_msd_weak", false, 9.9e9),
+    ("b52_msd_weak", false, 3.0e10),
+    ("b50_msd_weak_1t", false, 1.8e9),
+    ("b40_detailed", false, 4.2e7),
+    ("b50_detailed", false, 1.7e7),
+    ("b50_detailed_1t", false, 2.8e6),
+    ("b40_msd_strong", true, 2.8e11),
+    ("b40_msd_weak", true, 1.6e11),
+    ("b50_residue_dense", true, 1.4e11),
+    ("b50_msd_weak", true, 1.4e11),
+    ("b52_msd_weak", true, 1.4e11),
+    ("b40_detailed", true, 2.4e9),
+    ("b50_detailed", true, 1.5e9),
 ];
 
-/// Geometric mean of measured rate over reference rate, scaled so the
-/// reference machine scores 1000. Scenarios without a pinned reference or
+/// Geometric mean of measured rate over reference rate, scaled so matching
+/// every reference exactly scores 1000. Scenarios without a pinned reference or
 /// that were dropped (rate <= 0) are excluded; `None` if nothing scored.
 pub fn compute_score<'a>(
     rates: impl IntoIterator<Item = (&'a str, f64)>,

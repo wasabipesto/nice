@@ -1736,7 +1736,7 @@
                     score === null ? "n/a" : Math.round(score).toString();
                 document.getElementById("nicemarkDetail").textContent =
                     `detailed ${gpu ? "gpu" : "cpu"} · ${clientVersion}` +
-                    (score === null ? "" : " · 1000 = native reference box");
+                    (score === null ? "" : " · 1000 = reference");
                 const uploadBtn = document.getElementById("uploadBtn");
                 uploadBtn.disabled = false;
                 uploadBtn.textContent = "Upload score";

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Re-pin the NiceMark reference rates. Every scenario's reference (CPU and GPU, niceonly and detailed) moves to a point between two current machines' v3.4.5 results, so scores from this version are not comparable with earlier ones; the per-scenario rates in the report are unchanged and remain comparable. The code and comments no longer describe the references as belonging to any particular hardware: they are arbitrary anchors that will be re-pinned as needed.
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.
