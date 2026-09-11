@@ -418,6 +418,7 @@ __device__ __forceinline__ u32 lower_bound_residue(
 #define COMPACT_QUEUE 64
 #endif
 
+// Lean: `Nice.exists_ordinal_eq` (GPU-0)
 // One warp per MSD-valid range. Each range is (field_start + offset,
 // field_start + offset + len). Lanes stride through the range's valid
 // candidates by global residue-sequence index; the g-th candidate at or

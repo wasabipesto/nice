@@ -812,6 +812,7 @@ fn candidate_check(
 
 /// `lanes = 1 << lane_shift` threads cooperate on each range, striding
 /// through its candidates by index — pure index arithmetic, no subgroup ops.
+/// Lean: `Nice.exists_ordinal_eq` (GPU-0)
 /// The g-th valid candidate at or after a range start is
 /// `B0 + (g / R) * M + residues[g % R]`.
 ///
