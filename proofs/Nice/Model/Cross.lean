@@ -271,4 +271,107 @@ theorem fixedDigits_sub {b lo hi lo' hi' k : ℕ} (h1 : lo ≤ lo') (h2 : lo' �
   have : lo' ^ c.e / b ^ c.j = lo ^ c.e / b ^ c.j := by omega
   rw [this]
 
+/-! ### GPU-2: block starts -/
+
+/-- A rejected range of more than `minSize` numbers, with depth left, emits nothing. -/
+theorem validRangesMasked_rejected {b k minSize d start stop : ℕ} {inh : Finset ℕ}
+    (hd : 1 ≤ d) (hsize : minSize < stop - start) (hrej : analyzeRange b start (stop - 1) = false) :
+    validRangesMasked b k minSize d start stop inh = [] := by
+  obtain ⟨d', rfl⟩ : ∃ d', d = d' + 1 := ⟨d - 1, by omega⟩
+  unfold validRangesMasked
+  rw [if_neg (by omega), if_pos hrej]
+
+/-- One step of the recursion, as an equation (so a single occurrence can be
+rewritten without unfolding the others). -/
+theorem validRangesMasked_succ (b k minSize d start stop : ℕ) (inh : Finset ℕ) :
+    validRangesMasked b k minSize (d + 1) start stop inh =
+      if stop - start ≤ minSize then [(start, stop, inh)]
+      else if analyzeRange b start (stop - 1) = false then []
+      else
+        let mask := inh ∪ fixedDigits b start (stop - 1) k
+        if stop - start < 2 * minSize then [(start, stop, mask)]
+        else
+          validRangesMasked b k minSize d start (start + (stop - start) / 2) mask ++
+            validRangesMasked b k minSize d (start + (stop - start) / 2) stop mask := rfl
+
+/-- Above the floor, the recursion depends on the inherited mask only through
+its union with the range's own certificate. -/
+theorem validRangesMasked_congr_mask {b k minSize d start stop : ℕ} {inh inh' : Finset ℕ}
+    (hsize : minSize < stop - start)
+    (h : inh ∪ fixedDigits b start (stop - 1) k = inh' ∪ fixedDigits b start (stop - 1) k) :
+    validRangesMasked b k minSize (d + 1) start stop inh =
+      validRangesMasked b k minSize (d + 1) start stop inh' := by
+  rw [validRangesMasked_succ, validRangesMasked_succ, if_neg (by omega)]
+  split_ifs <;> first | rfl | omega | simp only [h]
+
+/-- Claim GPU-2: starting the masked recursion at a block of `2^j` chunks
+yields the same leaves and masks as starting at each chunk, provided chunks
+are wider than the floor and the block is given `j` extra levels of depth.
+Generalised over an inherited mask contained in every chunk's own
+certificate (the block's ancestors only add digits each chunk fixes too). -/
+theorem validRangesMasked_block {b k minSize C : ℕ} (hb : 2 ≤ b) (hC : minSize < C) (d : ℕ)
+    (hd : 1 ≤ d) :
+    ∀ (j start : ℕ) (inh : Finset ℕ),
+      (∀ i < 2 ^ j, inh ⊆ fixedDigits b (start + i * C) (start + (i + 1) * C - 1) k) →
+      validRangesMasked b k minSize (d + j) start (start + 2 ^ j * C) inh =
+        (List.range (2 ^ j)).flatMap fun i =>
+          validRangesMasked b k minSize d (start + i * C) (start + (i + 1) * C) ∅ := by
+  intro j
+  induction j with
+  | zero =>
+    intro start inh hinh
+    have h0 := hinh 0 (by norm_num)
+    simp only [Nat.zero_mul, Nat.add_zero, Nat.zero_add, Nat.one_mul] at h0
+    simp only [pow_zero, one_mul, List.range_one, List.flatMap_cons, List.flatMap_nil,
+      List.append_nil, Nat.add_zero, Nat.zero_mul, Nat.zero_add]
+    obtain ⟨d', rfl⟩ : ∃ d', d = d' + 1 := ⟨d - 1, by omega⟩
+    apply validRangesMasked_congr_mask (by omega)
+    rw [Finset.empty_union, Finset.union_eq_right.mpr h0]
+  | succ j ih =>
+    intro start inh hinh
+    have hpow : 2 ^ (j + 1) * C = 2 ^ j * C + 2 ^ j * C := by ring
+    have hC2 : 2 * C ≤ 2 ^ (j + 1) * C := Nat.mul_le_mul_right _ (by
+      calc 2 = 2 ^ 1 := by norm_num
+        _ ≤ 2 ^ (j + 1) := Nat.pow_le_pow_right (by norm_num) (by omega))
+    have hchunk : ∀ i < 2 ^ (j + 1), (i + 1) * C ≤ 2 ^ (j + 1) * C :=
+      fun i hi => Nat.mul_le_mul_right _ (by omega)
+    rw [show d + (j + 1) = (d + j) + 1 from rfl, validRangesMasked_succ, if_neg (by omega)]
+    split_ifs with hrej hnw
+    · -- rejected: every chunk is rejected too (MSD-9)
+      symm
+      apply List.flatMap_eq_nil_iff.mpr
+      intro i hi
+      rw [List.mem_range] at hi
+      have hiC : (i + 1) * C = i * C + C := by ring
+      have := hchunk i hi
+      apply validRangesMasked_rejected hd (by omega)
+      exact analyzeRange_mono hb (Nat.le_add_right _ _) (by omega) (by omega) hrej
+    · exfalso
+      omega
+    · have hmid : start + (start + 2 ^ (j + 1) * C - start) / 2 = start + 2 ^ j * C := by
+        rw [Nat.add_sub_cancel_left, hpow]
+        omega
+      simp only [hmid]
+      have hsub : ∀ i < 2 ^ (j + 1), inh ∪ fixedDigits b start (start + 2 ^ (j + 1) * C - 1) k ⊆
+          fixedDigits b (start + i * C) (start + (i + 1) * C - 1) k := by
+        intro i hi
+        apply Finset.union_subset (hinh i hi)
+        have hiC : (i + 1) * C = i * C + C := by ring
+        have := hchunk i hi
+        apply fixedDigits_sub (Nat.le_add_right _ _) (by omega) (by omega)
+      have hj1 : 2 ^ j ≤ 2 ^ (j + 1) := Nat.pow_le_pow_right (by norm_num) (by omega)
+      have hleft := ih start _ (fun i hi => hsub i (by omega))
+      have hright := ih (start + 2 ^ j * C) _ (fun i hi => by
+        have := hsub (2 ^ j + i) (by rw [pow_succ]; omega)
+        have e1 : start + (2 ^ j + i) * C = start + 2 ^ j * C + i * C := by ring
+        have e2 : start + (2 ^ j + i + 1) * C = start + 2 ^ j * C + (i + 1) * C := by ring
+        rwa [e1, e2] at this)
+      have hend : start + 2 ^ (j + 1) * C = start + 2 ^ j * C + 2 ^ j * C := by rw [hpow]; ring
+      rw [hend] at hleft hright ⊢
+      rw [hleft, hright, pow_succ, mul_two, List.range_add, List.flatMap_append, List.flatMap_map]
+      congr 1
+      apply congrArg (fun f => List.flatMap f (List.range (2 ^ j)))
+      funext i
+      congr 1 <;> ring
+
 end Nice

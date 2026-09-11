@@ -99,7 +99,7 @@ the theorem's hypotheses are the implementation's spec.
 | 2 | 0 | 10 | 0 | 0 | 0 |
 | 3 | 0 | 8 | 0 | 1 | 0 |
 | 4 | 0 | 4 | 0 | 0 | 1 |
-| 5 | 0 | 11 | 0 | 1 | 0 |
+| 5 | 0 | 12 | 0 | 0 | 0 |
 | 6 | 0 | 4 | 0 | 5 | 0 |
 | — | 0 | 0 | 0 | 0 | 2 |
 
@@ -151,6 +151,7 @@ Proved or defined so far:
 - **REF-1** `Nice.msd_lsd_skip_unsound`: the removed MSD×LSD skip is unsound: witness b=10, k=2, `[68,70)` (quotient test passes, low digits differ, 69 is nice); generally `n mod b^k` is never constant on a range of size > 1 (`mod_pow_not_constant`)
 - **END-1** `Nice.niceonly_complete`: the modelled niceonly pipeline (masked subdivision × stride walk × one-AND × nice check) reports every nice n of the range (`niceonly_complete`, for b ≥ 6, k ≤ 3) and only nice n of the range (`niceonly_sound`)
 - **GPU-1** `Nice.blockTiling_cover`: block tiling (64-chunk blocks, descending powers of two, partial chunk) sums to the field size and covers it without overlap (`blockLens_sum`, `tile_cover`, `tile_disjoint`)
+- **GPU-2** `Nice.validRangesMasked_block`: block starts yield the same leaves and masks as chunk starts: with chunks wider than the floor and the block given j extra depth levels, the masked recursion on a 2^j-chunk block equals the concatenation of the per-chunk recursions (`validRangesMasked_block`; uses MSD-9 and `fixedDigits_sub`)
 - **GPU-3** `Nice.validRangesMasked_cover`: mixing floors within a field loses nothing: the cover theorem holds for every floor and depth, so any per-block choice is sound
 - **GPU-4** `Nice.lane_partition`: lane tiling partitions the ordinals for any lane count
 - **GPU-5** `Nice.split16_exact`: split16 chunk step is exact when `d < 2^16`
