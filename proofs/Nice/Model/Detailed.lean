@@ -52,4 +52,20 @@ theorem topN_of_superset {α : Type*} {key : α → ℕ} {N : ℕ} {l₁ l : Lis
     (l₁.filter fun y => decide (key x < key y)).length < N :=
   lt_of_le_of_lt (hsub.filter _).length_le hx
 
+/-- Claim DEF-4: the near-miss cutoff `⌊0.9·b⌋`; a near miss has strictly
+more distinct digits than this (`NEAR_MISS_CUTOFF_PERCENT = 0.9`, strict
+`>` in every implementation). The Rust computes it in `f32`; for every
+base the search can represent the rounding never crosses an integer, so
+this is the same number. -/
+def nearMissCutoff (b : ℕ) : ℕ := 9 * b / 10
+
+def IsNearMiss (b n : ℕ) : Prop := nearMissCutoff b < numUniques b n
+
+/-- Every nice number is a near miss. -/
+theorem isNearMiss_of_isNice {b n : ℕ} (hb : 2 ≤ b) (h : IsNice b n) : IsNearMiss b n := by
+  unfold IsNearMiss
+  rw [(numUniques_eq_iff_isNice hb (inBaseRange_of_isNice h)).mpr h]
+  unfold nearMissCutoff
+  omega
+
 end Nice
