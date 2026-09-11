@@ -219,4 +219,39 @@ theorem niceonly_sound {b k minSize depth start stop n : ℕ}
   obtain ⟨h3, h4⟩ := validRangesMasked_subset depth start stop ∅ r hr
   exact ⟨by omega, by omega, hnice⟩
 
+/-! ### MSD-8: the common-prefix path -/
+
+/-- Claim MSD-8: the over-64 prefix check is the singleton-domain case. Two
+distinct constrained positions whose domains are the same singleton (a
+repeated digit inside one power's common prefix, or a digit shared by the
+two prefixes) rule out every `n` in the range. -/
+theorem no_nice_of_equal_singletons {b lo hi n e j e' j' : ℕ} (hb : 2 ≤ b)
+    (hlo : lo ≤ n) (hhi : n ≤ hi) (he : e = 2 ∨ e = 3) (he' : e' = 2 ∨ e' = 3)
+    (hne : e ≠ e' ∨ j ≠ j') (hj : j < numDigits b (lo ^ e)) (hj' : j' < numDigits b (lo ^ e'))
+    (hw : width b lo hi e j = 0) (hw' : width b lo hi e' j' = 0)
+    (hd : digit b (lo ^ e) j = digit b (lo ^ e') j') : ¬ IsNice b n := by
+  intro h
+  have hnd : (outputDigits b n).Nodup := h.nodup_iff.mpr List.nodup_range
+  have hjn : j < numDigits b (n ^ e) := lt_of_lt_of_le hj (numDigits_pow_mono e hlo)
+  have hjn' : j' < numDigits b (n ^ e') := lt_of_lt_of_le hj' (numDigits_pow_mono e' hlo)
+  -- both digits of n equal the low endpoint's digit at their positions
+  have hsing : ∀ {e j}, width b lo hi e j = 0 → digit b (n ^ e) j = digit b (lo ^ e) j := by
+    intro e j hw
+    have := digit_mem_cyclicInterval (b := b) (e := e) (j := j) hlo hhi
+    unfold width at hw
+    rw [hw, cyclicInterval_one (digit_lt_base (by omega) _ _), Finset.mem_singleton] at this
+    exact this
+  have hi1 := outIndex_lt he hjn
+  have hi2 := outIndex_lt he' hjn'
+  have h1 := outputDigits_getD hb he hjn
+  have h2 := outputDigits_getD hb he' hjn'
+  rw [List.getD_eq_getElem _ _ hi1] at h1
+  rw [List.getD_eq_getElem _ _ hi2] at h2
+  have hidx : outIndex b n e j = outIndex b n e' j' := by
+    have : (outputDigits b n)[outIndex b n e j] = (outputDigits b n)[outIndex b n e' j'] := by
+      rw [h1, h2, hsing hw, hsing hw', hd]
+    exact (List.Nodup.getElem_inj_iff hnd).mp this
+  obtain ⟨hee, hjj⟩ := outIndex_inj he he' hjn hjn' hidx
+  rcases hne with hne | hne <;> exact hne (by assumption)
+
 end Nice

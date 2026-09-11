@@ -35,4 +35,21 @@ theorem one_le_numUniques {b n : ℕ} (hn : n ≠ 0) : 1 ≤ numUniques b n := b
   obtain ⟨d, hd⟩ := List.exists_mem_of_ne_nil _ this
   exact ⟨d, List.mem_toFinset.mpr (List.mem_append_left _ hd)⟩
 
+/-! ### DET-1: the accumulators -/
+
+/-- Histogram bins fold batch by batch: the count of a value over a
+concatenation is the sum of the counts (`DistributionAccumulator`). -/
+theorem histogram_fold {α : Type*} (p : α → Bool) (l₁ l₂ : List α) :
+    (l₁ ++ l₂).countP p = l₁.countP p + l₂.countP p :=
+  List.countP_append
+
+/-- Top-N compaction never drops a number that belongs in the final top-N:
+an element with fewer than `N` strictly larger keys in the whole list has
+fewer than `N` in any batch (`NumbersAccumulator`). Ties are not broken
+here; the Rust breaks them by value, which only matters for equal keys. -/
+theorem topN_of_superset {α : Type*} {key : α → ℕ} {N : ℕ} {l₁ l : List α} (hsub : List.Sublist l₁ l)
+    (x : α) (hx : (l.filter fun y => decide (key x < key y)).length < N) :
+    (l₁.filter fun y => decide (key x < key y)).length < N :=
+  lt_of_le_of_lt (hsub.filter _).length_le hx
+
 end Nice

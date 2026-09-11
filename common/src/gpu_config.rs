@@ -66,6 +66,7 @@ pub fn chunk_constants_below(base: u32, limit: u64) -> (u32, u32) {
 /// u32 and the `u64 / base^e` split is a 64-bit division by a compile-time
 /// constant — which nvcc strength-reduces to a multiply-high.
 #[must_use]
+// Lean: `Nice.chunkExp_spec` (NUM-6)
 pub fn chunk_constants(base: u32) -> (u32, u32) {
     chunk_constants_below(base, 1 << 31)
 }
@@ -144,7 +145,8 @@ fn guaranteed_low_digits(base: u32) -> Option<u32> {
 /// - n² and n³ must each be guaranteed at least p digits across the base's
 ///   whole range (see [`guaranteed_low_digits`]).
 #[must_use]
-/// Lean: `Nice.numDigits_pow_mono` (RNG-5), `Nice.prefilter_rejects_all_of_short` (GPU-8)
+/// Lean: `Nice.numDigits_pow_mono` (RNG-5), `Nice.prefilter_rejects_all_of_short` (GPU-8),
+/// `Nice.prefilter_sound` (NUM-7)
 pub fn prefilter_params(base: u32) -> Option<PrefilterParams> {
     // Profitability gate (see GPU_PREFILTER_MAX_BASE). Every consumer —
     // define injection, the CPU diagnostics mirror, the G0/G1 harnesses —

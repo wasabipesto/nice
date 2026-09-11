@@ -38,6 +38,7 @@ pub fn expand_numbers(numbers: &[NiceNumberSimple], base: u32) -> Vec<NiceNumber
 ///
 /// The working set is compacted back to the cap whenever it doubles, so peak
 /// memory is bounded by 2x the cap no matter how many batches are folded in.
+/// Lean: `Nice.topN_of_superset` (DET-1)
 /// Compaction never drops a number that belongs in the final top-N: the top-N
 /// of a set is contained in the top-N of every superset.
 #[derive(Default)]

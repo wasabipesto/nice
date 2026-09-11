@@ -573,6 +573,7 @@ pub fn analyze_range(range: FieldSize, base: u32, fixed_lsd_k: usize) -> MsdAnal
 /// The classic common-MSD-prefix duplicate/overlap analysis for bases above
 /// 64, whose digits don't fit u64 domain masks. Never emits a certificate
 /// (`fixed_mask` stays 0), matching the empty `low_digit_masks` there.
+// Lean: `Nice.no_nice_of_equal_singletons` (MSD-8)
 fn analyze_range_over_64(range: FieldSize, base: u32) -> MsdAnalysis {
     // Bases above 64 don't fit u64 digit masks; keep the classic
     // common-MSD-prefix duplicate/overlap analysis for them.
