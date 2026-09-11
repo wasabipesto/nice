@@ -41,8 +41,8 @@ checked outside Lean. `evidence` is what the Rust side has today.
 | RES-1a | a nice number's output digits sum to `b(b−1)/2` | `Nice.nice_digit_sum` | `common/src/residue_filter.rs` | — | proved | 0 |
 | RES-2 | `b ≡ 3 (mod 4) → ∀ n, ¬IsNice b n` | `Nice.no_nice_of_three_mod_four` | `common/src/residue_filter.rs` (oracle test) | oracle test 5–512 | planned | 2 |
 | RES-3 | `residueFilter b = ∅ → ∀ n, ¬IsNice b n`; `residueFilter 11 = ∅` | `Nice.no_nice_of_residueFilter_empty` | `common/src/gpu_niceonly.rs::residue_empty_result` | tests | proved | 2 |
-| LSD-1 | `digit b (n^e) j` for `j < k` depends only on `n mod b^k` | `Nice.digit_pow_mod_pow` | `common/src/lsd_filter.rs` | comment | planned | 2 |
-| LSD-2 | nice + RNG-3 ⇒ the 2k fixed-width low digits are pairwise distinct ⇒ `n mod b^k ∈ lsdBitmap b k` | `Nice.Model.Lsd.mem_bitmap_of_isNice` | `common/src/lsd_filter.rs::get_valid_multi_lsd_bitmap` | brute-force b 4–16 | planned | 2 |
+| LSD-1 | `digit b (n^e) j` for `j < k` depends only on `n mod b^k` | `Nice.digit_pow_mod_pow` | `common/src/lsd_filter.rs` | comment | proved | 2 |
+| LSD-2 | nice + RNG-3 ⇒ the 2k fixed-width low digits are pairwise distinct ⇒ `n mod b^k ∈ lsdBitmap b k` | `Nice.mem_lsdBitmap_of_isNice` | `common/src/lsd_filter.rs::get_valid_multi_lsd_bitmap` | brute-force b 4–16 | proved | 2 |
 | STR-1 | `Coprime (b−1) (b^k)`; passes both ⇔ `n mod M ∈ validResidues` | `Nice.Model.Stride.mem_validResidues_iff` | `common/src/stride_filter.rs::StrideTable::new` | comment | planned | 2 |
 | STR-2 | the gap-table walk visits exactly the valid n in `[start,end)` in order | `Nice.Model.Stride.walk_eq_filter` | `common/src/stride_filter.rs::iterate_range_masked` | tests (gap sum = M) | planned | 2 |
 | STR-3 | seeded check equals the plain check under RNG-3 | `Nice.Model.Stride.seeded_eq_plain` | `common/src/client_process.rs::get_is_nice_with_known_lsd` | 5000-sample test | planned | 2 |
