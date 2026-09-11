@@ -468,6 +468,7 @@ pub enum MsdAnalysis {
     Live { fixed_mask: u64 },
 }
 
+/// Lean: `Nice.no_nice_of_cross` (CRS-1)
 /// Interval-domain MSD analysis returning the full certificate.
 ///
 /// `fixed_lsd_k` is the stride table's LSD depth: singleton digits at
@@ -624,6 +625,7 @@ fn analyze_range_over_64(range: FieldSize, base: u32) -> MsdAnalysis {
         return MsdAnalysis::Rejected;
     }
 
+    // Lean: `Nice.msd_lsd_skip_unsound` (REF-1)
     // NOTE (2026-08 theory review): a "cross MSD×LSD collision check" used to
     // live here, gated on `range.first() / b^k == range.last() / b^k`. That
     // condition only means the range fits inside one quotient block of b^k;
@@ -750,6 +752,7 @@ pub fn get_valid_ranges(range: FieldSize, base: u32) -> Vec<FieldSize> {
     )
 }
 
+/// Lean: `Nice.validRangesMasked_cover` (CRS-2)
 /// `get_valid_ranges_recursive` with the cross-end certificate: each emitted
 /// leaf carries the union of every analyzed ancestor's `fixed_mask` — a fact
 /// proved for a range holds on all of its subranges, so leaves that stop at
