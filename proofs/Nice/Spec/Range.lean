@@ -16,6 +16,8 @@ namespace Nice
 /-- The set the search covers: digit counts of the two powers sum to `b`. -/
 def InBaseRange (b n : ℕ) : Prop := numDigits b (n ^ 2) + numDigits b (n ^ 3) = b
 
+instance (b n : ℕ) : Decidable (InBaseRange b n) := by unfold InBaseRange; infer_instance
+
 theorem inBaseRange_of_isNice {b n : ℕ} (h : IsNice b n) : InBaseRange b n :=
   nice_digit_count h
 

@@ -1,0 +1,192 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! nice_common = { path = "../common" }
+//! serde = { version = "1.0", features = ["derive"] }
+//! serde_json = "1.0"
+//! ```
+//! Emit the tables the Lean conformance check compares against the model
+//! (`proofs/Conformance.lean`). Small parameters on purpose: the Lean model
+//! is executable but not fast, and the point is "model = code" on the exact
+//! tables the code builds, not throughput. Regenerate with
+//! `just lean-fixtures`; the output is checked in.
+
+use nice_common::base_range::get_base_range_u128;
+use nice_common::client_process::{get_is_nice, get_is_nice_with_known_lsd};
+use nice_common::lsd_filter::get_valid_multi_lsd_bitmap;
+use nice_common::residue_filter::get_residue_filter;
+use nice_common::stride_filter::StrideTable;
+use serde::Serialize;
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Serialize)]
+struct Residue {
+    base: u32,
+    residues: Vec<u32>,
+}
+
+#[derive(Serialize)]
+struct Lsd {
+    base: u32,
+    k: u32,
+    valid: Vec<u32>,
+}
+
+#[derive(Serialize)]
+struct FirstValid {
+    start: String,
+    n: String,
+    idx: usize,
+}
+
+#[derive(Serialize)]
+struct Stride {
+    base: u32,
+    k: u32,
+    modulus: String,
+    valid_residues: Vec<u32>,
+    gap_table: Vec<u32>,
+    /// Digit sets, one sorted list per residue (from `low_digit_masks`).
+    low_digits: Vec<Vec<u32>>,
+    first_valid: Vec<FirstValid>,
+}
+
+#[derive(Serialize)]
+struct Range {
+    base: u32,
+    start: Option<String>,
+    end: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Seeded {
+    base: u32,
+    k: u32,
+    /// (n, seeded verdict, plain verdict)
+    samples: Vec<(String, bool, bool)>,
+}
+
+fn digits_of_mask(mask: u64) -> Vec<u32> {
+    (0..64).filter(|d| mask & (1u64 << d) != 0).collect()
+}
+
+fn main() {
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("proofs")
+        .join("fixtures");
+    let out = if out.exists() {
+        out
+    } else {
+        PathBuf::from("proofs/fixtures")
+    };
+    fs::create_dir_all(&out).unwrap();
+
+    let residues: Vec<Residue> = (5..=40)
+        .map(|base| Residue {
+            base,
+            residues: get_residue_filter(&base),
+        })
+        .collect();
+    fs::write(
+        out.join("residue.json"),
+        serde_json::to_string_pretty(&residues).unwrap(),
+    )
+    .unwrap();
+
+    let lsd: Vec<Lsd> = [(10, 1), (10, 2), (12, 2), (16, 2), (10, 3)]
+        .iter()
+        .map(|&(base, k)| Lsd {
+            base,
+            k,
+            valid: get_valid_multi_lsd_bitmap(base, k)
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| v)
+                .map(|(i, _)| i as u32)
+                .collect(),
+        })
+        .collect();
+    fs::write(out.join("lsd.json"), serde_json::to_string_pretty(&lsd).unwrap()).unwrap();
+
+    let stride: Vec<Stride> = [(10, 1), (10, 2), (12, 2), (16, 2)]
+        .iter()
+        .map(|&(base, k)| {
+            let t = StrideTable::new(base, k);
+            let starts: Vec<u128> = [0u128, 1, 47, 68, 69, 99, 100, 1_000, 12_345]
+                .into_iter()
+                .chain((0..8).map(|i| t.modulus * 3 + i * 7 + 1))
+                .chain([t.modulus - 1, t.modulus, t.modulus + 1])
+                .collect();
+            Stride {
+                base,
+                k,
+                modulus: t.modulus.to_string(),
+                valid_residues: t.valid_residues.clone(),
+                gap_table: t.gap_table.clone(),
+                low_digits: t.low_digit_masks.iter().map(|&m| digits_of_mask(m)).collect(),
+                first_valid: starts
+                    .into_iter()
+                    .map(|start| {
+                        let (n, idx) = t.first_valid_at_or_after(start);
+                        FirstValid {
+                            start: start.to_string(),
+                            n: n.to_string(),
+                            idx,
+                        }
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    fs::write(
+        out.join("stride.json"),
+        serde_json::to_string_pretty(&stride).unwrap(),
+    )
+    .unwrap();
+
+    let ranges: Vec<Range> = (5..=20)
+        .map(|base| {
+            let r = get_base_range_u128(base).unwrap();
+            Range {
+                base,
+                start: r.map(|f| f.start().to_string()),
+                end: r.map(|f| f.end().to_string()),
+            }
+        })
+        .collect();
+    fs::write(
+        out.join("range.json"),
+        serde_json::to_string_pretty(&ranges).unwrap(),
+    )
+    .unwrap();
+
+    // Seeded check on real base-40 candidates: the first 300 stride
+    // candidates of the base range plus 69 in base 10 for good measure.
+    let mut seeded = Vec::new();
+    for &(base, k) in &[(40u32, 3u32), (10, 1)] {
+        let t = StrideTable::new(base, k);
+        let range = get_base_range_u128(base).unwrap().unwrap();
+        let (mut n, mut idx) = t.first_valid_at_or_after(range.start());
+        let mut samples = Vec::new();
+        while samples.len() < 300 && n < range.end() {
+            let mask = t.low_digit_masks[idx];
+            samples.push((
+                n.to_string(),
+                get_is_nice_with_known_lsd(n, base, k, mask),
+                get_is_nice(n, base),
+            ));
+            n += u128::from(t.gap_table[idx]);
+            idx = (idx + 1) % t.gap_table.len();
+        }
+        seeded.push(Seeded { base, k, samples });
+    }
+    fs::write(
+        out.join("seeded.json"),
+        serde_json::to_string_pretty(&seeded).unwrap(),
+    )
+    .unwrap();
+    println!("fixtures written to {}", out.display());
+}

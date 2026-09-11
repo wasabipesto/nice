@@ -19,7 +19,7 @@ import Mathlib.Data.Finset.Sort
 namespace Nice
 
 /-- The Rust `valid_residues` vector: the residue set, sorted. -/
-noncomputable def residueList (b k : ℕ) : List ℕ := (validResidues b k).sort (· ≤ ·)
+def residueList (b k : ℕ) : List ℕ := (validResidues b k).sort (· ≤ ·)
 
 theorem residueList_sorted (b k : ℕ) : (residueList b k).Pairwise (· < ·) :=
   ((Finset.pairwise_sort _ _).and (Finset.sort_nodup _ _)).imp fun ⟨hle, hne⟩ =>
@@ -32,7 +32,7 @@ theorem length_residueList (b k : ℕ) : (residueList b k).length = (validResidu
   Finset.length_sort _
 
 /-- The `g`-th candidate from block base `B0`. -/
-noncomputable def ordinal (b k B0 g : ℕ) : ℕ :=
+def ordinal (b k B0 g : ℕ) : ℕ :=
   let V := residueList b k
   B0 + g / V.length * strideModulus b k + V.getD (g % V.length) 0
 
