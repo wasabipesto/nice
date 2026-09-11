@@ -95,7 +95,7 @@ the theorem's hypotheses are the implementation's spec.
 | phase | def | proved | stated | planned | other |
 |---|---|---|---|---|---|
 | 0 | 1 | 3 | 0 | 0 | 0 |
-| 1 | 0 | 16 | 0 | 2 | 0 |
+| 1 | 1 | 16 | 0 | 1 | 0 |
 | 2 | 0 | 10 | 0 | 0 | 0 |
 | 3 | 0 | 7 | 0 | 2 | 0 |
 | 4 | 0 | 4 | 0 | 0 | 1 |
@@ -109,6 +109,7 @@ Proved or defined so far:
 - **DEF-1a** `Nice.isNice_iff_pandigital`: the three-part `Pandigital` definition of `origin/proofs` is equivalent
 - **DEF-2** `Nice.numUniques_eq_iff_isNice`: inside the base range, `numUniques b n = b ↔ IsNice b n`
 - **DEF-3** `Nice.one_le_numUniques`: `1 ≤ numUniques b n` for `n ≥ 1` (histogram bin 0 is empty)
+- **DEF-4** `Nice.nearMissCutoff`: near-miss cutoff is `⌊0.9 b⌋` with strict `>` (`IsNearMiss`); every nice number is a near miss (`isNearMiss_of_isNice`)
 - **RNG-1** `Nice.nice_digit_count`: `IsNice b n → numDigits(n²) + numDigits(n³) = b`
 - **RNG-2** `Nice.memBaseRange_of_inBaseRange`: the per-`b mod 5` closed-form interval contains every n with `numDigits(n²) + numDigits(n³) = b`
 - **RNG-3** `Nice.three_le_numDigits_of_inBaseRange`: inside the range every power has `≥ k` digits for `k ≤ 3`, `b ≥ 6`

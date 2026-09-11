@@ -12,6 +12,7 @@ pub const SAVE_TOP_N_NUMBERS: usize = 10_000;
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
 )]
+// Lean: `Nice.nearMissCutoff` (DEF-4)
 pub fn get_near_miss_cutoff(base: u32) -> u32 {
     (base as f32 * NEAR_MISS_CUTOFF_PERCENT).floor() as u32
 }

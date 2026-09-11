@@ -20,7 +20,7 @@ checked outside Lean. `evidence` is what the Rust side has today.
 | DEF-1a | the three-part `Pandigital` definition of `origin/proofs` is equivalent | `Nice.isNice_iff_pandigital` | — | — | proved | 0 |
 | DEF-2 | inside the base range, `numUniques b n = b ↔ IsNice b n` | `Nice.numUniques_eq_iff_isNice` | `common/src/client_process.rs::get_num_unique_digits` | comment | proved | 1 |
 | DEF-3 | `1 ≤ numUniques b n` for `n ≥ 1` (histogram bin 0 is empty) | `Nice.one_le_numUniques` | `common/src/distribution_stats.rs` | comment | proved | 1 |
-| DEF-4 | near-miss cutoff is `⌊0.9 b⌋`, strict `>` | `Nice.nearMissCutoff` | `common/src/number_stats.rs::get_near_miss_cutoff` | tests | planned | 1 |
+| DEF-4 | near-miss cutoff is `⌊0.9 b⌋` with strict `>` (`IsNearMiss`); every nice number is a near miss (`isNearMiss_of_isNice`) | `Nice.nearMissCutoff` | `common/src/number_stats.rs::get_near_miss_cutoff` | tests | def | 1 |
 | RNG-1 | `IsNice b n → numDigits(n²) + numDigits(n³) = b` | `Nice.nice_digit_count` | `common/src/base_range.rs` | tests | proved | 0 |
 | RNG-2 | the per-`b mod 5` closed-form interval contains every n with `numDigits(n²) + numDigits(n³) = b` | `Nice.memBaseRange_of_inBaseRange` | `common/src/base_range.rs::get_base_range_natural` | tests pin 8 bases | proved | 1 |
 | RNG-2b | conversely every n in the closed-form interval has digit-count sum b (`InBaseRange`) | `Nice.inBaseRange_of_memBaseRange` | `common/src/base_range.rs::get_base_range_natural` | tests pin 8 bases | planned | 1 |
