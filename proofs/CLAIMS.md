@@ -22,19 +22,21 @@ checked outside Lean. `evidence` is what the Rust side has today.
 | DEF-3 | `1 ≤ numUniques b n` for `n ≥ 1` (histogram bin 0 is empty) | `Nice.one_le_numUniques` | `common/src/distribution_stats.rs` | comment | planned | 1 |
 | DEF-4 | near-miss cutoff is `⌊0.9 b⌋`, strict `>` | `Nice.nearMissCutoff` | `common/src/number_stats.rs::get_near_miss_cutoff` | tests | planned | 1 |
 | RNG-1 | `IsNice b n → numDigits(n²) + numDigits(n³) = b` | `Nice.nice_digit_count` | `common/src/base_range.rs` | tests | proved | 0 |
-| RNG-2 | the per-`b mod 5` interval is exactly `{n : numDigits(n²) + numDigits(n³) = b}` | `Nice.mem_baseRange_iff` | `common/src/base_range.rs::get_base_range_natural` | tests pin 8 bases | planned | 1 |
-| RNG-3 | inside the range every power has `≥ k` digits for `k ≤ 3`, `b ≥ 6` | `Nice.baseRange_numDigits_ge` | `common/src/lsd_filter.rs`, `common/src/client_process.rs::get_is_nice_with_known_lsd` | comment | planned | 1 |
-| RNG-4 | `b ≡ 1 (mod 5)` ⇒ no n has digit-count sum b | `Nice.baseRange_empty_of_one_mod_five` | `common/src/base_range.rs` | asserted | planned | 1 |
-| RNG-5 | `numDigits b (n^e)` is monotone in n | `Nice.numDigits_pow_mono` | `common/src/gpu_config.rs::prefilter_params` | comment | planned | 1 |
-| NUM-1 | `(rangeEnd 40 − 1)^3 < 2^128` | `Nice.Const.u128_cutoff` | `common/src/client_process.rs::MAX_BASE_FOR_FIXED_WIDTH_U128` | rust test (PR #158) | planned | 1 |
-| NUM-2 | `(rangeEnd b − 1)^3 < 2^256` for `b ≤ 68`; 69 fits, 70 does not | `Nice.Const.u256_cutoff` | `common/src/client_process.rs::MAX_BASE_FOR_FIXED_WIDTH_U256` | rust test (PR #158) | planned | 1 |
-| NUM-3 | `numDigits b (n^3) ≤ 38` for `b ≤ 64` in range | `Nice.Const.max_fw_digits` | `common/src/msd_prefix_filter.rs::MAX_FW_DIGITS` | comment | planned | 1 |
-| NUM-4 | `(b−1)·b^3 < 2^32` for `b ≤ 256`; `< 2^28` for `b ≤ 128` | `Nice.Const.stride_modulus_bounds` | `common/src/stride_filter.rs::StrideTable::new`, `common/src/gpu_niceonly.rs::MAX_STRIDE_MODULUS` | runtime assert | planned | 1 |
-| NUM-5 | digit masks need `b ≤ 64` (u64) / `b ≤ 128` (two words) | `Nice.Const.mask_width` | `common/src/gpu_config.rs::MAX_GPU_DIGIT_MASK_BASE` | const-assert | planned | 1 |
+| RNG-2 | the per-`b mod 5` closed-form interval contains every n with `numDigits(n²) + numDigits(n³) = b` | `Nice.memBaseRange_of_inBaseRange` | `common/src/base_range.rs::get_base_range_natural` | tests pin 8 bases | proved | 1 |
+| RNG-2b | conversely every n in the closed-form interval has digit-count sum b (`InBaseRange`) | `Nice.inBaseRange_of_memBaseRange` | `common/src/base_range.rs::get_base_range_natural` | tests pin 8 bases | planned | 1 |
+| RNG-3 | inside the range every power has `≥ k` digits for `k ≤ 3`, `b ≥ 6` | `Nice.three_le_numDigits_of_inBaseRange` | `common/src/lsd_filter.rs`, `common/src/client_process.rs::get_is_nice_with_known_lsd` | comment | proved | 1 |
+| RNG-4 | `b ≡ 1 (mod 5)` ⇒ no n has digit-count sum b | `Nice.not_inBaseRange_of_one_mod_five` | `common/src/base_range.rs` | asserted | proved | 1 |
+| RNG-5 | `numDigits b (n^e)` is monotone in n | `Nice.numDigits_pow_mono` | `common/src/gpu_config.rs::prefilter_params` | comment | proved | 1 |
+| NUM-1 | `(rangeEnd 40 − 1)^3 < 2^128` | `Nice.Const.u128_cutoff_40` | `common/src/client_process.rs::MAX_BASE_FOR_FIXED_WIDTH_U128` | rust test (PR #158) | proved | 1 |
+| NUM-2 | `(rangeEnd b − 1)^3 < 2^256` for `b ≤ 68`; 69 fits, 70 does not | `Nice.Const.u256_cutoff` | `common/src/client_process.rs::MAX_BASE_FOR_FIXED_WIDTH_U256` | rust test (PR #158) | proved | 1 |
+| NUM-3 | `numDigits b (n^3) ≤ 38` for `b ≤ 64` in range | `Nice.Const.max_fw_digits` | `common/src/msd_prefix_filter.rs::MAX_FW_DIGITS` | comment | proved | 1 |
+| NUM-4 | `(b−1)·b^3 < 2^32` for `b ≤ 256` (u32 stride table) | `Nice.Const.stride_modulus_u32` | `common/src/stride_filter.rs::StrideTable::new` | runtime assert | proved | 1 |
+| NUM-4a | `(b−1)·b^3 < 2^28` for `b ≤ 128` (`MAX_STRIDE_MODULUS`) | `Nice.Const.stride_modulus_gpu` | `common/src/gpu_niceonly.rs::MAX_STRIDE_MODULUS` | runtime assert | proved | 1 |
+| NUM-5 | digit masks need `b ≤ 64` (u64) / `b ≤ 128` (two words) | `Nice.Const.mask_width` | `common/src/stride_filter.rs::StrideTable::low_digit_masks` | const-assert | proved | 1 |
 | NUM-6 | GPU chunk constants maximal and split16-safe | `Nice.Const.chunk_constants` | `common/src/gpu_config.rs::chunk_constants` | tests | planned | 1 |
 | NUM-7 | per-base prefilter digit count equals the exact integer bound | `Nice.Const.prefilter_digits` | `common/src/gpu_config.rs::prefilter_params` | integer test re-checks the float | planned | 1 |
-| NUM-8 | `M² + M < 2^64` for `M < 2^32` | `Nice.Const.mod_m_bound` | `common/src/cuda/nice_kernels.cu::mod_m` | comment (fixed PR #158) | planned | 1 |
-| NUM-9 | histogram bins cannot overflow u32 | `Nice.Const.histogram_bins` | `common/src/cubecl_backend.rs::DRAIN_INTERVAL` | const-assert + test | planned | 1 |
+| NUM-8 | `M² + M < 2^64` for `M < 2^32` | `Nice.Const.mod_m_bound` | `common/src/cuda/nice_kernels.cu::mod_m` | comment (fixed PR #158) | proved | 1 |
+| NUM-9 | histogram bins cannot overflow u32 | `Nice.Const.histogram_bins` | `common/src/cubecl_backend.rs::DRAIN_INTERVAL` | const-assert + test | proved | 1 |
 | RES-1 | `IsNice b n → n² + n³ ≡ b(b−1)/2 (mod b−1)`; `n mod (b−1) ∈ residueFilter b` | `Nice.mem_residueFilter_of_isNice` | `common/src/residue_filter.rs::get_residue_filter` | tests | proved | 2 |
 | RES-1a | a nice number's output digits sum to `b(b−1)/2` | `Nice.nice_digit_sum` | `common/src/residue_filter.rs` | — | proved | 0 |
 | RES-2 | `b ≡ 3 (mod 4) → ∀ n, ¬IsNice b n` | `Nice.no_nice_of_three_mod_four` | `common/src/residue_filter.rs` (oracle test) | oracle test 5–512 | planned | 2 |

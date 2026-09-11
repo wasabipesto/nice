@@ -82,7 +82,7 @@ the theorem's hypotheses are the implementation's spec.
 | phase | def | proved | stated | planned | other |
 |---|---|---|---|---|---|
 | 0 | 1 | 3 | 0 | 0 | 0 |
-| 1 | 0 | 0 | 0 | 16 | 0 |
+| 1 | 0 | 12 | 0 | 6 | 0 |
 | 2 | 0 | 2 | 0 | 8 | 0 |
 | 3 | 0 | 0 | 0 | 9 | 0 |
 | 4 | 0 | 0 | 0 | 5 | 0 |
@@ -95,6 +95,18 @@ Proved or defined so far:
 - **DEF-1** `Nice.IsNice`: `IsNice b n` ⇔ the base-b digits of n² followed by those of n³ permute `0..b-1`
 - **DEF-1a** `Nice.isNice_iff_pandigital`: the three-part `Pandigital` definition of `origin/proofs` is equivalent
 - **RNG-1** `Nice.nice_digit_count`: `IsNice b n → numDigits(n²) + numDigits(n³) = b`
+- **RNG-2** `Nice.memBaseRange_of_inBaseRange`: the per-`b mod 5` closed-form interval contains every n with `numDigits(n²) + numDigits(n³) = b`
+- **RNG-3** `Nice.three_le_numDigits_of_inBaseRange`: inside the range every power has `≥ k` digits for `k ≤ 3`, `b ≥ 6`
+- **RNG-4** `Nice.not_inBaseRange_of_one_mod_five`: `b ≡ 1 (mod 5)` ⇒ no n has digit-count sum b
+- **RNG-5** `Nice.numDigits_pow_mono`: `numDigits b (n^e)` is monotone in n
+- **NUM-1** `Nice.Const.u128_cutoff_40`: `(rangeEnd 40 − 1)^3 < 2^128`
+- **NUM-2** `Nice.Const.u256_cutoff`: `(rangeEnd b − 1)^3 < 2^256` for `b ≤ 68`; 69 fits, 70 does not
+- **NUM-3** `Nice.Const.max_fw_digits`: `numDigits b (n^3) ≤ 38` for `b ≤ 64` in range
+- **NUM-4** `Nice.Const.stride_modulus_u32`: `(b−1)·b^3 < 2^32` for `b ≤ 256` (u32 stride table)
+- **NUM-4a** `Nice.Const.stride_modulus_gpu`: `(b−1)·b^3 < 2^28` for `b ≤ 128` (`MAX_STRIDE_MODULUS`)
+- **NUM-5** `Nice.Const.mask_width`: digit masks need `b ≤ 64` (u64) / `b ≤ 128` (two words)
+- **NUM-8** `Nice.Const.mod_m_bound`: `M² + M < 2^64` for `M < 2^32`
+- **NUM-9** `Nice.Const.histogram_bins`: histogram bins cannot overflow u32
 - **RES-1** `Nice.mem_residueFilter_of_isNice`: `IsNice b n → n² + n³ ≡ b(b−1)/2 (mod b−1)`; `n mod (b−1) ∈ residueFilter b`
 - **RES-1a** `Nice.nice_digit_sum`: a nice number's output digits sum to `b(b−1)/2`
 - **RES-3** `Nice.no_nice_of_residueFilter_empty`: `residueFilter b = ∅ → ∀ n, ¬IsNice b n`; `residueFilter 11 = ∅`

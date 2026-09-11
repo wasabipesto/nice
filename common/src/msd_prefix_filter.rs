@@ -39,6 +39,7 @@ use crate::fixed_width::U256;
 // For b62: k=12, b%5=2 → n³ has 3k+1 = 37 digits.
 // For b64: k=12, b%5=4 → n³ has 3k+2 = 38 digits.
 // 38 covers all specialized bases ≤ 64.
+// Lean: `Nice.Const.max_fw_digits` (NUM-3)
 const MAX_FW_DIGITS: usize = 38;
 
 /// Stack-resident digit sequence used by the fixed-width MSD path. Stores

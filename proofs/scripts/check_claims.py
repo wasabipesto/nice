@@ -85,7 +85,7 @@ def lean_query(decls: list[str], axioms_for: list[str]) -> dict[str, dict]:
         tmp.unlink()
     result = {d: {"exists": True, "axioms": None} for d in decls}
     for line in proc.stdout.splitlines() + proc.stderr.splitlines():
-        m = re.search(r"unknown (?:constant|identifier) '?([^'\s]+)'?", line)
+        m = re.search(r"unknown (?:constant|identifier) [`']?([^`'\s]+)[`']?", line, re.I)
         if m:
             name = m.group(1).lstrip("@")
             if name in result:
@@ -97,9 +97,12 @@ def lean_query(decls: list[str], axioms_for: list[str]) -> dict[str, dict]:
         m = re.match(r"'([^']+)' does not depend on any axioms", line.strip())
         if m:
             result.setdefault(m.group(1), {"exists": True})["axioms"] = []
-    if proc.returncode != 0 and "unknown" not in proc.stdout + proc.stderr:
-        print(proc.stdout, proc.stderr, file=sys.stderr)
-        sys.exit("lake env lean failed")
+    # Only "unknown constant/identifier" errors are expected (missing
+    # declarations); anything else means the library did not build.
+    for line in proc.stdout.splitlines() + proc.stderr.splitlines():
+        if "error" in line and not re.search(r"unknown (?:constant|identifier)", line, re.I):
+            print(proc.stdout, proc.stderr, file=sys.stderr)
+            sys.exit("lake env lean failed; run `lake build` first")
     return result
 
 

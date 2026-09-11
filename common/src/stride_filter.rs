@@ -38,6 +38,7 @@ pub struct StrideTable {
     /// construction (the LSD filter rejected everything else), so the nice
     /// check can seed its duplicate indicator from this mask and skip
     /// re-extracting the low digits. Empty when base > 64 (digits would not
+    /// Lean: `Nice.Const.mask_width` (NUM-5)
     /// fit a u64 mask); iteration then falls back to the unseeded check.
     pub low_digit_masks: Vec<u64>,
 }
@@ -48,6 +49,8 @@ impl StrideTable {
     /// # Arguments
     /// - `base`: The numeric base
     /// - `k`: Number of least significant digits to check (from multi-digit LSD filter)
+    ///
+    /// Lean: `Nice.Const.stride_modulus_u32` (NUM-4)
     ///
     /// # Panics
     /// Panics if base^k overflows u32 or (base-1) × base^k overflows u32
