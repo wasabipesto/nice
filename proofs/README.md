@@ -54,7 +54,7 @@ dumps the residue tables, LSD bitmaps, stride tables (residues, gaps,
 low-digit masks, `first_valid_at_or_after` samples), base ranges and
 seeded-check verdicts for small parameters into `fixtures/*.json`.
 `just lean-conformance` recomputes each from the executable Lean model
-and diffs (about 9,000 checks, about a minute). Theorems pin "model = spec"; this
+and diffs (about 9,000 checks, ~10 s). Theorems pin "model = spec"; this
 pins "model = code". The fixtures are checked in; regenerate them when
 the Rust tables change.
 
