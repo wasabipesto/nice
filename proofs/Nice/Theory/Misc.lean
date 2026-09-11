@@ -48,4 +48,17 @@ theorem hall_relaxation_incomplete :
     analyzeRange 10 47 60 = true ∧ ∀ n ∈ Finset.Icc 47 60, ¬ IsNice 10 n := by
   decide
 
+/-- The size of the search range in closed form (`0` for bases without one). -/
+noncomputable def baseRangeSize (b : ℕ) : ℕ :=
+  match baseRange b with
+  | some (lo, hi) => hi - lo
+  | none => 0
+
+/-- Claim THY-9: the random-digit witness model, `λ_b = |range_b| · b! / b^b`,
+the expected number of nice numbers in base `b` if output digits were
+uniform and independent. A heuristic, recorded as a definition only; the
+project's cost model is `λ_b` times an empirical tail correction. -/
+noncomputable def witnessRate (b : ℕ) : ℚ :=
+  (baseRangeSize b : ℚ) * (Nat.factorial b : ℚ) / ((b : ℚ) ^ b)
+
 end Nice

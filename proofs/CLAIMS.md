@@ -84,5 +84,5 @@ checked outside Lean. `evidence` is what the Rust side has today.
 | THY-6 | the interval-domain Hall check is strictly incomplete: base 10, `[47, 60]` has an SDR but no nice number (by `decide`) | `Nice.hall_relaxation_incomplete` | — | probe | proved | 6 |
 | THY-7 | carry-state ladder: distinct suffixes never share an exact future | `Nice.Theory.suffix_future_injective` | — | measured | planned | 6 |
 | THY-8 | tree recurrences for digits of n², n³ when appending a digit | `Nice.Theory.tree_recurrence` | `scripts/radix_tree_search.rs` | 20k random cases | planned | 6 |
-| THY-9 | witness model `λ_b = range_b · b!/b^b` (definition only) | `Nice.Theory.witnessRate` | — | heuristic | planned | 6 |
+| THY-9 | witness model `λ_b = range_b · b!/b^b` (definition only) | `Nice.witnessRate` | — | heuristic | def | 6 |
 <!-- claims:end -->

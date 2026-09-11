@@ -100,7 +100,7 @@ the theorem's hypotheses are the implementation's spec.
 | 3 | 0 | 8 | 0 | 1 | 0 |
 | 4 | 0 | 4 | 0 | 0 | 1 |
 | 5 | 0 | 12 | 0 | 0 | 0 |
-| 6 | 0 | 4 | 0 | 5 | 0 |
+| 6 | 1 | 4 | 0 | 4 | 0 |
 | — | 0 | 0 | 0 | 0 | 2 |
 
 Proved or defined so far:
@@ -166,4 +166,5 @@ Proved or defined so far:
 - **THY-3** `Nice.complement_sum`: once some output digits are fixed, the rest sum to the complement and form the complement set (`complement_set`): a digit-sum window on the unassigned positions is vacuous
 - **THY-5** `Nice.window_sound`: middle-window filter is sound (digits at `p..p+w` depend on `n mod b^(p+w)`)
 - **THY-6** `Nice.hall_relaxation_incomplete`: the interval-domain Hall check is strictly incomplete: base 10, `[47, 60]` has an SDR but no nice number (by `decide`)
+- **THY-9** `Nice.witnessRate`: witness model `λ_b = range_b · b!/b^b` (definition only)
 <!-- status:end -->
