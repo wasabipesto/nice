@@ -95,7 +95,7 @@ the theorem's hypotheses are the implementation's spec.
 | phase | def | proved | stated | planned | other |
 |---|---|---|---|---|---|
 | 0 | 1 | 3 | 0 | 0 | 0 |
-| 1 | 1 | 16 | 0 | 1 | 0 |
+| 1 | 1 | 17 | 0 | 0 | 0 |
 | 2 | 0 | 10 | 0 | 0 | 0 |
 | 3 | 0 | 7 | 0 | 2 | 0 |
 | 4 | 0 | 4 | 0 | 0 | 1 |
@@ -112,6 +112,7 @@ Proved or defined so far:
 - **DEF-4** `Nice.nearMissCutoff`: near-miss cutoff is `⌊0.9 b⌋` with strict `>` (`IsNearMiss`); every nice number is a near miss (`isNearMiss_of_isNice`)
 - **RNG-1** `Nice.nice_digit_count`: `IsNice b n → numDigits(n²) + numDigits(n³) = b`
 - **RNG-2** `Nice.memBaseRange_of_inBaseRange`: the per-`b mod 5` closed-form interval contains every n with `numDigits(n²) + numDigits(n³) = b`
+- **RNG-2b** `Nice.inBaseRange_of_memBaseRange`: conversely every n in the closed-form interval has digit-count sum b; with RNG-2 the interval is exactly the search range (`memBaseRange_iff`)
 - **RNG-3** `Nice.three_le_numDigits_of_inBaseRange`: inside the range every power has `≥ k` digits for `k ≤ 3`, `b ≥ 6`
 - **RNG-4** `Nice.not_inBaseRange_of_one_mod_five`: `b ≡ 1 (mod 5)` ⇒ no n has digit-count sum b
 - **RNG-5** `Nice.numDigits_pow_mono`: `numDigits b (n^e)` is monotone in n

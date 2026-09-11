@@ -14,6 +14,7 @@ use malachite::natural::Natural;
 /// Lean: `Nice.nice_digit_count` (RNG-1) — a nice number's powers have `b` digits between
 /// them, which is what these intervals are solved from.
 /// Lean: `Nice.memBaseRange_of_inBaseRange` (RNG-2) — the intervals cover every such n.
+/// Lean: `Nice.inBaseRange_of_memBaseRange` (RNG-2b) — and contain nothing else (`memBaseRange_iff`).
 /// Lean: `Nice.not_inBaseRange_of_one_mod_five` (RNG-4) — the `1 => None` arm.
 #[must_use]
 pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {

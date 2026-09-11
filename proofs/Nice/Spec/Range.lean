@@ -233,4 +233,125 @@ theorem memBaseRange_of_inBaseRange {b n : ℕ} (hb : 2 ≤ b) (h : InBaseRange 
       have : (m + 1) * 2 = 2 * m + 1 + 1 := by ring
       rw [this]; exact hhi2
 
+/-! ### Cross-power transfers -/
+
+theorem sq_ge_of_cube_ge {b n i j : ℕ} (hb : 1 ≤ b) (h : b ^ i ≤ n ^ 3) (hij : 3 * j ≤ 2 * i) :
+    b ^ j ≤ n ^ 2 := by
+  rw [← Nat.pow_le_pow_iff_left (n := 3) (by norm_num), ← pow_mul, ← pow_mul]
+  calc b ^ (j * 3) ≤ b ^ (i * 2) := Nat.pow_le_pow_right hb (by omega)
+    _ = (b ^ i) ^ 2 := by rw [← pow_mul]
+    _ ≤ (n ^ 3) ^ 2 := Nat.pow_le_pow_left h 2
+    _ = n ^ (2 * 3) := by rw [← pow_mul]
+
+theorem sq_lt_of_cube_lt {b n i j : ℕ} (hb : 1 ≤ b) (h : n ^ 3 < b ^ i) (hij : 2 * i ≤ 3 * j) :
+    n ^ 2 < b ^ j := by
+  rw [← Nat.pow_lt_pow_iff_left (n := 3) (by norm_num), ← pow_mul, ← pow_mul]
+  calc n ^ (2 * 3) = (n ^ 3) ^ 2 := by rw [← pow_mul]
+    _ < (b ^ i) ^ 2 := Nat.pow_lt_pow_left h (by norm_num)
+    _ = b ^ (i * 2) := by rw [← pow_mul]
+    _ ≤ b ^ (j * 3) := Nat.pow_le_pow_right hb (by omega)
+
+theorem cube_ge_of_sq_ge {b n i j : ℕ} (hb : 1 ≤ b) (h : b ^ i ≤ n ^ 2) (hij : 2 * j ≤ 3 * i) :
+    b ^ j ≤ n ^ 3 := by
+  rw [← Nat.pow_le_pow_iff_left (n := 2) (by norm_num), ← pow_mul, ← pow_mul]
+  calc b ^ (j * 2) ≤ b ^ (i * 3) := Nat.pow_le_pow_right hb (by omega)
+    _ = (b ^ i) ^ 3 := by rw [← pow_mul]
+    _ ≤ (n ^ 2) ^ 3 := Nat.pow_le_pow_left h 3
+    _ = n ^ (3 * 2) := by rw [← pow_mul]
+
+theorem cube_lt_of_sq_lt {b n i j : ℕ} (hb : 1 ≤ b) (h : n ^ 2 < b ^ i) (hij : 3 * i ≤ 2 * j) :
+    n ^ 3 < b ^ j := by
+  rw [← Nat.pow_lt_pow_iff_left (n := 2) (by norm_num), ← pow_mul, ← pow_mul]
+  calc n ^ (3 * 2) = (n ^ 2) ^ 3 := by rw [← pow_mul]
+    _ < (b ^ i) ^ 3 := Nat.pow_lt_pow_left h (by norm_num)
+    _ = b ^ (i * 3) := by rw [← pow_mul]
+    _ ≤ b ^ (j * 2) := Nat.pow_le_pow_right hb (by omega)
+
+/-- Claim RNG-2b (the converse): every `n` in the closed-form interval has
+digit-count sum `b`. With `memBaseRange_of_inBaseRange`, the interval is
+exactly the search range. -/
+theorem inBaseRange_of_memBaseRange {b n : ℕ} (hb : 2 ≤ b) (h : MemBaseRange b n) :
+    InBaseRange b n := by
+  obtain ⟨lo, hi, hrange, hlo, hhi⟩ := h
+  have hb1 : 1 ≤ b := by omega
+  have hmod : b % 5 < 5 := Nat.mod_lt _ (by norm_num)
+  unfold baseRange at hrange
+  unfold InBaseRange
+  interval_cases hr : b % 5
+  · -- class 0: b = 5k, k ≥ 1
+    simp only [Option.some.injEq, Prod.mk.injEq] at hrange
+    obtain ⟨rfl, rfl⟩ := hrange
+    obtain ⟨k, hk⟩ : ∃ k, b / 5 = k := ⟨_, rfl⟩
+    have hk1 : 1 ≤ k := by omega
+    have hbk : b = 5 * k := by omega
+    rw [hk] at hlo hhi
+    have h3 : b ^ (3 * k - 1) ≤ n ^ 3 := (le_ceilRoot_iff (by norm_num)).mp hlo
+    have hn3 : n ^ 3 < b ^ (3 * k) := by
+      calc n ^ 3 < (b ^ k) ^ 3 := Nat.pow_lt_pow_left hhi (by norm_num)
+        _ = b ^ (3 * k) := by rw [← pow_mul, mul_comm]
+    have hn2 : n ^ 2 < b ^ (2 * k) := by
+      calc n ^ 2 < (b ^ k) ^ 2 := Nat.pow_lt_pow_left hhi (by norm_num)
+        _ = b ^ (2 * k) := by rw [← pow_mul, mul_comm]
+    have h2 : b ^ (2 * k - 1) ≤ n ^ 2 := sq_ge_of_cube_ge hb1 h3 (by omega)
+    have hn : n ≠ 0 := by
+      rintro rfl
+      simp at h3
+      omega
+    have d2 := (numDigits_eq_iff hb (pow_ne_zero 2 hn) (2 * k - 1)).mpr
+      ⟨h2, by rw [Nat.sub_add_cancel (by omega)]; exact hn2⟩
+    have d3 := (numDigits_eq_iff hb (pow_ne_zero 3 hn) (3 * k - 1)).mpr
+      ⟨h3, by rw [Nat.sub_add_cancel (by omega)]; exact hn3⟩
+    omega
+  · simp at hrange
+  · -- class 2: b = 5k + 2
+    simp only [Option.some.injEq, Prod.mk.injEq] at hrange
+    obtain ⟨rfl, rfl⟩ := hrange
+    obtain ⟨k, hk⟩ : ∃ k, b / 5 = k := ⟨_, rfl⟩
+    have hbk : b = 5 * k + 2 := by omega
+    rw [hk] at hlo hhi
+    have h3 : n ^ 3 < b ^ (3 * k + 1) := (lt_ceilRoot_iff (by norm_num)).mp hhi
+    have hl2 : b ^ (2 * k) ≤ n ^ 2 := by
+      calc b ^ (2 * k) = (b ^ k) ^ 2 := by rw [← pow_mul, mul_comm]
+        _ ≤ n ^ 2 := Nat.pow_le_pow_left hlo 2
+    have hl3 : b ^ (3 * k) ≤ n ^ 3 := by
+      calc b ^ (3 * k) = (b ^ k) ^ 3 := by rw [← pow_mul, mul_comm]
+        _ ≤ n ^ 3 := Nat.pow_le_pow_left hlo 3
+    have h2 : n ^ 2 < b ^ (2 * k + 1) := sq_lt_of_cube_lt hb1 h3 (by omega)
+    have hn : n ≠ 0 := by rintro rfl; simp at hl2; omega
+    have d2 := (numDigits_eq_iff hb (pow_ne_zero 2 hn) (2 * k)).mpr ⟨hl2, h2⟩
+    have d3 := (numDigits_eq_iff hb (pow_ne_zero 3 hn) (3 * k)).mpr ⟨hl3, h3⟩
+    omega
+  · -- class 3: b = 5k + 3
+    simp only [Option.some.injEq, Prod.mk.injEq] at hrange
+    obtain ⟨rfl, rfl⟩ := hrange
+    obtain ⟨k, hk⟩ : ∃ k, b / 5 = k := ⟨_, rfl⟩
+    have hbk : b = 5 * k + 3 := by omega
+    rw [hk] at hlo hhi
+    have h3 : b ^ (3 * k + 1) ≤ n ^ 3 := (le_ceilRoot_iff (by norm_num)).mp hlo
+    have h2 : n ^ 2 < b ^ (2 * k + 1) := (lt_ceilRoot_iff (by norm_num)).mp hhi
+    have hl2 : b ^ (2 * k) ≤ n ^ 2 := sq_ge_of_cube_ge hb1 h3 (by omega)
+    have hh3 : n ^ 3 < b ^ (3 * k + 2) := cube_lt_of_sq_lt hb1 h2 (by omega)
+    have hn : n ≠ 0 := by rintro rfl; simp at h3; omega
+    have d2 := (numDigits_eq_iff hb (pow_ne_zero 2 hn) (2 * k)).mpr ⟨hl2, h2⟩
+    have d3 := (numDigits_eq_iff hb (pow_ne_zero 3 hn) (3 * k + 1)).mpr ⟨h3, hh3⟩
+    omega
+  · -- class 4: b = 5k + 4
+    simp only [Option.some.injEq, Prod.mk.injEq] at hrange
+    obtain ⟨rfl, rfl⟩ := hrange
+    obtain ⟨k, hk⟩ : ∃ k, b / 5 = k := ⟨_, rfl⟩
+    have hbk : b = 5 * k + 4 := by omega
+    rw [hk] at hlo hhi
+    have h2 : b ^ (2 * k + 1) ≤ n ^ 2 := (le_ceilRoot_iff (by norm_num)).mp hlo
+    have h3 : n ^ 3 < b ^ (3 * k + 2) := (lt_ceilRoot_iff (by norm_num)).mp hhi
+    have hh2 : n ^ 2 < b ^ (2 * k + 2) := sq_lt_of_cube_lt hb1 h3 (by omega)
+    have hl3 : b ^ (3 * k + 1) ≤ n ^ 3 := cube_ge_of_sq_ge hb1 h2 (by omega)
+    have hn : n ≠ 0 := by rintro rfl; simp at h2; omega
+    have d2 := (numDigits_eq_iff hb (pow_ne_zero 2 hn) (2 * k + 1)).mpr ⟨h2, hh2⟩
+    have d3 := (numDigits_eq_iff hb (pow_ne_zero 3 hn) (3 * k + 1)).mpr ⟨hl3, h3⟩
+    omega
+
+/-- Claim RNG-2 in full: the closed-form interval is exactly the search range. -/
+theorem memBaseRange_iff {b n : ℕ} (hb : 2 ≤ b) : MemBaseRange b n ↔ InBaseRange b n :=
+  ⟨inBaseRange_of_memBaseRange hb, memBaseRange_of_inBaseRange hb⟩
+
 end Nice
