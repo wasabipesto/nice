@@ -41,6 +41,8 @@ theorem residueList_getD_lt {b k : ℕ} {i : ℕ} (hi : i < (residueList b k).le
   rw [List.getD_eq_getElem _ _ hi]
   have hmem : (residueList b k)[i] ∈ residueList b k := List.getElem_mem hi
   rw [mem_residueList] at hmem
+  unfold validResidues at hmem
+  dsimp only at hmem
   exact Finset.mem_range.mp (Finset.mem_filter.mp hmem).1
 
 /-- Every ordinal is a valid number (when `B0` is a multiple of `M`). -/

@@ -23,14 +23,17 @@ theorem strideModulus_pos {b k : ℕ} (hb : 2 ≤ b) : 0 < strideModulus b k :=
 
 /-- The Rust `valid_residues`: residues mod `M` passing both filters. -/
 def validResidues (b k : ℕ) : Finset ℕ :=
-  (Finset.range (strideModulus b k)).filter fun r =>
-    r % (b - 1) ∈ residueFilter b ∧ r % b ^ k ∈ lsdBitmap b k
+  -- let-bound so the compiled model builds each table once
+  let R := residueFilter b
+  let L := lsdBitmap b k
+  (Finset.range (strideModulus b k)).filter fun r => r % (b - 1) ∈ R ∧ r % b ^ k ∈ L
 
 /-- Claim STR-1: `n mod M` is a valid residue iff `n` passes both filters. -/
 theorem mem_validResidues_iff {b k n : ℕ} (hb : 2 ≤ b) :
     n % strideModulus b k ∈ validResidues b k ↔
       n % (b - 1) ∈ residueFilter b ∧ n % b ^ k ∈ lsdBitmap b k := by
   unfold validResidues
+  dsimp only
   rw [Finset.mem_filter, Finset.mem_range]
   have h1 : n % strideModulus b k % (b - 1) = n % (b - 1) :=
     Nat.mod_mod_of_dvd n (dvd_mul_right _ _)
@@ -65,11 +68,14 @@ instance (b k n : ℕ) : Decidable (IsValid b k n) := by unfold IsValid; infer_i
 /-- The candidates of a half-open range, as the filter of the range: what
 `iterate_range` must visit. -/
 def strideCandidates (b k start stop : ℕ) : List ℕ :=
-  (List.range' start (stop - start)).filter fun n => decide (IsValid b k n)
+  let V := validResidues b k
+  let M := strideModulus b k
+  (List.range' start (stop - start)).filter fun n => decide (n % M ∈ V)
 
 theorem mem_strideCandidates {b k start stop n : ℕ} :
     n ∈ strideCandidates b k start stop ↔ start ≤ n ∧ n < stop ∧ IsValid b k n := by
-  unfold strideCandidates
+  unfold strideCandidates IsValid
+  dsimp only
   rw [List.mem_filter, List.mem_range'_1, decide_eq_true_iff]
   constructor
   · rintro ⟨⟨h1, h2⟩, h3⟩; exact ⟨h1, by omega, h3⟩
@@ -87,7 +93,10 @@ theorem exists_valid_ge {b k : ℕ} (hb : 2 ≤ b) (hV : (validResidues b k).Non
   obtain ⟨r, hr⟩ := hV
   set M := strideModulus b k with hM
   have hMpos : 0 < M := strideModulus_pos hb
-  have hrM : r < M := Finset.mem_range.mp (Finset.mem_filter.mp hr).1
+  have hrM : r < M := by
+    unfold validResidues at hr
+    dsimp only at hr
+    exact Finset.mem_range.mp (Finset.mem_filter.mp hr).1
   refine ⟨M + r - n % M, ?_⟩
   unfold IsValid
   have hdiv := Nat.div_add_mod n M

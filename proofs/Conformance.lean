@@ -37,6 +37,7 @@ def getNatList (j : Json) (k : String) : Except String (List Nat) := do
   let arr ← (← j.getObjVal? k).getArr?
   arr.toList.mapM fun v => match v with
     | .num n => pure n.mantissa.toNat
+    | .str s => match s.toNat? with | some n => pure n | none => throw s!"{k}: not a nat string"
     | _ => throw s!"{k}: array element is not a number"
 
 def getArr (j : Json) (k : String) : Except String (List Json) := do
@@ -182,6 +183,41 @@ def checkMsd (r : Report) : IO Report := do
       | _ => throw (IO.userError "leaves shape")
   pure r
 
+def checkPipeline (r : Report) : IO Report := do
+  let mut r := r
+  for j in ← load "pipeline.json" do
+    let b ← orFail (getNat j "base")
+    let k ← orFail (getNat j "k")
+    let start ← orFail (getNat j "start")
+    let stop ← orFail (getNat j "end")
+    for l in ← orFail (getArr j "masked_leaves") do
+      let arr ← orFail l.getArr?
+      match arr.toList with
+      | [.num d, .str m, .arr leaves] =>
+        let depth := d.mantissa.toNat
+        let some minSize := m.toNat? | throw (IO.userError "masked min")
+        let want ← orFail (leaves.toList.mapM fun x => do
+          let a ← x.getArr?
+          match a.toList with
+          | [.str ls, .str le, .arr ds] =>
+            let digits ← ds.toList.mapM fun v => match v with
+              | .num n => pure n.mantissa.toNat
+              | _ => throw "mask digit"
+            match ls.toNat?, le.toNat? with
+            | some a, some b => pure (a, b, digits)
+            | _, _ => throw "leaf nat"
+          | _ => throw "masked leaf shape")
+        let model := (Nice.validRangesMasked b k minSize depth start stop ∅).map fun r =>
+          (r.1, r.2.1, sortedList r.2.2)
+        r := r.check s!"get_valid_ranges_recursive_masked {b} depth {depth} min {minSize}"
+          (model == want)
+      | _ => throw (IO.userError "masked leaves shape")
+    let nice ← orFail (getNatList j "nice")
+    -- production constants: MSD_RECURSIVE_MIN_RANGE_SIZE = 8000, MAX_DEPTH = 22
+    let model := Nice.processRangeNiceonly b k 8000 22 start stop
+    r := r.check s!"process_range_niceonly {b}" (model == nice)
+  pure r
+
 end Conformance
 
 open Conformance in
@@ -192,6 +228,7 @@ def main : IO UInt32 := do
   r ← checkStride r
   r ← checkRanges r
   r ← checkMsd r
+  r ← checkPipeline r
   r ← checkSeeded r
   for f in r.failures.reverse do
     IO.println s!"FAIL: {f}"
