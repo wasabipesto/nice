@@ -34,6 +34,7 @@ pub fn expand_distribution(
 pub struct DistributionAccumulator {
     base: u32,
     // Counter vec indexed by `num_uniques`.
+    // Lean: `Nice.one_le_numUniques` (DEF-3) — bin 0 is provably empty.
     // Note: Array size is (base + 1) to allow indexing from 0..=base
     // We use indices [1..=base] (inclusive range) since `num_uniques` ranges from 1 to base
     counter: Vec<UniquesDistributionSimple>,

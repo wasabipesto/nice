@@ -486,6 +486,7 @@ pub fn offset_mod_m(offset: u64, stride_m: u32) -> u32 {
     acc
 }
 
+/// Lean: `Nice.split16_exact` (GPU-5)
 /// One `split16` step over the scalar limbs `{v}0..{v}{n_limbs}`: divides that
 /// value by `chunk_div` in place and leaves the remainder — one chunk of
 /// `chunk_digits` base-`b` digits — in `rem`.

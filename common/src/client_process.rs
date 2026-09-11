@@ -47,6 +47,7 @@ const MAX_BASE_FOR_FIXED_WIDTH_U128: u32 = 40;
 /// for digit extraction, which in detailed mode (full extraction every
 /// candidate) outperforms malachite's small-divisor multi-limb division.
 #[must_use]
+// Lean: `Nice.numUniques_eq_iff_isNice` (DEF-2)
 pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
     match base {
         40 => get_num_unique_digits_u128_const::<40>(num_u128),

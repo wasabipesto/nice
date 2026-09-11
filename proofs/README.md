@@ -95,11 +95,11 @@ the theorem's hypotheses are the implementation's spec.
 | phase | def | proved | stated | planned | other |
 |---|---|---|---|---|---|
 | 0 | 1 | 3 | 0 | 0 | 0 |
-| 1 | 0 | 12 | 0 | 6 | 0 |
+| 1 | 0 | 14 | 0 | 4 | 0 |
 | 2 | 0 | 9 | 0 | 1 | 0 |
 | 3 | 0 | 6 | 0 | 3 | 0 |
 | 4 | 0 | 4 | 0 | 0 | 1 |
-| 5 | 0 | 0 | 0 | 11 | 0 |
+| 5 | 0 | 8 | 0 | 3 | 0 |
 | 6 | 0 | 0 | 0 | 9 | 0 |
 | — | 0 | 0 | 0 | 0 | 2 |
 
@@ -107,6 +107,8 @@ Proved or defined so far:
 
 - **DEF-1** `Nice.IsNice`: `IsNice b n` ⇔ the base-b digits of n² followed by those of n³ permute `0..b-1`
 - **DEF-1a** `Nice.isNice_iff_pandigital`: the three-part `Pandigital` definition of `origin/proofs` is equivalent
+- **DEF-2** `Nice.numUniques_eq_iff_isNice`: inside the base range, `numUniques b n = b ↔ IsNice b n`
+- **DEF-3** `Nice.one_le_numUniques`: `1 ≤ numUniques b n` for `n ≥ 1` (histogram bin 0 is empty)
 - **RNG-1** `Nice.nice_digit_count`: `IsNice b n → numDigits(n²) + numDigits(n³) = b`
 - **RNG-2** `Nice.memBaseRange_of_inBaseRange`: the per-`b mod 5` closed-form interval contains every n with `numDigits(n²) + numDigits(n³) = b`
 - **RNG-3** `Nice.three_le_numDigits_of_inBaseRange`: inside the range every power has `≥ k` digits for `k ≤ 3`, `b ≥ 6`
@@ -141,4 +143,12 @@ Proved or defined so far:
 - **CRS-3** `Nice.validRangesMasked_cover`: an empty or partial certificate is sound (mask soundness holds for any accumulated mask, so ignoring certificates only checks more candidates)
 - **REF-1** `Nice.msd_lsd_skip_unsound`: the removed MSD×LSD skip is unsound: witness b=10, k=2, `[68,70)` (quotient test passes, low digits differ, 69 is nice); generally `n mod b^k` is never constant on a range of size > 1 (`mod_pow_not_constant`)
 - **END-1** `Nice.niceonly_complete`: the modelled niceonly pipeline (masked subdivision × stride walk × one-AND × nice check) reports every nice n of the range (`niceonly_complete`, for b ≥ 6, k ≤ 3) and only nice n of the range (`niceonly_sound`)
+- **GPU-1** `Nice.blockTiling_cover`: block tiling (64-chunk blocks, descending powers of two, partial chunk) sums to the field size and covers it without overlap (`blockLens_sum`, `tile_cover`, `tile_disjoint`)
+- **GPU-3** `Nice.validRangesMasked_cover`: mixing floors within a field loses nothing: the cover theorem holds for every floor and depth, so any per-block choice is sound
+- **GPU-4** `Nice.lane_partition`: lane tiling partitions the ordinals for any lane count
+- **GPU-5** `Nice.split16_exact`: split16 chunk step is exact when `d < 2^16`
+- **GPU-7** `Nice.hornerMod_chunksBE`: chunked Horner over the base-`2^c` chunks computes `off mod M` (`hornerMod_chunksBE`) and each step stays below `2^32` while `M ≤ 2^(32−c)` (`horner_step_lt`)
+- **GPU-8** `Nice.prefilter_rejects_all_of_short`: prefilter = LSD-2 at depth p (`mem_lsdBitmap_of_isNice`); where neither power has p digits the zero padding rejects every candidate (`prefilter_rejects_all_of_short`, the v3.2.14 failure)
+- **GPU-9** `Nice.mod_m_split`: `mod_m` via `2^64 mod M` is correct under NUM-8
+- **FLD-1** `Nice.inField_iff`: fields partition the base (`inField_iff`); a field lies inside the chunk containing its start point (`field_subset_chunk`, `chunk_of_field_start`), which is what start-point chunk matching relies on
 <!-- status:end -->

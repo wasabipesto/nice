@@ -144,7 +144,7 @@ fn guaranteed_low_digits(base: u32) -> Option<u32> {
 /// - n² and n³ must each be guaranteed at least p digits across the base's
 ///   whole range (see [`guaranteed_low_digits`]).
 #[must_use]
-/// Lean: `Nice.numDigits_pow_mono` (RNG-5)
+/// Lean: `Nice.numDigits_pow_mono` (RNG-5), `Nice.prefilter_rejects_all_of_short` (GPU-8)
 pub fn prefilter_params(base: u32) -> Option<PrefilterParams> {
     // Profitability gate (see GPU_PREFILTER_MAX_BASE). Every consumer —
     // define injection, the CPU diagnostics mirror, the G0/G1 harnesses —
