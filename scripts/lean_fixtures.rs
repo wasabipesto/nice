@@ -14,6 +14,8 @@
 use nice_common::base_range::get_base_range_u128;
 use nice_common::client_process::{get_is_nice, get_is_nice_with_known_lsd};
 use nice_common::lsd_filter::get_valid_multi_lsd_bitmap;
+use nice_common::msd_prefix_filter::{get_valid_ranges_recursive, has_duplicate_msd_prefix};
+use nice_common::FieldSize;
 use nice_common::residue_filter::get_residue_filter;
 use nice_common::stride_filter::StrideTable;
 use serde::Serialize;
@@ -57,6 +59,15 @@ struct Range {
     base: u32,
     start: Option<String>,
     end: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Msd {
+    base: u32,
+    /// (start, end) half-open, and whether `analyze_range` rejected it.
+    verdicts: Vec<(String, String, bool)>,
+    /// (start, end, depth, min_size) → emitted leaves as (start, end).
+    leaves: Vec<(String, String, u32, String, Vec<(String, String)>)>,
 }
 
 #[derive(Serialize)]
@@ -162,6 +173,42 @@ fn main() {
         serde_json::to_string_pretty(&ranges).unwrap(),
     )
     .unwrap();
+
+    // MSD verdicts and recursion leaves on small bases (the Lean SDR search
+    // is brute force, so keep the bases small and the windows short).
+    let mut msd = Vec::new();
+    for base in [8u32, 10, 12, 14, 17] {
+        let range = get_base_range_u128(base).unwrap().unwrap();
+        let (rs, re) = (range.start(), range.end());
+        let mut verdicts = Vec::new();
+        let mut x = rs;
+        while x < re {
+            for len in [1u128, 2, 3, 5, 8, 13, 21] {
+                let end = (x + len).min(re);
+                verdicts.push((
+                    x.to_string(),
+                    end.to_string(),
+                    has_duplicate_msd_prefix(FieldSize::new(x, end), base),
+                ));
+            }
+            x += 7;
+        }
+        let mut leaves = Vec::new();
+        for (min_size, depth) in [(2u128, 6u32), (4, 8), (1, 10)] {
+            let out: Vec<(String, String)> =
+                get_valid_ranges_recursive(FieldSize::new(rs, re), base, 0, depth, min_size, 2)
+                    .into_iter()
+                    .map(|f| (f.start().to_string(), f.end().to_string()))
+                    .collect();
+            leaves.push((rs.to_string(), re.to_string(), depth, min_size.to_string(), out));
+        }
+        msd.push(Msd {
+            base,
+            verdicts,
+            leaves,
+        });
+    }
+    fs::write(out.join("msd.json"), serde_json::to_string_pretty(&msd).unwrap()).unwrap();
 
     // Seeded check on real base-40 candidates: the first 300 stride
     // candidates of the base range plus 69 in base 10 for good measure.

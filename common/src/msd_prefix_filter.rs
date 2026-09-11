@@ -221,6 +221,7 @@ fn has_distinct_assignment(doms: &[u64]) -> bool {
     true
 }
 
+/// Lean: `Nice.powerDomains_sound` (MSD-3), `Nice.Sound.sublist` (MSD-6)
 /// Interval digit-domain analysis (Hall check) given pre-extracted endpoint
 /// digit arrays. Factored out so both u128 and U256 paths share identical
 /// post-extraction logic.
@@ -637,6 +638,7 @@ fn analyze_range_over_64(range: FieldSize, base: u32) -> MsdAnalysis {
     MsdAnalysis::Live { fixed_mask: 0 }
 }
 
+/// Lean: `Nice.validRanges_cover` (MSD-7)
 /// Recursively subdivide a range to find sub-ranges that need to be processed.
 ///
 /// This function applies the MSD prefix filter recursively:

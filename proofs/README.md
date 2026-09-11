@@ -54,7 +54,7 @@ dumps the residue tables, LSD bitmaps, stride tables (residues, gaps,
 low-digit masks, `first_valid_at_or_after` samples), base ranges and
 seeded-check verdicts for small parameters into `fixtures/*.json`.
 `just lean-conformance` recomputes each from the executable Lean model
-and diffs (783 checks, about a minute). Theorems pin "model = spec"; this
+and diffs (about 9,000 checks, about a minute). Theorems pin "model = spec"; this
 pins "model = code". The fixtures are checked in; regenerate them when
 the Rust tables change.
 
@@ -97,7 +97,7 @@ the theorem's hypotheses are the implementation's spec.
 | 0 | 1 | 3 | 0 | 0 | 0 |
 | 1 | 0 | 12 | 0 | 6 | 0 |
 | 2 | 0 | 9 | 0 | 1 | 0 |
-| 3 | 0 | 0 | 0 | 9 | 0 |
+| 3 | 0 | 6 | 0 | 3 | 0 |
 | 4 | 0 | 0 | 0 | 5 | 0 |
 | 5 | 0 | 0 | 0 | 11 | 0 |
 | 6 | 0 | 0 | 0 | 9 | 0 |
@@ -130,4 +130,10 @@ Proved or defined so far:
 - **STR-3** `Nice.seeded_iff_isNice`: seeded check equals the plain check under RNG-3
 - **STR-4** `Nice.lowMask_eq`: `low_digit_masks[i]` is exactly the low-digit set of residue i's powers
 - **GPU-0** `Nice.exists_ordinal_eq`: ordinal formula `B0 + ⌊g/#V⌋·M + V[g mod #V]` is strictly increasing (`ordinal_strictMono`), always valid (`ordinal_valid`) and hits every valid n ≥ B0, so it enumerates the same set as STR-2
+- **MSD-1** `Nice.digit_mem_cyclicInterval`: interval digit domains are a superset of the digits that occur
+- **MSD-2** `Nice.width_recurrence`: width recurrence `diff_j = b·diff_{j+1} + (yd_j − xd_j)` is exact; once `diff ≥ b−1` every lower position is too (`width_ge_of_succ`)
+- **MSD-3** `Nice.powerDomains_sound`: dropping a power's domains (unequal digit counts) is sound
+- **MSD-4** `Nice.no_nice_of_not_hasSDR`: Hall soundness: no injective digit choice ⇒ no nice n in the range; model form `no_nice_of_analyzeRange` for the executable `analyzeRange`
+- **MSD-6** `Nice.Sound.sublist`: domain-slot overflow only drops constraints
+- **MSD-7** `Nice.validRanges_cover`: recursive subdivision (factor 2, depth fuel, floor): every nice n of the input lies in some emitted leaf; leaves are sub-intervals (`validRanges_subset`)
 <!-- status:end -->
