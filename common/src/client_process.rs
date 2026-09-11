@@ -340,6 +340,7 @@ fn get_is_nice_u256_const<const BASE: u32>(num: u128) -> bool {
 /// Sound only when n² and n³ each have at least `k` digits, which holds for
 /// every number inside a legal base range for k ≤ 3 and base ≥ 6.
 ///
+/// Lean: `Nice.seeded_iff_isNice` (STR-3)
 /// Lean: `Nice.three_le_numDigits_of_inBaseRange` (RNG-3)
 ///
 /// Falls back to the plain check for (base, k) combinations without a

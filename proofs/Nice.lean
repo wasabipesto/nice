@@ -5,4 +5,6 @@ import Nice.Const
 import Nice.Model.Residue
 import Nice.Model.Lsd
 import Nice.Model.Stride
+import Nice.Model.Seeded
+import Nice.Model.Gpu
 import Nice.Examples
