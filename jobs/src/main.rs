@@ -18,7 +18,14 @@
 //!
 //! `--full` re-evaluates every field with detailed submissions and recomputes
 //! every chunk and base, exactly like the job always did, and then advances
-//! the watermark like any other successful run.
+//! the watermark like any other successful run. A full run also audits that
+//! the fields and chunks of every base still partition its range (see
+//! `db_util::audit`); `--audit` runs only that check and exits non-zero if
+//! anything is wrong, for use from cron or by hand:
+//!
+//! ```text
+//! cargo run -r -p nice_jobs -- --audit
+//! ```
 
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::too_many_lines)]
@@ -44,11 +51,12 @@ const WATERMARK_SAFETY_MARGIN: i64 = 10_000;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let full = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] => false,
-        ["--full"] => true,
+    let (full, audit_only) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] => (false, false),
+        ["--full"] => (true, false),
+        ["--audit"] => (false, true),
         _ => {
-            eprintln!("usage: nice_jobs [--full]");
+            eprintln!("usage: nice_jobs [--full | --audit]");
             std::process::exit(2);
         }
     };
@@ -58,6 +66,12 @@ fn main() {
     // get db connection
     let mut conn = db_util::get_database_connection();
     println!("Database connection established. Scheduled jobs started.");
+
+    if audit_only {
+        let problems = audit_partitions(&mut conn);
+        println!("Done in {:.1}s.", started.elapsed().as_secs_f32());
+        std::process::exit(i32::from(problems > 0));
+    }
 
     // Establish the submission window for this run. The watermark is read even
     // in full mode so a missing migration fails here rather than at the end.
@@ -372,6 +386,14 @@ fn main() {
         );
     }
 
+    // Every total above is a sum over field or chunk rows, which is only the
+    // number it claims to be if those rows partition the base. A full sweep
+    // is the natural place to re-check that; a failure is reported, not
+    // fatal, so the watermark still advances.
+    if full {
+        audit_partitions(&mut conn);
+    }
+
     // Advance the watermark, held back by the safety margin (see its docs).
     // This runs only after every consensus and stats update above committed,
     // so a crash anywhere earlier leaves the window to be redone next run.
@@ -387,4 +409,33 @@ fn main() {
         "Done in {:.1}s: {total_fields_evaluated} fields evaluated ({total_fields_updated} updated), {total_chunks_updated} chunks updated.",
         started.elapsed().as_secs_f32()
     );
+}
+
+/// Check that every base's fields and chunks partition its range and that
+/// every field sits inside its chunk. Prints one line per base with
+/// problems and a summary; returns the number of bases with problems.
+fn audit_partitions(conn: &mut db_util::PgConnection) -> usize {
+    println!("=== PARTITION AUDIT ===");
+    let bases = db_util::bases::get_all_bases(conn).unwrap();
+    let mut bad = 0usize;
+    for base in &bases {
+        let audit = db_util::audit::audit_base(conn, base).unwrap();
+        if audit.problems.is_empty() {
+            continue;
+        }
+        bad += 1;
+        println!(
+            "WARNING: base {} ({} fields, {} chunks): {}",
+            base.base,
+            audit.fields.rows,
+            audit.chunks.rows,
+            audit.problems.join("; ")
+        );
+    }
+    println!(
+        "Partition audit: {} of {} bases with problems.",
+        bad,
+        bases.len()
+    );
+    bad
 }

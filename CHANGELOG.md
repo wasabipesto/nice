@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Audit that the `fields` and `chunks` rows of every base still partition its range: no gaps, no overlaps, endpoints at the base bounds, `range_size` consistent, and every field inside a chunk of its own base. Every progress figure, leaderboard total and chunk/base aggregate is a sum over those rows and silently assumed this; nothing re-checked the stored rows before. `nice_jobs --full` now runs the audit after the sweep (warnings only), and `nice_jobs --audit` runs just the audit and exits non-zero on any problem, for cron. Integration test in `common/tests/partition_audit.rs`, gated on `NICE_TEST_DATABASE_URL` like the claim-query tests.
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.

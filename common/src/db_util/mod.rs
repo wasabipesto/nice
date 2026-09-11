@@ -16,6 +16,11 @@ use diesel::table;
 use dotenvy::dotenv;
 use serde_json::Value;
 
+/// Re-exported so binaries that only depend on `nice_common` can name the
+/// connection type in their own helper signatures.
+pub use diesel::PgConnection;
+
+pub mod audit;
 pub mod bases;
 pub mod benchmarks;
 pub mod cache;
