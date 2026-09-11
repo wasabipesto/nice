@@ -99,7 +99,7 @@ the theorem's hypotheses are the implementation's spec.
 | 2 | 0 | 10 | 0 | 0 | 0 |
 | 3 | 0 | 7 | 0 | 2 | 0 |
 | 4 | 0 | 4 | 0 | 0 | 1 |
-| 5 | 0 | 9 | 0 | 2 | 0 |
+| 5 | 0 | 10 | 0 | 2 | 0 |
 | 6 | 0 | 4 | 0 | 5 | 0 |
 | — | 0 | 0 | 0 | 0 | 2 |
 
@@ -156,7 +156,8 @@ Proved or defined so far:
 - **GPU-8** `Nice.prefilter_rejects_all_of_short`: prefilter = LSD-2 at depth p (`mem_lsdBitmap_of_isNice`); where neither power has p digits the zero padding rejects every candidate (`prefilter_rejects_all_of_short`, the v3.2.14 failure)
 - **GPU-9** `Nice.mod_m_split`: `mod_m` via `2^64 mod M` is correct under NUM-8
 - **FLD-1** `Nice.inField_iff`: fields partition the base (`inField_iff`); a field lies inside the chunk containing its start point (`field_subset_chunk`, `chunk_of_field_start`), which is what start-point chunk matching relies on
-- **DET-1** `Nice.topN_of_superset`: histogram bins fold batch by batch (`histogram_fold`); an element with fewer than N strictly larger keys in the whole list has fewer than N in any batch, so top-N compaction drops nothing (`topN_of_superset`; ties not modelled)
+- **DET-1** `Nice.histogram_fold`: histogram bins fold batch by batch: the count of a value over a concatenation is the sum of the counts
+- **DET-1b** `Nice.topN_of_superset`: top-N compaction drops nothing: an element with fewer than N strictly larger keys in the whole list has fewer than N in any batch (ties not modelled)
 - **THY-2** `Nice.collapse_of_invariant`: carry-blind collapse: a linear digit statistic invariant under every carry move has `w_{i+1} ≡ b·w_i` (`weight_rel_of_invariant`) and equals `w₀·N (mod m)` (`collapse`)
 - **THY-3** `Nice.complement_sum`: once some output digits are fixed, the rest sum to the complement and form the complement set (`complement_set`): a digit-sum window on the unassigned positions is vacuous
 - **THY-5** `Nice.window_sound`: middle-window filter is sound (digits at `p..p+w` depend on `n mod b^(p+w)`)
