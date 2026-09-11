@@ -96,11 +96,11 @@ the theorem's hypotheses are the implementation's spec.
 |---|---|---|---|---|---|
 | 0 | 1 | 3 | 0 | 0 | 0 |
 | 1 | 0 | 14 | 0 | 4 | 0 |
-| 2 | 0 | 9 | 0 | 1 | 0 |
+| 2 | 0 | 10 | 0 | 0 | 0 |
 | 3 | 0 | 6 | 0 | 3 | 0 |
 | 4 | 0 | 4 | 0 | 0 | 1 |
 | 5 | 0 | 8 | 0 | 3 | 0 |
-| 6 | 0 | 0 | 0 | 9 | 0 |
+| 6 | 0 | 4 | 0 | 5 | 0 |
 | — | 0 | 0 | 0 | 0 | 2 |
 
 Proved or defined so far:
@@ -124,6 +124,7 @@ Proved or defined so far:
 - **NUM-9** `Nice.Const.histogram_bins`: histogram bins cannot overflow u32
 - **RES-1** `Nice.mem_residueFilter_of_isNice`: `IsNice b n → n² + n³ ≡ b(b−1)/2 (mod b−1)`; `n mod (b−1) ∈ residueFilter b`
 - **RES-1a** `Nice.nice_digit_sum`: a nice number's output digits sum to `b(b−1)/2`
+- **RES-2** `Nice.no_nice_of_three_mod_four`: `b ≡ 3 (mod 4) → ∀ n, ¬IsNice b n`
 - **RES-3** `Nice.no_nice_of_residueFilter_empty`: `residueFilter b = ∅ → ∀ n, ¬IsNice b n`; `residueFilter 11 = ∅`
 - **LSD-1** `Nice.digit_pow_mod_pow`: `digit b (n^e) j` for `j < k` depends only on `n mod b^k`
 - **LSD-2** `Nice.mem_lsdBitmap_of_isNice`: nice + RNG-3 ⇒ the 2k fixed-width low digits are pairwise distinct ⇒ `n mod b^k ∈ lsdBitmap b k`
@@ -151,4 +152,8 @@ Proved or defined so far:
 - **GPU-8** `Nice.prefilter_rejects_all_of_short`: prefilter = LSD-2 at depth p (`mem_lsdBitmap_of_isNice`); where neither power has p digits the zero padding rejects every candidate (`prefilter_rejects_all_of_short`, the v3.2.14 failure)
 - **GPU-9** `Nice.mod_m_split`: `mod_m` via `2^64 mod M` is correct under NUM-8
 - **FLD-1** `Nice.inField_iff`: fields partition the base (`inField_iff`); a field lies inside the chunk containing its start point (`field_subset_chunk`, `chunk_of_field_start`), which is what start-point chunk matching relies on
+- **THY-2** `Nice.collapse_of_invariant`: carry-blind collapse: a linear digit statistic invariant under every carry move has `w_{i+1} ≡ b·w_i` (`weight_rel_of_invariant`) and equals `w₀·N (mod m)` (`collapse`)
+- **THY-3** `Nice.complement_sum`: once some output digits are fixed, the rest sum to the complement and form the complement set (`complement_set`): a digit-sum window on the unassigned positions is vacuous
+- **THY-5** `Nice.window_sound`: middle-window filter is sound (digits at `p..p+w` depend on `n mod b^(p+w)`)
+- **THY-6** `Nice.hall_relaxation_incomplete`: the interval-domain Hall check is strictly incomplete: base 10, `[47, 60]` has an SDR but no nice number (by `decide`)
 <!-- status:end -->
