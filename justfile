@@ -182,3 +182,11 @@ lean-build:
 # Validate proofs/CLAIMS.md against the built Lean library and the Rust `Lean:` tags
 lean-claims:
     cd proofs && python3 scripts/check_claims.py
+
+# Regenerate proofs/fixtures/*.json from the Rust tables (rust-script)
+lean-fixtures:
+    rust-script scripts/lean_fixtures.rs
+
+# Check the Lean model against the Rust fixtures
+lean-conformance:
+    cd proofs && lake exe conformance

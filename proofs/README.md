@@ -18,7 +18,9 @@ Nice/Refuted.lean, Nice/Conjectures.lean, Nice/Examples.lean
 DESIGN.md       design, layers, phases
 CLAIMS.md       the registry: claim id → Lean declaration → Rust site → status
 scripts/check_claims.py   validates CLAIMS.md against the build and the Rust tags
-fixtures/       tables emitted by Rust, checked against the Lean model (phase 2)
+fixtures/       tables emitted by Rust (`scripts/lean_fixtures.rs`), checked
+                against the Lean model by `lake exe conformance`
+Conformance.lean          the conformance executable
 ```
 
 Three layers. **Spec** states mathematics only. **Model** contains
@@ -44,6 +46,17 @@ Policy: no `native_decide`; `decide` / `norm_num` for concrete examples;
 milestone theorems must depend on no axioms beyond `propext`,
 `Classical.choice`, `Quot.sound` (the checker enforces this for every row
 marked `proved`).
+
+## Fixtures
+
+`just lean-fixtures` runs `scripts/lean_fixtures.rs` (rust-script), which
+dumps the residue tables, LSD bitmaps, stride tables (residues, gaps,
+low-digit masks, `first_valid_at_or_after` samples), base ranges and
+seeded-check verdicts for small parameters into `fixtures/*.json`.
+`just lean-conformance` recomputes each from the executable Lean model
+and diffs (783 checks, about a minute). Theorems pin "model = spec"; this
+pins "model = code". The fixtures are checked in; regenerate them when
+the Rust tables change.
 
 ## The registry and the Rust tags
 

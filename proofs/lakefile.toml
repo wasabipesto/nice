@@ -15,3 +15,7 @@ rev = "v4.33.1"
 
 [[lean_lib]]
 name = "Nice"
+
+[[lean_exe]]
+name = "conformance"
+root = "Conformance"
