@@ -321,7 +321,8 @@ __device__ __forceinline__ u32 num_unique_digits(u64 n_lo, u64 n_hi) {
 __device__ __forceinline__ u32 mod_m(u64 n_lo, u64 n_hi) {
     u32 hi_mod = (u32)(n_hi % STRIDE_M);
     u32 lo_mod = (u32)(n_lo % STRIDE_M);
-    // hi_mod * POW64_MOD_M + lo_mod < M^2 + M <= 2^42, fits u64.
+    // hi_mod * POW64_MOD_M + lo_mod < M^2 + M < 2^64 because the host
+    // rejects M > u32::MAX (k=3 puts M near 2^28 at base 128).
     u64 t = (u64)hi_mod * POW64_MOD_M + lo_mod;
     return (u32)(t % STRIDE_M);
 }

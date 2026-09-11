@@ -621,10 +621,10 @@ pub trait RangeSink {
 /// MSD-filter one chunk into descriptors relative to `field_start`.
 ///
 /// Each surviving range becomes 20 bytes: a u64 offset, a u32 length, and a
-/// u64 cross-end certificate mask. That
-/// encoding, not the filter, is what bounds a range — a field is at most 1e12
-/// numbers so the offset always fits, but a range longer than `u32::MAX` would
-/// not, which is why this can fail.
+/// u64 cross-end certificate mask. That encoding, not the filter, is what
+/// bounds a range — fields are 1e13 numbers at most (the CUDA throughput
+/// harness uses that size), far inside u64, so the offset always fits, but a
+/// range longer than `u32::MAX` would not, which is why this can fail.
 fn descriptors_for_chunk(
     chunk: FieldSize,
     base: u32,

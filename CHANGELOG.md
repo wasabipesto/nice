@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Turn the fixed-width arithmetic's "n³ fits in 256 bits" precondition into a test instead of a comment: the largest cube of every base routed to the U256 path (through `MAX_BASE_FOR_FIXED_WIDTH_U256 = 68`) is checked against 2^256 exactly, as is the u128 cutoff at base 40. The two doc comments that disagreed about where the bound lies ("base ≤ 80" at the call site, "base 70" in the module header) now both state the checked fact: base 69 would still fit, base 70 would not. Also corrected two stale bounds in comments only: the CUDA `mod_m` overflow argument still assumed k=2, and the GPU descriptor encoding note said fields were at most 1e12 numbers when the CUDA harness uses 1e13.
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.
