@@ -218,6 +218,30 @@ def checkPipeline (r : Report) : IO Report := do
     r := r.check s!"process_range_niceonly {b}" (model == nice)
   pure r
 
+def getPair (j : Json) (k : String) : Except String (Nat × Nat) := do
+  let arr ← (← j.getObjVal? k).getArr?
+  match arr.toList with
+  | [.num a, .num b] => pure (a.mantissa.toNat, b.mantissa.toNat)
+  | _ => throw s!"{k}: not a pair"
+
+def checkGpuConfig (r : Report) : IO Report := do
+  let mut r := r
+  for j in ← load "gpu_config.json" do
+    let b ← orFail (getNat j "base")
+    let (e, d) ← orFail (getPair j "chunk")
+    let (e16, d16) ← orFail (getPair j "chunk_u16")
+    r := r.check s!"chunk_constants {b}" (Nice.chunkExp b (2 ^ 31) == e && b ^ e == d)
+    r := r.check s!"chunk_constants_u16 {b}" (Nice.chunkExp b (2 ^ 16) == e16 && b ^ e16 == d16)
+    let pf ← orFail (getNatOpt j "prefilter_digits")
+    let start ← orFail (getNatOpt j "range_start")
+    match pf, start with
+    | some p, some s =>
+      -- the Rust depth (float log, minus one for safety) never exceeds the exact depth
+      r := r.check s!"prefilter_digits {b}" (p ≤ Nice.prefilterDepth b s)
+    | some _, none => r := r.check s!"prefilter_digits {b} without a range" false
+    | none, _ => pure ()
+  pure r
+
 end Conformance
 
 open Conformance in
@@ -229,6 +253,7 @@ def main : IO UInt32 := do
   r ← checkRanges r
   r ← checkMsd r
   r ← checkPipeline r
+  r ← checkGpuConfig r
   r ← checkSeeded r
   for f in r.failures.reverse do
     IO.println s!"FAIL: {f}"
