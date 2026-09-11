@@ -1,0 +1,1614 @@
+[
+  {
+    "base": 5,
+    "chunk": [
+      13,
+      1220703125
+    ],
+    "chunk_u16": [
+      6,
+      15625
+    ],
+    "prefilter_digits": null,
+    "range_start": "3"
+  },
+  {
+    "base": 6,
+    "chunk": [
+      11,
+      362797056
+    ],
+    "chunk_u16": [
+      6,
+      46656
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 7,
+    "chunk": [
+      11,
+      1977326743
+    ],
+    "chunk_u16": [
+      5,
+      16807
+    ],
+    "prefilter_digits": null,
+    "range_start": "7"
+  },
+  {
+    "base": 8,
+    "chunk": [
+      10,
+      1073741824
+    ],
+    "chunk_u16": [
+      5,
+      32768
+    ],
+    "prefilter_digits": null,
+    "range_start": "16"
+  },
+  {
+    "base": 9,
+    "chunk": [
+      9,
+      387420489
+    ],
+    "chunk_u16": [
+      5,
+      59049
+    ],
+    "prefilter_digits": null,
+    "range_start": "27"
+  },
+  {
+    "base": 10,
+    "chunk": [
+      9,
+      1000000000
+    ],
+    "chunk_u16": [
+      4,
+      10000
+    ],
+    "prefilter_digits": null,
+    "range_start": "47"
+  },
+  {
+    "base": 11,
+    "chunk": [
+      8,
+      214358881
+    ],
+    "chunk_u16": [
+      4,
+      14641
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 12,
+    "chunk": [
+      8,
+      429981696
+    ],
+    "chunk_u16": [
+      4,
+      20736
+    ],
+    "prefilter_digits": null,
+    "range_start": "144"
+  },
+  {
+    "base": 13,
+    "chunk": [
+      8,
+      815730721
+    ],
+    "chunk_u16": [
+      4,
+      28561
+    ],
+    "prefilter_digits": null,
+    "range_start": "398"
+  },
+  {
+    "base": 14,
+    "chunk": [
+      8,
+      1475789056
+    ],
+    "chunk_u16": [
+      4,
+      38416
+    ],
+    "prefilter_digits": null,
+    "range_start": "734"
+  },
+  {
+    "base": 15,
+    "chunk": [
+      7,
+      170859375
+    ],
+    "chunk_u16": [
+      4,
+      50625
+    ],
+    "prefilter_digits": null,
+    "range_start": "1369"
+  },
+  {
+    "base": 16,
+    "chunk": [
+      7,
+      268435456
+    ],
+    "chunk_u16": [
+      3,
+      4096
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 17,
+    "chunk": [
+      7,
+      410338673
+    ],
+    "chunk_u16": [
+      3,
+      4913
+    ],
+    "prefilter_digits": null,
+    "range_start": "4913"
+  },
+  {
+    "base": 18,
+    "chunk": [
+      7,
+      612220032
+    ],
+    "chunk_u16": [
+      3,
+      5832
+    ],
+    "prefilter_digits": null,
+    "range_start": "15285"
+  },
+  {
+    "base": 19,
+    "chunk": [
+      7,
+      893871739
+    ],
+    "chunk_u16": [
+      3,
+      6859
+    ],
+    "prefilter_digits": null,
+    "range_start": "29898"
+  },
+  {
+    "base": 20,
+    "chunk": [
+      7,
+      1280000000
+    ],
+    "chunk_u16": [
+      3,
+      8000
+    ],
+    "prefilter_digits": null,
+    "range_start": "58945"
+  },
+  {
+    "base": 21,
+    "chunk": [
+      7,
+      1801088541
+    ],
+    "chunk_u16": [
+      3,
+      9261
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 22,
+    "chunk": [
+      6,
+      113379904
+    ],
+    "chunk_u16": [
+      3,
+      10648
+    ],
+    "prefilter_digits": null,
+    "range_start": "234256"
+  },
+  {
+    "base": 23,
+    "chunk": [
+      6,
+      148035889
+    ],
+    "chunk_u16": [
+      3,
+      12167
+    ],
+    "prefilter_digits": null,
+    "range_start": "795831"
+  },
+  {
+    "base": 24,
+    "chunk": [
+      6,
+      191102976
+    ],
+    "chunk_u16": [
+      3,
+      13824
+    ],
+    "prefilter_digits": null,
+    "range_start": "1625364"
+  },
+  {
+    "base": 25,
+    "chunk": [
+      6,
+      244140625
+    ],
+    "chunk_u16": [
+      3,
+      15625
+    ],
+    "prefilter_digits": null,
+    "range_start": "3339797"
+  },
+  {
+    "base": 26,
+    "chunk": [
+      6,
+      308915776
+    ],
+    "chunk_u16": [
+      3,
+      17576
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 27,
+    "chunk": [
+      6,
+      387420489
+    ],
+    "chunk_u16": [
+      3,
+      19683
+    ],
+    "prefilter_digits": null,
+    "range_start": "14348907"
+  },
+  {
+    "base": 28,
+    "chunk": [
+      6,
+      481890304
+    ],
+    "chunk_u16": [
+      3,
+      21952
+    ],
+    "prefilter_digits": 9,
+    "range_start": "52260814"
+  },
+  {
+    "base": 29,
+    "chunk": [
+      6,
+      594823321
+    ],
+    "chunk_u16": [
+      3,
+      24389
+    ],
+    "prefilter_digits": 9,
+    "range_start": "110455918"
+  },
+  {
+    "base": 30,
+    "chunk": [
+      6,
+      729000000
+    ],
+    "chunk_u16": [
+      3,
+      27000
+    ],
+    "prefilter_digits": 9,
+    "range_start": "234613921"
+  },
+  {
+    "base": 31,
+    "chunk": [
+      6,
+      887503681
+    ],
+    "chunk_u16": [
+      3,
+      29791
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 32,
+    "chunk": [
+      6,
+      1073741824
+    ],
+    "chunk_u16": [
+      3,
+      32768
+    ],
+    "prefilter_digits": 9,
+    "range_start": "1073741824"
+  },
+  {
+    "base": 33,
+    "chunk": [
+      6,
+      1291467969
+    ],
+    "chunk_u16": [
+      3,
+      35937
+    ],
+    "prefilter_digits": 9,
+    "range_start": "4142427847"
+  },
+  {
+    "base": 34,
+    "chunk": [
+      6,
+      1544804416
+    ],
+    "chunk_u16": [
+      3,
+      39304
+    ],
+    "prefilter_digits": 9,
+    "range_start": "9007680237"
+  },
+  {
+    "base": 35,
+    "chunk": [
+      6,
+      1838265625
+    ],
+    "chunk_u16": [
+      3,
+      42875
+    ],
+    "prefilter_digits": 9,
+    "range_start": "19669212048"
+  },
+  {
+    "base": 36,
+    "chunk": [
+      5,
+      60466176
+    ],
+    "chunk_u16": [
+      3,
+      46656
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 37,
+    "chunk": [
+      5,
+      69343957
+    ],
+    "chunk_u16": [
+      3,
+      50653
+    ],
+    "prefilter_digits": 9,
+    "range_start": "94931877133"
+  },
+  {
+    "base": 38,
+    "chunk": [
+      5,
+      79235168
+    ],
+    "chunk_u16": [
+      3,
+      54872
+    ],
+    "prefilter_digits": 9,
+    "range_start": "384662374829"
+  },
+  {
+    "base": 39,
+    "chunk": [
+      5,
+      90224199
+    ],
+    "chunk_u16": [
+      3,
+      59319
+    ],
+    "prefilter_digits": 9,
+    "range_start": "857007362029"
+  },
+  {
+    "base": 40,
+    "chunk": [
+      5,
+      102400000
+    ],
+    "chunk_u16": [
+      3,
+      64000
+    ],
+    "prefilter_digits": 9,
+    "range_start": "1916284264916"
+  },
+  {
+    "base": 41,
+    "chunk": [
+      5,
+      115856201
+    ],
+    "chunk_u16": [
+      2,
+      1681
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 42,
+    "chunk": [
+      5,
+      130691232
+    ],
+    "chunk_u16": [
+      2,
+      1764
+    ],
+    "prefilter_digits": null,
+    "range_start": "9682651996416"
+  },
+  {
+    "base": 43,
+    "chunk": [
+      5,
+      147008443
+    ],
+    "chunk_u16": [
+      2,
+      1849
+    ],
+    "prefilter_digits": null,
+    "range_start": "40948418181959"
+  },
+  {
+    "base": 44,
+    "chunk": [
+      5,
+      164916224
+    ],
+    "chunk_u16": [
+      2,
+      1936
+    ],
+    "prefilter_digits": null,
+    "range_start": "93185373471696"
+  },
+  {
+    "base": 45,
+    "chunk": [
+      5,
+      184528125
+    ],
+    "chunk_u16": [
+      2,
+      2025
+    ],
+    "prefilter_digits": null,
+    "range_start": "212736390383970"
+  },
+  {
+    "base": 46,
+    "chunk": [
+      5,
+      205962976
+    ],
+    "chunk_u16": [
+      2,
+      2116
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 47,
+    "chunk": [
+      5,
+      229345007
+    ],
+    "chunk_u16": [
+      2,
+      2209
+    ],
+    "prefilter_digits": null,
+    "range_start": "1119130473102767"
+  },
+  {
+    "base": 48,
+    "chunk": [
+      5,
+      254803968
+    ],
+    "chunk_u16": [
+      2,
+      2304
+    ],
+    "prefilter_digits": null,
+    "range_start": "4915694472847618"
+  },
+  {
+    "base": 49,
+    "chunk": [
+      5,
+      282475249
+    ],
+    "chunk_u16": [
+      2,
+      2401
+    ],
+    "prefilter_digits": null,
+    "range_start": "11398895185373143"
+  },
+  {
+    "base": 50,
+    "chunk": [
+      5,
+      312500000
+    ],
+    "chunk_u16": [
+      2,
+      2500
+    ],
+    "prefilter_digits": null,
+    "range_start": "26507984537059635"
+  },
+  {
+    "base": 51,
+    "chunk": [
+      5,
+      345025251
+    ],
+    "chunk_u16": [
+      2,
+      2601
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 52,
+    "chunk": [
+      5,
+      380204032
+    ],
+    "chunk_u16": [
+      2,
+      2704
+    ],
+    "prefilter_digits": null,
+    "range_start": "144555105949057024"
+  },
+  {
+    "base": 53,
+    "chunk": [
+      5,
+      418195493
+    ],
+    "chunk_u16": [
+      2,
+      2809
+    ],
+    "prefilter_digits": null,
+    "range_start": "656927313525736563"
+  },
+  {
+    "base": 54,
+    "chunk": [
+      5,
+      459165024
+    ],
+    "chunk_u16": [
+      2,
+      2916
+    ],
+    "prefilter_digits": null,
+    "range_start": "1549296280153679229"
+  },
+  {
+    "base": 55,
+    "chunk": [
+      5,
+      503284375
+    ],
+    "chunk_u16": [
+      2,
+      3025
+    ],
+    "prefilter_digits": null,
+    "range_start": "3663267963587310490"
+  },
+  {
+    "base": 56,
+    "chunk": [
+      5,
+      550731776
+    ],
+    "chunk_u16": [
+      2,
+      3136
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 57,
+    "chunk": [
+      5,
+      601692057
+    ],
+    "chunk_u16": [
+      2,
+      3249
+    ],
+    "prefilter_digits": null,
+    "range_start": "20635899893042801193"
+  },
+  {
+    "base": 58,
+    "chunk": [
+      5,
+      656356768
+    ],
+    "chunk_u16": [
+      2,
+      3364
+    ],
+    "prefilter_digits": null,
+    "range_start": "96720216587923470200"
+  },
+  {
+    "base": 59,
+    "chunk": [
+      5,
+      714924299
+    ],
+    "chunk_u16": [
+      2,
+      3481
+    ],
+    "prefilter_digits": null,
+    "range_start": "231631774300498175921"
+  },
+  {
+    "base": 60,
+    "chunk": [
+      5,
+      777600000
+    ],
+    "chunk_u16": [
+      2,
+      3600
+    ],
+    "prefilter_digits": null,
+    "range_start": "556029612114824200908"
+  },
+  {
+    "base": 61,
+    "chunk": [
+      5,
+      844596301
+    ],
+    "chunk_u16": [
+      2,
+      3721
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 62,
+    "chunk": [
+      5,
+      916132832
+    ],
+    "chunk_u16": [
+      2,
+      3844
+    ],
+    "prefilter_digits": null,
+    "range_start": "3226266762397899821056"
+  },
+  {
+    "base": 63,
+    "chunk": [
+      5,
+      992436543
+    ],
+    "chunk_u16": [
+      2,
+      3969
+    ],
+    "prefilter_digits": null,
+    "range_start": "15554883995458128017102"
+  },
+  {
+    "base": 64,
+    "chunk": [
+      5,
+      1073741824
+    ],
+    "chunk_u16": [
+      2,
+      4096
+    ],
+    "prefilter_digits": null,
+    "range_start": "37778931862957161709568"
+  },
+  {
+    "base": 65,
+    "chunk": [
+      5,
+      1160290625
+    ],
+    "chunk_u16": [
+      2,
+      4225
+    ],
+    "prefilter_digits": null,
+    "range_start": "91953694755747944887348"
+  },
+  {
+    "base": 66,
+    "chunk": [
+      5,
+      1252332576
+    ],
+    "chunk_u16": [
+      2,
+      4356
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 67,
+    "chunk": [
+      5,
+      1350125107
+    ],
+    "chunk_u16": [
+      2,
+      4489
+    ],
+    "prefilter_digits": null,
+    "range_start": "548242166610401428685587"
+  },
+  {
+    "base": 68,
+    "chunk": [
+      5,
+      1453933568
+    ],
+    "chunk_u16": [
+      2,
+      4624
+    ],
+    "prefilter_digits": null,
+    "range_start": "2713014840550843048084693"
+  },
+  {
+    "base": 69,
+    "chunk": [
+      5,
+      1564031349
+    ],
+    "chunk_u16": [
+      2,
+      4761
+    ],
+    "prefilter_digits": null,
+    "range_start": "6675176061585159609396207"
+  },
+  {
+    "base": 70,
+    "chunk": [
+      5,
+      1680700000
+    ],
+    "chunk_u16": [
+      2,
+      4900
+    ],
+    "prefilter_digits": null,
+    "range_start": "16456591172673850596148008"
+  },
+  {
+    "base": 71,
+    "chunk": [
+      5,
+      1804229351
+    ],
+    "chunk_u16": [
+      2,
+      5041
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 72,
+    "chunk": [
+      5,
+      1934917632
+    ],
+    "chunk_u16": [
+      2,
+      5184
+    ],
+    "prefilter_digits": null,
+    "range_start": "100613197241791537106386944"
+  },
+  {
+    "base": 73,
+    "chunk": [
+      5,
+      2073071593
+    ],
+    "chunk_u16": [
+      2,
+      5329
+    ],
+    "prefilter_digits": null,
+    "range_start": "510067510899210671569684485"
+  },
+  {
+    "base": 74,
+    "chunk": [
+      4,
+      29986576
+    ],
+    "chunk_u16": [
+      2,
+      5476
+    ],
+    "prefilter_digits": null,
+    "range_start": "1270164399631151609970127595"
+  },
+  {
+    "base": 75,
+    "chunk": [
+      4,
+      31640625
+    ],
+    "chunk_u16": [
+      2,
+      5625
+    ],
+    "prefilter_digits": null,
+    "range_start": "3168826999456348122876221569"
+  },
+  {
+    "base": 76,
+    "chunk": [
+      4,
+      33362176
+    ],
+    "chunk_u16": [
+      2,
+      5776
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 77,
+    "chunk": [
+      4,
+      35153041
+    ],
+    "chunk_u16": [
+      2,
+      5929
+    ],
+    "prefilter_digits": null,
+    "range_start": "19831742626597600733536317893"
+  },
+  {
+    "base": 78,
+    "chunk": [
+      4,
+      37015056
+    ],
+    "chunk_u16": [
+      2,
+      6084
+    ],
+    "prefilter_digits": null,
+    "range_start": "102829385677598770765476816824"
+  },
+  {
+    "base": 79,
+    "chunk": [
+      4,
+      38950081
+    ],
+    "chunk_u16": [
+      2,
+      6241
+    ],
+    "prefilter_digits": null,
+    "range_start": "258952384818697126217483561852"
+  },
+  {
+    "base": 80,
+    "chunk": [
+      4,
+      40960000
+    ],
+    "chunk_u16": [
+      2,
+      6400
+    ],
+    "prefilter_digits": null,
+    "range_start": "653245554420798943087177909799"
+  },
+  {
+    "base": 81,
+    "chunk": [
+      4,
+      43046721
+    ],
+    "chunk_u16": [
+      2,
+      6561
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 82,
+    "chunk": [
+      4,
+      45212176
+    ],
+    "chunk_u16": [
+      2,
+      6724
+    ],
+    "prefilter_digits": null,
+    "range_start": "4178511850022702569647809560576"
+  },
+  {
+    "base": 83,
+    "chunk": [
+      4,
+      47458321
+    ],
+    "chunk_u16": [
+      2,
+      6889
+    ],
+    "prefilter_digits": null,
+    "range_start": "22128000647627410287823658733218"
+  },
+  {
+    "base": 84,
+    "chunk": [
+      4,
+      49787136
+    ],
+    "chunk_u16": [
+      2,
+      7056
+    ],
+    "prefilter_digits": null,
+    "range_start": "56312942377237435733597461491303"
+  },
+  {
+    "base": 85,
+    "chunk": [
+      4,
+      52200625
+    ],
+    "chunk_u16": [
+      2,
+      7225
+    ],
+    "prefilter_digits": null,
+    "range_start": "143543025330965793204023642513500"
+  },
+  {
+    "base": 86,
+    "chunk": [
+      4,
+      54700816
+    ],
+    "chunk_u16": [
+      2,
+      7396
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 87,
+    "chunk": [
+      4,
+      57289761
+    ],
+    "chunk_u16": [
+      2,
+      7569
+    ],
+    "prefilter_digits": null,
+    "range_start": "937189241636402729052111114871767"
+  },
+  {
+    "base": 88,
+    "chunk": [
+      4,
+      59969536
+    ],
+    "chunk_u16": [
+      2,
+      7744
+    ],
+    "prefilter_digits": null,
+    "range_start": "5062514932976556158810392405111548"
+  },
+  {
+    "base": 89,
+    "chunk": [
+      4,
+      62742241
+    ],
+    "chunk_u16": [
+      2,
+      7921
+    ],
+    "prefilter_digits": null,
+    "range_start": "13011432596758118980166663776661963"
+  },
+  {
+    "base": 90,
+    "chunk": [
+      4,
+      65610000
+    ],
+    "chunk_u16": [
+      2,
+      8100
+    ],
+    "prefilter_digits": null,
+    "range_start": "33492764832792484045981163311105668"
+  },
+  {
+    "base": 91,
+    "chunk": [
+      4,
+      68574961
+    ],
+    "chunk_u16": [
+      2,
+      8281
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 92,
+    "chunk": [
+      4,
+      71639296
+    ],
+    "chunk_u16": [
+      2,
+      8464
+    ],
+    "prefilter_digits": null,
+    "range_start": "222936352980619746738642598267715584"
+  },
+  {
+    "base": 93,
+    "chunk": [
+      4,
+      74805201
+    ],
+    "chunk_u16": [
+      2,
+      8649
+    ],
+    "prefilter_digits": null,
+    "range_start": "1227026823693494988240298801231589358"
+  },
+  {
+    "base": 94,
+    "chunk": [
+      4,
+      78074896
+    ],
+    "chunk_u16": [
+      2,
+      8836
+    ],
+    "prefilter_digits": null,
+    "range_start": "3183210008247514747571732759297930427"
+  },
+  {
+    "base": 95,
+    "chunk": [
+      4,
+      81450625
+    ],
+    "chunk_u16": [
+      2,
+      9025
+    ],
+    "prefilter_digits": null,
+    "range_start": "8270034070172644280043770101532655486"
+  },
+  {
+    "base": 96,
+    "chunk": [
+      4,
+      84934656
+    ],
+    "chunk_u16": [
+      2,
+      9216
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 97,
+    "chunk": [
+      4,
+      88529281
+    ],
+    "chunk_u16": [
+      2,
+      9409
+    ],
+    "prefilter_digits": null,
+    "range_start": "56061272466674974994842655144706937633"
+  },
+  {
+    "base": 98,
+    "chunk": [
+      4,
+      92236816
+    ],
+    "chunk_u16": [
+      2,
+      9604
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 99,
+    "chunk": [
+      4,
+      96059601
+    ],
+    "chunk_u16": [
+      2,
+      9801
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 100,
+    "chunk": [
+      4,
+      100000000
+    ],
+    "chunk_u16": [
+      2,
+      10000
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 101,
+    "chunk": [
+      4,
+      104060401
+    ],
+    "chunk_u16": [
+      2,
+      10201
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 102,
+    "chunk": [
+      4,
+      108243216
+    ],
+    "chunk_u16": [
+      2,
+      10404
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 103,
+    "chunk": [
+      4,
+      112550881
+    ],
+    "chunk_u16": [
+      2,
+      10609
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 104,
+    "chunk": [
+      4,
+      116985856
+    ],
+    "chunk_u16": [
+      2,
+      10816
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 105,
+    "chunk": [
+      4,
+      121550625
+    ],
+    "chunk_u16": [
+      2,
+      11025
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 106,
+    "chunk": [
+      4,
+      126247696
+    ],
+    "chunk_u16": [
+      2,
+      11236
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 107,
+    "chunk": [
+      4,
+      131079601
+    ],
+    "chunk_u16": [
+      2,
+      11449
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 108,
+    "chunk": [
+      4,
+      136048896
+    ],
+    "chunk_u16": [
+      2,
+      11664
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 109,
+    "chunk": [
+      4,
+      141158161
+    ],
+    "chunk_u16": [
+      2,
+      11881
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 110,
+    "chunk": [
+      4,
+      146410000
+    ],
+    "chunk_u16": [
+      2,
+      12100
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 111,
+    "chunk": [
+      4,
+      151807041
+    ],
+    "chunk_u16": [
+      2,
+      12321
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 112,
+    "chunk": [
+      4,
+      157351936
+    ],
+    "chunk_u16": [
+      2,
+      12544
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 113,
+    "chunk": [
+      4,
+      163047361
+    ],
+    "chunk_u16": [
+      2,
+      12769
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 114,
+    "chunk": [
+      4,
+      168896016
+    ],
+    "chunk_u16": [
+      2,
+      12996
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 115,
+    "chunk": [
+      4,
+      174900625
+    ],
+    "chunk_u16": [
+      2,
+      13225
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 116,
+    "chunk": [
+      4,
+      181063936
+    ],
+    "chunk_u16": [
+      2,
+      13456
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 117,
+    "chunk": [
+      4,
+      187388721
+    ],
+    "chunk_u16": [
+      2,
+      13689
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 118,
+    "chunk": [
+      4,
+      193877776
+    ],
+    "chunk_u16": [
+      2,
+      13924
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 119,
+    "chunk": [
+      4,
+      200533921
+    ],
+    "chunk_u16": [
+      2,
+      14161
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 120,
+    "chunk": [
+      4,
+      207360000
+    ],
+    "chunk_u16": [
+      2,
+      14400
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 121,
+    "chunk": [
+      4,
+      214358881
+    ],
+    "chunk_u16": [
+      2,
+      14641
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 122,
+    "chunk": [
+      4,
+      221533456
+    ],
+    "chunk_u16": [
+      2,
+      14884
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 123,
+    "chunk": [
+      4,
+      228886641
+    ],
+    "chunk_u16": [
+      2,
+      15129
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 124,
+    "chunk": [
+      4,
+      236421376
+    ],
+    "chunk_u16": [
+      2,
+      15376
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 125,
+    "chunk": [
+      4,
+      244140625
+    ],
+    "chunk_u16": [
+      2,
+      15625
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 126,
+    "chunk": [
+      4,
+      252047376
+    ],
+    "chunk_u16": [
+      2,
+      15876
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 127,
+    "chunk": [
+      4,
+      260144641
+    ],
+    "chunk_u16": [
+      2,
+      16129
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  },
+  {
+    "base": 128,
+    "chunk": [
+      4,
+      268435456
+    ],
+    "chunk_u16": [
+      2,
+      16384
+    ],
+    "prefilter_digits": null,
+    "range_start": null
+  }
+]

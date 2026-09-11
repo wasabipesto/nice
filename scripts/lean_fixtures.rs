@@ -15,6 +15,7 @@ use nice_common::base_range::get_base_range_u128;
 use nice_common::client_process::{get_is_nice, get_is_nice_with_known_lsd};
 use nice_common::lsd_filter::get_valid_multi_lsd_bitmap;
 use nice_common::client_process::process_range_niceonly;
+use nice_common::gpu_config::{chunk_constants, chunk_constants_u16, prefilter_params};
 use nice_common::msd_prefix_filter::{
     get_valid_ranges_recursive, get_valid_ranges_recursive_masked, has_duplicate_msd_prefix,
     MaskedRecursion,
@@ -84,6 +85,17 @@ struct Pipeline {
     masked_leaves: Vec<(u32, String, Vec<(String, String, Vec<u32>)>)>,
     /// `process_range_niceonly` over the whole range (production floor).
     nice: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GpuConfig {
+    base: u32,
+    /// (exponent, base^exponent) below 2^31 and below 2^16.
+    chunk: (u32, u32),
+    chunk_u16: (u32, u32),
+    /// Prefilter digits when enabled, with the base range start.
+    prefilter_digits: Option<u32>,
+    range_start: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -273,6 +285,25 @@ fn main() {
     fs::write(
         out.join("pipeline.json"),
         serde_json::to_string_pretty(&pipeline).unwrap(),
+    )
+    .unwrap();
+
+    // GPU per-base constants (NUM-6, NUM-7).
+    let gpu: Vec<GpuConfig> = (5..=128)
+        .map(|base| GpuConfig {
+            base,
+            chunk: chunk_constants(base),
+            chunk_u16: chunk_constants_u16(base),
+            prefilter_digits: prefilter_params(base).map(|p| p.digits),
+            range_start: get_base_range_u128(base)
+                .ok()
+                .flatten()
+                .map(|f| f.start().to_string()),
+        })
+        .collect();
+    fs::write(
+        out.join("gpu_config.json"),
+        serde_json::to_string_pretty(&gpu).unwrap(),
     )
     .unwrap();
 
