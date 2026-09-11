@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `proofs/`, a Lean 4 + Mathlib project that states and proves the mathematics the search relies on (design and phases in `proofs/DESIGN.md`). Phase 0: definitions (`IsNice`, positional digits, the residue filter), the first proved claims (digit-count necessity, the digit-sum congruence, residue-filter soundness, empty-filter nonexistence, base 11 dead, 69 nice in base 10 by `decide`), the claims registry `proofs/CLAIMS.md`, `Lean:` tags at four Rust sites, and `just lean-build` / `just lean-claims` / `just lean-fixtures` / `just lean-conformance`. Phases 1–4 prove the base range and its numeric cutoffs, the residue/LSD/stride/seeded-check models, the MSD interval-domain filter with Hall soundness and the recursive subdivision, the cross-end certificate, and the end-to-end theorem `niceonly_complete` / `niceonly_sound` for the modelled niceonly pipeline; `Refuted.lean` records the 2026-02 skip with its witness. A `Lean proofs` CI job (`.github/workflows/lean.yml`) builds the library, runs the conformance check against the Rust-emitted fixtures, and validates the claims registry, on changes under `proofs/`.
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.

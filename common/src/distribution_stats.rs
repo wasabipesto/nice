@@ -28,12 +28,14 @@ pub fn expand_distribution(
 
 /// Incrementally aggregates distribution counts over batches of submissions.
 ///
+/// Lean: `Nice.histogram_fold` (DET-1)
 /// Folding batch-by-batch produces the same result as one pass over the
 /// concatenation, which is what lets the jobs binary stream a base's canon
 /// submissions chunk-by-chunk instead of holding them all in memory.
 pub struct DistributionAccumulator {
     base: u32,
     // Counter vec indexed by `num_uniques`.
+    // Lean: `Nice.one_le_numUniques` (DEF-3) — bin 0 is provably empty.
     // Note: Array size is (base + 1) to allow indexing from 0..=base
     // We use indices [1..=base] (inclusive range) since `num_uniques` ranges from 1 to base
     counter: Vec<UniquesDistributionSimple>,

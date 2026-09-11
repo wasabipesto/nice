@@ -155,6 +155,7 @@ pub fn update_chunk(
 }
 
 #[allow(clippy::cast_possible_wrap)]
+// Lean: `Nice.inField_iff` (FLD-1) — start-point matching is correct because a field lies inside the chunk holding its start
 pub fn reassign_fields_to_chunks(conn: &mut PgConnection, base: u32) -> Result<()> {
     use diesel::sql_types::Integer;
 

@@ -12,6 +12,7 @@ pub const SAVE_TOP_N_NUMBERS: usize = 10_000;
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
 )]
+// Lean: `Nice.nearMissCutoff` (DEF-4)
 pub fn get_near_miss_cutoff(base: u32) -> u32 {
     (base as f32 * NEAR_MISS_CUTOFF_PERCENT).floor() as u32
 }
@@ -38,6 +39,7 @@ pub fn expand_numbers(numbers: &[NiceNumberSimple], base: u32) -> Vec<NiceNumber
 ///
 /// The working set is compacted back to the cap whenever it doubles, so peak
 /// memory is bounded by 2x the cap no matter how many batches are folded in.
+/// Lean: `Nice.topN_of_superset` (DET-1b)
 /// Compaction never drops a number that belongs in the final top-N: the top-N
 /// of a set is contained in the top-N of every superset.
 #[derive(Default)]

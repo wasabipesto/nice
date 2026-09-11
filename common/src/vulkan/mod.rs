@@ -1116,6 +1116,7 @@ impl RangeSink for NiceonlyRun<'_> {
             masks.len()
         );
         let _ = masks; // certificates not yet applied on this backend
+        // Lean: `Nice.validRangesMasked_cover` (CRS-3)
         // `masks` (cross-end certificates) are not yet applied on this
         // backend: WGSL has no u64, so the mask test needs a two-word port.
         // Ignoring them only means checking more candidates - never fewer.

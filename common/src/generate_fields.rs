@@ -11,6 +11,7 @@ use std::ops::Add;
 /// and produces half-open ranges [start, end) as output. Each returned `FieldSize`
 /// follows Rust's convention where `range_start` is inclusive and `range_end` is exclusive.
 #[must_use]
+// Lean: `Nice.inField_iff` (FLD-1)
 pub fn break_range_into_fields(min: u128, max: u128, size: u128) -> Vec<FieldSize> {
     // create output vec
     let mut fields = Vec::new();

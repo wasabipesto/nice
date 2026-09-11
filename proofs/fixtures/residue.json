@@ -1,0 +1,253 @@
+[
+  {
+    "base": 5,
+    "residues": [
+      1
+    ]
+  },
+  {
+    "base": 6,
+    "residues": [
+      0,
+      4
+    ]
+  },
+  {
+    "base": 7,
+    "residues": []
+  },
+  {
+    "base": 8,
+    "residues": [
+      0,
+      6
+    ]
+  },
+  {
+    "base": 9,
+    "residues": [
+      2,
+      3,
+      6
+    ]
+  },
+  {
+    "base": 10,
+    "residues": [
+      0,
+      3,
+      6,
+      8
+    ]
+  },
+  {
+    "base": 11,
+    "residues": []
+  },
+  {
+    "base": 12,
+    "residues": [
+      0,
+      10
+    ]
+  },
+  {
+    "base": 13,
+    "residues": [
+      5,
+      9
+    ]
+  },
+  {
+    "base": 14,
+    "residues": [
+      0,
+      12
+    ]
+  },
+  {
+    "base": 15,
+    "residues": []
+  },
+  {
+    "base": 16,
+    "residues": [
+      0,
+      5,
+      9,
+      14
+    ]
+  },
+  {
+    "base": 17,
+    "residues": [
+      7
+    ]
+  },
+  {
+    "base": 18,
+    "residues": [
+      0,
+      16
+    ]
+  },
+  {
+    "base": 19,
+    "residues": []
+  },
+  {
+    "base": 20,
+    "residues": [
+      0,
+      18
+    ]
+  },
+  {
+    "base": 21,
+    "residues": [
+      5,
+      9
+    ]
+  },
+  {
+    "base": 22,
+    "residues": [
+      0,
+      6,
+      14,
+      20
+    ]
+  },
+  {
+    "base": 23,
+    "residues": []
+  },
+  {
+    "base": 24,
+    "residues": [
+      0,
+      22
+    ]
+  },
+  {
+    "base": 25,
+    "residues": [
+      2,
+      3,
+      6,
+      11,
+      14,
+      18
+    ]
+  },
+  {
+    "base": 26,
+    "residues": [
+      0,
+      5,
+      10,
+      15,
+      20,
+      24
+    ]
+  },
+  {
+    "base": 27,
+    "residues": []
+  },
+  {
+    "base": 28,
+    "residues": [
+      0,
+      9,
+      18,
+      26
+    ]
+  },
+  {
+    "base": 29,
+    "residues": [
+      13,
+      21
+    ]
+  },
+  {
+    "base": 30,
+    "residues": [
+      0,
+      28
+    ]
+  },
+  {
+    "base": 31,
+    "residues": []
+  },
+  {
+    "base": 32,
+    "residues": [
+      0,
+      30
+    ]
+  },
+  {
+    "base": 33,
+    "residues": [
+      4,
+      12,
+      15,
+      20,
+      28
+    ]
+  },
+  {
+    "base": 34,
+    "residues": [
+      0,
+      11,
+      21,
+      32
+    ]
+  },
+  {
+    "base": 35,
+    "residues": []
+  },
+  {
+    "base": 36,
+    "residues": [
+      0,
+      14,
+      20,
+      34
+    ]
+  },
+  {
+    "base": 37,
+    "residues": [
+      9,
+      17,
+      21,
+      33
+    ]
+  },
+  {
+    "base": 38,
+    "residues": [
+      0,
+      36
+    ]
+  },
+  {
+    "base": 39,
+    "residues": []
+  },
+  {
+    "base": 40,
+    "residues": [
+      0,
+      12,
+      26,
+      38
+    ]
+  }
+]

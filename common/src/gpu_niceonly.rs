@@ -96,6 +96,8 @@ const WORKER_BATCH_RANGES: usize = 4096;
 /// thousands of chunks' worth of device work.
 const WORKER_BATCH_CHUNKS: usize = 256;
 
+/// Lean: `Nice.validRangesMasked_block` (GPU-2), `Nice.analyzeRange_mono` (MSD-9)
+///
 /// Log2 of the number of chunks one MSD work unit (a *block*) spans.
 ///
 /// The MSD recursion used to start at [`PROCESSING_CHUNK_SIZE`], so a 1e13
@@ -145,6 +147,7 @@ struct BlockTiling {
 }
 
 impl BlockTiling {
+    // Lean: `Nice.blockTiling_cover` (GPU-1)
     fn new(range: &FieldSize, min_blocks: usize) -> Self {
         let full_chunks = range.size() / PROCESSING_CHUNK_SIZE;
         let mut log2 = MSD_BLOCK_CHUNKS_LOG2;
@@ -1393,6 +1396,8 @@ pub fn report_field(backend: &str, base: u32, stats: NiceonlyStats) {
 /// The CUDA path has the same guard inside `process_range_niceonly_cuda`; the
 /// Vulkan and `CubeCL` paths call this ahead of their CPU fallbacks, so it
 /// also covers bases the GPU itself cannot take.
+///
+/// Lean: `Nice.no_nice_of_residueFilter_empty` (RES-3)
 #[must_use]
 pub fn residue_empty_result(base: u32) -> Option<FieldResults> {
     if residue_filter::get_residue_filter_u128(&base).is_empty() {
@@ -1455,6 +1460,7 @@ const MIN_DISPATCH_THREADS: u64 = 1 << 16;
 /// count keeps the kernel's `gid >> shift` / `gid & (lanes - 1)` split exact,
 /// so the tiling stays pure index arithmetic at any width.
 #[must_use]
+// Lean: `Nice.lane_partition` (GPU-4)
 pub fn lane_shift_for(num_ranges: u64, mean_len: u64, stride_m: u32, stride_r: u32) -> u32 {
     let candidates = mean_len * u64::from(stride_r) / u64::from(stride_m);
     // Round down to a power of two: 63 candidates' worth of lanes is 4, not 8,
@@ -1486,6 +1492,7 @@ pub fn lane_shift_for(num_ranges: u64, mean_len: u64, stride_m: u32, stride_r: u
 /// base 80 among them. A 4-bit chunk covers the whole supported range with
 /// room to spare, and costs nothing measurable because this reduction runs
 /// once per *range descriptor*, not per candidate.
+/// Lean: `Nice.Const.stride_modulus_gpu` (NUM-4a)
 pub const MAX_STRIDE_MODULUS: u128 = 1 << 28;
 
 /// Width in bits of one Horner chunk in the kernels' offset reduction.
@@ -1495,6 +1502,7 @@ pub const MAX_STRIDE_MODULUS: u128 = 1 << 28;
 /// device kernels and the host mirror derive `c` from the same modulus, so
 /// they cannot disagree.
 #[must_use]
+// Lean: `Nice.hornerMod_chunksBE` (GPU-7)
 pub fn stride_chunk_bits(stride_m: u32) -> u32 {
     if u128::from(stride_m) <= 1 << 24 {
         8

@@ -33,6 +33,8 @@
 //! - LSD=8: 8²=64, 8³=512 → LSDs are 4 and 2, no collision ✓
 //! - LSD=9: 9²=81, 9³=729 → LSDs are 1 and 9, no collision ✓
 //!
+//! Lean: `Nice.digit_pow_mod_pow` (LSD-1)
+//!
 //! Result: Valid LSDs for base 10 are {2, 3, 4, 7, 8, 9}, filtering out 40% of candidates.
 //!
 //! This eliminates a significant portion of the search space with minimal computation.
@@ -57,6 +59,7 @@
 //! Note on zero padding: the fixed-width window treats value 5 with k=2 as digits "05".
 //! This is sound for any candidate whose square/cube has at least k digits, which holds
 //! for every number inside a legal base range (for k=2 any base ≥ 4; for k=3 any base ≥ 6).
+//! Lean: `Nice.three_le_numDigits_of_inBaseRange` (RNG-3)
 
 use log::trace;
 use malachite::base::num::arithmetic::traits::Pow;
@@ -157,6 +160,8 @@ fn is_valid_lsd(lsd: u32, base: u32) -> bool {
 /// - The digit 4 repeats within the square suffix, so suffix 12 is invalid
 /// - For suffix=69: 69²=4761 (last 2 digits: 6,1) and 69³=328509 (last 2 digits: 0,9)
 /// - All four digits {6,1,0,9} are distinct, so suffix 69 is valid
+///
+/// Lean: `Nice.mem_lsdBitmap_of_isNice` (LSD-2)
 ///
 /// # Panics
 /// Panics if base^k would overflow u32

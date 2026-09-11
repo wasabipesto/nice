@@ -318,6 +318,7 @@ __device__ __forceinline__ u32 num_unique_digits(u64 n_lo, u64 n_hi) {
 #ifdef NICEONLY
 
 // n mod STRIDE_M for n = (lo, hi). Both % below are by the constant M.
+// Lean: `Nice.Const.mod_m_bound` (NUM-8), `Nice.mod_m_split` (GPU-9)
 __device__ __forceinline__ u32 mod_m(u64 n_lo, u64 n_hi) {
     u32 hi_mod = (u32)(n_hi % STRIDE_M);
     u32 lo_mod = (u32)(n_lo % STRIDE_M);
@@ -417,6 +418,7 @@ __device__ __forceinline__ u32 lower_bound_residue(
 #define COMPACT_QUEUE 64
 #endif
 
+// Lean: `Nice.exists_ordinal_eq` (GPU-0)
 // One warp per MSD-valid range. Each range is (field_start + offset,
 // field_start + offset + len). Lanes stride through the range's valid
 // candidates by global residue-sequence index; the g-th candidate at or

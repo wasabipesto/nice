@@ -23,6 +23,7 @@ const MAX_BASE_FOR_DIGIT_ARRAY_U128: usize = 128;
 /// Above this, n³ exceeds 256 bits and we fall back to malachite `Natural`.
 /// Empirically determined: base 70's max-n cubed is 3.1e77 > 2^256 (1.16e77),
 /// while base 68's max-n cubed is ~2.7e74 < 2^256. Pick 68 for safety.
+/// Lean: `Nice.Const.u256_cutoff` (NUM-2)
 pub const MAX_BASE_FOR_FIXED_WIDTH_U256: u32 = 68;
 
 /// Inclusive upper bound on bases where n³ fits in u128 (skips the U256 path
@@ -34,8 +35,10 @@ pub const MAX_BASE_FOR_FIXED_WIDTH_U256: u32 = 68;
 /// leading-zero skip is the better choice for bases 41–68 (msd-ineff +30%).
 /// We accept the detailed-b40 regression because the niceonly speedup
 /// dominates real workloads — most production traffic is niceonly.
+/// Lean: `Nice.Const.u128_cutoff_40` (NUM-1)
 const MAX_BASE_FOR_FIXED_WIDTH_U128: u32 = 40;
 
+/// Lean: `Nice.IsNice` (DEF-1)
 /// Calculate the number of unique digits in (n^2, n^3) represented in base b.
 /// A number is nice if the result of this is equal to b (means all digits are used once).
 /// If you're just checking if the number is 100% nice, there is a faster version below.
@@ -44,6 +47,7 @@ const MAX_BASE_FOR_FIXED_WIDTH_U128: u32 = 40;
 /// for digit extraction, which in detailed mode (full extraction every
 /// candidate) outperforms malachite's small-divisor multi-limb division.
 #[must_use]
+// Lean: `Nice.numUniques_eq_iff_isNice` (DEF-2)
 pub fn get_num_unique_digits(num_u128: u128, base: u32) -> u32 {
     match base {
         40 => get_num_unique_digits_u128_const::<40>(num_u128),
@@ -337,6 +341,9 @@ fn get_is_nice_u256_const<const BASE: u32>(num: u128) -> bool {
 /// Sound only when n² and n³ each have at least `k` digits, which holds for
 /// every number inside a legal base range for k ≤ 3 and base ≥ 6.
 ///
+/// Lean: `Nice.seeded_iff_isNice` (STR-3)
+/// Lean: `Nice.three_le_numDigits_of_inBaseRange` (RNG-3)
+///
 /// Falls back to the plain check for (base, k) combinations without a
 /// specialization, so callers may use it unconditionally.
 #[must_use]
@@ -534,6 +541,7 @@ fn get_is_nice_natural(num: u128, base: u32) -> bool {
     true
 }
 
+/// Lean: `Nice.niceonly_complete` (END-1)
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
 #[must_use]
