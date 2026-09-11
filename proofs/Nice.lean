@@ -9,5 +9,8 @@ import Nice.Model.Seeded
 import Nice.Model.Gpu
 import Nice.Model.Msd
 import Nice.Model.Cross
+import Nice.Model.GpuArith
+import Nice.Model.Fields
+import Nice.Model.Detailed
 import Nice.Refuted
 import Nice.Examples

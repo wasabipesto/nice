@@ -18,8 +18,8 @@ checked outside Lean. `evidence` is what the Rust side has today.
 |---|---|---|---|---|---|---|
 | DEF-1 | `IsNice b n` ⇔ the base-b digits of n² followed by those of n³ permute `0..b-1` | `Nice.IsNice` | `common/src/client_process.rs::get_is_nice` | tests | def | 0 |
 | DEF-1a | the three-part `Pandigital` definition of `origin/proofs` is equivalent | `Nice.isNice_iff_pandigital` | — | — | proved | 0 |
-| DEF-2 | inside the base range, `numUniques b n = b ↔ IsNice b n` | `Nice.numUniques_eq_iff_isNice` | `common/src/client_process.rs::get_num_unique_digits` | comment | planned | 1 |
-| DEF-3 | `1 ≤ numUniques b n` for `n ≥ 1` (histogram bin 0 is empty) | `Nice.one_le_numUniques` | `common/src/distribution_stats.rs` | comment | planned | 1 |
+| DEF-2 | inside the base range, `numUniques b n = b ↔ IsNice b n` | `Nice.numUniques_eq_iff_isNice` | `common/src/client_process.rs::get_num_unique_digits` | comment | proved | 1 |
+| DEF-3 | `1 ≤ numUniques b n` for `n ≥ 1` (histogram bin 0 is empty) | `Nice.one_le_numUniques` | `common/src/distribution_stats.rs` | comment | proved | 1 |
 | DEF-4 | near-miss cutoff is `⌊0.9 b⌋`, strict `>` | `Nice.nearMissCutoff` | `common/src/number_stats.rs::get_near_miss_cutoff` | tests | planned | 1 |
 | RNG-1 | `IsNice b n → numDigits(n²) + numDigits(n³) = b` | `Nice.nice_digit_count` | `common/src/base_range.rs` | tests | proved | 0 |
 | RNG-2 | the per-`b mod 5` closed-form interval contains every n with `numDigits(n²) + numDigits(n³) = b` | `Nice.memBaseRange_of_inBaseRange` | `common/src/base_range.rs::get_base_range_natural` | tests pin 8 bases | proved | 1 |
@@ -62,17 +62,17 @@ checked outside Lean. `evidence` is what the Rust side has today.
 | CRS-3 | an empty or partial certificate is sound (mask soundness holds for any accumulated mask, so ignoring certificates only checks more candidates) | `Nice.validRangesMasked_cover` | `common/src/vulkan/mod.rs` | comment | proved | 4 |
 | REF-1 | the removed MSD×LSD skip is unsound: witness b=10, k=2, `[68,70)` (quotient test passes, low digits differ, 69 is nice); generally `n mod b^k` is never constant on a range of size > 1 (`mod_pow_not_constant`) | `Nice.msd_lsd_skip_unsound` | `common/src/msd_prefix_filter.rs` (NOTE) | regression test | refuted | 4 |
 | END-1 | the modelled niceonly pipeline (masked subdivision × stride walk × one-AND × nice check) reports every nice n of the range (`niceonly_complete`, for b ≥ 6, k ≤ 3) and only nice n of the range (`niceonly_sound`) | `Nice.niceonly_complete` | `common/src/client_process.rs::process_range_niceonly` | small-base brute force | proved | 4 |
-| GPU-1 | block tiling partitions the field | `Nice.Model.Gpu.tiling_partition` | `common/src/gpu_niceonly.rs::BlockTiling::new` | test | planned | 5 |
+| GPU-1 | block tiling (64-chunk blocks, descending powers of two, partial chunk) sums to the field size and covers it without overlap (`blockLens_sum`, `tile_cover`, `tile_disjoint`) | `Nice.blockTiling_cover` | `common/src/gpu_niceonly.rs::BlockTiling::new` | test | proved | 5 |
 | GPU-2 | block starts yield the same leaves and masks as chunk starts | `Nice.Model.Gpu.block_start_eq` | `common/src/gpu_niceonly.rs` | one test | planned | 5 |
-| GPU-3 | mixing floors within a field loses nothing | `Nice.Model.Gpu.floor_mix_sound` | `common/src/gpu_niceonly.rs` | comment | planned | 5 |
-| GPU-4 | lane tiling partitions the ordinals for any lane count | `Nice.Model.Gpu.lane_partition` | `common/src/gpu_niceonly.rs::lane_shift_for` | device tests | planned | 5 |
-| GPU-5 | split16 chunk step is exact when `d < 2^16` | `Nice.Model.Gpu.split16_exact` | `common/src/vulkan/codegen.rs` | test | planned | 5 |
+| GPU-3 | mixing floors within a field loses nothing: the cover theorem holds for every floor and depth, so any per-block choice is sound | `Nice.validRangesMasked_cover` | `common/src/gpu_niceonly.rs` | comment | proved | 5 |
+| GPU-4 | lane tiling partitions the ordinals for any lane count | `Nice.lane_partition` | `common/src/gpu_niceonly.rs::lane_shift_for` | device tests | proved | 5 |
+| GPU-5 | split16 chunk step is exact when `d < 2^16` | `Nice.split16_exact` | `common/src/vulkan/codegen.rs` | test | proved | 5 |
 | GPU-6 | truncated schoolbook multiply ≡ reduction mod `d^limbs`; no u32 overflow | `Nice.Model.Gpu.truncated_mul` | `common/src/vulkan/codegen.rs`, `common/src/gpu_config.rs` | tests | planned | 5 |
-| GPU-7 | chunked Horner keeps `acc << c` in u32 and covers the offset | `Nice.Model.Gpu.horner_exact` | `common/src/gpu_niceonly.rs::stride_chunk_bits` | tests | planned | 5 |
-| GPU-8 | prefilter = LSD-2 at depth p plus NUM-7; without NUM-7 it rejects everything | `Nice.Model.Gpu.prefilter_sound` | `common/src/gpu_config.rs::prefilter_params` | tests | planned | 5 |
-| GPU-9 | `mod_m` via `2^64 mod M` is correct under NUM-8 | `Nice.Model.Gpu.mod_m_correct` | `common/src/cuda/nice_kernels.cu::mod_m` | test | planned | 5 |
+| GPU-7 | chunked Horner over the base-`2^c` chunks computes `off mod M` (`hornerMod_chunksBE`) and each step stays below `2^32` while `M ≤ 2^(32−c)` (`horner_step_lt`) | `Nice.hornerMod_chunksBE` | `common/src/gpu_niceonly.rs::stride_chunk_bits` | tests | proved | 5 |
+| GPU-8 | prefilter = LSD-2 at depth p (`mem_lsdBitmap_of_isNice`); where neither power has p digits the zero padding rejects every candidate (`prefilter_rejects_all_of_short`, the v3.2.14 failure) | `Nice.prefilter_rejects_all_of_short` | `common/src/gpu_config.rs::prefilter_params` | tests | proved | 5 |
+| GPU-9 | `mod_m` via `2^64 mod M` is correct under NUM-8 | `Nice.mod_m_split` | `common/src/cuda/nice_kernels.cu::mod_m` | test | proved | 5 |
 | GPU-C | warp/cube compaction queue bounds and uniformity | — | `common/src/cuda/nice_kernels.cu`, `common/src/cubecl_backend.rs` | device tests | device-test | — |
-| FLD-1 | field and chunk generators partition the base; start-point chunk matching is correct | `Nice.Model.Fields.partition` | `common/src/generate_fields.rs`, `common/src/generate_chunks.rs`, `common/src/db_util/chunks.rs::reassign_fields_to_chunks` | tests | planned | 5 |
+| FLD-1 | fields partition the base (`inField_iff`); a field lies inside the chunk containing its start point (`field_subset_chunk`, `chunk_of_field_start`), which is what start-point chunk matching relies on | `Nice.inField_iff` | `common/src/generate_fields.rs`, `common/src/generate_chunks.rs`, `common/src/db_util/chunks.rs::reassign_fields_to_chunks` | tests | proved | 5 |
 | FLD-DB | the stored field/chunk rows partition each base | — | `common/src/db_util/audit.rs` (PR #159) | sql audit | sql-audit | — |
 | DET-1 | accumulator equals single pass; top-N of a superset contains the top-N | `Nice.Model.Detailed.accumulate_eq` | `common/src/distribution_stats.rs`, `common/src/number_stats.rs` | tests | planned | 5 |
 | THY-1 | residue-count closed form over the prime powers of `b−1` | `Nice.Theory.residueFilter_card` | `common/src/residue_filter.rs` (oracle test) | oracle test 5–512 | planned | 6 |
