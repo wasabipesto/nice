@@ -1822,6 +1822,7 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
 ) -> Result<FieldResults> {
     /// Batches launched between blocking histogram drains; the overflow
     /// bound is checked below.
+    // Lean: `Nice.Const.histogram_bins` (NUM-9)
     const DRAIN_INTERVAL: usize = 64;
     const _: () = assert!((DRAIN_INTERVAL as u128) * CUBECL_BATCH_SIZE < u32::MAX as u128);
 

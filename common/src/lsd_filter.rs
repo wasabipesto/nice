@@ -57,6 +57,7 @@
 //! Note on zero padding: the fixed-width window treats value 5 with k=2 as digits "05".
 //! This is sound for any candidate whose square/cube has at least k digits, which holds
 //! for every number inside a legal base range (for k=2 any base ≥ 4; for k=3 any base ≥ 6).
+//! Lean: `Nice.three_le_numDigits_of_inBaseRange` (RNG-3)
 
 use log::trace;
 use malachite::base::num::arithmetic::traits::Pow;

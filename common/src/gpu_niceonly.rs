@@ -1488,6 +1488,7 @@ pub fn lane_shift_for(num_ranges: u64, mean_len: u64, stride_m: u32, stride_r: u
 /// base 80 among them. A 4-bit chunk covers the whole supported range with
 /// room to spare, and costs nothing measurable because this reduction runs
 /// once per *range descriptor*, not per candidate.
+/// Lean: `Nice.Const.stride_modulus_gpu` (NUM-4a)
 pub const MAX_STRIDE_MODULUS: u128 = 1 << 28;
 
 /// Width in bits of one Horner chunk in the kernels' offset reduction.
