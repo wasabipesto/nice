@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add a brute-force oracle test for the MSD filter's Hall check (`has_distinct_assignment`, Kuhn's augmenting-path matching): 20,000 random interval-shaped domain sets are compared against an exhaustive system-of-distinct-representatives search. A wrong `false` there would skip a range that could hold a nice number, and no parity or small-base brute-force test can catch that direction, since nice numbers are far too rare for a wrongly-rejected range to contain one.
+
 ## Nice v3.4.5
 
 - Fix NVIDIA niceonly fields failing with `CUDA_ERROR_INVALID_HANDLE` at the end of the field: the per-batch events used to measure device busy time were created with timing disabled, which `cuEventElapsedTime` rejects. Busy-time events are now timing-capable, a timing failure drops `device_busy_secs` instead of failing, and a new GPU test runs a field through the pipeline and checks the busy time comes back.
