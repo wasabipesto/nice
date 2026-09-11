@@ -39,7 +39,7 @@ checked outside Lean. `evidence` is what the Rust side has today.
 | NUM-9 | histogram bins cannot overflow u32 | `Nice.Const.histogram_bins` | `common/src/cubecl_backend.rs::DRAIN_INTERVAL` | const-assert + test | proved | 1 |
 | RES-1 | `IsNice b n → n² + n³ ≡ b(b−1)/2 (mod b−1)`; `n mod (b−1) ∈ residueFilter b` | `Nice.mem_residueFilter_of_isNice` | `common/src/residue_filter.rs::get_residue_filter` | tests | proved | 2 |
 | RES-1a | a nice number's output digits sum to `b(b−1)/2` | `Nice.nice_digit_sum` | `common/src/residue_filter.rs` | — | proved | 0 |
-| RES-2 | `b ≡ 3 (mod 4) → ∀ n, ¬IsNice b n` | `Nice.no_nice_of_three_mod_four` | `common/src/residue_filter.rs` (oracle test) | oracle test 5–512 | planned | 2 |
+| RES-2 | `b ≡ 3 (mod 4) → ∀ n, ¬IsNice b n` | `Nice.no_nice_of_three_mod_four` | `common/src/residue_filter.rs` (oracle test) | oracle test 5–512 | proved | 2 |
 | RES-3 | `residueFilter b = ∅ → ∀ n, ¬IsNice b n`; `residueFilter 11 = ∅` | `Nice.no_nice_of_residueFilter_empty` | `common/src/gpu_niceonly.rs::residue_empty_result` | tests | proved | 2 |
 | LSD-1 | `digit b (n^e) j` for `j < k` depends only on `n mod b^k` | `Nice.digit_pow_mod_pow` | `common/src/lsd_filter.rs` | comment | proved | 2 |
 | LSD-2 | nice + RNG-3 ⇒ the 2k fixed-width low digits are pairwise distinct ⇒ `n mod b^k ∈ lsdBitmap b k` | `Nice.mem_lsdBitmap_of_isNice` | `common/src/lsd_filter.rs::get_valid_multi_lsd_bitmap` | brute-force b 4–16 | proved | 2 |
@@ -76,11 +76,11 @@ checked outside Lean. `evidence` is what the Rust side has today.
 | FLD-DB | the stored field/chunk rows partition each base | — | `common/src/db_util/audit.rs` (PR #159) | sql audit | sql-audit | — |
 | DET-1 | accumulator equals single pass; top-N of a superset contains the top-N | `Nice.Model.Detailed.accumulate_eq` | `common/src/distribution_stats.rs`, `common/src/number_stats.rs` | tests | planned | 5 |
 | THY-1 | residue-count closed form over the prime powers of `b−1` | `Nice.Theory.residueFilter_card` | `common/src/residue_filter.rs` (oracle test) | oracle test 5–512 | planned | 6 |
-| THY-2 | carry-blind collapse: a carry-invariant linear digit statistic is `w₀·N (mod m)` | `Nice.Theory.collapse` | — | prose proof | planned | 6 |
-| THY-3 | digit-sum windows in a MITM join are vacuous | `Nice.Theory.window_vacuous` | — | prose | planned | 6 |
+| THY-2 | carry-blind collapse: a linear digit statistic invariant under every carry move has `w_{i+1} ≡ b·w_i` (`weight_rel_of_invariant`) and equals `w₀·N (mod m)` (`collapse`) | `Nice.collapse_of_invariant` | — | prose proof | proved | 6 |
+| THY-3 | once some output digits are fixed, the rest sum to the complement and form the complement set (`complement_set`): a digit-sum window on the unassigned positions is vacuous | `Nice.complement_sum` | — | prose | proved | 6 |
 | THY-4 | `b²−1` block filter collapses (r-subset sums fill an interval of length ≥ b) | `Nice.Theory.subsetSum_interval` | — | prose proof | planned | 6 |
-| THY-5 | middle-window filter is sound (digits at `p..p+w` depend on `n mod b^(p+w)`) | `Nice.Theory.window_sound` | — | prose | planned | 6 |
-| THY-6 | Hall's marginal relaxation is strictly incomplete (witness) | `Nice.Theory.hall_relaxation_incomplete` | — | probe | planned | 6 |
+| THY-5 | middle-window filter is sound (digits at `p..p+w` depend on `n mod b^(p+w)`) | `Nice.window_sound` | — | prose | proved | 6 |
+| THY-6 | the interval-domain Hall check is strictly incomplete: base 10, `[47, 60]` has an SDR but no nice number (by `decide`) | `Nice.hall_relaxation_incomplete` | — | probe | proved | 6 |
 | THY-7 | carry-state ladder: distinct suffixes never share an exact future | `Nice.Theory.suffix_future_injective` | — | measured | planned | 6 |
 | THY-8 | tree recurrences for digits of n², n³ when appending a digit | `Nice.Theory.tree_recurrence` | `scripts/radix_tree_search.rs` | 20k random cases | planned | 6 |
 | THY-9 | witness model `λ_b = range_b · b!/b^b` (definition only) | `Nice.Theory.witnessRate` | — | heuristic | planned | 6 |

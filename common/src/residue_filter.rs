@@ -77,6 +77,7 @@ mod tests {
         assert_eq!(get_residue_filter(&120), Vec::from([0, 34, 84, 118]));
     }
 
+    /// Lean: `Nice.no_nice_of_three_mod_four` (RES-2) — every base ≡ 3 (mod 4) is dead.
     /// Closed-form count of valid residues, from the 2026-08 theory review
     /// (scratchpad/2026-08-theory-review/THEORY_AND_SEARCH_DIRECTIONS.md §2).
     ///

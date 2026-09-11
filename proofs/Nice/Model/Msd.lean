@@ -184,24 +184,30 @@ theorem no_nice_of_not_hasSDR {b lo hi : ℕ} {cs : List Constraint} (hb : 2 ≤
 
 /-! ### The executable model -/
 
-/-- Backtracking SDR search: pick an unused digit for the first constraint
-and recurse. The Rust uses Kuhn's matching for the same question. -/
-def sdrAux : Finset ℕ → List Constraint → Bool
+/-- Backtracking SDR search over a candidate digit list: pick an unused
+digit for the first constraint and recurse. The Rust uses Kuhn's matching
+for the same question. -/
+def sdrAux (cands : List ℕ) : Finset ℕ → List Constraint → Bool
   | _, [] => true
-  | used, c :: cs => ((c.dom \ used).sort (· ≤ ·)).any fun d => sdrAux (insert d used) cs
+  | used, c :: cs => cands.any fun d => decide (d ∈ c.dom ∧ d ∉ used) && sdrAux cands (insert d used) cs
 
-theorem sdrAux_iff (used : Finset ℕ) (cs : List Constraint) :
-    sdrAux used cs = true ↔
-      ∃ ds : List ℕ, List.Forall₂ (fun c d => d ∈ c.dom) cs ds ∧ ds.Nodup ∧ ∀ d ∈ ds, d ∉ used := by
+theorem sdrAux_iff (cands : List ℕ) (used : Finset ℕ) :
+    ∀ cs : List Constraint, (∀ c ∈ cs, ∀ d ∈ c.dom, d ∈ cands) →
+      (sdrAux cands used cs = true ↔
+        ∃ ds : List ℕ, List.Forall₂ (fun c d => d ∈ c.dom) cs ds ∧ ds.Nodup ∧ ∀ d ∈ ds, d ∉ used) := by
+  intro cs
   induction cs generalizing used with
   | nil =>
+    intro _
     simp only [sdrAux, true_iff]
     exact ⟨[], List.Forall₂.nil, List.nodup_nil, by simp⟩
   | cons c cs ih =>
-    simp only [sdrAux, List.any_eq_true, Finset.mem_sort, Finset.mem_sdiff]
+    intro hsub
+    have hsub' : ∀ c ∈ cs, ∀ d ∈ c.dom, d ∈ cands := fun c hc => hsub c (List.mem_cons_of_mem _ hc)
+    simp only [sdrAux, List.any_eq_true, Bool.and_eq_true, decide_eq_true_iff]
     constructor
-    · rintro ⟨d, ⟨hd, hdu⟩, hrec⟩
-      obtain ⟨ds, hf, hnd, hus⟩ := (ih _).mp hrec
+    · rintro ⟨d, -, ⟨hd, hdu⟩, hrec⟩
+      obtain ⟨ds, hf, hnd, hus⟩ := (ih _ hsub').mp hrec
       refine ⟨d :: ds, List.Forall₂.cons hd hf, ?_, ?_⟩
       · rw [List.nodup_cons]
         exact ⟨fun hmem => hus d hmem (Finset.mem_insert_self _ _), hnd⟩
@@ -215,19 +221,20 @@ theorem sdrAux_iff (used : Finset ℕ) (cs : List Constraint) :
       | cons hd hf' =>
         rename_i d ds'
         rw [List.nodup_cons] at hnd
-        refine ⟨d, ⟨hd, hus d (by simp)⟩, (ih _).mpr ⟨ds', hf', hnd.2, ?_⟩⟩
+        refine ⟨d, hsub c (by simp) d hd, ⟨hd, hus d (by simp)⟩, (ih _ hsub').mpr ⟨ds', hf', hnd.2, ?_⟩⟩
         intro x hx hxu
         rw [Finset.mem_insert] at hxu
         rcases hxu with rfl | hxu
         · exact hnd.1 hx
         · exact hus x (List.mem_cons_of_mem _ hx) hxu
 
-/-- `has_distinct_assignment`, as brute force. -/
-def sdrExists (cs : List Constraint) : Bool := sdrAux ∅ cs
+/-- `has_distinct_assignment`, as brute force over the digits of base `b`. -/
+def sdrExists (b : ℕ) (cs : List Constraint) : Bool := sdrAux (List.range b) ∅ cs
 
-theorem sdrExists_iff (cs : List Constraint) : sdrExists cs = true ↔ HasSDR cs := by
+theorem sdrExists_iff {b : ℕ} (cs : List Constraint) (hsub : ∀ c ∈ cs, ∀ d ∈ c.dom, d < b) :
+    sdrExists b cs = true ↔ HasSDR cs := by
   unfold sdrExists HasSDR
-  rw [sdrAux_iff]
+  rw [sdrAux_iff _ _ cs (fun c hc d hd => List.mem_range.mpr (hsub c hc d hd))]
   constructor
   · rintro ⟨ds, hf, hnd, -⟩; exact ⟨ds, hf, hnd⟩
   · rintro ⟨ds, hf, hnd⟩; exact ⟨ds, hf, hnd, by simp⟩
@@ -314,13 +321,37 @@ theorem rangeDomains_sound (b lo hi : ℕ) : Sound b lo hi (rangeDomains b lo hi
   · exact powerDomains_sound (Or.inl rfl) c hc
   · exact powerDomains_sound (Or.inr rfl) c hc
 
-def analyzeRange (b lo hi : ℕ) : Bool := sdrExists (rangeDomains b lo hi)
+def analyzeRange (b lo hi : ℕ) : Bool := sdrExists b (rangeDomains b lo hi)
+
+/-- Every domain digit is below the base. -/
+theorem cyclicInterval_lt {b lo width d : ℕ} (hb : 0 < b) (hd : d ∈ cyclicInterval b lo width) :
+    d < b := by
+  unfold cyclicInterval at hd
+  rw [Finset.mem_image] at hd
+  obtain ⟨i, -, rfl⟩ := hd
+  exact Nat.mod_lt _ hb
+
+theorem powerDomains_dom_lt {b lo hi e : ℕ} (hb : 0 < b) {c : Constraint}
+    (hc : c ∈ powerDomains b lo hi e) : ∀ d ∈ c.dom, d < b := by
+  unfold powerDomains at hc
+  split_ifs at hc
+  · rw [List.mem_map] at hc
+    obtain ⟨j, -, rfl⟩ := hc
+    exact fun d hd => cyclicInterval_lt hb hd
+  · simp at hc
+
+theorem rangeDomains_dom_lt {b lo hi : ℕ} (hb : 0 < b) :
+    ∀ c ∈ rangeDomains b lo hi, ∀ d ∈ c.dom, d < b := by
+  intro c hc
+  unfold rangeDomains at hc
+  rw [List.mem_append] at hc
+  rcases hc with hc | hc <;> exact powerDomains_dom_lt hb hc
 
 /-- Claim MSD-4 (model): a rejected range holds no nice number. -/
 theorem no_nice_of_analyzeRange {b lo hi : ℕ} (hb : 2 ≤ b)
     (h : analyzeRange b lo hi = false) : ∀ n, lo ≤ n → n ≤ hi → ¬ IsNice b n := by
   apply no_nice_of_not_hasSDR hb (rangeDomains_sound b lo hi) (rangeDomains_nodup b lo hi)
-  rw [← sdrExists_iff]
+  rw [← sdrExists_iff _ (rangeDomains_dom_lt (by omega))]
   simp [analyzeRange] at h
   simp [h]
 
