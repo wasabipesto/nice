@@ -83,7 +83,7 @@ the theorem's hypotheses are the implementation's spec.
 |---|---|---|---|---|---|
 | 0 | 1 | 3 | 0 | 0 | 0 |
 | 1 | 0 | 12 | 0 | 6 | 0 |
-| 2 | 0 | 4 | 0 | 6 | 0 |
+| 2 | 0 | 7 | 0 | 3 | 0 |
 | 3 | 0 | 0 | 0 | 9 | 0 |
 | 4 | 0 | 0 | 0 | 5 | 0 |
 | 5 | 0 | 0 | 0 | 11 | 0 |
@@ -112,4 +112,7 @@ Proved or defined so far:
 - **RES-3** `Nice.no_nice_of_residueFilter_empty`: `residueFilter b = ∅ → ∀ n, ¬IsNice b n`; `residueFilter 11 = ∅`
 - **LSD-1** `Nice.digit_pow_mod_pow`: `digit b (n^e) j` for `j < k` depends only on `n mod b^k`
 - **LSD-2** `Nice.mem_lsdBitmap_of_isNice`: nice + RNG-3 ⇒ the 2k fixed-width low digits are pairwise distinct ⇒ `n mod b^k ∈ lsdBitmap b k`
+- **STR-1** `Nice.mem_validResidues_iff`: `Coprime (b−1) (b^k)`; passes both ⇔ `n mod M ∈ validResidues`
+- **STR-2** `Nice.walk_eq_filter`: the gap-table walk visits exactly the valid n in `[start,end)` in order
+- **STR-4** `Nice.lowMask_eq`: `low_digit_masks[i]` is exactly the low-digit set of residue i's powers
 <!-- status:end -->

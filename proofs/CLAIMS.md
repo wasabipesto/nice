@@ -43,10 +43,10 @@ checked outside Lean. `evidence` is what the Rust side has today.
 | RES-3 | `residueFilter b = ∅ → ∀ n, ¬IsNice b n`; `residueFilter 11 = ∅` | `Nice.no_nice_of_residueFilter_empty` | `common/src/gpu_niceonly.rs::residue_empty_result` | tests | proved | 2 |
 | LSD-1 | `digit b (n^e) j` for `j < k` depends only on `n mod b^k` | `Nice.digit_pow_mod_pow` | `common/src/lsd_filter.rs` | comment | proved | 2 |
 | LSD-2 | nice + RNG-3 ⇒ the 2k fixed-width low digits are pairwise distinct ⇒ `n mod b^k ∈ lsdBitmap b k` | `Nice.mem_lsdBitmap_of_isNice` | `common/src/lsd_filter.rs::get_valid_multi_lsd_bitmap` | brute-force b 4–16 | proved | 2 |
-| STR-1 | `Coprime (b−1) (b^k)`; passes both ⇔ `n mod M ∈ validResidues` | `Nice.Model.Stride.mem_validResidues_iff` | `common/src/stride_filter.rs::StrideTable::new` | comment | planned | 2 |
-| STR-2 | the gap-table walk visits exactly the valid n in `[start,end)` in order | `Nice.Model.Stride.walk_eq_filter` | `common/src/stride_filter.rs::iterate_range_masked` | tests (gap sum = M) | planned | 2 |
-| STR-3 | seeded check equals the plain check under RNG-3 | `Nice.Model.Stride.seeded_eq_plain` | `common/src/client_process.rs::get_is_nice_with_known_lsd` | 5000-sample test | planned | 2 |
-| STR-4 | `low_digit_masks[i]` is exactly the low-digit set of residue i's powers | `Nice.Model.Stride.lowMask_eq` | `common/src/stride_filter.rs::StrideTable::new` | by construction | planned | 2 |
+| STR-1 | `Coprime (b−1) (b^k)`; passes both ⇔ `n mod M ∈ validResidues` | `Nice.mem_validResidues_iff` | `common/src/stride_filter.rs::StrideTable::new` | comment | proved | 2 |
+| STR-2 | the gap-table walk visits exactly the valid n in `[start,end)` in order | `Nice.walk_eq_filter` | `common/src/stride_filter.rs::iterate_range_masked` | tests (gap sum = M) | proved | 2 |
+| STR-3 | seeded check equals the plain check under RNG-3 | `Nice.seeded_iff_isNice` | `common/src/client_process.rs::get_is_nice_with_known_lsd` | 5000-sample test | planned | 2 |
+| STR-4 | `low_digit_masks[i]` is exactly the low-digit set of residue i's powers | `Nice.lowMask_eq` | `common/src/stride_filter.rs::StrideTable::new` | by construction | proved | 2 |
 | GPU-0 | ordinal formula `B0 + ⌊g/#V⌋·M + V[g mod #V]` enumerates the same set as STR-2 | `Nice.Model.Gpu.enumerate_eq_walk` | `common/src/cuda/nice_kernels.cu`, `common/src/vulkan/codegen.rs`, `common/src/cubecl_backend.rs` | host-mirror tests | planned | 2 |
 | MSD-1 | interval digit domains are a superset of the digits that occur | `Nice.Model.Msd.digit_mem_domain` | `common/src/msd_prefix_filter.rs::collect_power_domains` | tests | planned | 3 |
 | MSD-2 | width recurrence exact; `diff ≥ b−1` ⇒ every lower position full | `Nice.Model.Msd.diff_recurrence` | `common/src/msd_prefix_filter.rs::collect_power_domains` | comment | planned | 3 |
