@@ -7,4 +7,5 @@ import Nice.Model.Lsd
 import Nice.Model.Stride
 import Nice.Model.Seeded
 import Nice.Model.Gpu
+import Nice.Model.Msd
 import Nice.Examples

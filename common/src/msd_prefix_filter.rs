@@ -213,6 +213,8 @@ const HALL_MAX_POSITIONS: usize = 2 * MAX_FW_DIGITS + 2;
 /// `diff >= base - 1` the domain covers all digits and every lower position
 /// is unconstrained (the width only grows as `j` decreases).
 ///
+/// Lean: `Nice.digit_mem_cyclicInterval` (MSD-1), `Nice.width_recurrence` (MSD-2)
+///
 /// A `diff == 0` position is a singleton — exactly a digit of the classic
 /// common MSD prefix — so this generalizes the previous prefix extraction.
 /// `fixed_lsd_k` and `fixed` feed the cross-end residue filter: a singleton
@@ -334,6 +336,7 @@ fn has_distinct_assignment_closure(doms: &[u64]) -> bool {
     nr == 0 || has_distinct_assignment(&rest[..nr])
 }
 
+/// Lean: `Nice.no_nice_of_not_hasSDR` (MSD-4)
 /// Can every constrained position be assigned a distinct digit from its
 /// domain? By Hall's theorem this fails exactly when some set of positions
 /// collectively offers fewer digits than positions — which makes a nice
