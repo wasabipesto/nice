@@ -1164,6 +1164,83 @@ mod tests {
         assert!(has_distinct_assignment(&[0b01, 0b11, 0b110]));
     }
 
+    /// Brute-force oracle for `has_distinct_assignment`: does an injective
+    /// choice of one digit per position exist? Exhaustive backtracking over
+    /// the positions, no cleverness — the point is to have something that
+    /// is obviously right to compare Kuhn's algorithm against.
+    fn has_sdr_brute_force(doms: &[u64]) -> bool {
+        fn go(doms: &[u64], i: usize, used: u64) -> bool {
+            if i == doms.len() {
+                return true;
+            }
+            let mut cand = doms[i] & !used;
+            while cand != 0 {
+                let d = cand.trailing_zeros();
+                if go(doms, i + 1, used | (1u64 << d)) {
+                    return true;
+                }
+                cand &= cand - 1;
+            }
+            false
+        }
+        go(doms, 0, 0)
+    }
+
+    /// Kuhn's augmenting-path search must agree with the brute-force SDR
+    /// oracle on every input, both ways: a wrong `false` would skip a range
+    /// that may hold a nice number (unsound), a wrong `true` only costs work.
+    /// No parity or brute-force-nice-number test can catch the unsound
+    /// direction — nice numbers are far too rare for a wrongly-rejected
+    /// range to ever contain one — so the algorithm gets its own oracle.
+    ///
+    /// Domains are drawn as narrow cyclic intervals over few digits, the
+    /// shape `collect_power_domains` actually produces, so that collective
+    /// (non-pairwise) Hall violations are common rather than vanishingly
+    /// rare. A deterministic xorshift keeps the test reproducible without a
+    /// `rand` dev-dependency.
+    #[test_log::test]
+    fn has_distinct_assignment_matches_brute_force_sdr_oracle() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut agreements = [0usize; 2];
+        for _ in 0..20_000 {
+            let base = 3 + (next() % 10) as u32; // 3..=12 digits
+            let m = 1 + (next() % 12) as usize; // 1..=12 positions
+            let doms: Vec<u64> = (0..m)
+                .map(|_| {
+                    let lo = (next() % u64::from(base)) as u32;
+                    let width = 1 + (next() % u64::from(base.min(4))) as u32;
+                    let mut mask = 0u64;
+                    for i in 0..width {
+                        mask |= 1u64 << ((lo + i) % base);
+                    }
+                    mask
+                })
+                .collect();
+            let expected = has_sdr_brute_force(&doms);
+            assert_eq!(
+                has_distinct_assignment(&doms),
+                expected,
+                "Kuhn disagrees with the SDR oracle on domains {doms:?}"
+            );
+            agreements[usize::from(expected)] += 1;
+        }
+        // The distribution must actually exercise both answers.
+        assert!(
+            agreements[0] > 1_000,
+            "too few unsatisfiable cases: {agreements:?}"
+        );
+        assert!(
+            agreements[1] > 1_000,
+            "too few satisfiable cases: {agreements:?}"
+        );
+    }
+
     #[test_log::test]
     fn test_hall_rejects_more_than_prefix_checks() {
         // Regression pin for the interval-domain upgrade: this b42 range has
