@@ -83,7 +83,7 @@ the theorem's hypotheses are the implementation's spec.
 |---|---|---|---|---|---|
 | 0 | 1 | 3 | 0 | 0 | 0 |
 | 1 | 0 | 12 | 0 | 6 | 0 |
-| 2 | 0 | 2 | 0 | 8 | 0 |
+| 2 | 0 | 4 | 0 | 6 | 0 |
 | 3 | 0 | 0 | 0 | 9 | 0 |
 | 4 | 0 | 0 | 0 | 5 | 0 |
 | 5 | 0 | 0 | 0 | 11 | 0 |
@@ -110,4 +110,6 @@ Proved or defined so far:
 - **RES-1** `Nice.mem_residueFilter_of_isNice`: `IsNice b n → n² + n³ ≡ b(b−1)/2 (mod b−1)`; `n mod (b−1) ∈ residueFilter b`
 - **RES-1a** `Nice.nice_digit_sum`: a nice number's output digits sum to `b(b−1)/2`
 - **RES-3** `Nice.no_nice_of_residueFilter_empty`: `residueFilter b = ∅ → ∀ n, ¬IsNice b n`; `residueFilter 11 = ∅`
+- **LSD-1** `Nice.digit_pow_mod_pow`: `digit b (n^e) j` for `j < k` depends only on `n mod b^k`
+- **LSD-2** `Nice.mem_lsdBitmap_of_isNice`: nice + RNG-3 ⇒ the 2k fixed-width low digits are pairwise distinct ⇒ `n mod b^k ∈ lsdBitmap b k`
 <!-- status:end -->

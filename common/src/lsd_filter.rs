@@ -33,6 +33,8 @@
 //! - LSD=8: 8²=64, 8³=512 → LSDs are 4 and 2, no collision ✓
 //! - LSD=9: 9²=81, 9³=729 → LSDs are 1 and 9, no collision ✓
 //!
+//! Lean: `Nice.digit_pow_mod_pow` (LSD-1)
+//!
 //! Result: Valid LSDs for base 10 are {2, 3, 4, 7, 8, 9}, filtering out 40% of candidates.
 //!
 //! This eliminates a significant portion of the search space with minimal computation.
@@ -158,6 +160,8 @@ fn is_valid_lsd(lsd: u32, base: u32) -> bool {
 /// - The digit 4 repeats within the square suffix, so suffix 12 is invalid
 /// - For suffix=69: 69²=4761 (last 2 digits: 6,1) and 69³=328509 (last 2 digits: 0,9)
 /// - All four digits {6,1,0,9} are distinct, so suffix 69 is valid
+///
+/// Lean: `Nice.mem_lsdBitmap_of_isNice` (LSD-2)
 ///
 /// # Panics
 /// Panics if base^k would overflow u32
