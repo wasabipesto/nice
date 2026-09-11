@@ -110,6 +110,7 @@ impl KernelConfig {
     }
 }
 
+/// Lean: `Nice.truncated_mul_mod` (GPU-6)
 /// Fully-unrolled schoolbook multiply: `r[0..ra+rb] = a[0..ra] * b[0..rb]`,
 /// with all operands as scalar locals named `{a}0..`, `{b}0..`, `{r}0..`.
 ///
