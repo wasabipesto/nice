@@ -233,4 +233,42 @@ theorem blockTiling_cover (C start size n : ℕ) (h1 : start ≤ n) (h2 : n < st
     ∃ blk ∈ tile start (blockLens size C), blk.1 ≤ n ∧ n < blk.2 :=
   tile_cover start _ n h1 (by rw [blockLens_sum]; exact h2)
 
+/-! ### NUM-6, NUM-7: per-base constants -/
+
+/-- `chunk_constants`: the exponent of the largest power of `b` below `bound`. -/
+def chunkExp (b bound : ℕ) : ℕ := Nat.log b (bound - 1)
+
+/-- Claim NUM-6: `b^e < bound ≤ b^(e+1)`, i.e. the chosen power is maximal. -/
+theorem chunkExp_spec {b bound : ℕ} (hb : 2 ≤ b) (hbound : 2 ≤ bound) :
+    b ^ chunkExp b bound < bound ∧ bound ≤ b ^ (chunkExp b bound + 1) := by
+  unfold chunkExp
+  constructor
+  · have := Nat.pow_log_le_self b (by omega : bound - 1 ≠ 0)
+    omega
+  · have := Nat.lt_pow_succ_log_self (by omega : 1 < b) (bound - 1)
+    rw [Nat.succ_eq_add_one] at this
+    omega
+
+/-- The `split16` bound for the `u16` constants: `(div - 1) · 2^16 < 2^32`. -/
+theorem split16_shift_bound {d : ℕ} (hd : d < 2 ^ 16) : (d - 1) * 2 ^ 16 < 2 ^ 32 := by
+  have : (d - 1) * 2 ^ 16 ≤ (2 ^ 16 - 2) * 2 ^ 16 := Nat.mul_le_mul_right _ (by omega)
+  omega
+
+/-- `prefilter_params`: digits guaranteed for both powers over `[start, ∞)`,
+computed exactly from the range start (the Rust subtracts one for safety). -/
+def prefilterDepth (b start : ℕ) : ℕ :=
+  min (numDigits b (start ^ 2)) (numDigits b (start ^ 3)) - 1
+
+/-- Claim NUM-7 with GPU-8: at that depth the prefilter is sound for every
+candidate at or after the range start. -/
+theorem prefilter_sound {b start n : ℕ} (hb : 2 ≤ b) (hs : start ≤ n) (h : IsNice b n) :
+    n % b ^ prefilterDepth b start ∈ lsdBitmap b (prefilterDepth b start) := by
+  apply mem_lsdBitmap_of_isNice hb _ _ h
+  · unfold prefilterDepth
+    have := numDigits_pow_mono (b := b) 2 hs
+    omega
+  · unfold prefilterDepth
+    have := numDigits_pow_mono (b := b) 3 hs
+    omega
+
 end Nice

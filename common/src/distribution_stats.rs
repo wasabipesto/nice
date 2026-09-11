@@ -28,6 +28,7 @@ pub fn expand_distribution(
 
 /// Incrementally aggregates distribution counts over batches of submissions.
 ///
+/// Lean: `Nice.histogram_fold` (DET-1)
 /// Folding batch-by-batch produces the same result as one pass over the
 /// concatenation, which is what lets the jobs binary stream a base's canon
 /// submissions chunk-by-chunk instead of holding them all in memory.
