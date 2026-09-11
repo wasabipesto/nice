@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `proofs/`, a Lean 4 + Mathlib project that states and proves the mathematics the search relies on (design and phases in `scratchpad/2026-09-lean-formalization/PROPOSAL.md`). Phase 0: definitions (`IsNice`, positional digits, the residue filter), the first proved claims (digit-count necessity, the digit-sum congruence, residue-filter soundness, empty-filter nonexistence, base 11 dead, 69 nice in base 10 by `decide`), the claims registry `proofs/CLAIMS.md`, `Lean:` tags at four Rust sites, and `just lean-build` / `just lean-claims`. CI is not wired yet; that comes with the end-to-end theorem.
+
 ## Nice v3.4.6
 
 - Add an overlap join as the primary nice-only path for large fields. It skips much of the existing filter work by joining an overlapping list of the top-digit prefixes and bottom-digit residues which eliminates more candidates with the same underlying strategies. When the device or backend doesn't support this path it falls back to the existing stride implementation. Major thanks to [danstoyell](https://github.com/danstoyell) for the report and prototype.

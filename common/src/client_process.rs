@@ -36,6 +36,7 @@ pub const MAX_BASE_FOR_FIXED_WIDTH_U256: u32 = 68;
 /// dominates real workloads — most production traffic is niceonly.
 const MAX_BASE_FOR_FIXED_WIDTH_U128: u32 = 40;
 
+/// Lean: `Nice.IsNice` (DEF-1)
 /// Calculate the number of unique digits in (n^2, n^3) represented in base b.
 /// A number is nice if the result of this is equal to b (means all digits are used once).
 /// If you're just checking if the number is 100% nice, there is a faster version below.
