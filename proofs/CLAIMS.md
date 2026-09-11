@@ -4,8 +4,7 @@ One row per mathematical claim the search relies on, links to the Lean
 declaration that states or proves it and to the Rust sites that depend on
 it. `scripts/check_claims.py` validates this file against the built Lean
 library and the `Lean:` tags in the Rust sources; the README's status
-table is generated from it. Ids follow
-`scratchpad/2026-09-lean-formalization/PROPOSAL.md` §4.
+table is generated from it. Phases are those of `DESIGN.md`.
 
 Columns: `status` ∈ `def` (a definition), `proved` (sorry-free, standard
 axioms only), `stated` (declared, proof incomplete), `planned` (no Lean yet;
