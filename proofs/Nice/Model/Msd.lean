@@ -102,9 +102,16 @@ def Sound (b lo hi : ℕ) (cs : List Constraint) : Prop :=
   ∀ c ∈ cs, (c.e = 2 ∨ c.e = 3) ∧
     ∀ n, lo ≤ n → n ≤ hi → c.j < numDigits b (n ^ c.e) ∧ digit b (n ^ c.e) c.j ∈ c.dom
 
-/-- A choice of one digit per constraint, all distinct. -/
+/-- A choice of one digit per constraint, all distinct (a system of
+distinct representatives). -/
 def HasSDR (cs : List Constraint) : Prop :=
-  ∃ f : ℕ → ℕ → ℕ, (∀ c ∈ cs, f c.e c.j ∈ c.dom) ∧ (cs.map fun c => f c.e c.j).Nodup
+  ∃ ds : List ℕ, List.Forall₂ (fun c d => d ∈ c.dom) cs ds ∧ ds.Nodup
+
+/-- Claim MSD-6: dropping constraints keeps a system sound (so running out
+of domain slots, or skipping a power, only weakens the check). -/
+theorem Sound.sublist {b lo hi : ℕ} {cs cs' : List Constraint} (h : List.Sublist cs' cs)
+    (hs : Sound b lo hi cs) : Sound b lo hi cs' :=
+  fun c hc => hs c (h.subset hc)
 
 /-- Index of position `j` of power `e` inside the concatenated output digits. -/
 def outIndex (b n e j : ℕ) : ℕ := if e = 2 then j else numDigits b (n ^ 2) + j
@@ -142,7 +149,9 @@ theorem outIndex_inj {b n e j e' j' : ℕ} (he : e = 2 ∨ e = 3) (he' : e' = 2 
 theorem hasSDR_of_isNice {b lo hi n : ℕ} {cs : List Constraint} (hb : 2 ≤ b)
     (hs : Sound b lo hi cs) (hd : (cs.map fun c => (c.e, c.j)).Nodup)
     (hlo : lo ≤ n) (hhi : n ≤ hi) (h : IsNice b n) : HasSDR cs := by
-  refine ⟨fun e j => digit b (n ^ e) j, fun c hc => ((hs c hc).2 n hlo hhi).2, ?_⟩
+  refine ⟨cs.map fun c => digit b (n ^ c.e) c.j, ?_, ?_⟩
+  · rw [List.forall₂_map_right_iff, List.forall₂_same]
+    exact fun c hc => ((hs c hc).2 n hlo hhi).2
   have hnd : (outputDigits b n).Nodup := h.nodup_iff.mpr List.nodup_range
   have hcs : cs.Nodup := hd.of_map _
   refine List.Nodup.map_on ?_ hcs
@@ -172,5 +181,202 @@ theorem no_nice_of_not_hasSDR {b lo hi : ℕ} {cs : List Constraint} (hb : 2 ≤
     (hs : Sound b lo hi cs) (hd : (cs.map fun c => (c.e, c.j)).Nodup) (hno : ¬ HasSDR cs) :
     ∀ n, lo ≤ n → n ≤ hi → ¬ IsNice b n :=
   fun _ hlo hhi h => hno (hasSDR_of_isNice hb hs hd hlo hhi h)
+
+/-! ### The executable model -/
+
+/-- Backtracking SDR search: pick an unused digit for the first constraint
+and recurse. The Rust uses Kuhn's matching for the same question. -/
+def sdrAux : Finset ℕ → List Constraint → Bool
+  | _, [] => true
+  | used, c :: cs => ((c.dom \ used).sort (· ≤ ·)).any fun d => sdrAux (insert d used) cs
+
+theorem sdrAux_iff (used : Finset ℕ) (cs : List Constraint) :
+    sdrAux used cs = true ↔
+      ∃ ds : List ℕ, List.Forall₂ (fun c d => d ∈ c.dom) cs ds ∧ ds.Nodup ∧ ∀ d ∈ ds, d ∉ used := by
+  induction cs generalizing used with
+  | nil =>
+    simp only [sdrAux, true_iff]
+    exact ⟨[], List.Forall₂.nil, List.nodup_nil, by simp⟩
+  | cons c cs ih =>
+    simp only [sdrAux, List.any_eq_true, Finset.mem_sort, Finset.mem_sdiff]
+    constructor
+    · rintro ⟨d, ⟨hd, hdu⟩, hrec⟩
+      obtain ⟨ds, hf, hnd, hus⟩ := (ih _).mp hrec
+      refine ⟨d :: ds, List.Forall₂.cons hd hf, ?_, ?_⟩
+      · rw [List.nodup_cons]
+        exact ⟨fun hmem => hus d hmem (Finset.mem_insert_self _ _), hnd⟩
+      · intro x hx
+        rw [List.mem_cons] at hx
+        rcases hx with rfl | hx
+        · exact hdu
+        · exact fun hxu => hus x hx (Finset.mem_insert_of_mem hxu)
+    · rintro ⟨ds, hf, hnd, hus⟩
+      cases hf with
+      | cons hd hf' =>
+        rename_i d ds'
+        rw [List.nodup_cons] at hnd
+        refine ⟨d, ⟨hd, hus d (by simp)⟩, (ih _).mpr ⟨ds', hf', hnd.2, ?_⟩⟩
+        intro x hx hxu
+        rw [Finset.mem_insert] at hxu
+        rcases hxu with rfl | hxu
+        · exact hnd.1 hx
+        · exact hus x (List.mem_cons_of_mem _ hx) hxu
+
+/-- `has_distinct_assignment`, as brute force. -/
+def sdrExists (cs : List Constraint) : Bool := sdrAux ∅ cs
+
+theorem sdrExists_iff (cs : List Constraint) : sdrExists cs = true ↔ HasSDR cs := by
+  unfold sdrExists HasSDR
+  rw [sdrAux_iff]
+  constructor
+  · rintro ⟨ds, hf, hnd, -⟩; exact ⟨ds, hf, hnd⟩
+  · rintro ⟨ds, hf, hnd⟩; exact ⟨ds, hf, hnd, by simp⟩
+
+/-- The interval width at position `j` for power `e` over `[lo, hi]`. -/
+def width (b lo hi e j : ℕ) : ℕ := hi ^ e / b ^ j - lo ^ e / b ^ j
+
+/-- `collect_power_domains`: positions from the top down while the width is
+below `b - 1`, only when both endpoints have the same digit count. -/
+def powerDomains (b lo hi e : ℕ) : List Constraint :=
+  if numDigits b (lo ^ e) = numDigits b (hi ^ e) then
+    (((List.range (numDigits b (lo ^ e))).reverse.takeWhile fun j =>
+        decide (width b lo hi e j < b - 1)).map fun j =>
+      ⟨e, j, cyclicInterval b (digit b (lo ^ e) j) (width b lo hi e j + 1)⟩)
+  else []
+
+theorem powerDomains_e {b lo hi e : ℕ} {c : Constraint} (hc : c ∈ powerDomains b lo hi e) :
+    c.e = e := by
+  unfold powerDomains at hc
+  split_ifs at hc
+  · rw [List.mem_map] at hc
+    obtain ⟨j, -, rfl⟩ := hc
+    rfl
+  · simp at hc
+
+theorem powerDomains_j_lt {b lo hi e : ℕ} {c : Constraint} (hc : c ∈ powerDomains b lo hi e) :
+    c.j < numDigits b (lo ^ e) := by
+  unfold powerDomains at hc
+  split_ifs at hc
+  · rw [List.mem_map] at hc
+    obtain ⟨j, hj, rfl⟩ := hc
+    have := (List.takeWhile_sublist _).subset hj
+    simpa using this
+  · simp at hc
+
+theorem powerDomains_nodup (b lo hi e : ℕ) :
+    ((powerDomains b lo hi e).map fun c => (c.e, c.j)).Nodup := by
+  unfold powerDomains
+  split_ifs
+  · rw [List.map_map]
+    refine List.Nodup.map_on ?_ ((List.nodup_reverse.mpr List.nodup_range).sublist (List.takeWhile_sublist _))
+    intro x _ y _ h
+    simpa using h
+  · exact List.nodup_nil
+
+/-- Claim MSD-3 (with MSD-1): the collected domains are sound. -/
+theorem powerDomains_sound {b lo hi e : ℕ} (he : e = 2 ∨ e = 3) :
+    Sound b lo hi (powerDomains b lo hi e) := by
+  intro c hc
+  have hce := powerDomains_e hc
+  refine ⟨hce ▸ he, fun n hlo hhi => ⟨?_, ?_⟩⟩
+  · have hj := powerDomains_j_lt hc
+    have hmono : numDigits b (lo ^ e) ≤ numDigits b (n ^ e) := numDigits_pow_mono e hlo
+    rw [hce]; omega
+  · unfold powerDomains at hc
+    split_ifs at hc
+    · rw [List.mem_map] at hc
+      obtain ⟨j, -, rfl⟩ := hc
+      exact digit_mem_cyclicInterval hlo hhi
+    · simp at hc
+
+/-- `analyze_range` without the certificate: both powers' domains, one SDR
+question. `true` is `Live`, `false` is `Rejected`. -/
+def rangeDomains (b lo hi : ℕ) : List Constraint :=
+  powerDomains b lo hi 2 ++ powerDomains b lo hi 3
+
+theorem rangeDomains_nodup (b lo hi : ℕ) :
+    ((rangeDomains b lo hi).map fun c => (c.e, c.j)).Nodup := by
+  unfold rangeDomains
+  rw [List.map_append, List.nodup_append]
+  refine ⟨powerDomains_nodup b lo hi 2, powerDomains_nodup b lo hi 3, ?_⟩
+  intro x hx y hy hxy
+  rw [List.mem_map] at hx hy
+  obtain ⟨c, hc, rfl⟩ := hx
+  obtain ⟨c', hc', rfl⟩ := hy
+  rw [powerDomains_e hc, powerDomains_e hc'] at hxy
+  simp at hxy
+
+theorem rangeDomains_sound (b lo hi : ℕ) : Sound b lo hi (rangeDomains b lo hi) := by
+  intro c hc
+  unfold rangeDomains at hc
+  rw [List.mem_append] at hc
+  rcases hc with hc | hc
+  · exact powerDomains_sound (Or.inl rfl) c hc
+  · exact powerDomains_sound (Or.inr rfl) c hc
+
+def analyzeRange (b lo hi : ℕ) : Bool := sdrExists (rangeDomains b lo hi)
+
+/-- Claim MSD-4 (model): a rejected range holds no nice number. -/
+theorem no_nice_of_analyzeRange {b lo hi : ℕ} (hb : 2 ≤ b)
+    (h : analyzeRange b lo hi = false) : ∀ n, lo ≤ n → n ≤ hi → ¬ IsNice b n := by
+  apply no_nice_of_not_hasSDR hb (rangeDomains_sound b lo hi) (rangeDomains_nodup b lo hi)
+  rw [← sdrExists_iff]
+  simp [analyzeRange] at h
+  simp [h]
+
+/-! ### Recursive subdivision -/
+
+/-- `get_valid_ranges_recursive` with subdivision factor 2: depth fuel,
+minimum size, half-open `[start, stop)`. -/
+def validRanges (b minSize : ℕ) : ℕ → ℕ → ℕ → List (ℕ × ℕ)
+  | 0, start, stop => [(start, stop)]
+  | d + 1, start, stop =>
+    if stop - start ≤ minSize then [(start, stop)]
+    else if analyzeRange b start (stop - 1) = false then []
+    else if stop - start < 2 * minSize then [(start, stop)]
+    else
+      validRanges b minSize d start (start + (stop - start) / 2) ++
+        validRanges b minSize d (start + (stop - start) / 2) stop
+
+/-- Claim MSD-7: every nice number of the range lies in some emitted leaf. -/
+theorem validRanges_cover {b minSize : ℕ} (hb : 2 ≤ b) (d : ℕ) :
+    ∀ start stop n, start ≤ n → n < stop → IsNice b n →
+      ∃ r ∈ validRanges b minSize d start stop, r.1 ≤ n ∧ n < r.2 := by
+  induction d with
+  | zero =>
+    intro start stop n h1 h2 _
+    exact ⟨(start, stop), by simp [validRanges], h1, h2⟩
+  | succ d ih =>
+    intro start stop n h1 h2 hn
+    unfold validRanges
+    split_ifs with hsmall hrej hnw
+    · exact ⟨(start, stop), by simp, h1, h2⟩
+    · exact absurd hn (no_nice_of_analyzeRange hb hrej n h1 (by omega))
+    · exact ⟨(start, stop), by simp, h1, h2⟩
+    · rcases Nat.lt_or_ge n (start + (stop - start) / 2) with hmid | hmid
+      · obtain ⟨r, hr, hr1, hr2⟩ := ih start _ n h1 hmid hn
+        exact ⟨r, List.mem_append_left _ hr, hr1, hr2⟩
+      · obtain ⟨r, hr, hr1, hr2⟩ := ih _ stop n hmid h2 hn
+        exact ⟨r, List.mem_append_right _ hr, hr1, hr2⟩
+
+/-- Leaves are sub-intervals of the input. -/
+theorem validRanges_subset {b minSize : ℕ} (d : ℕ) :
+    ∀ start stop r, r ∈ validRanges b minSize d start stop → start ≤ r.1 ∧ r.2 ≤ stop := by
+  induction d with
+  | zero =>
+    intro start stop r hr
+    simp [validRanges] at hr
+    subst hr; exact ⟨le_refl _, le_refl _⟩
+  | succ d ih =>
+    intro start stop r hr
+    unfold validRanges at hr
+    split_ifs at hr
+    · simp at hr; subst hr; exact ⟨le_refl _, le_refl _⟩
+    · simp at hr
+    · simp at hr; subst hr; exact ⟨le_refl _, le_refl _⟩
+    · rw [List.mem_append] at hr
+      rcases hr with hr | hr
+      · have := ih _ _ r hr; omega
+      · have := ih _ _ r hr; omega
 
 end Nice

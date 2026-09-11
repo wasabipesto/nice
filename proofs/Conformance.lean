@@ -147,6 +147,41 @@ def checkSeeded (r : Report) : IO Report := do
       | _ => throw (IO.userError "seeded sample shape")
   pure r
 
+def checkMsd (r : Report) : IO Report := do
+  let mut r := r
+  for j in ← load "msd.json" do
+    let b ← orFail (getNat j "base")
+    for v in ← orFail (getArr j "verdicts") do
+      let arr ← orFail v.getArr?
+      match arr.toList with
+      | [.str s, .str e, .bool rejected] =>
+        let some start := s.toNat? | throw (IO.userError "verdict start")
+        let some stop := e.toNat? | throw (IO.userError "verdict end")
+        -- Rust `has_duplicate_msd_prefix` is true exactly when the model's
+        -- SDR search fails (size-1 ranges are always Live in Rust).
+        let model := if stop - start ≤ 1 then false else !Nice.analyzeRange b start (stop - 1)
+        r := r.check s!"analyze_range {b} [{start}, {stop})" (model == rejected)
+      | _ => throw (IO.userError "verdict shape")
+    for l in ← orFail (getArr j "leaves") do
+      let arr ← orFail l.getArr?
+      match arr.toList with
+      | [.str s, .str e, .num d, .str m, .arr leaves] =>
+        let some start := s.toNat? | throw (IO.userError "leaves start")
+        let some stop := e.toNat? | throw (IO.userError "leaves end")
+        let some minSize := m.toNat? | throw (IO.userError "leaves min")
+        let depth := d.mantissa.toNat
+        let want ← orFail (leaves.toList.mapM fun x => do
+          let a ← x.getArr?
+          match a.toList with
+          | [.str ls, .str le] => match ls.toNat?, le.toNat? with
+            | some a, some b => pure (a, b)
+            | _, _ => throw "leaf nat"
+          | _ => throw "leaf shape")
+        r := r.check s!"get_valid_ranges_recursive {b} depth {depth} min {minSize}"
+          (Nice.validRanges b minSize depth start stop == want)
+      | _ => throw (IO.userError "leaves shape")
+  pure r
+
 end Conformance
 
 open Conformance in
@@ -156,6 +191,7 @@ def main : IO UInt32 := do
   r ← checkLsd r
   r ← checkStride r
   r ← checkRanges r
+  r ← checkMsd r
   r ← checkSeeded r
   for f in r.failures.reverse do
     IO.println s!"FAIL: {f}"
