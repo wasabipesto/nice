@@ -1393,6 +1393,8 @@ pub fn report_field(backend: &str, base: u32, stats: NiceonlyStats) {
 /// The CUDA path has the same guard inside `process_range_niceonly_cuda`; the
 /// Vulkan and `CubeCL` paths call this ahead of their CPU fallbacks, so it
 /// also covers bases the GPU itself cannot take.
+///
+/// Lean: `Nice.no_nice_of_residueFilter_empty` (RES-3)
 #[must_use]
 pub fn residue_empty_result(base: u32) -> Option<FieldResults> {
     if residue_filter::get_residue_filter_u128(&base).is_empty() {

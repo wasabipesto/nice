@@ -1,0 +1,102 @@
+# Lean proofs for the nice-number search
+
+Machine-checked statements of the mathematics the search relies on: the
+definition of a nice number, the search interval per base, and the
+soundness of every filter in the niceonly cascade, plus the structural and
+negative results the project has accumulated. The design, phases and the
+full claim catalogue are in
+`scratchpad/2026-09-lean-formalization/PROPOSAL.md`; this directory is the
+implementation. The first Lean attempt (`origin/proofs`, Dec 2025) supplied
+the definitions; the rest is new.
+
+## Layout
+
+```
+Nice/Spec/      the mathematics: digits, IsNice, base range
+Nice/Model/     executable mirrors of the Rust filters, proved sound against Spec
+Nice/Theory/    structural facts and negative results independent of the code
+Nice/Const.lean numeric constants the Rust relies on, certified
+Nice/Refuted.lean, Nice/Conjectures.lean, Nice/Examples.lean
+CLAIMS.md       the registry: claim id → Lean declaration → Rust site → status
+scripts/check_claims.py   validates CLAIMS.md against the build and the Rust tags
+fixtures/       tables emitted by Rust, checked against the Lean model (phase 2)
+```
+
+Three layers. **Spec** states mathematics only. **Model** contains
+computable Lean functions that do what the Rust does at the algorithmic
+level, each with a soundness theorem against Spec ("if the model rejects,
+no nice number is lost"). **Theory** is what is true about the problem
+independent of the code. The end-to-end target is `END-1`: the modelled
+niceonly pipeline reports every nice number in a field.
+
+## Building
+
+```
+elan toolchain install $(cat lean-toolchain)   # once
+cd proofs
+lake exe cache get      # Mathlib build cache, ~6 GB on disk, minutes
+lake build
+```
+
+or `just lean-build` from the repo root. Mathlib is pinned to the release
+tag matching `lean-toolchain`; bump both together, deliberately.
+
+Policy: no `native_decide`; `decide` / `norm_num` for concrete examples;
+milestone theorems must depend on no axioms beyond `propext`,
+`Classical.choice`, `Quot.sound` (the checker enforces this for every row
+marked `proved`).
+
+## The registry and the Rust tags
+
+`CLAIMS.md` has one row per claim. A Rust doc comment of the form
+
+```rust
+/// Lean: `Nice.mem_residueFilter_of_isNice` (RES-1)
+```
+
+ties a code site to a row. `just lean-claims` (after `lake build`) checks
+that every tag names its row's declaration, that every `proved` declaration
+exists and is sorry-free, and reports `stated`/`planned` declarations that
+have become sorry-free so their status can be promoted. Proof debt is
+allowed and visible: a filter PR may add a row and a tag whose theorem is
+only `stated`. It may not silently un-prove something.
+
+## Adding a claim (code → Lean)
+
+1. Add a row to `CLAIMS.md` with the statement and explicit hypotheses.
+   If the statement cannot be written down, that is the review finding.
+2. Add the model function under `Nice/Model/` and, when tables are
+   involved, a fixture the Rust emits for it.
+3. State the soundness theorem; prove it, or mark the row `stated`.
+4. Tag the Rust site.
+
+## Proposing an optimization (Lean → code)
+
+State it in `Nice/Conjectures.lean` as a soundness theorem with `sorry`
+and a `decide` check on bases 5–16. A failing check moves it to
+`Nice/Refuted.lean` with its witness. A passing one earns proof effort, and
+the theorem's hypotheses are the implementation's spec.
+
+## Status
+
+<!-- status:begin -->
+| phase | def | proved | stated | planned | other |
+|---|---|---|---|---|---|
+| 0 | 1 | 3 | 0 | 0 | 0 |
+| 1 | 0 | 0 | 0 | 16 | 0 |
+| 2 | 0 | 2 | 0 | 8 | 0 |
+| 3 | 0 | 0 | 0 | 9 | 0 |
+| 4 | 0 | 0 | 0 | 5 | 0 |
+| 5 | 0 | 0 | 0 | 11 | 0 |
+| 6 | 0 | 0 | 0 | 9 | 0 |
+| — | 0 | 0 | 0 | 0 | 2 |
+
+Proved or defined so far:
+
+- **DEF-1** `Nice.IsNice`: `IsNice b n` ⇔ the base-b digits of n² followed by those of n³ permute `0..b-1`
+- **DEF-1a** `Nice.isNice_iff_pandigital`: the three-part `Pandigital` definition of `origin/proofs` is equivalent
+- **RNG-1** `Nice.nice_digit_count`: `IsNice b n → numDigits(n²) + numDigits(n³) = b`
+- **RES-1** `Nice.mem_residueFilter_of_isNice`: `IsNice b n → n² + n³ ≡ b(b−1)/2 (mod b−1)`; `n mod (b−1) ∈ residueFilter b`
+- **RES-1a** `Nice.nice_digit_sum`: a nice number's output digits sum to `b(b−1)/2`
+- **RES-3** `Nice.no_nice_of_residueFilter_empty`: `residueFilter b = ∅ → ∀ n, ¬IsNice b n`; `residueFilter 11 = ∅`
+<!-- status:end -->

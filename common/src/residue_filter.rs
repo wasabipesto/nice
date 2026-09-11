@@ -2,6 +2,8 @@
 //! For more information: <https://beautifulthorns.wixsite.com/home/post/progress-update-on-the-search-for-nice-numbers>
 
 /// Get a list of residue filters for a base.
+///
+/// Lean: `Nice.mem_residueFilter_of_isNice` (RES-1)
 #[must_use]
 pub fn get_residue_filter(base: &u32) -> Vec<u32> {
     let target_residue = base * (base - 1) / 2 % (base - 1);
