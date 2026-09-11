@@ -23,15 +23,6 @@ theorem cyclicInterval_one {b x : ℕ} (hx : x < b) : cyclicInterval b x 1 = {x}
   unfold cyclicInterval
   rw [Finset.range_one, Finset.image_singleton, Nat.add_zero, Nat.mod_eq_of_lt hx]
 
-theorem powerDomains_dom {b lo hi e : ℕ} {c : Constraint} (hc : c ∈ powerDomains b lo hi e) :
-    c.dom = cyclicInterval b (digit b (lo ^ e) c.j) (width b lo hi e c.j + 1) := by
-  unfold powerDomains at hc
-  split_ifs at hc
-  · rw [List.mem_map] at hc
-    obtain ⟨j, -, rfl⟩ := hc
-    rfl
-  · simp at hc
-
 theorem rangeDomains_dom {b lo hi : ℕ} {c : Constraint} (hc : c ∈ rangeDomains b lo hi) :
     c.dom = cyclicInterval b (digit b (lo ^ c.e) c.j) (width b lo hi c.e c.j + 1) := by
   unfold rangeDomains at hc
@@ -253,5 +244,31 @@ theorem no_nice_of_equal_singletons {b lo hi n e j e' j' : ℕ} (hb : 2 ≤ b)
     exact (List.Nodup.getElem_inj_iff hnd).mp this
   obtain ⟨hee, hjj⟩ := outIndex_inj he he' hjn hjn' hidx
   rcases hne with hne | hne <;> exact hne (by assumption)
+
+/-- Certificates grow on sub-ranges: a singleton position of a range is a
+singleton with the same digit on every sub-range. -/
+theorem fixedDigits_sub {b lo hi lo' hi' k : ℕ} (h1 : lo ≤ lo') (h2 : lo' ≤ hi') (h3 : hi' ≤ hi) :
+    fixedDigits b lo hi k ⊆ fixedDigits b lo' hi' k := by
+  intro d hd
+  unfold fixedDigits at *
+  rw [List.mem_toFinset, List.mem_map] at *
+  obtain ⟨c, hc, rfl⟩ := hd
+  rw [List.mem_filter, decide_eq_true_iff] at hc
+  obtain ⟨hc, hk, hw⟩ := hc
+  obtain ⟨c', hc', he, hj, -⟩ := rangeDomains_sub h1 h2 h3 c hc
+  have hw' : width b lo' hi' c'.e c'.j = 0 := by
+    rw [he, hj]
+    have := width_sub (b := b) (e := c.e) (j := c.j) h1 h3
+    omega
+  refine ⟨c', List.mem_filter.mpr ⟨hc', decide_eq_true_iff.mpr ⟨hj ▸ hk, hw'⟩⟩, ?_⟩
+  -- width zero: the quotient is constant on [lo, hi], so the digit agrees
+  rw [he, hj]
+  unfold width at hw
+  unfold digit
+  have a := Nat.div_le_div_right (c := b ^ c.j) (Nat.pow_le_pow_left h1 c.e)
+  have b' := Nat.div_le_div_right (c := b ^ c.j) (Nat.pow_le_pow_left h2 c.e)
+  have c'' := Nat.div_le_div_right (c := b ^ c.j) (Nat.pow_le_pow_left h3 c.e)
+  have : lo' ^ c.e / b ^ c.j = lo ^ c.e / b ^ c.j := by omega
+  rw [this]
 
 end Nice

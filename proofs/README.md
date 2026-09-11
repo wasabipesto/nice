@@ -97,9 +97,9 @@ the theorem's hypotheses are the implementation's spec.
 | 0 | 1 | 3 | 0 | 0 | 0 |
 | 1 | 1 | 17 | 0 | 0 | 0 |
 | 2 | 0 | 10 | 0 | 0 | 0 |
-| 3 | 0 | 7 | 0 | 2 | 0 |
+| 3 | 0 | 8 | 0 | 1 | 0 |
 | 4 | 0 | 4 | 0 | 0 | 1 |
-| 5 | 0 | 10 | 0 | 2 | 0 |
+| 5 | 0 | 11 | 0 | 1 | 0 |
 | 6 | 0 | 4 | 0 | 5 | 0 |
 | — | 0 | 0 | 0 | 0 | 2 |
 
@@ -144,6 +144,7 @@ Proved or defined so far:
 - **MSD-6** `Nice.Sound.sublist`: domain-slot overflow only drops constraints
 - **MSD-7** `Nice.validRanges_cover`: recursive subdivision (factor 2, depth fuel, floor): every nice n of the input lies in some emitted leaf; leaves are sub-intervals (`validRanges_subset`)
 - **MSD-8** `Nice.no_nice_of_equal_singletons`: the over-64 prefix path is the singleton-domain case of MSD-4
+- **MSD-9** `Nice.analyzeRange_mono`: monotone rejection: `Rejected(I) ∧ J ⊆ I → Rejected(J)` (sub-range domains are position-wise subsets, `rangeDomains_sub`; an SDR transfers, `hasSDR_of_sub`); certificates grow on sub-ranges (`fixedDigits_sub`)
 - **CRS-1** `Nice.no_nice_of_cross`: singleton high digit at position `≥ k` colliding with a residue's exact low digit kills the residue in the range
 - **CRS-2** `Nice.validRangesMasked_cover`: the masked recursion: every nice n lies in a leaf whose inherited mask consists of high digits of n (a certificate for a range holds on every sub-range)
 - **CRS-3** `Nice.validRangesMasked_cover`: an empty or partial certificate is sound (mask soundness holds for any accumulated mask, so ignoring certificates only checks more candidates)
@@ -153,6 +154,7 @@ Proved or defined so far:
 - **GPU-3** `Nice.validRangesMasked_cover`: mixing floors within a field loses nothing: the cover theorem holds for every floor and depth, so any per-block choice is sound
 - **GPU-4** `Nice.lane_partition`: lane tiling partitions the ordinals for any lane count
 - **GPU-5** `Nice.split16_exact`: split16 chunk step is exact when `d < 2^16`
+- **GPU-6** `Nice.truncated_mul_mod`: dropping partial products at or above limb L is reduction mod B^L (`truncated_mul_mod`); a limb step `a·c + acc + carry` stays below 2^32 for B ≤ 2^16 (`limb_step_lt`)
 - **GPU-7** `Nice.hornerMod_chunksBE`: chunked Horner over the base-`2^c` chunks computes `off mod M` (`hornerMod_chunksBE`) and each step stays below `2^32` while `M ≤ 2^(32−c)` (`horner_step_lt`)
 - **GPU-8** `Nice.prefilter_rejects_all_of_short`: prefilter = LSD-2 at depth p (`mem_lsdBitmap_of_isNice`); where neither power has p digits the zero padding rejects every candidate (`prefilter_rejects_all_of_short`, the v3.2.14 failure)
 - **GPU-9** `Nice.mod_m_split`: `mod_m` via `2^64 mod M` is correct under NUM-8

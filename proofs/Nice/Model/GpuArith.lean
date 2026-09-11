@@ -271,4 +271,38 @@ theorem prefilter_sound {b start n : ℕ} (hb : 2 ≤ b) (hs : start ≤ n) (h :
     have := numDigits_pow_mono (b := b) 3 hs
     omega
 
+/-! ### GPU-6: the truncated schoolbook multiply -/
+
+/-- Dropping every partial product at or above limb position `L` is
+reduction modulo `B^L`: the dropped terms are multiples of `B^L`. -/
+theorem truncated_mul_mod (B L : ℕ) (a c : ℕ → ℕ) :
+    (∑ i ∈ Finset.range L, ∑ j ∈ Finset.range L, a i * c j * B ^ (i + j)) % B ^ L =
+      (∑ i ∈ Finset.range L, ∑ j ∈ Finset.range (L - i), a i * c j * B ^ (i + j)) % B ^ L := by
+  have hsplit : ∀ i ∈ Finset.range L,
+      ∑ j ∈ Finset.range L, a i * c j * B ^ (i + j) =
+        ∑ j ∈ Finset.range (L - i), a i * c j * B ^ (i + j) +
+          ∑ j ∈ Finset.Ico (L - i) L, a i * c j * B ^ (i + j) := by
+    intro i hi
+    rw [Finset.sum_range_add_sum_Ico _ (by omega)]
+  rw [Finset.sum_congr rfl hsplit, Finset.sum_add_distrib]
+  have hrest : (∑ i ∈ Finset.range L, ∑ j ∈ Finset.Ico (L - i) L, a i * c j * B ^ (i + j)) ≡ 0
+      [MOD B ^ L] := by
+    apply Nat.modEq_zero_iff_dvd.mpr
+    apply Finset.dvd_sum
+    intro i _
+    apply Finset.dvd_sum
+    intro j hj
+    rw [Finset.mem_Ico] at hj
+    exact Dvd.dvd.mul_left (Nat.pow_dvd_pow B (by omega)) _
+  change _ ≡ _ [MOD B ^ L]
+  exact (hrest.add_left _).trans (by rw [Nat.add_zero])
+
+/-- One limb step of the schoolbook multiply stays inside `u32` when every
+operand is below `B ≤ 2^16`: `a·c + acc + carry ≤ B² − 1`. -/
+theorem limb_step_lt {B a c acc carry : ℕ} (hB : B ≤ 2 ^ 16) (ha : a < B) (hc : c < B)
+    (hacc : acc < B) (hcarry : carry < B) : a * c + acc + carry < 2 ^ 32 := by
+  have h1 : a * c ≤ (B - 1) * (B - 1) := Nat.mul_le_mul (by omega) (by omega)
+  have h2 : (B - 1) * (B - 1) ≤ (2 ^ 16 - 1) * (2 ^ 16 - 1) := Nat.mul_le_mul (by omega) (by omega)
+  omega
+
 end Nice

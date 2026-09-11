@@ -242,12 +242,18 @@ theorem sdrExists_iff {b : ℕ} (cs : List Constraint) (hsub : ∀ c ∈ cs, ∀
 /-- The interval width at position `j` for power `e` over `[lo, hi]`. -/
 def width (b lo hi e j : ℕ) : ℕ := hi ^ e / b ^ j - lo ^ e / b ^ j
 
-/-- `collect_power_domains`: positions from the top down while the width is
-below `b - 1`, only when both endpoints have the same digit count. -/
+/-- Position `j` is constrained when it and every position above it has width
+below `b - 1`. The Rust walks from the top and stops at the first wide
+position; by `width_ge_of_succ` every position below a wide one is wide, so
+this is the same set. -/
+def constrained (b lo hi e j : ℕ) : Bool :=
+  (List.range (numDigits b (lo ^ e))).all fun j' => decide (j ≤ j' → width b lo hi e j' < b - 1)
+
+/-- `collect_power_domains`: the constrained positions, only when both
+endpoints have the same digit count. -/
 def powerDomains (b lo hi e : ℕ) : List Constraint :=
   if numDigits b (lo ^ e) = numDigits b (hi ^ e) then
-    (((List.range (numDigits b (lo ^ e))).reverse.takeWhile fun j =>
-        decide (width b lo hi e j < b - 1)).map fun j =>
+    (((List.range (numDigits b (lo ^ e))).reverse.filter fun j => constrained b lo hi e j).map fun j =>
       ⟨e, j, cyclicInterval b (digit b (lo ^ e) j) (width b lo hi e j + 1)⟩)
   else []
 
@@ -266,7 +272,7 @@ theorem powerDomains_j_lt {b lo hi e : ℕ} {c : Constraint} (hc : c ∈ powerDo
   split_ifs at hc
   · rw [List.mem_map] at hc
     obtain ⟨j, hj, rfl⟩ := hc
-    have := (List.takeWhile_sublist _).subset hj
+    have := (List.mem_filter.mp hj).1
     simpa using this
   · simp at hc
 
@@ -275,7 +281,7 @@ theorem powerDomains_nodup (b lo hi e : ℕ) :
   unfold powerDomains
   split_ifs
   · rw [List.map_map]
-    refine List.Nodup.map_on ?_ ((List.nodup_reverse.mpr List.nodup_range).sublist (List.takeWhile_sublist _))
+    refine List.Nodup.map_on ?_ ((List.nodup_reverse.mpr List.nodup_range).filter _)
     intro x _ y _ h
     simpa using h
   · exact List.nodup_nil
@@ -409,5 +415,187 @@ theorem validRanges_subset {b minSize : ℕ} (d : ℕ) :
       rcases hr with hr | hr
       · have := ih _ _ r hr; omega
       · have := ih _ _ r hr; omega
+
+/-! ### Membership in the collected domains -/
+
+theorem powerDomains_eq {b lo hi e : ℕ} {c : Constraint} (hc : c ∈ powerDomains b lo hi e) :
+    numDigits b (lo ^ e) = numDigits b (hi ^ e) := by
+  unfold powerDomains at hc
+  split_ifs at hc with h
+  · exact h
+  · simp at hc
+
+theorem powerDomains_constrained {b lo hi e : ℕ} {c : Constraint}
+    (hc : c ∈ powerDomains b lo hi e) : constrained b lo hi e c.j = true := by
+  unfold powerDomains at hc
+  split_ifs at hc
+  · rw [List.mem_map] at hc
+    obtain ⟨j, hj, rfl⟩ := hc
+    exact (List.mem_filter.mp hj).2
+  · simp at hc
+
+theorem powerDomains_dom {b lo hi e : ℕ} {c : Constraint} (hc : c ∈ powerDomains b lo hi e) :
+    c.dom = cyclicInterval b (digit b (lo ^ e) c.j) (width b lo hi e c.j + 1) := by
+  unfold powerDomains at hc
+  split_ifs at hc
+  · rw [List.mem_map] at hc
+    obtain ⟨j, -, rfl⟩ := hc
+    rfl
+  · simp at hc
+
+theorem mem_powerDomains {b lo hi e j : ℕ} (heq : numDigits b (lo ^ e) = numDigits b (hi ^ e))
+    (hj : j < numDigits b (lo ^ e)) (hc : constrained b lo hi e j = true) :
+    (⟨e, j, cyclicInterval b (digit b (lo ^ e) j) (width b lo hi e j + 1)⟩ : Constraint) ∈
+      powerDomains b lo hi e := by
+  unfold powerDomains
+  rw [if_pos heq, List.mem_map]
+  exact ⟨j, List.mem_filter.mpr ⟨List.mem_reverse.mpr (List.mem_range.mpr hj), hc⟩, rfl⟩
+
+/-! ### Sub-ranges (MSD-9) -/
+
+theorem numDigits_sub {b lo hi lo' hi' e : ℕ} (heq : numDigits b (lo ^ e) = numDigits b (hi ^ e))
+    (h1 : lo ≤ lo') (h2 : lo' ≤ hi') (h3 : hi' ≤ hi) :
+    numDigits b (lo' ^ e) = numDigits b (lo ^ e) ∧ numDigits b (hi' ^ e) = numDigits b (lo ^ e) := by
+  have a := numDigits_pow_mono (b := b) e h1
+  have b' := numDigits_pow_mono (b := b) e h2
+  have c := numDigits_pow_mono (b := b) e h3
+  omega
+
+theorem width_sub {b lo hi lo' hi' e j : ℕ} (h1 : lo ≤ lo') (h3 : hi' ≤ hi) :
+    width b lo' hi' e j ≤ width b lo hi e j := by
+  unfold width
+  have a := Nat.div_le_div_right (c := b ^ j) (Nat.pow_le_pow_left h1 e)
+  have c := Nat.div_le_div_right (c := b ^ j) (Nat.pow_le_pow_left h3 e)
+  omega
+
+theorem constrained_sub {b lo hi lo' hi' e j : ℕ} (heq : numDigits b (lo ^ e) = numDigits b (hi ^ e))
+    (h1 : lo ≤ lo') (h2 : lo' ≤ hi') (h3 : hi' ≤ hi) (hc : constrained b lo hi e j = true) :
+    constrained b lo' hi' e j = true := by
+  unfold constrained at *
+  rw [(numDigits_sub heq h1 h2 h3).1]
+  rw [List.all_eq_true] at *
+  intro j' hj'
+  have := hc j' hj'
+  rw [decide_eq_true_iff] at *
+  intro hjj
+  exact lt_of_le_of_lt (width_sub h1 h3) (this hjj)
+
+theorem cyclicInterval_sub {b u v u' v' : ℕ} (h1 : u ≤ u') (h2 : u' ≤ v') (h3 : v' ≤ v) :
+    cyclicInterval b (u' % b) (v' - u' + 1) ⊆ cyclicInterval b (u % b) (v - u + 1) := by
+  intro d hd
+  unfold cyclicInterval at *
+  rw [Finset.mem_image] at *
+  obtain ⟨i, hi, rfl⟩ := hd
+  rw [Finset.mem_range] at hi
+  refine ⟨u' - u + i, Finset.mem_range.mpr (by omega), ?_⟩
+  have : u + (u' - u + i) = u' + i := by omega
+  rw [Nat.mod_add_mod, Nat.mod_add_mod, this]
+
+/-- Every constraint of a range has a counterpart on any sub-range at the same
+position with a smaller domain. -/
+theorem powerDomains_sub {b lo hi lo' hi' e : ℕ} (h1 : lo ≤ lo') (h2 : lo' ≤ hi') (h3 : hi' ≤ hi) :
+    ∀ c ∈ powerDomains b lo hi e,
+      ∃ c' ∈ powerDomains b lo' hi' e, c'.e = c.e ∧ c'.j = c.j ∧ c'.dom ⊆ c.dom := by
+  intro c hc
+  have heq := powerDomains_eq hc
+  have hj := powerDomains_j_lt hc
+  have hcon := powerDomains_constrained hc
+  have hce := powerDomains_e hc
+  have hdom := powerDomains_dom hc
+  obtain ⟨hl, hh⟩ := numDigits_sub heq h1 h2 h3
+  refine ⟨⟨e, c.j, cyclicInterval b (digit b (lo' ^ e) c.j) (width b lo' hi' e c.j + 1)⟩,
+    mem_powerDomains (by omega) (by omega) (constrained_sub heq h1 h2 h3 hcon), hce.symm, rfl, ?_⟩
+  show cyclicInterval b (digit b (lo' ^ e) c.j) (width b lo' hi' e c.j + 1) ⊆ c.dom
+  rw [hdom]
+  unfold digit width
+  apply cyclicInterval_sub
+  · exact Nat.div_le_div_right (Nat.pow_le_pow_left h1 e)
+  · exact Nat.div_le_div_right (Nat.pow_le_pow_left h2 e)
+  · exact Nat.div_le_div_right (Nat.pow_le_pow_left h3 e)
+
+theorem rangeDomains_sub {b lo hi lo' hi' : ℕ} (h1 : lo ≤ lo') (h2 : lo' ≤ hi') (h3 : hi' ≤ hi) :
+    ∀ c ∈ rangeDomains b lo hi,
+      ∃ c' ∈ rangeDomains b lo' hi', c'.e = c.e ∧ c'.j = c.j ∧ c'.dom ⊆ c.dom := by
+  intro c hc
+  unfold rangeDomains at *
+  rw [List.mem_append] at hc
+  rcases hc with hc | hc
+  · obtain ⟨c', hc', h⟩ := powerDomains_sub h1 h2 h3 c hc
+    exact ⟨c', List.mem_append_left _ hc', h⟩
+  · obtain ⟨c', hc', h⟩ := powerDomains_sub h1 h2 h3 c hc
+    exact ⟨c', List.mem_append_right _ hc', h⟩
+
+/-- The function form of an SDR, for lists with distinct `(e, j)` pairs. -/
+theorem hasSDR_iff_fun {cs : List Constraint} (hd : (cs.map fun c => (c.e, c.j)).Nodup) :
+    HasSDR cs ↔ ∃ f : ℕ → ℕ → ℕ, (∀ c ∈ cs, f c.e c.j ∈ c.dom) ∧
+      (cs.map fun c => f c.e c.j).Nodup := by
+  constructor
+  · rintro ⟨ds, hf, hnd⟩
+    have hlen := hf.length_eq
+    let f : ℕ → ℕ → ℕ := fun e j => ds.getD ((cs.map fun c => (c.e, c.j)).idxOf (e, j)) 0
+    have hget : ∀ i (hi : i < cs.length), f cs[i].e cs[i].j = ds[i]'(hlen ▸ hi) := by
+      intro i hi
+      show ds.getD ((cs.map fun c => (c.e, c.j)).idxOf (cs[i].e, cs[i].j)) 0 = _
+      have hi' : i < (cs.map fun c => (c.e, c.j)).length := by simpa using hi
+      have hidx : (cs.map fun c => (c.e, c.j)).idxOf (cs[i].e, cs[i].j) = i := by
+        have := hd.idxOf_getElem i hi'
+        simpa using this
+      rw [hidx, List.getD_eq_getElem _ _ (hlen ▸ hi)]
+    refine ⟨f, ?_, ?_⟩
+    · intro c hc
+      obtain ⟨i, hi, rfl⟩ := List.getElem_of_mem hc
+      rw [hget i hi]
+      have := (List.forall₂_iff_get.mp hf).2 i hi (hlen ▸ hi)
+      simpa using this
+    · have : (cs.map fun c => f c.e c.j) = ds := by
+        apply List.ext_getElem (by simpa using hlen)
+        intro i h1 h2
+        simp only [List.getElem_map]
+        exact hget i (by simpa using h1)
+      rw [this]
+      exact hnd
+  · rintro ⟨f, hmem, hnd⟩
+    refine ⟨cs.map fun c => f c.e c.j, ?_, hnd⟩
+    rw [List.forall₂_map_right_iff, List.forall₂_same]
+    exact hmem
+
+/-- An SDR for the finer constraints gives one for the coarser. -/
+theorem hasSDR_of_sub {cs cs' : List Constraint} (hd : (cs.map fun c => (c.e, c.j)).Nodup)
+    (hd' : (cs'.map fun c => (c.e, c.j)).Nodup)
+    (hsub : ∀ c ∈ cs, ∃ c' ∈ cs', c'.e = c.e ∧ c'.j = c.j ∧ c'.dom ⊆ c.dom)
+    (h : HasSDR cs') : HasSDR cs := by
+  rw [hasSDR_iff_fun hd'] at h
+  rw [hasSDR_iff_fun hd]
+  obtain ⟨f, hmem, hnd⟩ := h
+  refine ⟨f, ?_, ?_⟩
+  · intro c hc
+    obtain ⟨c', hc', he, hj, hdom⟩ := hsub c hc
+    rw [← he, ← hj]
+    exact hdom (hmem c' hc')
+  · apply List.Nodup.map_on _ (hd.of_map _)
+    intro c₁ h₁ c₂ h₂ heq
+    obtain ⟨c₁', hc₁', he₁, hj₁, -⟩ := hsub c₁ h₁
+    obtain ⟨c₂', hc₂', he₂, hj₂, -⟩ := hsub c₂ h₂
+    have hcc : c₁' = c₂' := by
+      apply List.inj_on_of_nodup_map hnd hc₁' hc₂'
+      rw [he₁, hj₁, he₂, hj₂]
+      exact heq
+    apply List.inj_on_of_nodup_map hd h₁ h₂
+    rw [← he₁, ← hj₁, ← he₂, ← hj₂, hcc]
+
+/-- Claim MSD-9: a rejected range rejects every sub-range. -/
+theorem analyzeRange_mono {b lo hi lo' hi' : ℕ} (hb : 2 ≤ b) (h1 : lo ≤ lo') (h2 : lo' ≤ hi')
+    (h3 : hi' ≤ hi) (h : analyzeRange b lo hi = false) : analyzeRange b lo' hi' = false := by
+  by_contra hc
+  have hc' : analyzeRange b lo' hi' = true := by simpa using hc
+  have hsdr' : HasSDR (rangeDomains b lo' hi') :=
+    (sdrExists_iff _ (rangeDomains_dom_lt (by omega))).mp hc'
+  have hsdr : HasSDR (rangeDomains b lo hi) :=
+    hasSDR_of_sub (rangeDomains_nodup _ _ _) (rangeDomains_nodup _ _ _)
+      (rangeDomains_sub h1 h2 h3) hsdr'
+  have := (sdrExists_iff _ (rangeDomains_dom_lt (by omega))).mpr hsdr
+  unfold analyzeRange at h
+  rw [h] at this
+  exact Bool.false_ne_true this
 
 end Nice
