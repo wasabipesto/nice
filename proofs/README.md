@@ -3,11 +3,9 @@
 Machine-checked statements of the mathematics the search relies on: the
 definition of a nice number, the search interval per base, and the
 soundness of every filter in the niceonly cascade, plus the structural and
-negative results the project has accumulated. The design, phases and the
-full claim catalogue are in
-`scratchpad/2026-09-lean-formalization/PROPOSAL.md`; this directory is the
-implementation. The first Lean attempt (`origin/proofs`, Dec 2025) supplied
-the definitions; the rest is new.
+negative results the project has accumulated. `DESIGN.md` has the plan and
+phases; `CLAIMS.md` is the catalogue. The first Lean attempt (the `proofs`
+branch, Dec 2025) supplied the definitions; the rest is new.
 
 ## Layout
 
@@ -17,6 +15,7 @@ Nice/Model/     executable mirrors of the Rust filters, proved sound against Spe
 Nice/Theory/    structural facts and negative results independent of the code
 Nice/Const.lean numeric constants the Rust relies on, certified
 Nice/Refuted.lean, Nice/Conjectures.lean, Nice/Examples.lean
+DESIGN.md       design, layers, phases
 CLAIMS.md       the registry: claim id → Lean declaration → Rust site → status
 scripts/check_claims.py   validates CLAIMS.md against the build and the Rust tags
 fixtures/       tables emitted by Rust, checked against the Lean model (phase 2)
