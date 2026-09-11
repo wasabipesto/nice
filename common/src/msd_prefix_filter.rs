@@ -1209,12 +1209,12 @@ mod tests {
         };
         let mut agreements = [0usize; 2];
         for _ in 0..20_000 {
-            let base = 3 + (next() % 10) as u32; // 3..=12 digits
-            let m = 1 + (next() % 12) as usize; // 1..=12 positions
+            let base = 3 + u32::try_from(next() % 10).unwrap(); // 3..=12 digits
+            let m = 1 + usize::try_from(next() % 12).unwrap(); // 1..=12 positions
             let doms: Vec<u64> = (0..m)
                 .map(|_| {
-                    let lo = (next() % u64::from(base)) as u32;
-                    let width = 1 + (next() % u64::from(base.min(4))) as u32;
+                    let lo = u32::try_from(next() % u64::from(base)).unwrap();
+                    let width = 1 + u32::try_from(next() % u64::from(base.min(4))).unwrap();
                     let mut mask = 0u64;
                     for i in 0..width {
                         mask |= 1u64 << ((lo + i) % base);
