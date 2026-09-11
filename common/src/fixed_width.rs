@@ -17,8 +17,9 @@
 //! | 80   | 102    | 203     | 304     | u512   |
 //! | 97   | 126    | 251     | 377     | u512   |
 //!
-//! Bases ≥ 69 fall back to malachite `Natural` in the caller (n³ exceeds
-//! 256 bits at base 70).
+//! Bases ≥ 69 fall back to malachite `Natural` in the caller
+//! (`MAX_BASE_FOR_FIXED_WIDTH_U256`). Base 69's largest cube still fits in
+//! 251 bits; base 70's needs 258, so 68 leaves one base of slack.
 
 // Pedantic's cast and inlining opinions are rejected wholesale here: this is
 // hot-path fixed-width arithmetic where the truncating casts are the point.
@@ -84,8 +85,10 @@ impl U256 {
     }
 
     /// Compute `self * b` truncated to 256 bits.
-    /// Caller guarantees the true product fits in 256 bits (true for n³ at
-    /// base ≤ 80).
+    /// Caller guarantees the true product fits in 256 bits. For n³ over a
+    /// legal base range that holds through base 69 and fails from base 70
+    /// (see `u256_holds_every_cube_the_fixed_width_path_is_given`); the
+    /// caller's cutoff is `MAX_BASE_FOR_FIXED_WIDTH_U256 = 68`.
     #[inline]
     pub fn mul_u128_truncating(&self, b: u128) -> Self {
         let b_lo = b as u64;
@@ -275,6 +278,39 @@ mod tests {
             let want = naive_mul128_to_256(a, b);
             assert_eq!(got.limbs, want, "mul_u128_u128({a}, {b}) mismatch");
         }
+    }
+
+    /// The `mul_u128_truncating` precondition, checked exactly instead of
+    /// asserted in a comment: the largest cube in every base routed to the
+    /// U256 path is below 2^256, and the u128 cutoff at base 40 is likewise
+    /// exact. Also pins where the slack ends (69 fits, 70 does not) so the
+    /// two cutoff comments cannot drift apart again.
+    #[test]
+    fn u256_holds_every_cube_the_fixed_width_path_is_given() {
+        use crate::base_range::get_base_range_natural;
+        use crate::client_process::MAX_BASE_FOR_FIXED_WIDTH_U256;
+        use malachite::base::num::arithmetic::traits::Pow;
+        use malachite::natural::Natural;
+
+        let two_256 = Natural::from(1u32) << 256u64;
+        let two_128 = Natural::from(1u32) << 128u64;
+        let max_cube = |base: u32| -> Option<Natural> {
+            let (_, end) = get_base_range_natural(base)?;
+            Some((end - Natural::from(1u32)).pow(3u64))
+        };
+
+        assert_eq!(MAX_BASE_FOR_FIXED_WIDTH_U256, 68);
+        for base in 5..=MAX_BASE_FOR_FIXED_WIDTH_U256 {
+            if let Some(cube) = max_cube(base) {
+                assert!(cube < two_256, "base {base}: largest n³ does not fit U256");
+            }
+        }
+        // u128 path: base 40 fits, the next base with a range (42) does not.
+        assert!(max_cube(40).unwrap() < two_128);
+        assert!(max_cube(42).unwrap() >= two_128);
+        // The slack above the cutoff: 69 would still fit, 70 would not.
+        assert!(max_cube(69).unwrap() < two_256);
+        assert!(max_cube(70).unwrap() >= two_256);
     }
 
     #[test]
