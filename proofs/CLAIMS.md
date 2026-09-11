@@ -23,7 +23,7 @@ checked outside Lean. `evidence` is what the Rust side has today.
 | DEF-4 | near-miss cutoff is `⌊0.9 b⌋` with strict `>` (`IsNearMiss`); every nice number is a near miss (`isNearMiss_of_isNice`) | `Nice.nearMissCutoff` | `common/src/number_stats.rs::get_near_miss_cutoff` | tests | def | 1 |
 | RNG-1 | `IsNice b n → numDigits(n²) + numDigits(n³) = b` | `Nice.nice_digit_count` | `common/src/base_range.rs` | tests | proved | 0 |
 | RNG-2 | the per-`b mod 5` closed-form interval contains every n with `numDigits(n²) + numDigits(n³) = b` | `Nice.memBaseRange_of_inBaseRange` | `common/src/base_range.rs::get_base_range_natural` | tests pin 8 bases | proved | 1 |
-| RNG-2b | conversely every n in the closed-form interval has digit-count sum b (`InBaseRange`) | `Nice.inBaseRange_of_memBaseRange` | `common/src/base_range.rs::get_base_range_natural` | tests pin 8 bases | planned | 1 |
+| RNG-2b | conversely every n in the closed-form interval has digit-count sum b; with RNG-2 the interval is exactly the search range (`memBaseRange_iff`) | `Nice.inBaseRange_of_memBaseRange` | `common/src/base_range.rs::get_base_range_natural` | tests pin 8 bases | proved | 1 |
 | RNG-3 | inside the range every power has `≥ k` digits for `k ≤ 3`, `b ≥ 6` | `Nice.three_le_numDigits_of_inBaseRange` | `common/src/lsd_filter.rs`, `common/src/client_process.rs::get_is_nice_with_known_lsd` | comment | proved | 1 |
 | RNG-4 | `b ≡ 1 (mod 5)` ⇒ no n has digit-count sum b | `Nice.not_inBaseRange_of_one_mod_five` | `common/src/base_range.rs` | asserted | proved | 1 |
 | RNG-5 | `numDigits b (n^e)` is monotone in n | `Nice.numDigits_pow_mono` | `common/src/gpu_config.rs::prefilter_params` | comment | proved | 1 |
