@@ -540,6 +540,7 @@ fn get_is_nice_natural(num: u128, base: u32) -> bool {
     true
 }
 
+/// Lean: `Nice.niceonly_complete` (END-1)
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
 #[must_use]

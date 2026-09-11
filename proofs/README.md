@@ -98,7 +98,7 @@ the theorem's hypotheses are the implementation's spec.
 | 1 | 0 | 12 | 0 | 6 | 0 |
 | 2 | 0 | 9 | 0 | 1 | 0 |
 | 3 | 0 | 6 | 0 | 3 | 0 |
-| 4 | 0 | 0 | 0 | 5 | 0 |
+| 4 | 0 | 4 | 0 | 0 | 1 |
 | 5 | 0 | 0 | 0 | 11 | 0 |
 | 6 | 0 | 0 | 0 | 9 | 0 |
 | — | 0 | 0 | 0 | 0 | 2 |
@@ -136,4 +136,9 @@ Proved or defined so far:
 - **MSD-4** `Nice.no_nice_of_not_hasSDR`: Hall soundness: no injective digit choice ⇒ no nice n in the range; model form `no_nice_of_analyzeRange` for the executable `analyzeRange`
 - **MSD-6** `Nice.Sound.sublist`: domain-slot overflow only drops constraints
 - **MSD-7** `Nice.validRanges_cover`: recursive subdivision (factor 2, depth fuel, floor): every nice n of the input lies in some emitted leaf; leaves are sub-intervals (`validRanges_subset`)
+- **CRS-1** `Nice.no_nice_of_cross`: singleton high digit at position `≥ k` colliding with a residue's exact low digit kills the residue in the range
+- **CRS-2** `Nice.validRangesMasked_cover`: the masked recursion: every nice n lies in a leaf whose inherited mask consists of high digits of n (a certificate for a range holds on every sub-range)
+- **CRS-3** `Nice.validRangesMasked_cover`: an empty or partial certificate is sound (mask soundness holds for any accumulated mask, so ignoring certificates only checks more candidates)
+- **REF-1** `Nice.msd_lsd_skip_unsound`: the removed MSD×LSD skip is unsound: witness b=10, k=2, `[68,70)` (quotient test passes, low digits differ, 69 is nice); generally `n mod b^k` is never constant on a range of size > 1 (`mod_pow_not_constant`)
+- **END-1** `Nice.niceonly_complete`: the modelled niceonly pipeline (masked subdivision × stride walk × one-AND × nice check) reports every nice n of the range (`niceonly_complete`, for b ≥ 6, k ≤ 3) and only nice n of the range (`niceonly_sound`)
 <!-- status:end -->
