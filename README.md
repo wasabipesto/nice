@@ -241,3 +241,7 @@ The `gpu` umbrella feature needs nothing installed to build on any platform, sin
 ## Why are you writing this from scratch for like the tenth time
 
 It's the sixth time. And no comment.
+
+## Proofs
+
+`proofs/` is a Lean 4 project that states and proves the mathematics the search relies on: the definition of a nice number, the search interval per base, the numeric cutoffs, and the soundness of every filter in the niceonly cascade up to the end-to-end theorem `niceonly_complete`. `proofs/DESIGN.md` has the plan, `proofs/CLAIMS.md` maps each claim to its Lean declaration and Rust site, and `Lean:` tags in the Rust doc comments point back. `just lean-build`, `just lean-conformance` (the Lean model against Rust-emitted fixtures) and `just lean-claims` (the registry checker) are what CI runs; a change to the filter cascade must keep `niceonly_complete` proving.

@@ -96,6 +96,8 @@ const WORKER_BATCH_RANGES: usize = 4096;
 /// thousands of chunks' worth of device work.
 const WORKER_BATCH_CHUNKS: usize = 256;
 
+/// Lean: `Nice.analyzeRange_mono` (MSD-9), `Nice.fixedDigits_sub` (CRS-2)
+///
 /// Log2 of the number of chunks one MSD work unit (a *block*) spans.
 ///
 /// The MSD recursion used to start at [`PROCESSING_CHUNK_SIZE`], so a 1e13
