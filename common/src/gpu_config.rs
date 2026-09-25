@@ -174,6 +174,43 @@ pub fn prefilter_params(base: u32) -> Option<PrefilterParams> {
     })
 }
 
+/// Parameters for the niceonly kernels' affine middle-digit filter
+/// (see [`crate::affine_filter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AffineParams {
+    /// `base^k`, the stride suffix modulus (k is the stride depth, 3).
+    pub bk: u32,
+    /// `base^{2k}`: candidates are reduced to this before the affine maps.
+    pub b2k: u64,
+    /// `2^64 mod b2k`, for reducing a (hi, lo) u128 on the device.
+    pub pow64_mod: u64,
+}
+
+/// Compute the affine filter's parameters for a base, or `None` when the
+/// filter must stay disabled.
+///
+/// The filter tests output positions `k..2k-1` of `n²` and `n³`, so both
+/// powers must be guaranteed at least `2k` digits everywhere in the range
+/// (see [`guaranteed_low_digits`]), and the digit masks it compares against
+/// are one u64 word, so the base must be at most 64. It rides on the
+/// cross-end filter's masks, which exist under the same base bound.
+#[must_use]
+pub fn affine_params(base: u32, k: u32) -> Option<AffineParams> {
+    if k != 3 || base > 64 || guaranteed_low_digits(base)? < 2 * k {
+        return None;
+    }
+    let bk = u64::from(base).pow(k);
+    let b2k = bk * bk;
+    #[allow(clippy::cast_possible_truncation)]
+    let pow64_mod = ((1u128 << 64) % u128::from(b2k)) as u64;
+    Some(AffineParams {
+        #[allow(clippy::cast_possible_truncation)]
+        bk: bk as u32,
+        b2k,
+        pow64_mod,
+    })
+}
+
 /// Parameters for the Vulkan niceonly shader's low-digit prefilter.
 ///
 /// Same idea as [`PrefilterParams`], different number representation. CUDA
@@ -252,6 +289,20 @@ pub fn vulkan_prefilter_params(base: u32) -> Option<VulkanPrefilterParams> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affine_params_gate_and_constants() {
+        // Too few guaranteed digits at tiny bases; masks overflow past 64.
+        assert!(affine_params(10, 3).is_none());
+        assert!(affine_params(65, 3).is_none());
+        assert!(affine_params(40, 2).is_none());
+        for base in [40u32, 45, 52, 57, 62, 64] {
+            let p = affine_params(base, 3).unwrap();
+            assert_eq!(u64::from(p.bk), u64::from(base).pow(3));
+            assert_eq!(p.b2k, u64::from(base).pow(6));
+            assert_eq!(u128::from(p.pow64_mod), (1u128 << 64) % u128::from(p.b2k));
+        }
+    }
 
     #[test]
     fn chunk_constants_are_maximal() {
