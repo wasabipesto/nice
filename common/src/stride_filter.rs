@@ -260,6 +260,8 @@ impl StrideTable {
     /// runs on exactly the candidates that pass the cross-end test and, with
     /// `use_affine`, the affine filter. Production passes the seeded nice
     /// check; tests pass a recorder to see which candidates got through.
+    /// With the affine filter on (specialized bases) this is the two-phase
+    /// walk; everything else takes the plain loop below.
     #[inline]
     fn walk_masked(
         &self,
@@ -269,6 +271,10 @@ impl StrideTable {
         use_affine: bool,
         mut check: impl FnMut(u128, u64) -> bool,
     ) -> Vec<NiceNumberSimple> {
+        if use_affine && !self.low_digit_masks.is_empty() && range.size() < (1u128 << 62) {
+            return self.walk_two_phase(range, base, high_mask, check);
+        }
+
         let mut results = Vec::new();
         let (mut n, mut idx) = self.first_valid_at_or_after(range.start());
 
@@ -279,27 +285,12 @@ impl StrideTable {
         // always 0 — the analysis never emits mask bits there.)
         let masks = &self.low_digit_masks;
 
-        // `n mod b^{2k}`, tracked incrementally for the affine filter only:
-        // the modulus fits u64 whenever the filter is supported (b ≤ 64,
-        // k = 3), and every gap is at most the stride modulus
-        // `(b-1)·b^k < b^{2k}`, so one conditional subtraction keeps it
-        // reduced. Without the filter it is neither needed nor updated.
-        let b2k: u64 = if use_affine {
-            u64::from(base).pow(2 * self.k)
-        } else {
-            1
-        };
-        #[allow(clippy::cast_possible_truncation)]
-        let mut nmod = (n % u128::from(b2k)) as u64;
-
         while n < range.end() {
             let is_nice = if masks.is_empty() {
                 crate::client_process::get_is_nice(n, base)
             } else {
                 let low = masks[idx];
-                let rejected = low & high_mask != 0
-                    || (use_affine && !affine_filter::survives(base, nmod, low | high_mask));
-                !rejected && check(n, low)
+                low & high_mask == 0 && check(n, low)
             };
             if is_nice {
                 results.push(NiceNumberSimple {
@@ -307,14 +298,7 @@ impl StrideTable {
                     num_uniques: base,
                 });
             }
-            let gap = self.gap_table[idx];
-            n += u128::from(gap);
-            if use_affine {
-                nmod += u64::from(gap);
-                if nmod >= b2k {
-                    nmod -= b2k;
-                }
-            }
+            n += u128::from(self.gap_table[idx]);
             idx += 1;
             if idx == self.gap_table.len() {
                 idx = 0;
@@ -323,6 +307,490 @@ impl StrideTable {
 
         results
     }
+
+    /// Two-phase walk for specialized bases.
+    ///
+    /// Phase 1 streams the gap and low-mask tables in blocks, keeping each
+    /// candidate's offset from the range start, `n mod b^{2k}` (for the
+    /// affine filter; every gap is at most `(b-1)·b^k < b^{2k}`, so one
+    /// conditional subtraction keeps it reduced) and low mask, and compacts
+    /// the cross-end survivors (`low & high_mask == 0`) into small buffers
+    /// with no data-dependent branch: 8 candidates per step under AVX-512, 4
+    /// under AVX2, or an unconditional-store/conditional-increment scalar
+    /// loop elsewhere. Phase 2 runs the affine filter and `check` on the
+    /// survivors only. Same candidates, same checks, same results as the
+    /// plain loop plus the affine filter.
+    fn walk_two_phase(
+        &self,
+        range: &FieldSize,
+        base: u32,
+        high_mask: u64,
+        mut check: impl FnMut(u128, u64) -> bool,
+    ) -> Vec<NiceNumberSimple> {
+        let k = self.k;
+        let bk = u64::from(base).pow(k);
+        let b2k = bk * bk;
+        let start = range.start();
+        let (n0, mut idx) = self.first_valid_at_or_after(start);
+        // `range.size() < 2^62` and `n0 < start + M`, so offsets fit u64.
+        #[allow(clippy::cast_possible_truncation)]
+        let end_off = (range.end() - start) as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let mut off = (n0 - start) as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let mut nmod = (n0 % u128::from(b2k)) as u64;
+
+        let mut results = Vec::new();
+        SURVIVOR_BUFS.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let bufs: &mut SurvivorBufs = &mut guard;
+            while off < end_off {
+                let cursor = Cursor { idx, off, nmod };
+                let (cnt, next) = phase1(
+                    &self.gap_table,
+                    &self.low_digit_masks,
+                    cursor,
+                    end_off,
+                    b2k,
+                    high_mask,
+                    bufs,
+                );
+                for i in 0..cnt {
+                    let low = bufs.lows[i];
+                    if affine_filter::survives(base, bufs.nmods[i], low | high_mask) {
+                        let n = start + u128::from(bufs.offs[i]);
+                        if check(n, low) {
+                            results.push(NiceNumberSimple {
+                                number: n,
+                                num_uniques: base,
+                            });
+                        }
+                    }
+                }
+                idx = next.idx;
+                off = next.off;
+                nmod = next.nmod;
+            }
+        });
+        results
+    }
+
+    /// Cross-end survivors a masked walk of `range` hands to phase 2, for
+    /// tests comparing the block-wise phase 1 against a plain count.
+    #[cfg(test)]
+    #[allow(clippy::cast_possible_truncation)]
+    fn two_phase_survivor_count(&self, range: &FieldSize, base: u32, high_mask: u64) -> usize {
+        let bk = u64::from(base).pow(self.k);
+        let b2k = bk * bk;
+        let start = range.start();
+        let (n0, idx) = self.first_valid_at_or_after(start);
+        let end_off = (range.end() - start) as u64;
+        let mut cursor = Cursor {
+            idx,
+            off: (n0 - start) as u64,
+            nmod: (n0 % u128::from(b2k)) as u64,
+        };
+        let mut bufs = SurvivorBufs::new();
+        let mut total = 0;
+        while cursor.off < end_off {
+            let (cnt, next) = phase1(
+                &self.gap_table,
+                &self.low_digit_masks,
+                cursor,
+                end_off,
+                b2k,
+                high_mask,
+                &mut bufs,
+            );
+            total += cnt;
+            cursor = next;
+        }
+        total
+    }
+}
+
+/// Candidates per phase-1 block; bounds the survivor buffers.
+const BLOCK: usize = 1024;
+
+/// Phase-1 output: survivors' offsets from the range start, `n mod b^{2k}`
+/// and low masks, structure-of-arrays. Sized for a full block plus the
+/// unmasked 8-lane store past the last survivor.
+struct SurvivorBufs {
+    offs: [u64; BLOCK + 16],
+    nmods: [u64; BLOCK + 16],
+    lows: [u64; BLOCK + 16],
+}
+
+impl SurvivorBufs {
+    fn new() -> Self {
+        Self {
+            offs: [0; BLOCK + 16],
+            nmods: [0; BLOCK + 16],
+            lows: [0; BLOCK + 16],
+        }
+    }
+}
+
+thread_local! {
+    /// The buffers, once per thread: they are 25 KB, and a leaf at the MSD
+    /// floor holds a few hundred candidates, so zeroing a fresh set per leaf
+    /// would cost as much as walking it.
+    static SURVIVOR_BUFS: std::cell::RefCell<Box<SurvivorBufs>> =
+        std::cell::RefCell::new(Box::new(SurvivorBufs::new()));
+}
+
+/// Position in the walk: residue index, offset from the range start, and
+/// `n mod b^{2k}` at that candidate.
+#[derive(Clone, Copy)]
+struct Cursor {
+    idx: usize,
+    off: u64,
+    nmod: u64,
+}
+
+/// Phase-1 implementation selected for this process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase1Impl {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
+}
+
+/// The best implementation this CPU supports, detected once. `NICE_SIMD`
+/// caps it for A/B testing: `0` forces the scalar loop, `avx2` the AVX2
+/// one; anything else (or unset) takes the best available.
+fn phase1_impl() -> Phase1Impl {
+    static IMPL: std::sync::OnceLock<Phase1Impl> = std::sync::OnceLock::new();
+    *IMPL.get_or_init(|| {
+        let cap = std::env::var("NICE_SIMD").unwrap_or_default();
+        if cap == "0" {
+            return Phase1Impl::Scalar;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if cap != "avx2" && std::arch::is_x86_feature_detected!("avx512f") {
+                return Phase1Impl::Avx512;
+            }
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return Phase1Impl::Avx2;
+            }
+        }
+        Phase1Impl::Scalar
+    })
+}
+
+/// Run phase 1 over at most one block of candidates from `cursor`, writing
+/// survivors to `bufs`. Returns the survivor count and the cursor to resume
+/// from (`off >= end_off` when the range is exhausted).
+#[inline]
+fn phase1(
+    gaps: &[u32],
+    masks: &[u64],
+    cursor: Cursor,
+    end_off: u64,
+    b2k: u64,
+    high_mask: u64,
+    bufs: &mut SurvivorBufs,
+) -> (usize, Cursor) {
+    match phase1_impl() {
+        Phase1Impl::Scalar => {
+            phase1_scalar(gaps, masks, cursor, end_off, b2k, high_mask, bufs, 0, BLOCK)
+        }
+        // SAFETY: the features were detected on this CPU.
+        #[cfg(target_arch = "x86_64")]
+        Phase1Impl::Avx2 => unsafe {
+            phase1_avx2(gaps, masks, cursor, end_off, b2k, high_mask, bufs)
+        },
+        #[cfg(target_arch = "x86_64")]
+        Phase1Impl::Avx512 => unsafe {
+            phase1_avx512(gaps, masks, cursor, end_off, b2k, high_mask, bufs)
+        },
+    }
+}
+
+/// Scalar phase 1: unconditional store, conditional increment. Writes
+/// survivors from buffer index `cnt` on, walks at most `max_candidates`
+/// candidates, and returns the new survivor count.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn phase1_scalar(
+    gaps: &[u32],
+    masks: &[u64],
+    mut cur: Cursor,
+    end_off: u64,
+    b2k: u64,
+    high_mask: u64,
+    bufs: &mut SurvivorBufs,
+    mut cnt: usize,
+    max_candidates: usize,
+) -> (usize, Cursor) {
+    let glen = gaps.len();
+    let mut seen = 0usize;
+    while cur.off < end_off && seen < max_candidates {
+        let low = masks[cur.idx];
+        bufs.offs[cnt] = cur.off;
+        bufs.nmods[cnt] = cur.nmod;
+        bufs.lows[cnt] = low;
+        cnt += usize::from(low & high_mask == 0);
+        let gap = u64::from(gaps[cur.idx]);
+        cur.off += gap;
+        cur.nmod += gap;
+        if cur.nmod >= b2k {
+            cur.nmod -= b2k;
+        }
+        cur.idx += 1;
+        if cur.idx == glen {
+            cur.idx = 0;
+        }
+        seen += 1;
+    }
+    (cnt, cur)
+}
+
+/// Lane-compaction table for the AVX2 path: for each 4-bit keep mask, the
+/// `vpermd` index vector that moves the kept 64-bit lanes (as i32 pairs) to
+/// the front.
+#[cfg(target_arch = "x86_64")]
+static AVX2_COMPRESS: [[i32; 8]; 16] = {
+    let mut table = [[0i32; 8]; 16];
+    let mut mask = 0usize;
+    while mask < 16 {
+        let mut dst = 0usize;
+        let mut lane = 0i32;
+        while lane < 4 {
+            if mask >> lane & 1 == 1 {
+                table[mask][2 * dst] = 2 * lane;
+                table[mask][2 * dst + 1] = 2 * lane + 1;
+                dst += 1;
+            }
+            lane += 1;
+        }
+        mask += 1;
+    }
+    table
+};
+
+/// AVX2 phase 1: four candidates per step, the same scheme as the AVX-512
+/// routine with `vpermq` for the lane shifts, signed 64-bit compares (every
+/// operand is far below 2^63) and a table-driven `vpermd` for the
+/// compaction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_ptr_alignment, // the loads are the unaligned forms
+    clippy::too_many_lines
+)]
+unsafe fn phase1_avx2(
+    gaps: &[u32],
+    masks: &[u64],
+    mut cur: Cursor,
+    end_off: u64,
+    b2k: u64,
+    high_mask: u64,
+    bufs: &mut SurvivorBufs,
+) -> (usize, Cursor) {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_loadu_si128, _mm256_add_epi64, _mm256_and_si256, _mm256_castsi256_pd,
+        _mm256_cmpeq_epi64, _mm256_cmpgt_epi64, _mm256_cvtepu32_epi64, _mm256_extract_epi64,
+        _mm256_loadu_si256, _mm256_movemask_pd, _mm256_permute4x64_epi64,
+        _mm256_permutevar8x32_epi32, _mm256_set_epi64x, _mm256_set1_epi64x, _mm256_setzero_si256,
+        _mm256_storeu_si256, _mm256_sub_epi64,
+    };
+    let glen = gaps.len();
+    let mut cnt = 0usize;
+    let mut seen = 0usize;
+    let vhi = _mm256_set1_epi64x(high_mask as i64);
+    let vb2k = _mm256_set1_epi64x(b2k as i64);
+    let vb2k_m1 = _mm256_set1_epi64x(b2k as i64 - 1);
+    let vend = _mm256_set1_epi64x(end_off as i64);
+    let zero = _mm256_setzero_si256();
+    // Keep lanes 1..3 / 2..3 after a lane shift (set_epi64x lists lane 3 first).
+    let keep_upper3 = _mm256_set_epi64x(-1, -1, -1, 0);
+    let keep_upper2 = _mm256_set_epi64x(-1, -1, 0, 0);
+    while cur.off < end_off && seen < BLOCK {
+        if cur.idx + 4 > glen {
+            // Tail of the residue table before the wrap: scalar.
+            let n = glen - cur.idx;
+            let (c, next) = phase1_scalar(gaps, masks, cur, end_off, b2k, high_mask, bufs, cnt, n);
+            cnt = c;
+            cur = next;
+            seen += n;
+            continue;
+        }
+        // SAFETY: cur.idx + 4 <= glen == masks.len(); loads stay in bounds.
+        let (g32, vlow) = unsafe {
+            (
+                _mm_loadu_si128(gaps.as_ptr().add(cur.idx).cast::<__m128i>()),
+                _mm256_loadu_si256(masks.as_ptr().add(cur.idx).cast::<__m256i>()),
+            )
+        };
+        let mut g = _mm256_cvtepu32_epi64(g32);
+        // Inclusive prefix sum: lanes [a, b, c, d] -> [a, a+b, a+b+c, a+b+c+d].
+        // permute4x64 imm 0b10_01_00_00 = lanes (0, 0, 1, 2).
+        g = _mm256_add_epi64(
+            g,
+            _mm256_and_si256(_mm256_permute4x64_epi64::<0b10_01_00_00>(g), keep_upper3),
+        );
+        // imm 0b01_00_00_00 = lanes (0, 0, 0, 1).
+        g = _mm256_add_epi64(
+            g,
+            _mm256_and_si256(_mm256_permute4x64_epi64::<0b01_00_00_00>(g), keep_upper2),
+        );
+        // Exclusive prefix: lane i holds the sum of gaps before candidate i.
+        let ex = _mm256_and_si256(_mm256_permute4x64_epi64::<0b10_01_00_00>(g), keep_upper3);
+        let voff = _mm256_add_epi64(_mm256_set1_epi64x(cur.off as i64), ex);
+        let mut vnmod = _mm256_add_epi64(_mm256_set1_epi64x(cur.nmod as i64), ex);
+        let ge = _mm256_cmpgt_epi64(vnmod, vb2k_m1);
+        vnmod = _mm256_sub_epi64(vnmod, _mm256_and_si256(ge, vb2k));
+        let in_range = _mm256_cmpgt_epi64(vend, voff);
+        let pass = _mm256_cmpeq_epi64(_mm256_and_si256(vlow, vhi), zero);
+        let keep = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_and_si256(in_range, pass)));
+        // SAFETY: the table has 16 rows and `keep` is a 4-bit mask; cnt <=
+        // seen <= BLOCK + 3 and the buffers hold BLOCK + 16, so the four-lane
+        // stores at `cnt` stay in bounds.
+        unsafe {
+            let perm =
+                _mm256_loadu_si256(AVX2_COMPRESS.as_ptr().add(keep as usize).cast::<__m256i>());
+            _mm256_storeu_si256(
+                bufs.offs.as_mut_ptr().add(cnt).cast::<__m256i>(),
+                _mm256_permutevar8x32_epi32(voff, perm),
+            );
+            _mm256_storeu_si256(
+                bufs.nmods.as_mut_ptr().add(cnt).cast::<__m256i>(),
+                _mm256_permutevar8x32_epi32(vnmod, perm),
+            );
+            _mm256_storeu_si256(
+                bufs.lows.as_mut_ptr().add(cnt).cast::<__m256i>(),
+                _mm256_permutevar8x32_epi32(vlow, perm),
+            );
+        }
+        cnt += keep.count_ones() as usize;
+        // Block total = last lane of the inclusive prefix.
+        let total = _mm256_extract_epi64::<3>(g) as u64;
+        cur.off += total;
+        cur.nmod += total;
+        if cur.nmod >= b2k {
+            cur.nmod -= b2k;
+        }
+        cur.idx += 4;
+        if cur.idx == glen {
+            cur.idx = 0;
+        }
+        seen += 4;
+    }
+    (cnt, cur)
+}
+
+/// AVX-512 phase 1: eight candidates per step. The eight gaps are
+/// prefix-summed in-register to give each lane its offset and its
+/// `n mod b^{2k}`, the eight low masks are tested against the certificate, and the
+/// surviving lanes are compressed (in register — the memory form of the
+/// compress store is microcoded and slow) and stored unmasked at the
+/// buffer cursor, which advances by the survivor count. The residue table's
+/// last few entries before the wrap are walked by the scalar loop.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_ptr_alignment, // the loads are the unaligned forms
+    clippy::too_many_lines
+)]
+unsafe fn phase1_avx512(
+    gaps: &[u32],
+    masks: &[u64],
+    mut cur: Cursor,
+    end_off: u64,
+    b2k: u64,
+    high_mask: u64,
+    bufs: &mut SurvivorBufs,
+) -> (usize, Cursor) {
+    use std::arch::x86_64::{
+        __m256i, __m512i, _mm256_extract_epi64, _mm256_loadu_si256, _mm512_add_epi64,
+        _mm512_and_si512, _mm512_cmpeq_epi64_mask, _mm512_cmpge_epu64_mask,
+        _mm512_cmplt_epu64_mask, _mm512_cvtepu32_epi64, _mm512_extracti64x4_epi64,
+        _mm512_loadu_si512, _mm512_mask_sub_epi64, _mm512_maskz_compress_epi64,
+        _mm512_maskz_permutexvar_epi64, _mm512_set_epi64, _mm512_set1_epi64, _mm512_setzero_si512,
+        _mm512_storeu_si512,
+    };
+    let glen = gaps.len();
+    let mut cnt = 0usize;
+    let mut seen = 0usize;
+    let vhi = _mm512_set1_epi64(high_mask as i64);
+    let vb2k = _mm512_set1_epi64(b2k as i64);
+    let vend = _mm512_set1_epi64(end_off as i64);
+    let zero = _mm512_setzero_si512();
+    // Lane shifts for the in-register inclusive prefix sum.
+    let sh1 = _mm512_set_epi64(6, 5, 4, 3, 2, 1, 0, 0);
+    let sh2 = _mm512_set_epi64(5, 4, 3, 2, 1, 0, 0, 0);
+    let sh4 = _mm512_set_epi64(3, 2, 1, 0, 0, 0, 0, 0);
+    while cur.off < end_off && seen < BLOCK {
+        if cur.idx + 8 > glen {
+            // Tail of the residue table before the wrap: scalar.
+            let n = glen - cur.idx;
+            let (c, next) = phase1_scalar(gaps, masks, cur, end_off, b2k, high_mask, bufs, cnt, n);
+            cnt = c;
+            cur = next;
+            seen += n;
+            continue;
+        }
+        // SAFETY: cur.idx + 8 <= glen == masks.len(); loads stay in bounds.
+        let (g32, vlow) = unsafe {
+            (
+                _mm256_loadu_si256(gaps.as_ptr().add(cur.idx).cast::<__m256i>()),
+                _mm512_loadu_si512(masks.as_ptr().add(cur.idx).cast::<__m512i>()),
+            )
+        };
+        let mut g = _mm512_cvtepu32_epi64(g32);
+        g = _mm512_add_epi64(g, _mm512_maskz_permutexvar_epi64(0b1111_1110, sh1, g));
+        g = _mm512_add_epi64(g, _mm512_maskz_permutexvar_epi64(0b1111_1100, sh2, g));
+        g = _mm512_add_epi64(g, _mm512_maskz_permutexvar_epi64(0b1111_0000, sh4, g));
+        // Exclusive prefix: lane i holds the sum of gaps before candidate i.
+        let ex = _mm512_maskz_permutexvar_epi64(0b1111_1110, sh1, g);
+        let voff = _mm512_add_epi64(_mm512_set1_epi64(cur.off as i64), ex);
+        let mut vnmod = _mm512_add_epi64(_mm512_set1_epi64(cur.nmod as i64), ex);
+        let ge = _mm512_cmpge_epu64_mask(vnmod, vb2k);
+        vnmod = _mm512_mask_sub_epi64(vnmod, ge, vnmod, vb2k);
+        let in_range = _mm512_cmplt_epu64_mask(voff, vend);
+        let pass = _mm512_cmpeq_epi64_mask(_mm512_and_si512(vlow, vhi), zero);
+        let keep = in_range & pass;
+        // SAFETY: cnt <= seen <= BLOCK + 7 and the buffers hold BLOCK + 16,
+        // so the eight-lane stores at `cnt` stay in bounds.
+        unsafe {
+            _mm512_storeu_si512(
+                bufs.offs.as_mut_ptr().add(cnt).cast::<__m512i>(),
+                _mm512_maskz_compress_epi64(keep, voff),
+            );
+            _mm512_storeu_si512(
+                bufs.nmods.as_mut_ptr().add(cnt).cast::<__m512i>(),
+                _mm512_maskz_compress_epi64(keep, vnmod),
+            );
+            _mm512_storeu_si512(
+                bufs.lows.as_mut_ptr().add(cnt).cast::<__m512i>(),
+                _mm512_maskz_compress_epi64(keep, vlow),
+            );
+        }
+        cnt += keep.count_ones() as usize;
+        // Block total = last lane of the inclusive prefix.
+        let total = _mm256_extract_epi64::<3>(_mm512_extracti64x4_epi64::<1>(g)) as u64;
+        cur.off += total;
+        cur.nmod += total;
+        if cur.nmod >= b2k {
+            cur.nmod -= b2k;
+        }
+        cur.idx += 8;
+        if cur.idx == glen {
+            cur.idx = 0;
+        }
+        seen += 8;
+    }
+    (cnt, cur)
 }
 
 #[cfg(test)]
@@ -330,6 +798,7 @@ mod tests {
     use super::*;
     use crate::base_range::get_base_range_u128;
     use crate::client_process::get_is_nice;
+    use crate::msd_prefix_filter::get_valid_ranges_masked;
 
     /// Base-`base` digits of `n²` and `n³`, least significant first.
     fn power_digits(n: u128, base: u32) -> (Vec<u32>, Vec<u32>) {
@@ -512,6 +981,115 @@ mod tests {
         let range = FieldSize::new(60, 80);
         let results = table.iterate_range(&range, 10);
         assert!(results.iter().any(|r| r.number == 69));
+    }
+
+    /// Phase 1 must hand phase 2 exactly the cross-end survivors a plain
+    /// walk finds — in count and content, through both the scalar and (where
+    /// the CPU has it) the AVX-512 implementation, on production windows of
+    /// every specialized base, including the residue table's wrap.
+    type Phase1Fn = fn(&[u32], &[u64], Cursor, u64, u64, u64, &mut SurvivorBufs) -> (usize, Cursor);
+
+    #[test_log::test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn two_phase_walk_matches_plain_walk() {
+        for base in [40u32, 42, 45, 50, 52, 53, 57, 60, 62, 64] {
+            let table = StrideTable::new(base, 3);
+            let range = get_base_range_u128(base).unwrap().unwrap();
+            // The MSD filter rejects some windows outright; take the first
+            // of a few evenly spaced ones that leaves work for the walk.
+            let leaves = (1..200)
+                .map(|step| {
+                    let start = range.start() + range.size() / 200 * step;
+                    get_valid_ranges_masked(FieldSize::new(start, start + 3_000_000), base, 3)
+                })
+                .find(|leaves| !leaves.is_empty())
+                .unwrap_or_else(|| panic!("b{base}: every probed window fully rejected"));
+            let bk = u64::from(base).pow(3);
+            let b2k = bk * bk;
+            let mut checked = 0usize;
+            for (leaf, hi) in leaves {
+                // Plain survivor list.
+                let mut want: Vec<(u64, u64, u64)> = Vec::new();
+                let (mut n, mut idx) = table.first_valid_at_or_after(leaf.start());
+                while n < leaf.end() {
+                    let low = table.low_digit_masks[idx];
+                    if low & hi == 0 {
+                        want.push(((n - leaf.start()) as u64, (n % u128::from(b2k)) as u64, low));
+                    }
+                    n += u128::from(table.gap_table[idx]);
+                    idx = (idx + 1) % table.gap_table.len();
+                }
+                // Block-wise phase 1 through every implementation this CPU
+                // can run, the dispatched one included.
+                let (n0, idx0) = table.first_valid_at_or_after(leaf.start());
+                let end_off = (leaf.end() - leaf.start()) as u64;
+                let start_cursor = Cursor {
+                    idx: idx0,
+                    off: (n0 - leaf.start()) as u64,
+                    nmod: (n0 % u128::from(b2k)) as u64,
+                };
+                let mut bufs = SurvivorBufs::new();
+                let mut impls: Vec<(&str, Phase1Fn)> = vec![("dispatch", phase1)];
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if std::arch::is_x86_feature_detected!("avx2") {
+                        impls.push(("avx2", |g, m, c, e, b, h, bufs| unsafe {
+                            phase1_avx2(g, m, c, e, b, h, bufs)
+                        }));
+                    }
+                    if std::arch::is_x86_feature_detected!("avx512f") {
+                        impls.push(("avx512", |g, m, c, e, b, h, bufs| unsafe {
+                            phase1_avx512(g, m, c, e, b, h, bufs)
+                        }));
+                    }
+                }
+                for (name, imp) in &impls {
+                    let mut cur = start_cursor;
+                    let mut got: Vec<(u64, u64, u64)> = Vec::new();
+                    while cur.off < end_off {
+                        let (cnt, next) = imp(
+                            &table.gap_table,
+                            &table.low_digit_masks,
+                            cur,
+                            end_off,
+                            b2k,
+                            hi,
+                            &mut bufs,
+                        );
+                        for i in 0..cnt {
+                            got.push((bufs.offs[i], bufs.nmods[i], bufs.lows[i]));
+                        }
+                        cur = next;
+                    }
+                    assert_eq!(got, want, "b{base} leaf {leaf:?} ({name})");
+                }
+                let mut cur = start_cursor;
+                // And the scalar implementation on its own, in small blocks so
+                // block boundaries and the wrap are both exercised.
+                let mut got_scalar: Vec<(u64, u64, u64)> = Vec::new();
+                while cur.off < end_off {
+                    let (cnt, next) = phase1_scalar(
+                        &table.gap_table,
+                        &table.low_digit_masks,
+                        cur,
+                        end_off,
+                        b2k,
+                        hi,
+                        &mut bufs,
+                        0,
+                        13,
+                    );
+                    for i in 0..cnt {
+                        got_scalar.push((bufs.offs[i], bufs.nmods[i], bufs.lows[i]));
+                    }
+                    cur = next;
+                }
+                assert_eq!(got_scalar, want, "b{base} leaf {leaf:?} (scalar)");
+                assert_eq!(table.two_phase_survivor_count(&leaf, base, hi), want.len());
+                checked += want.len();
+            }
+            assert!(checked > 100, "b{base}: too few survivors exercised");
+        }
     }
 
     #[test_log::test]
