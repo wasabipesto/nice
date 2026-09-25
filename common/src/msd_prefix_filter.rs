@@ -58,44 +58,137 @@ impl FwDigits {
     }
 }
 
+/// Digits peeled per wide division in the chunked extraction: the largest
+/// `e` with `base^e < 2^32`, so a chunk fits a `u32` and its digits come
+/// out of cheap 32-bit constant divisions.
+const fn chunk_digits(base: u32) -> u32 {
+    let mut e = 0;
+    let mut div: u64 = 1;
+    while div * (base as u64) < (1u64 << 32) {
+        div *= base as u64;
+        e += 1;
+    }
+    e
+}
+
+/// `base^chunk_digits(base)`.
+#[allow(clippy::cast_possible_truncation)]
+const fn chunk_div(base: u32) -> u32 {
+    (base as u64).pow(chunk_digits(base)) as u32
+}
+
+/// Unpack a `u32` chunk holding exactly `count` base-`BASE` digits (zero
+/// padded) into `buf`, LSD first.
+#[inline(always)]
+fn push_chunk_digits<const BASE: u32>(mut chunk: u32, count: usize, buf: &mut FwDigits) {
+    for _ in 0..count {
+        debug_assert!(buf.len < MAX_FW_DIGITS);
+        buf.buf[buf.len] = chunk % BASE;
+        chunk /= BASE;
+        buf.len += 1;
+    }
+}
+
+/// Unpack the most significant chunk: its digits up to the leading one.
+#[inline(always)]
+fn push_top_chunk_digits<const BASE: u32>(mut chunk: u32, buf: &mut FwDigits) {
+    while chunk != 0 {
+        debug_assert!(buf.len < MAX_FW_DIGITS);
+        buf.buf[buf.len] = chunk % BASE;
+        chunk /= BASE;
+        buf.len += 1;
+    }
+}
+
 /// Extract base-`BASE` digits of `n` (LSD first) into a stack array.
-/// Used by the const-generic fixed-width MSD path. With `BASE` known at
-/// compile time, `% BASE` and `/ BASE` lower to multiply-by-magic.
-// `(n % base_u128) as u32` is bounded by `BASE - 1 < 2^32`. Hot path:
+/// Used by the const-generic fixed-width MSD path.
+///
+/// Chunked: each wide division peels `chunk_digits(BASE)` digits at once
+/// (dividing by `BASE^e < 2^32`, a compile-time constant that lowers to
+/// multiply-by-magic), and the chunk's digits are then split with 32-bit
+/// constant divisions. An endpoint's 16-38 digits cost 3-8 wide divisions
+/// instead of one per digit — measured 3.5-5x cheaper on bases 40-60, and
+/// endpoint extraction was ~80% of every MSD node's cost.
+// `(n % CD) as u32` is bounded by `CD - 1 < 2^32`. Hot path:
 // `inline(always)` matches the convention in `fixed_width.rs`.
 #[allow(clippy::cast_possible_truncation)]
 #[inline(always)]
 fn extract_digits_u128_const<const BASE: u32>(mut n: u128) -> FwDigits {
-    let base_u128 = u128::from(BASE);
-    let mut buf = [0u32; MAX_FW_DIGITS];
-    let mut len = 0;
+    let cd = u128::from(const { chunk_div(BASE) });
+    let e = const { chunk_digits(BASE) } as usize;
+    let mut out = FwDigits {
+        buf: [0u32; MAX_FW_DIGITS],
+        len: 0,
+    };
     if n == 0 {
-        return FwDigits { buf, len: 1 };
+        out.len = 1;
+        return out;
     }
     while n != 0 {
-        debug_assert!(len < MAX_FW_DIGITS);
-        buf[len] = (n % base_u128) as u32;
-        n /= base_u128;
-        len += 1;
+        let chunk = (n % cd) as u32;
+        n /= cd;
+        if n == 0 {
+            push_top_chunk_digits::<BASE>(chunk, &mut out);
+        } else {
+            push_chunk_digits::<BASE>(chunk, e, &mut out);
+        }
     }
-    FwDigits { buf, len }
+    out
 }
 
-/// Extract base-`BASE` digits of a U256 (LSD first) into a stack array.
-/// `div_assign_rem_u32_const` mutates the input limbs; we work on a copy.
+/// Extract base-`BASE` digits of a U256 (LSD first) into a stack array;
+/// chunked exactly like [`extract_digits_u128_const`]. The divisor is a
+/// compile-time constant, so the inlined limb division strength-reduces.
 #[inline(always)]
 fn extract_digits_u256_const<const BASE: u32>(mut n: U256) -> FwDigits {
-    let mut buf = [0u32; MAX_FW_DIGITS];
-    let mut len = 0;
+    let cd = const { chunk_div(BASE) };
+    let e = const { chunk_digits(BASE) } as usize;
+    let mut out = FwDigits {
+        buf: [0u32; MAX_FW_DIGITS],
+        len: 0,
+    };
     if n.is_zero() {
-        return FwDigits { buf, len: 1 };
+        out.len = 1;
+        return out;
     }
     while !n.is_zero() {
-        debug_assert!(len < MAX_FW_DIGITS);
-        buf[len] = n.div_assign_rem_u32_const::<BASE>();
-        len += 1;
+        let chunk = n.div_assign_rem_u32(cd);
+        if n.is_zero() {
+            push_top_chunk_digits::<BASE>(chunk, &mut out);
+        } else {
+            push_chunk_digits::<BASE>(chunk, e, &mut out);
+        }
     }
-    FwDigits { buf, len }
+    out
+}
+
+/// Both powers' digit arrays for one endpoint `n` of a range.
+#[derive(Copy, Clone)]
+struct Endpoint {
+    sq: FwDigits,
+    cu: FwDigits,
+}
+
+/// Compute an endpoint's digit arrays. `b40` fits `n³` in `u128`
+/// (`(40^8 - 1)³ < 40^24 ≈ 1.76e38 < u128::MAX`); every other specialized
+/// base needs U256. Chosen at compile time from `BASE`.
+#[inline(always)]
+fn endpoint_const<const BASE: u32>(n: u128) -> Endpoint {
+    if const { BASE <= 40 } {
+        let sq = n * n;
+        let cu = sq * n;
+        Endpoint {
+            sq: extract_digits_u128_const::<BASE>(sq),
+            cu: extract_digits_u128_const::<BASE>(cu),
+        }
+    } else {
+        let sq = U256::mul_u128_u128(n, n);
+        let cu = sq.mul_u128_truncating(n);
+        Endpoint {
+            sq: extract_digits_u256_const::<BASE>(sq),
+            cu: extract_digits_u256_const::<BASE>(cu),
+        }
+    }
 }
 
 /// Maximum number of constrained output positions the Hall check tracks:
@@ -189,6 +282,57 @@ fn hall_augment(i: usize, doms: &[u64], visited: &mut u64, owner: &mut [usize; 6
     false
 }
 
+/// [`has_distinct_assignment`] with singleton closure first.
+///
+/// Most constrained positions are singletons (the classic common-prefix
+/// digits). Those must be pairwise distinct, and a wider domain can never
+/// use a singleton's digit; removing singleton digits from the wider
+/// domains can leave one of them a singleton too, which then joins the set
+/// (repeat to closure). Only the domains still wider than one digit need
+/// the matching, and they are few. Same verdict as running Kuhn on the full
+/// set, at 1-1.6x lower cost on bases 50-60 (the codebase's pinned tests
+/// compare the two).
+fn has_distinct_assignment_closure(doms: &[u64]) -> bool {
+    let mut single: u64 = 0;
+    let mut rest = [0u64; HALL_MAX_POSITIONS];
+    let mut nr = 0usize;
+    for &d in doms {
+        if d.is_power_of_two() {
+            if single & d != 0 {
+                return false;
+            }
+            single |= d;
+        } else {
+            rest[nr] = d;
+            nr += 1;
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0;
+        while i < nr {
+            let d = rest[i] & !single;
+            if d == 0 {
+                return false;
+            }
+            if d.is_power_of_two() {
+                // Newly forced: leaves `rest`, its digit is reserved.
+                single |= d;
+                nr -= 1;
+                rest[i] = rest[nr];
+                changed = true;
+            } else {
+                rest[i] = d;
+                i += 1;
+            }
+        }
+    }
+    // Singletons hold their own digits and those digits are gone from every
+    // remaining domain, so matching the rest is the whole question.
+    nr == 0 || has_distinct_assignment(&rest[..nr])
+}
+
 /// Can every constrained position be assigned a distinct digit from its
 /// domain? By Hall's theorem this fails exactly when some set of positions
 /// collectively offers fewer digits than positions — which makes a nice
@@ -272,80 +416,36 @@ fn analyze_msd_prefix<const BASE: u32>(
     if m == 0 {
         return MsdAnalysis::Live { fixed_mask: 0 };
     }
-    if has_distinct_assignment(&doms[..m]) {
+    if has_distinct_assignment_closure(&doms[..m]) {
         MsdAnalysis::Live { fixed_mask: fixed }
     } else {
         MsdAnalysis::Rejected
     }
 }
 
-/// Specialized const-generic MSD prefix check for bases where `n³` fits
-/// in `u128` (b40 only — see #16). Replaces 4 per-call
-/// `Natural::pow().to_digits_asc()` invocations (heap alloc + multi-limb
-/// arithmetic) with stack-resident u128 division by a const-known base.
-///
-/// SAFETY (correctness): for b40 the max valid candidate is `40^8 - 1`
-/// and `(40^8 - 1)³ < 40^24 ≈ 1.76e38 < u128::MAX = 3.40e38`, so the
-/// cube fits with 50% margin. The `FwDigits` buffer has 38 slots,
-/// enough for any specialized base ≤ 64's cube digit count (b64 needs 38).
-#[inline]
-fn analyze_msd_prefix_u128_const<const BASE: u32>(
-    range: FieldSize,
+/// Interval analysis of a range from its two endpoints' digit arrays.
+#[inline(always)]
+fn analyze_endpoints<const BASE: u32>(
+    lo: &Endpoint,
+    hi: &Endpoint,
     fixed_lsd_k: usize,
 ) -> MsdAnalysis {
-    if range.size() == 1 {
-        return MsdAnalysis::Live { fixed_mask: 0 };
-    }
-
-    let first = range.first();
-    let last = range.last();
-
-    let start_sq = first * first;
-    let end_sq = last * last;
-    let start_cu = start_sq * first;
-    let end_cu = end_sq * last;
-
-    let start_sq_d = extract_digits_u128_const::<BASE>(start_sq);
-    let end_sq_d = extract_digits_u128_const::<BASE>(end_sq);
-    let start_cu_d = extract_digits_u128_const::<BASE>(start_cu);
-    let end_cu_d = extract_digits_u128_const::<BASE>(end_cu);
-
-    analyze_msd_prefix::<BASE>(&start_sq_d, &end_sq_d, &start_cu_d, &end_cu_d, fixed_lsd_k)
+    analyze_msd_prefix::<BASE>(&lo.sq, &hi.sq, &lo.cu, &hi.cu, fixed_lsd_k)
 }
 
-/// Specialized const-generic MSD prefix check for bases where `n³` fits in
-/// U256 (i.e., bases > 40 with n ≤ 60-ish). Same structure as the u128 path
-/// but uses the U256 fixed-width arithmetic from `fixed_width.rs`.
-///
-/// Per #16: the original malachite path's heap allocations are the dominant
-/// cost on xlarge-niceonly-t1 for b40; the same pattern applies for b50 and
-/// other production bases (msd-ineff workload, etc.).
+/// Specialized const-generic MSD analysis: fixed-width endpoint arithmetic
+/// (see [`endpoint_const`]) in place of malachite's heap-allocated
+/// `Natural::pow().to_digits_asc()`, which #16 found to be ~17% of all
+/// cycles on the MSD-heavy benchmark. The `FwDigits` buffer has 38 slots,
+/// enough for any specialized base ≤ 64's cube digit count (b64 needs 38).
 #[inline]
-fn analyze_msd_prefix_u256_const<const BASE: u32>(
-    range: FieldSize,
-    fixed_lsd_k: usize,
-) -> MsdAnalysis {
+fn analyze_range_const<const BASE: u32>(range: FieldSize, fixed_lsd_k: usize) -> MsdAnalysis {
     if range.size() == 1 {
         return MsdAnalysis::Live { fixed_mask: 0 };
     }
-
-    let first = range.first();
-    let last = range.last();
-
-    // For bases ≤ 60, n² fits in u128 (verified empirically: b60 max n² < 2^144,
-    // wait — actually b60 max n ≈ 2.18e21 ≈ 2^71 → n² ≈ 2^142 doesn't fit u128).
-    // Use U256 throughout.
-    let start_sq = U256::mul_u128_u128(first, first);
-    let end_sq = U256::mul_u128_u128(last, last);
-    let start_cu = start_sq.mul_u128_truncating(first);
-    let end_cu = end_sq.mul_u128_truncating(last);
-
-    let start_sq_d = extract_digits_u256_const::<BASE>(start_sq);
-    let end_sq_d = extract_digits_u256_const::<BASE>(end_sq);
-    let start_cu_d = extract_digits_u256_const::<BASE>(start_cu);
-    let end_cu_d = extract_digits_u256_const::<BASE>(end_cu);
-
-    analyze_msd_prefix::<BASE>(&start_sq_d, &end_sq_d, &start_cu_d, &end_cu_d, fixed_lsd_k)
+    let lo = endpoint_const::<BASE>(range.first());
+    let hi = endpoint_const::<BASE>(range.last());
+    analyze_endpoints::<BASE>(&lo, &hi, fixed_lsd_k)
 }
 
 // Recursive MSD filter subdivision parameters for the binary search.
@@ -490,25 +590,25 @@ pub fn analyze_range(range: FieldSize, base: u32, fixed_lsd_k: usize) -> MsdAnal
     // b40 fits in u128 (max n³ < 1.77e38 < u128::MAX = 3.40e38). All
     // other production bases overflow u128 and need U256.
     match base {
-        40 => return analyze_msd_prefix_u128_const::<40>(range, fixed_lsd_k),
-        42 => return analyze_msd_prefix_u256_const::<42>(range, fixed_lsd_k),
-        43 => return analyze_msd_prefix_u256_const::<43>(range, fixed_lsd_k),
-        44 => return analyze_msd_prefix_u256_const::<44>(range, fixed_lsd_k),
-        45 => return analyze_msd_prefix_u256_const::<45>(range, fixed_lsd_k),
-        47 => return analyze_msd_prefix_u256_const::<47>(range, fixed_lsd_k),
-        48 => return analyze_msd_prefix_u256_const::<48>(range, fixed_lsd_k),
-        49 => return analyze_msd_prefix_u256_const::<49>(range, fixed_lsd_k),
-        50 => return analyze_msd_prefix_u256_const::<50>(range, fixed_lsd_k),
-        52 => return analyze_msd_prefix_u256_const::<52>(range, fixed_lsd_k),
-        53 => return analyze_msd_prefix_u256_const::<53>(range, fixed_lsd_k),
-        54 => return analyze_msd_prefix_u256_const::<54>(range, fixed_lsd_k),
-        55 => return analyze_msd_prefix_u256_const::<55>(range, fixed_lsd_k),
-        57 => return analyze_msd_prefix_u256_const::<57>(range, fixed_lsd_k),
-        58 => return analyze_msd_prefix_u256_const::<58>(range, fixed_lsd_k),
-        59 => return analyze_msd_prefix_u256_const::<59>(range, fixed_lsd_k),
-        60 => return analyze_msd_prefix_u256_const::<60>(range, fixed_lsd_k),
-        62 => return analyze_msd_prefix_u256_const::<62>(range, fixed_lsd_k),
-        64 => return analyze_msd_prefix_u256_const::<64>(range, fixed_lsd_k),
+        40 => return analyze_range_const::<40>(range, fixed_lsd_k),
+        42 => return analyze_range_const::<42>(range, fixed_lsd_k),
+        43 => return analyze_range_const::<43>(range, fixed_lsd_k),
+        44 => return analyze_range_const::<44>(range, fixed_lsd_k),
+        45 => return analyze_range_const::<45>(range, fixed_lsd_k),
+        47 => return analyze_range_const::<47>(range, fixed_lsd_k),
+        48 => return analyze_range_const::<48>(range, fixed_lsd_k),
+        49 => return analyze_range_const::<49>(range, fixed_lsd_k),
+        50 => return analyze_range_const::<50>(range, fixed_lsd_k),
+        52 => return analyze_range_const::<52>(range, fixed_lsd_k),
+        53 => return analyze_range_const::<53>(range, fixed_lsd_k),
+        54 => return analyze_range_const::<54>(range, fixed_lsd_k),
+        55 => return analyze_range_const::<55>(range, fixed_lsd_k),
+        57 => return analyze_range_const::<57>(range, fixed_lsd_k),
+        58 => return analyze_range_const::<58>(range, fixed_lsd_k),
+        59 => return analyze_range_const::<59>(range, fixed_lsd_k),
+        60 => return analyze_range_const::<60>(range, fixed_lsd_k),
+        62 => return analyze_range_const::<62>(range, fixed_lsd_k),
+        64 => return analyze_range_const::<64>(range, fixed_lsd_k),
         _ => {}
     }
 
@@ -771,6 +871,103 @@ pub fn get_valid_ranges_recursive_masked(
     inherited_mask: u64,
     out: &mut Vec<(FieldSize, u64)>,
 ) {
+    macro_rules! fw {
+        ($($b:literal),*) => {
+            match params.base {
+                $($b => {
+                    let lo = endpoint_const::<$b>(range.first());
+                    let hi = endpoint_const::<$b>(range.last());
+                    recurse_fw::<$b>(range, &lo, &hi, params, current_depth, inherited_mask, out);
+                    return;
+                })*
+                _ => {}
+            }
+        };
+    }
+    fw!(
+        40, 42, 43, 44, 45, 47, 48, 49, 50, 52, 53, 54, 55, 57, 58, 59, 60, 62, 64
+    );
+    recurse_generic(range, params, current_depth, inherited_mask, out);
+}
+
+/// The masked recursion for a specialized base, carrying each range's two
+/// endpoint digit arrays down the tree. A binary split shares its outer
+/// endpoints with the parent and needs only the two new adjacent ones
+/// (`mid - 1`, `mid`), so the recursion computes about half as many
+/// endpoints as analyzing every child from scratch (measured 47-49% of
+/// endpoints are shared on production windows). Identical traversal and
+/// output to [`recurse_generic`].
+fn recurse_fw<const BASE: u32>(
+    range: FieldSize,
+    lo: &Endpoint,
+    hi: &Endpoint,
+    params: &MaskedRecursion,
+    current_depth: u32,
+    inherited_mask: u64,
+    out: &mut Vec<(FieldSize, u64)>,
+) {
+    if current_depth >= params.max_depth || range.size() <= params.min_range_size {
+        out.push((range, inherited_mask));
+        return;
+    }
+    let analysis = if range.size() == 1 {
+        MsdAnalysis::Live { fixed_mask: 0 }
+    } else {
+        analyze_endpoints::<BASE>(lo, hi, params.fixed_lsd_k)
+    };
+    let mask = match analysis {
+        MsdAnalysis::Rejected => return,
+        MsdAnalysis::Live { fixed_mask } => inherited_mask | fixed_mask,
+    };
+    if range.size() < params.min_range_size * (params.subdivision_factor as u128) {
+        out.push((range, mask));
+        return;
+    }
+    let chunk_size = range.size() / (params.subdivision_factor as u128);
+    for i in 0..params.subdivision_factor {
+        let sub_start = range.start() + (i as u128) * chunk_size;
+        let sub_end = if i == params.subdivision_factor - 1 {
+            range.end()
+        } else {
+            sub_start + chunk_size
+        };
+        if sub_start < sub_end {
+            let new_lo;
+            let sub_lo: &Endpoint = if i == 0 {
+                lo
+            } else {
+                new_lo = endpoint_const::<BASE>(sub_start);
+                &new_lo
+            };
+            let new_hi;
+            let sub_hi: &Endpoint = if i == params.subdivision_factor - 1 {
+                hi
+            } else {
+                new_hi = endpoint_const::<BASE>(sub_end - 1);
+                &new_hi
+            };
+            recurse_fw::<BASE>(
+                FieldSize::new(sub_start, sub_end),
+                sub_lo,
+                sub_hi,
+                params,
+                current_depth + 1,
+                mask,
+                out,
+            );
+        }
+    }
+}
+
+/// The masked recursion for unspecialized bases, analyzing every range from
+/// scratch through [`analyze_range`].
+fn recurse_generic(
+    range: FieldSize,
+    params: &MaskedRecursion,
+    current_depth: u32,
+    inherited_mask: u64,
+    out: &mut Vec<(FieldSize, u64)>,
+) {
     if current_depth >= params.max_depth || range.size() <= params.min_range_size {
         out.push((range, inherited_mask));
         return;
@@ -792,7 +989,7 @@ pub fn get_valid_ranges_recursive_masked(
             sub_start + chunk_size
         };
         if sub_start < sub_end {
-            get_valid_ranges_recursive_masked(
+            recurse_generic(
                 FieldSize::new(sub_start, sub_end),
                 params,
                 current_depth + 1,
@@ -1239,6 +1436,134 @@ mod tests {
                     "base {base}: nice number {n} not covered by get_valid_ranges output"
                 );
             }
+        }
+    }
+
+    /// Per-digit reference extraction (what the chunked version replaced).
+    fn extract_digits_reference(mut n: U256, base: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        if n.is_zero() {
+            return vec![0];
+        }
+        while !n.is_zero() {
+            out.push(n.div_assign_rem_u32(base));
+        }
+        out
+    }
+
+    /// The chunked extraction must produce exactly the per-digit stream for
+    /// every specialized base, over squares and cubes across the range,
+    /// including the zero-padded interior chunks.
+    #[test_log::test]
+    fn chunked_extraction_matches_per_digit() {
+        macro_rules! check {
+            ($($b:literal),*) => {$({
+                let base: u32 = $b;
+                let r = base_range::get_base_range_u128(base).unwrap().unwrap();
+                let mut x: u128 = 0x2545_f491_4f6c_dd1d_9e37_79b9_7f4a_7c15;
+                for i in 0..400u128 {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
+                    let n = r.start() + x % r.size();
+                    let e = endpoint_const::<$b>(n);
+                    let sq = U256::mul_u128_u128(n, n);
+                    let cu = sq.mul_u128_truncating(n);
+                    assert_eq!(e.sq.as_slice(), &extract_digits_reference(sq, base)[..], "b{base} n={n} square");
+                    assert_eq!(e.cu.as_slice(), &extract_digits_reference(cu, base)[..], "b{base} n={n} cube");
+                }
+                // Small values exercise the leading-chunk path and zero.
+                for n in [0u128, 1, $b - 1, $b, $b * $b, u128::from(chunk_div($b)), u128::from(chunk_div($b)) * $b] {
+                    let got = if $b <= 40 {
+                        extract_digits_u128_const::<$b>(n)
+                    } else {
+                        extract_digits_u256_const::<$b>(U256::from_u128(n))
+                    };
+                    assert_eq!(got.as_slice(), &extract_digits_reference(U256::from_u128(n), base)[..], "b{base} small n={n}");
+                }
+            })*};
+        }
+        check!(
+            40, 42, 43, 44, 45, 47, 48, 49, 50, 52, 53, 54, 55, 57, 58, 59, 60, 62, 64
+        );
+    }
+
+    /// Endpoint reuse must not change the traversal: the fixed-width
+    /// recursion and the from-scratch recursion emit the same leaves with
+    /// the same certificates, at production and at forced-fine floors.
+    #[test_log::test]
+    fn endpoint_reuse_matches_from_scratch_recursion() {
+        // MSD-weak windows (the benchmark's b40/b52 regions and a mid-range
+        // b60 slice), so that the recursion really descends and emits leaves.
+        for (base, start, floor) in [
+            (40u32, 5_007_828_088_304u128, 8000u128),
+            (40, 5_007_828_088_304, 500),
+            (52, 407_887_399_136_188_818, 8000),
+            (52, 407_887_399_136_188_818, 977),
+            (60, 1_500_000_000_000_000_000_000, 4000),
+        ] {
+            let slice = FieldSize::new(start, start + 4_000_000);
+            let params = MaskedRecursion {
+                base,
+                fixed_lsd_k: 3,
+                max_depth: MSD_RECURSIVE_MAX_DEPTH,
+                min_range_size: floor,
+                subdivision_factor: MSD_RECURSIVE_SUBDIVISION_FACTOR,
+            };
+            let mut reused = Vec::new();
+            get_valid_ranges_recursive_masked(slice, &params, 0, 0, &mut reused);
+            let mut scratch = Vec::new();
+            recurse_generic(slice, &params, 0, 0, &mut scratch);
+            assert_eq!(reused, scratch, "b{base} floor {floor}");
+            assert!(!reused.is_empty());
+        }
+    }
+
+    /// Singleton closure must agree with the plain matching on every domain
+    /// set the analysis produces (and on hand-built cases).
+    #[test_log::test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn closure_matching_agrees_with_kuhn() {
+        assert!(has_distinct_assignment_closure(&[0b01, 0b10]));
+        assert!(!has_distinct_assignment_closure(&[0b100, 0b100]));
+        assert!(!has_distinct_assignment_closure(&[0b11, 0b11, 0b11]));
+        assert!(!has_distinct_assignment_closure(&[
+            0b011, 0b011, 0b110, 0b101
+        ]));
+        assert!(has_distinct_assignment_closure(&[0b01, 0b11, 0b110]));
+        // Closure chain: {7} forces {7,8} to 8, which forces {8,9} to 9,
+        // which collides with the singleton {9}.
+        assert!(!has_distinct_assignment_closure(&[
+            1 << 7,
+            0b11 << 7,
+            0b11 << 8,
+            1 << 9
+        ]));
+        assert!(has_distinct_assignment_closure(&[
+            1 << 7,
+            0b11 << 7,
+            0b11 << 8
+        ]));
+        let mut x: u128 = 0x1234_5678_9abc_def0_0fed_cba9_8765_4321;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let m = 2 + (x as usize % 6);
+            let mut doms = [0u64; 8];
+            for d in doms.iter_mut().take(m) {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                // Cyclic intervals of 1-3 digits over an 8-digit alphabet.
+                let lo = (x >> 64) as u32 % 8;
+                let size = 1 + ((x >> 96) as u32 % 3);
+                let mut mask = 0u64;
+                for t in 0..size {
+                    mask |= 1u64 << ((lo + t) % 8);
+                }
+                *d = mask;
+            }
+            assert_eq!(
+                has_distinct_assignment_closure(&doms[..m]),
+                has_distinct_assignment(&doms[..m]),
+                "{:?}",
+                &doms[..m]
+            );
         }
     }
 
