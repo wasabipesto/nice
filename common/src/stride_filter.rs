@@ -9,7 +9,7 @@
 //! per candidate - we simply never visit invalid candidates.
 
 use crate::client_process::get_is_nice_with_known_lsd;
-use crate::{FieldSize, NiceNumberSimple, lsd_filter, residue_filter};
+use crate::{FieldSize, NiceNumberSimple, affine_filter, lsd_filter, residue_filter};
 use log::trace;
 
 /// A precomputed stride table for efficient CRT-based iteration.
@@ -200,6 +200,11 @@ impl StrideTable {
     /// positions, so its candidates are skipped without a nice check —
     /// one AND on a mask this loop already loads.
     ///
+    /// Survivors of that test then go through the affine middle-digit
+    /// filter ([`affine_filter`]): the next three digits of each power,
+    /// computed from `n mod b^{2k}` with word arithmetic, are tested against
+    /// the union of both masks before the full check runs.
+    ///
     /// Sound only when `high_mask` excludes positions below `k` (which
     /// `analyze_range(_, _, k)` guarantees); pass 0 to disable.
     #[must_use]
@@ -208,6 +213,34 @@ impl StrideTable {
         range: &FieldSize,
         base: u32,
         high_mask: u64,
+    ) -> Vec<NiceNumberSimple> {
+        self.iterate_range_impl(
+            range,
+            base,
+            high_mask,
+            affine_filter::supports(base, self.k),
+        )
+    }
+
+    /// [`StrideTable::iterate_range_masked`] without the affine middle-digit
+    /// filter; the reference path for parity tests and A/B measurements.
+    #[must_use]
+    pub fn iterate_range_masked_unfiltered(
+        &self,
+        range: &FieldSize,
+        base: u32,
+        high_mask: u64,
+    ) -> Vec<NiceNumberSimple> {
+        self.iterate_range_impl(range, base, high_mask, false)
+    }
+
+    #[inline]
+    fn iterate_range_impl(
+        &self,
+        range: &FieldSize,
+        base: u32,
+        high_mask: u64,
+        use_affine: bool,
     ) -> Vec<NiceNumberSimple> {
         let mut results = Vec::new();
         let (mut n, mut idx) = self.first_valid_at_or_after(range.start());
@@ -219,13 +252,26 @@ impl StrideTable {
         // always 0 — the analysis never emits mask bits there.)
         let masks = &self.low_digit_masks;
 
+        // `n mod b^{2k}`, tracked incrementally for the affine filter: the
+        // modulus fits u64 whenever the filter is supported (b ≤ 64, k = 3),
+        // and every gap is below the stride modulus `(b-1)·b^k < b^{2k}`, so
+        // one conditional subtraction keeps it reduced.
+        let b2k: u64 = if use_affine {
+            u64::from(base).pow(2 * self.k)
+        } else {
+            1
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let mut nmod = (n % u128::from(b2k)) as u64;
+
         while n < range.end() {
             let is_nice = if masks.is_empty() {
                 crate::client_process::get_is_nice(n, base)
-            } else if masks[idx] & high_mask != 0 {
-                false
             } else {
-                get_is_nice_with_known_lsd(n, base, self.k, masks[idx])
+                let low = masks[idx];
+                let rejected = low & high_mask != 0
+                    || (use_affine && !affine_filter::survives(base, nmod, low | high_mask));
+                !rejected && get_is_nice_with_known_lsd(n, base, self.k, low)
             };
             if is_nice {
                 results.push(NiceNumberSimple {
@@ -233,7 +279,12 @@ impl StrideTable {
                     num_uniques: base,
                 });
             }
-            n += u128::from(self.gap_table[idx]);
+            let gap = self.gap_table[idx];
+            n += u128::from(gap);
+            nmod += u64::from(gap);
+            if nmod >= b2k {
+                nmod -= b2k;
+            }
             idx += 1;
             if idx == self.gap_table.len() {
                 idx = 0;

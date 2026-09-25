@@ -2,6 +2,7 @@
 
 #![warn(clippy::all, clippy::pedantic)]
 
+pub mod affine_filter;
 pub mod base_range;
 pub mod bench_defs;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]

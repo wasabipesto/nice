@@ -4,6 +4,7 @@
 
 - Update `--threads 0` (and `NICE_THREADS=0`) to explicitly spawn as many threads as the host has CPU cores instead of falling back to edge case behavior. `RAYON_NUM_THREADS` no longer influences the client. Omitting this option still defaults to 4 threads.
 - Record the build commit SHA alongside the version for benchmarks, telemetry, and api `/status`. 
+- Add an affine middle-digit filter to the CPU nice-only path. A cross-end survivor `n = s + b³·t` has its output digits at positions 3-5 of both `n²` and `n³` determined by `s` and `t mod b³` through two affine maps (`⌊s²/b³⌋ + 2st` and `⌊s³/b³⌋ + 3s²t`, mod `b³`), so those six fresh digits are computed with word arithmetic and compile-time divisors and tested against the residue's low digits and the range's high certificate before the full nice check runs. About 97% of cross-end survivors die there (measured 96.6-97.3% on bases 40-60), and the whole-scenario CPU nice-only rate roughly doubles on every check-dominated benchmark window (b40/b50/b52 MSD-weak and residue-dense: 1.8-1.95x on 4 threads and single-threaded); MSD-dominated windows are unchanged.
 
 ## Nice v3.4.5
 
