@@ -463,8 +463,15 @@ fn analyze_range_const<const BASE: u32>(range: FieldSize, fixed_lsd_k: usize) ->
 // ~25-40% more and 1000 ~70-100% more. Note binary subdivision of
 // 1e6-number chunks quantizes leaf sizes to ~976/1953/3906/7812/..., so
 // only power-of-two-ish floors are distinct.
+//
+// 2026-09: with the affine middle-digit filter (cheaper survivors) and the
+// 2-3x cheaper MSD node (chunked extraction, endpoint reuse), a single-core
+// sweep through the production paths on 16 production-weighted 5e7 windows
+// per base puts the minimum at 4000: vs 8000 it is +5% (b40), 0% (b50),
+// +2% (b52), +2% (b57); 2000 is within 1% of 4000 at b40/b50 and 8-10%
+// worse at b52/b57; 16000 is 7-14% worse everywhere.
 pub const MSD_RECURSIVE_MAX_DEPTH: u32 = 22;
-pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 8000;
+pub const MSD_RECURSIVE_MIN_RANGE_SIZE: u128 = 4000;
 pub const MSD_RECURSIVE_SUBDIVISION_FACTOR: usize = 2;
 
 /// Find the longest common prefix of the most significant digits.
