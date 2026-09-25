@@ -28,7 +28,8 @@
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::gpu_config::{
-    VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
+    AffineParams, VulkanPrefilterParams, affine_params, chunk_constants_u16, gpu_supports_base,
+    n_limbs, vulkan_prefilter_params,
 };
 use crate::gpu_niceonly::{
     DeviceResult, GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline, NiceonlyStarted, NiceonlyStats,
@@ -820,6 +821,120 @@ fn candidate_check(
 /// comptime constant, including the range offset's chunked Horner reduction
 /// (`offset_chunk_bits` wide, u32 throughout — the construct RADV cannot
 /// strength-reduce at 64 bits, avoided the same way the WGSL avoids it).
+/// The affine middle-digit filter's per-range constants: `s0 = B0 mod b^3`
+/// and `t0 = (B0 div b^3) mod b^3` for the range's enumeration base
+/// `B0 = b0_hi·2^64 + b0_lo`, packed as `t0 << 32 | s0`. Every candidate of
+/// the range is `B0 + cycle·M + residue`, and since `M = (b-1)·b^3` the
+/// candidate's own `(s, t)` follow from these by 32-bit digit arithmetic —
+/// this is the one place the filter divides a 64-bit value, once per range.
+///
+/// `b0_hi` is below 2^12 for every base the filter is enabled on (n < 2^77
+/// at base 64), so `b0_hi·pow64 < 2^48` and nothing here overflows.
+#[cube]
+fn affine_range_base(
+    b0_lo: u64,
+    b0_hi: u64,
+    #[comptime] aff_bk: u32,
+    #[comptime] aff_pow64_lo: u32,
+    #[comptime] aff_pow64_hi: u32,
+) -> u64 {
+    let bk = u64::cast_from(aff_bk);
+    let b2k = bk * bk;
+    let pow64 = (u64::cast_from(aff_pow64_hi) << 32u64) | u64::cast_from(aff_pow64_lo);
+    let bm = (b0_hi * pow64 + b0_lo % b2k) % b2k;
+    ((bm / bk) << 32u64) | (bm % bk)
+}
+
+/// Affine middle-digit filter (the device form of `crate::affine_filter`).
+///
+/// For `n = s + b^3·t` the output digits at positions 3..5 of `n²` are the
+/// base-b digits of `(⌊s²/b^3⌋ + 2st) mod b^3` and those of `n³` are the
+/// digits of `(⌊s³/b^3⌋ + 3s²t) mod b^3`. Here `s` and `t` (both `< b^3`)
+/// are split into base-b digits and everything is schoolbook arithmetic on
+/// those digits, so every product is below 2^16 and every divisor is the
+/// 32-bit compile-time constant `base` — the wgpu backends do not
+/// strength-reduce 64-bit division (see `chunk_constants_u16`), and this
+/// keeps the filter cheap on all of them. `known` holds the residue's exact
+/// low digits and the range certificate; the six positions tested here are
+/// disjoint from both. Returns true when the candidate survives: six
+/// pairwise-distinct digits, none in `known`.
+#[cube]
+#[allow(clippy::similar_names, clippy::many_single_char_names)]
+fn affine_survives(s: u32, t: u32, known: u64, #[comptime] base: u32) -> bool {
+    let s0 = s % base;
+    let s12 = s / base;
+    let s1 = s12 % base;
+    let s2 = s12 / base;
+    let t0 = t % base;
+    let t12 = t / base;
+    let t1 = t12 % base;
+    let t2 = t12 / base;
+
+    // s² as six base-b digits x0..x5 (column sums are below 3·63², carries
+    // ride along in the same u32).
+    let mut c = s0 * s0;
+    let x0 = c % base;
+    c = c / base + 2u32 * s0 * s1;
+    let x1 = c % base;
+    c = c / base + 2u32 * s0 * s2 + s1 * s1;
+    let x2 = c % base;
+    c = c / base + 2u32 * s1 * s2;
+    let x3 = c % base;
+    c = c / base + s2 * s2;
+    let x4 = c % base;
+    let x5 = c / base;
+
+    // u = 2st mod b^3, three digits.
+    let mut cu = 2u32 * s0 * t0;
+    let u0 = cu % base;
+    cu = cu / base + 2u32 * (s0 * t1 + s1 * t0);
+    let u1 = cu % base;
+    cu = cu / base + 2u32 * (s0 * t2 + s1 * t1 + s2 * t0);
+    let u2 = cu % base;
+
+    // n² positions 3..5 = (x3 x4 x5) + (u0 u1 u2) mod b^3.
+    let mut cq = x3 + u0;
+    let q0 = cq % base;
+    cq = cq / base + x4 + u1;
+    let q1 = cq % base;
+    cq = cq / base + x5 + u2;
+    let q2 = cq % base;
+
+    // s³ = s²·s, positions 0..5; only the carries matter below position 3.
+    let mut cw = x0 * s0;
+    cw = cw / base + x0 * s1 + x1 * s0;
+    cw = cw / base + x0 * s2 + x1 * s1 + x2 * s0;
+    cw = cw / base + x1 * s2 + x2 * s1 + x3 * s0;
+    let w3 = cw % base;
+    cw = cw / base + x2 * s2 + x3 * s1 + x4 * s0;
+    let w4 = cw % base;
+    cw = cw / base + x3 * s2 + x4 * s1 + x5 * s0;
+    let w5 = cw % base;
+
+    // v = 3s²t mod b^3 = 3·(x0 x1 x2)·t mod b^3, three digits.
+    let mut cv = 3u32 * x0 * t0;
+    let v0 = cv % base;
+    cv = cv / base + 3u32 * (x0 * t1 + x1 * t0);
+    let v1 = cv % base;
+    cv = cv / base + 3u32 * (x0 * t2 + x1 * t1 + x2 * t0);
+    let v2 = cv % base;
+
+    // n³ positions 3..5 = (w3 w4 w5) + (v0 v1 v2) mod b^3.
+    let mut cc = w3 + v0;
+    let c0 = cc % base;
+    cc = cc / base + w4 + v1;
+    let c1 = cc % base;
+    cc = cc / base + w5 + v2;
+    let c2 = cc % base;
+
+    let dup = q0 == q1 || q0 == q2 || q1 == q2 || c0 == c1 || c0 == c2 || c1 == c2;
+    let mq =
+        (1u64 << u64::cast_from(q0)) | (1u64 << u64::cast_from(q1)) | (1u64 << u64::cast_from(q2));
+    let mc =
+        (1u64 << u64::cast_from(c0)) | (1u64 << u64::cast_from(c1)) | (1u64 << u64::cast_from(c2));
+    !dup && ((mq | mc) & known) == 0u64 && (mq & mc) == 0u64
+}
+
 #[cube(launch_unchecked)]
 // The single-character and lookalike names (m, g, j, rs/re, ...) deliberately
 // match the generated WGSL, so the two kernels review side by side.
@@ -868,8 +983,13 @@ fn niceonly_kernel(
     #[comptime] cross: bool, // cross-end residue filter (certificate x low mask)
     #[comptime] compact: bool, // plane-compact mask survivors before checking
     #[comptime] plane_scoped: bool, // compaction queue per plane (needs Plane::Sync)
+    #[comptime] affine: bool, // affine middle-digit filter on cross survivors
+    #[comptime] aff_bk: u32, // base^3 (0 when `affine` is off)
+    #[comptime] aff_pow64_lo: u32, // 2^64 mod base^6, low word
+    #[comptime] aff_pow64_hi: u32, // 2^64 mod base^6, high word
 ) {
     let cu_limbs = comptime!(3 * limbs);
+    let base_m1 = comptime!(base - 1);
     let offset_chunks = comptime!(64 / offset_chunk_bits);
     let per_word = comptime!(32 / offset_chunk_bits);
     let offset_chunk_mask = comptime!((1u32 << offset_chunk_bits) - 1);
@@ -913,6 +1033,8 @@ fn niceonly_kernel(
         let mut re_hi = 0u64;
         let mut b0_lo = 0u64;
         let mut b0_hi = 0u64;
+        let mut aff_s0 = 0u32;
+        let mut aff_t0 = 0u32;
         let mut g = 0u32;
         let mut qn = 0u32;
         loop {
@@ -955,6 +1077,11 @@ fn niceonly_kernel(
                 if rs_lo < u64::cast_from(m) {
                     b0_hi -= 1u64;
                 }
+                if affine {
+                    let ab = affine_range_base(b0_lo, b0_hi, aff_bk, aff_pow64_lo, aff_pow64_hi);
+                    aff_s0 = u32::cast_from(ab);
+                    aff_t0 = u32::cast_from(ab >> 32u64);
+                }
                 let mut lb_lo = 0u32;
                 let mut lb_hi = stride_r.runtime();
                 while lb_lo < lb_hi {
@@ -993,11 +1120,30 @@ fn niceonly_kernel(
                     }
                 } else {
                     let mut masked = false;
+                    let mut lm = 0u64;
                     if cross {
-                        let lm = (u64::cast_from(low_masks[(2u32 * j + 1u32) as usize]) << 32u64)
+                        lm = (u64::cast_from(low_masks[(2u32 * j + 1u32) as usize]) << 32u64)
                             | u64::cast_from(low_masks[(2u32 * j) as usize]);
                         if (lm & rmask) != 0u64 {
                             masked = true;
+                        }
+                    }
+                    // Affine middle-digit filter on the cross survivors, before
+                    // they take a queue slot: the candidate's (s, t) follow
+                    // from the range base and residue j by digit arithmetic.
+                    if affine {
+                        if !masked {
+                            let res = residues[j as usize];
+                            let mut sa = aff_s0 + res % aff_bk;
+                            let mut carry = 0u32;
+                            if sa >= aff_bk {
+                                sa -= aff_bk;
+                                carry = 1u32;
+                            }
+                            let ta = (aff_t0 + cycle * base_m1 + res / aff_bk + carry) % aff_bk;
+                            if !affine_survives(sa, ta, lm | rmask, base) {
+                                masked = true;
+                            }
                         }
                     }
                     if !masked {
@@ -1090,6 +1236,8 @@ fn niceonly_kernel(
         let mut re_hi = 0u64;
         let mut b0_lo = 0u64;
         let mut b0_hi = 0u64;
+        let mut aff_s0 = 0u32;
+        let mut aff_t0 = 0u32;
         let mut g = 0u32;
         let mut qn = 0u32;
         loop {
@@ -1132,6 +1280,11 @@ fn niceonly_kernel(
                 if rs_lo < u64::cast_from(m) {
                     b0_hi -= 1u64;
                 }
+                if affine {
+                    let ab = affine_range_base(b0_lo, b0_hi, aff_bk, aff_pow64_lo, aff_pow64_hi);
+                    aff_s0 = u32::cast_from(ab);
+                    aff_t0 = u32::cast_from(ab >> 32u64);
+                }
                 let mut lb_lo = 0u32;
                 let mut lb_hi = stride_r.runtime();
                 while lb_lo < lb_hi {
@@ -1170,11 +1323,30 @@ fn niceonly_kernel(
                     }
                 } else {
                     let mut masked = false;
+                    let mut lm = 0u64;
                     if cross {
-                        let lm = (u64::cast_from(low_masks[(2u32 * j + 1u32) as usize]) << 32u64)
+                        lm = (u64::cast_from(low_masks[(2u32 * j + 1u32) as usize]) << 32u64)
                             | u64::cast_from(low_masks[(2u32 * j) as usize]);
                         if (lm & rmask) != 0u64 {
                             masked = true;
+                        }
+                    }
+                    // Affine middle-digit filter on the cross survivors, before
+                    // they take a queue slot: the candidate's (s, t) follow
+                    // from the range base and residue j by digit arithmetic.
+                    if affine {
+                        if !masked {
+                            let res = residues[j as usize];
+                            let mut sa = aff_s0 + res % aff_bk;
+                            let mut carry = 0u32;
+                            if sa >= aff_bk {
+                                sa -= aff_bk;
+                                carry = 1u32;
+                            }
+                            let ta = (aff_t0 + cycle * base_m1 + res / aff_bk + carry) % aff_bk;
+                            if !affine_survives(sa, ta, lm | rmask, base) {
+                                masked = true;
+                            }
                         }
                     }
                     if !masked {
@@ -1310,6 +1482,13 @@ fn niceonly_kernel(
             if rs_lo < u64::cast_from(m) {
                 b0_hi -= 1u64;
             }
+            let mut aff_s0 = 0u32;
+            let mut aff_t0 = 0u32;
+            if affine {
+                let ab = affine_range_base(b0_lo, b0_hi, aff_bk, aff_pow64_lo, aff_pow64_hi);
+                aff_s0 = u32::cast_from(ab);
+                aff_t0 = u32::cast_from(ab >> 32u64);
+            }
 
             // First residue index at or after m: lower_bound over the sorted table.
             let mut lb_lo = 0u32;
@@ -1343,11 +1522,29 @@ fn niceonly_kernel(
                 // duplicated digit across two distinct positions - skip the
                 // candidate without checking anything.
                 let mut masked = false;
+                let mut lm = 0u64;
                 if cross {
-                    let lm = (u64::cast_from(low_masks[(2u32 * j + 1u32) as usize]) << 32u64)
+                    lm = (u64::cast_from(low_masks[(2u32 * j + 1u32) as usize]) << 32u64)
                         | u64::cast_from(low_masks[(2u32 * j) as usize]);
                     if (lm & rmask) != 0u64 {
                         masked = true;
+                    }
+                }
+                // Affine middle-digit filter on the cross survivors (see the
+                // compacted paths).
+                if affine {
+                    if !masked {
+                        let res = residues[j as usize];
+                        let mut sa = aff_s0 + res % aff_bk;
+                        let mut carry = 0u32;
+                        if sa >= aff_bk {
+                            sa -= aff_bk;
+                            carry = 1u32;
+                        }
+                        let ta = (aff_t0 + cycle * base_m1 + res / aff_bk + carry) % aff_bk;
+                        if !affine_survives(sa, ta, lm | rmask, base) {
+                            masked = true;
+                        }
                     }
                 }
                 if !masked {
@@ -2319,6 +2516,10 @@ pub struct NiceonlyPlan {
     /// (default on under `wgpu<spirv>` and `cuda`; `NICE_CUBECL_PLANE_COMPACT=0|1`
     /// overrides; requires `compact` and a device with plane barriers).
     plane_compact: bool,
+    /// Affine middle-digit filter on the cross filter's survivors
+    /// (`NICE_CUBECL_AFFINE=0` opts out; requires `cross` and a base where
+    /// both powers have six guaranteed digits — see `gpu_config::affine_params`).
+    affine: Option<AffineParams>,
 }
 
 impl NiceonlyPlan {
@@ -2383,7 +2584,9 @@ impl NiceonlyPlan {
             };
         debug!(
             "CubeCL niceonly plan base {base}: cross {cross}, compact {compact} \
-             (plane ops {plane_ok}), plane-scoped {plane_compact} (plane sync {plane_sync})"
+             (plane ops {plane_ok}), plane-scoped {plane_compact} (plane sync {plane_sync}), \
+             affine {}",
+            affine_params(base, GPU_LSD_K).is_some()
         );
         #[allow(clippy::cast_possible_truncation)]
         let mask_words: Vec<u32> = if cross {
@@ -2397,6 +2600,11 @@ impl NiceonlyPlan {
         };
         let low_masks = client.create(cubecl::bytes::Bytes::from_elems(mask_words));
         let residues = client.create(cubecl::bytes::Bytes::from_elems(table.valid_residues));
+        let affine = if cross && std::env::var("NICE_CUBECL_AFFINE").map_or(true, |v| v != "0") {
+            affine_params(base, GPU_LSD_K)
+        } else {
+            None
+        };
         Ok(Self {
             stride_m,
             stride_r,
@@ -2406,6 +2614,7 @@ impl NiceonlyPlan {
             cross,
             compact,
             plane_compact,
+            affine,
         })
     }
 }
@@ -2435,6 +2644,10 @@ struct CubeclNiceonlyRun<R: cubecl::prelude::Runtime> {
     /// Force the plane-scoped queue on or off (device tests).
     #[cfg(test)]
     plane_override: Option<bool>,
+    /// Force the affine filter off (device tests); it cannot be forced on
+    /// where the plan has no parameters for it.
+    #[cfg(test)]
+    affine_override: Option<bool>,
 }
 
 impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
@@ -2495,6 +2708,8 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
             compact_override: None,
             #[cfg(test)]
             plane_override: None,
+            #[cfg(test)]
+            affine_override: None,
         })
     }
 
@@ -2576,6 +2791,15 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
         self.plan.compact && masks.iter().any(|&m| m != 0)
     }
 
+    /// The affine filter parameters this dispatch compiles in, if any.
+    fn dispatch_affine(&self) -> Option<AffineParams> {
+        #[cfg(test)]
+        if self.affine_override == Some(false) {
+            return None;
+        }
+        self.plan.affine
+    }
+
     /// Whether a compacted dispatch uses the plane-scoped queue.
     fn dispatch_plane_scoped(&self, compact: bool) -> bool {
         #[cfg(test)]
@@ -2629,6 +2853,8 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
         })
     }
 
+    // `too_many_lines`: the kernel launch is one long argument list.
+    #[allow(clippy::too_many_lines)]
     fn launch(&mut self, _field: u64, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
         ensure!(
             offsets.len() == lens.len() && offsets.len() == masks.len(),
@@ -2694,6 +2920,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
             .plan
             .prefilter
             .map_or((0, 0, 0), |p| (p.limbs, p.chunk_digits, p.chunk_div));
+        let affine = self.dispatch_affine();
 
         #[allow(clippy::cast_possible_truncation)]
         unsafe {
@@ -2741,6 +2968,10 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
                 self.plan.cross,
                 compact,
                 self.dispatch_plane_scoped(compact),
+                affine.is_some(),
+                affine.map_or(0, |a| a.bk),
+                affine.map_or(0, |a| a.pow64_mod as u32),
+                affine.map_or(0, |a| (a.pow64_mod >> 32) as u32),
             );
         }
         Ok(())
@@ -3073,6 +3304,23 @@ mod tests {
         !dup
     }
 
+    /// Host mirror of the device's affine middle-digit filter for a
+    /// candidate whose `known` digits (low mask | certificate) are given:
+    /// the six digits from `crate::affine_filter::middle_digits`, pairwise
+    /// distinct and disjoint from `known`.
+    fn affine_mirror(n: u128, base: u32, known: u64) -> bool {
+        #[allow(clippy::cast_possible_truncation)]
+        let nmod = (n % u128::from(base).pow(6)) as u64;
+        let (sq, cu) = crate::affine_filter::middle_digits(base, nmod);
+        let mut seen = known;
+        let mut ok = true;
+        for &d in sq.iter().chain(cu.iter()) {
+            ok &= seen & (1u64 << d) == 0;
+            seen |= 1u64 << d;
+        }
+        ok
+    }
+
     /// The cross-end filter's device semantics against a host mirror, with
     /// certificates that actually fire: word packing of both the low-mask
     /// table and the range certificates, residue-to-mask indexing, and the
@@ -3110,26 +3358,49 @@ mod tests {
             // digits miss the certificate and (where present) whose low
             // digits pass the prefilter.
             let end = start + u128::from(len);
-            let (mut n, mut idx) = table.first_valid_at_or_after(start);
-            let mut want = Vec::new();
+            // Two mirrors: cross + prefilter only, and with the affine
+            // middle-digit filter in between (the production configuration).
+            let mut want_plain = Vec::new();
+            let mut want_affine = Vec::new();
             let mut cross_rejected = 0u32;
-            while n < end {
-                if table.low_digit_masks[idx] & mask != 0 {
-                    cross_rejected += 1;
-                } else if pre.is_none_or(|p| prefilter_mirror(n, base, &p)) {
-                    want.push(n);
+            let mut affine_rejected = 0u32;
+            {
+                let (mut n, mut idx) = table.first_valid_at_or_after(start);
+                while n < end {
+                    let low = table.low_digit_masks[idx];
+                    if low & mask != 0 {
+                        cross_rejected += 1;
+                    } else {
+                        // Counted over every cross survivor, not only the
+                        // prefilter's, so the guard below is meaningful at
+                        // b40 where the prefilter alone leaves ~1%.
+                        let affine_ok = affine_mirror(n, base, low | mask);
+                        if !affine_ok {
+                            affine_rejected += 1;
+                        }
+                        if pre.is_none_or(|p| prefilter_mirror(n, base, &p)) {
+                            want_plain.push(n);
+                            if affine_ok {
+                                want_affine.push(n);
+                            }
+                        }
+                    }
+                    n += u128::from(table.gap_table[idx]);
+                    idx = (idx + 1) % table.gap_table.len();
                 }
-                n += u128::from(table.gap_table[idx]);
-                idx = (idx + 1) % table.gap_table.len();
             }
             assert!(
                 cross_rejected > 1000,
                 "base {base}: certificate {mask:#x} rejected too little to test"
             );
             assert!(
-                want.len() < NICEONLY_OUT_CAPACITY / 2,
+                affine_rejected > 1000,
+                "base {base}: the affine mirror rejected too little to test"
+            );
+            assert!(
+                want_plain.len() < NICEONLY_OUT_CAPACITY / 2,
                 "base {base}: {} probe survivors would risk the output buffer; shrink the window",
-                want.len()
+                want_plain.len()
             );
 
             // The plane-scoped queue needs a real subgroup barrier: llvmpipe
@@ -3148,24 +3419,29 @@ mod tests {
                 &[(true, false), (false, false)]
             };
             for &(forced_compact, forced_plane) in variants {
-                let mut run =
-                    CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
-                run.probe = true;
-                run.compact_override = Some(forced_compact);
-                run.plane_override = Some(forced_plane);
-                run.launch(0, &[0], &[len], &[mask]).expect("dispatch");
-                let mut got: Vec<u128> = run
-                    .finish()
-                    .expect("results")
-                    .iter()
-                    .map(|n| n.number)
-                    .collect();
-                got.sort_unstable();
-                assert_eq!(
-                    got, want,
-                    "base {base} compact={forced_compact} plane={forced_plane}: \
-                     cross-filtered survivor set mismatch"
-                );
+                for affine_on in [false, true] {
+                    let mut run =
+                        CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
+                    assert!(run.plan.affine.is_some(), "base {base}: no affine params");
+                    run.probe = true;
+                    run.compact_override = Some(forced_compact);
+                    run.plane_override = Some(forced_plane);
+                    run.affine_override = Some(affine_on);
+                    run.launch(0, &[0], &[len], &[mask]).expect("dispatch");
+                    let mut got: Vec<u128> = run
+                        .finish()
+                        .expect("results")
+                        .iter()
+                        .map(|n| n.number)
+                        .collect();
+                    got.sort_unstable();
+                    let want = if affine_on { &want_affine } else { &want_plain };
+                    assert_eq!(
+                        &got, want,
+                        "base {base} compact={forced_compact} plane={forced_plane} \
+                         affine={affine_on}: cross-filtered survivor set mismatch"
+                    );
+                }
             }
         }
     }
@@ -3213,14 +3489,18 @@ mod tests {
                         .collect::<Vec<u128>>(),
                 );
             }
-            // Every stride candidate in the range, filtered by the mirror.
+            // Every stride candidate in the range, filtered by the mirror:
+            // the affine filter (certificate 0, so against the residue's own
+            // low digits) and the prefilter, as the default plan runs them.
             let end = start + u128::from(len);
             let (mut n, mut idx) = table.first_valid_at_or_after(start);
             let mut want = Vec::new();
             let mut candidates = 0u32;
             while n < end {
                 candidates += 1;
-                if prefilter_mirror(n, base, &pre) {
+                if affine_mirror(n, base, table.low_digit_masks[idx])
+                    && prefilter_mirror(n, base, &pre)
+                {
                     want.push(n);
                 }
                 n += u128::from(table.gap_table[idx]);
