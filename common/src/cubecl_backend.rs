@@ -1022,6 +1022,20 @@ fn niceonly_kernel(
         // plane_all. Requires Plane::Sync (spirv/msl/cuda; not wgsl).
         let mut q_lo = SharedMemory::<u64>::new(comptime!((2 * WORKGROUP_SIZE) as usize));
         let mut q_hi = SharedMemory::<u64>::new(comptime!((2 * WORKGROUP_SIZE) as usize));
+        // With the affine filter: each queued candidate's (t << 32 | s) and
+        // known-digit mask, plus a second-stage queue of the candidates that
+        // pass it, so the full check too runs only in dense waves. Sized to
+        // one slot when the filter is off.
+        let aff_slots = comptime!(if affine {
+            (2 * WORKGROUP_SIZE) as usize
+        } else {
+            1
+        });
+        let mut q_st = SharedMemory::<u64>::new(aff_slots);
+        let mut q_known = SharedMemory::<u64>::new(aff_slots);
+        let mut q2_lo = SharedMemory::<u64>::new(aff_slots);
+        let mut q2_hi = SharedMemory::<u64>::new(aff_slots);
+        let mut q2n = 0u32;
         let qbase = PLANE_POS * (2u32 * PLANE_DIM);
         let lane_in_plane = UNIT_POS_X % PLANE_DIM;
 
@@ -1101,6 +1115,8 @@ fn niceonly_kernel(
             let mut pf = 0u32;
             let mut cand_lo = 0u64;
             let mut cand_hi = 0u64;
+            let mut cand_st = 0u64;
+            let mut cand_known = 0u64;
             if have_range {
                 let cycle = g / stride_r;
                 let j = g - cycle * stride_r;
@@ -1128,9 +1144,14 @@ fn niceonly_kernel(
                             masked = true;
                         }
                     }
-                    // Affine middle-digit filter on the cross survivors, before
-                    // they take a queue slot: the candidate's (s, t) follow
-                    // from the range base and residue j by digit arithmetic.
+                    // Affine middle-digit filter inputs for the cross
+                    // survivors: the candidate's (s, t) follow from the range
+                    // base and residue j by digit arithmetic, and ride the
+                    // queue with its known-digit mask. The test itself runs at
+                    // drain time, in dense waves — inline here it cost the
+                    // whole plane a test on nearly every iteration (measured
+                    // -3..-17% on an RTX 3080), while a drained wave tests
+                    // PLANE_DIM survivors at once.
                     if affine {
                         if !masked {
                             let res = residues[j as usize];
@@ -1141,9 +1162,8 @@ fn niceonly_kernel(
                                 carry = 1u32;
                             }
                             let ta = (aff_t0 + cycle * base_m1 + res / aff_bk + carry) % aff_bk;
-                            if !affine_survives(sa, ta, lm | rmask, base) {
-                                masked = true;
-                            }
+                            cand_st = (u64::cast_from(ta) << 32u64) | u64::cast_from(sa);
+                            cand_known = lm | rmask;
                         }
                     }
                     if !masked {
@@ -1162,6 +1182,10 @@ fn niceonly_kernel(
                 let dst = (qbase + qn + idx_in_plane) as usize;
                 q_lo[dst] = cand_lo;
                 q_hi[dst] = cand_hi;
+                if affine {
+                    q_st[dst] = cand_st;
+                    q_known[dst] = cand_known;
+                }
             }
             qn += tot;
             // Queue writes become visible to the drain below.
@@ -1173,32 +1197,99 @@ fn niceonly_kernel(
             } else if done {
                 take = qn;
             }
-            if lane_in_plane < take {
-                let s = (qbase + qn - take + lane_in_plane) as usize;
-                candidate_check(
-                    q_lo[s],
-                    q_hi[s],
-                    &mut sv_s,
-                    svb,
-                    nice_out,
-                    nice_count,
-                    nice_cap,
-                    base,
-                    limbs,
-                    chunk_digits,
-                    chunk_div,
-                    wide_chunk,
-                    pre_limbs,
-                    pre_chunk_digits,
-                    pre_chunk_div,
-                    probe,
-                );
-            }
-            qn -= take;
-            // Drain reads are ordered before the next iteration reuses slots.
-            sync_plane();
-            if done && qn == 0u32 {
-                break;
+            if affine {
+                // Stage 1: the affine test on a dense wave of cross
+                // survivors; the few that pass compact into the second queue.
+                let mut pf2 = 0u32;
+                let mut c2_lo = 0u64;
+                let mut c2_hi = 0u64;
+                if lane_in_plane < take {
+                    let s = (qbase + qn - take + lane_in_plane) as usize;
+                    let st = q_st[s];
+                    if affine_survives(
+                        u32::cast_from(st),
+                        u32::cast_from(st >> 32u64),
+                        q_known[s],
+                        base,
+                    ) {
+                        pf2 = 1u32;
+                        c2_lo = q_lo[s];
+                        c2_hi = q_hi[s];
+                    }
+                }
+                qn -= take;
+                let idx2 = plane_exclusive_sum(pf2);
+                let tot2 = plane_sum(pf2);
+                if pf2 != 0u32 {
+                    let dst2 = (qbase + q2n + idx2) as usize;
+                    q2_lo[dst2] = c2_lo;
+                    q2_hi[dst2] = c2_hi;
+                }
+                q2n += tot2;
+                // Second-queue writes (and the stage-1 reads) are ordered
+                // before the check below and the next iteration's writes.
+                sync_plane();
+                // Stage 2: the full check on a dense wave of affine survivors.
+                let mut take2 = 0u32;
+                if q2n >= PLANE_DIM {
+                    take2 = PLANE_DIM;
+                } else if done && qn == 0u32 {
+                    take2 = q2n;
+                }
+                if lane_in_plane < take2 {
+                    let s2 = (qbase + q2n - take2 + lane_in_plane) as usize;
+                    candidate_check(
+                        q2_lo[s2],
+                        q2_hi[s2],
+                        &mut sv_s,
+                        svb,
+                        nice_out,
+                        nice_count,
+                        nice_cap,
+                        base,
+                        limbs,
+                        chunk_digits,
+                        chunk_div,
+                        wide_chunk,
+                        pre_limbs,
+                        pre_chunk_digits,
+                        pre_chunk_div,
+                        probe,
+                    );
+                }
+                q2n -= take2;
+                sync_plane();
+                if done && qn == 0u32 && q2n == 0u32 {
+                    break;
+                }
+            } else {
+                if lane_in_plane < take {
+                    let s = (qbase + qn - take + lane_in_plane) as usize;
+                    candidate_check(
+                        q_lo[s],
+                        q_hi[s],
+                        &mut sv_s,
+                        svb,
+                        nice_out,
+                        nice_count,
+                        nice_cap,
+                        base,
+                        limbs,
+                        chunk_digits,
+                        chunk_div,
+                        wide_chunk,
+                        pre_limbs,
+                        pre_chunk_digits,
+                        pre_chunk_div,
+                        probe,
+                    );
+                }
+                qn -= take;
+                // Drain reads are ordered before the next iteration reuses slots.
+                sync_plane();
+                if done && qn == 0u32 {
+                    break;
+                }
             }
         }
     } else if compact {
@@ -1222,6 +1313,15 @@ fn niceonly_kernel(
         // divides CUBE_DIM_X.
         let mut q_lo = SharedMemory::<u64>::new(comptime!((2 * WORKGROUP_SIZE) as usize));
         let mut q_hi = SharedMemory::<u64>::new(comptime!((2 * WORKGROUP_SIZE) as usize));
+        // Affine filter inputs per queued candidate (one slot when off); the
+        // test runs on the drained wave, ahead of the check.
+        let aff_slots = comptime!(if affine {
+            (2 * WORKGROUP_SIZE) as usize
+        } else {
+            1
+        });
+        let mut q_st = SharedMemory::<u64>::new(aff_slots);
+        let mut q_known = SharedMemory::<u64>::new(aff_slots);
         // Indexed by plane id; sized for the narrowest plane wgpu allows.
         let mut plane_tot = SharedMemory::<u32>::new(comptime!(WORKGROUP_SIZE as usize));
         let mut plane_done = SharedMemory::<u32>::new(comptime!(WORKGROUP_SIZE as usize));
@@ -1304,6 +1404,8 @@ fn niceonly_kernel(
             let mut pf = 0u32;
             let mut cand_lo = 0u64;
             let mut cand_hi = 0u64;
+            let mut cand_st = 0u64;
+            let mut cand_known = 0u64;
             if have_range {
                 let cycle = g / stride_r;
                 let j = g - cycle * stride_r;
@@ -1331,9 +1433,14 @@ fn niceonly_kernel(
                             masked = true;
                         }
                     }
-                    // Affine middle-digit filter on the cross survivors, before
-                    // they take a queue slot: the candidate's (s, t) follow
-                    // from the range base and residue j by digit arithmetic.
+                    // Affine middle-digit filter inputs for the cross
+                    // survivors: the candidate's (s, t) follow from the range
+                    // base and residue j by digit arithmetic, and ride the
+                    // queue with its known-digit mask. The test itself runs at
+                    // drain time, in dense waves — inline here it cost the
+                    // whole plane a test on nearly every iteration (measured
+                    // -3..-17% on an RTX 3080), while a drained wave tests
+                    // PLANE_DIM survivors at once.
                     if affine {
                         if !masked {
                             let res = residues[j as usize];
@@ -1344,9 +1451,8 @@ fn niceonly_kernel(
                                 carry = 1u32;
                             }
                             let ta = (aff_t0 + cycle * base_m1 + res / aff_bk + carry) % aff_bk;
-                            if !affine_survives(sa, ta, lm | rmask, base) {
-                                masked = true;
-                            }
+                            cand_st = (u64::cast_from(ta) << 32u64) | u64::cast_from(sa);
+                            cand_known = lm | rmask;
                         }
                     }
                     if !masked {
@@ -1393,6 +1499,10 @@ fn niceonly_kernel(
                 let dst = (base_off + idx_in_plane) as usize;
                 q_lo[dst] = cand_lo;
                 q_hi[dst] = cand_hi;
+                if affine {
+                    q_st[dst] = cand_st;
+                    q_known[dst] = cand_known;
+                }
             }
             qn += incoming;
             // Barrier 2: queue writes become visible to the drain below.
@@ -1408,24 +1518,38 @@ fn niceonly_kernel(
             }
             if UNIT_POS_X < take {
                 let s = (qn - take + UNIT_POS_X) as usize;
-                candidate_check(
-                    q_lo[s],
-                    q_hi[s],
-                    &mut sv_s,
-                    svb,
-                    nice_out,
-                    nice_count,
-                    nice_cap,
-                    base,
-                    limbs,
-                    chunk_digits,
-                    chunk_div,
-                    wide_chunk,
-                    pre_limbs,
-                    pre_chunk_digits,
-                    pre_chunk_div,
-                    probe,
-                );
+                let mut go = true;
+                if affine {
+                    let st = q_st[s];
+                    if !affine_survives(
+                        u32::cast_from(st),
+                        u32::cast_from(st >> 32u64),
+                        q_known[s],
+                        base,
+                    ) {
+                        go = false;
+                    }
+                }
+                if go {
+                    candidate_check(
+                        q_lo[s],
+                        q_hi[s],
+                        &mut sv_s,
+                        svb,
+                        nice_out,
+                        nice_count,
+                        nice_cap,
+                        base,
+                        limbs,
+                        chunk_digits,
+                        chunk_div,
+                        wide_chunk,
+                        pre_limbs,
+                        pre_chunk_digits,
+                        pre_chunk_div,
+                        probe,
+                    );
+                }
             }
             qn -= take;
             if all_done && qn == 0u32 {
@@ -2522,6 +2646,43 @@ pub struct NiceonlyPlan {
     affine: Option<AffineParams>,
 }
 
+/// Whether the compacted niceonly paths' shared memory still fits the device
+/// with the affine filter on. The filter adds, per cube, `(t << 32 | s)` and
+/// known-mask words for every queue slot and — on the plane-scoped path — the
+/// second-stage queue: 16 KB on top of the 8 KB queues and the digit-scan
+/// scratch, 8 KB on the cube-scoped path. That is 31-37 KB in total by base,
+/// which a 32 KB device (Metal) cannot hold at three limbs; without the
+/// filter every device this backend runs on has had room. The plain path
+/// has no queues and needs no check.
+fn affine_shared_memory_fits<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    base: u32,
+    compact: bool,
+    plane_compact: bool,
+) -> bool {
+    if !compact {
+        return true;
+    }
+    let limbs = u64::from(n_limbs(base).unwrap_or(4));
+    let slots = 2 * u64::from(WORKGROUP_SIZE);
+    let scan_scratch = u64::from(WORKGROUP_SIZE) * ((3 * limbs) | 1) * 4;
+    let queues = 2 * slots * 8;
+    let affine_words = if plane_compact { 4 } else { 2 } * slots * 8;
+    let plane_totals = if plane_compact {
+        0
+    } else {
+        2 * u64::from(WORKGROUP_SIZE) * 4
+    };
+    let need = scan_scratch + queues + affine_words + plane_totals;
+    let max = client.properties().hardware.max_shared_memory_size as u64;
+    if need > max {
+        debug!(
+            "base {base}: affine filter off, compacted path would need {need} B of shared memory (device max {max})"
+        );
+    }
+    need <= max
+}
+
 impl NiceonlyPlan {
     /// # Errors
     /// Returns an error for an unconfigurable base. Residue-empty bases must
@@ -2602,6 +2763,7 @@ impl NiceonlyPlan {
         let residues = client.create(cubecl::bytes::Bytes::from_elems(table.valid_residues));
         let affine = if cross && std::env::var("NICE_CUBECL_AFFINE").map_or(true, |v| v != "0") {
             affine_params(base, GPU_LSD_K)
+                .filter(|_| affine_shared_memory_fits(client, base, compact, plane_compact))
         } else {
             None
         };
