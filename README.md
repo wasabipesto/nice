@@ -12,7 +12,7 @@ For more background, check out the [original article](https://beautifulthorns.wi
 
 The easiest way to get started is by going to [https://nicenumbers.net/search/](https://nicenumbers.net/search) and running it in your browser. You'll see live results and everything will be submitted in your name.
 
-If you want to go even faster, you can run the [native binaries from the latest release](https://github.com/wasabipesto/nice/releases) or run the docker image. We usually see a ~2x speedup versus the browser.
+If you want to go even faster, you can run the [native binaries from the latest release](https://github.com/wasabipesto/nice/releases) or run the docker image. We usually see a ~2x speedup versus the browser. Each release also includes `nice_client-gpu-*` binaries that add support for the `--gpu` option.
 
 ```sh
 # Run the release binary
@@ -228,7 +228,7 @@ If you want to run a copy of this server yourself, a SQL schema file has been pr
 
 ## GPU backends
 
-The GPU-enabled client (`--features gpu`, or the `-gpu` docker tag) carries multiple backends in one binary and picks one at runtime; the CPU path is always available as a fallback and for verification. Kernels are JIT-compiled per base at first use, so the first field on a new base takes a few extra seconds.
+The GPU-enabled client (the `nice_client-gpu-*` release binaries, the `-gpu` docker tag, or a `--features gpu` build) carries multiple backends in one binary and picks one at runtime; the CPU path is always available as a fallback and for verification. Kernels are JIT-compiled per base at first use, so the first field on a new base takes a few extra seconds.
 
 The `gpu` umbrella feature needs nothing installed to build on any platform, since every included backend loads its driver at runtime. Some opt-in features have additional dependencies listed below.
 
