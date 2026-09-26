@@ -984,9 +984,10 @@ fn niceonly_kernel(
     #[comptime] compact: bool, // plane-compact mask survivors before checking
     #[comptime] plane_scoped: bool, // compaction queue per plane (needs Plane::Sync)
     #[comptime] affine: bool, // affine middle-digit filter on cross survivors
-    #[comptime] aff_bk: u32, // base^3 (0 when `affine` is off)
-    #[comptime] aff_pow64_lo: u32, // 2^64 mod base^6, low word
-    #[comptime] aff_pow64_hi: u32, // 2^64 mod base^6, high word
+    #[comptime] affine_two_stage: bool, // plane path: compact the affine survivors again before the check
+    #[comptime] aff_bk: u32,            // base^3 (0 when `affine` is off)
+    #[comptime] aff_pow64_lo: u32,      // 2^64 mod base^6, low word
+    #[comptime] aff_pow64_hi: u32,      // 2^64 mod base^6, high word
 ) {
     let cu_limbs = comptime!(3 * limbs);
     let base_m1 = comptime!(base - 1);
@@ -1033,8 +1034,13 @@ fn niceonly_kernel(
         });
         let mut q_st = SharedMemory::<u64>::new(aff_slots);
         let mut q_known = SharedMemory::<u64>::new(aff_slots);
-        let mut q2_lo = SharedMemory::<u64>::new(aff_slots);
-        let mut q2_hi = SharedMemory::<u64>::new(aff_slots);
+        let q2_slots = comptime!(if affine && affine_two_stage {
+            (2 * WORKGROUP_SIZE) as usize
+        } else {
+            1
+        });
+        let mut q2_lo = SharedMemory::<u64>::new(q2_slots);
+        let mut q2_hi = SharedMemory::<u64>::new(q2_slots);
         let mut q2n = 0u32;
         let qbase = PLANE_POS * (2u32 * PLANE_DIM);
         let lane_in_plane = UNIT_POS_X % PLANE_DIM;
@@ -1198,67 +1204,101 @@ fn niceonly_kernel(
                 take = qn;
             }
             if affine {
-                // Stage 1: the affine test on a dense wave of cross
-                // survivors; the few that pass compact into the second queue.
-                let mut pf2 = 0u32;
-                let mut c2_lo = 0u64;
-                let mut c2_hi = 0u64;
-                if lane_in_plane < take {
-                    let s = (qbase + qn - take + lane_in_plane) as usize;
-                    let st = q_st[s];
-                    if affine_survives(
-                        u32::cast_from(st),
-                        u32::cast_from(st >> 32u64),
-                        q_known[s],
-                        base,
-                    ) {
-                        pf2 = 1u32;
-                        c2_lo = q_lo[s];
-                        c2_hi = q_hi[s];
+                // Everything the filter adds runs only on iterations that
+                // drain: the extra plane reductions and barriers on every
+                // producer iteration measured 0.85-0.95x on an RTX 3080.
+                // `take` is plane-uniform, so the branch is too.
+                if take != 0u32 {
+                    // Stage 1: the affine test on a dense wave of cross
+                    // survivors.
+                    let mut pf2 = 0u32;
+                    let mut c2_lo = 0u64;
+                    let mut c2_hi = 0u64;
+                    if lane_in_plane < take {
+                        let s = (qbase + qn - take + lane_in_plane) as usize;
+                        let st = q_st[s];
+                        if affine_survives(
+                            u32::cast_from(st),
+                            u32::cast_from(st >> 32u64),
+                            q_known[s],
+                            base,
+                        ) {
+                            pf2 = 1u32;
+                            c2_lo = q_lo[s];
+                            c2_hi = q_hi[s];
+                        }
+                    }
+                    qn -= take;
+                    if affine_two_stage {
+                        // The few that pass compact into the second queue.
+                        let idx2 = plane_exclusive_sum(pf2);
+                        let tot2 = plane_sum(pf2);
+                        if pf2 != 0u32 {
+                            let dst2 = (qbase + q2n + idx2) as usize;
+                            q2_lo[dst2] = c2_lo;
+                            q2_hi[dst2] = c2_hi;
+                        }
+                        q2n += tot2;
+                    } else if pf2 != 0u32 {
+                        // Single stage: check in place, as the CUDA kernel does.
+                        candidate_check(
+                            c2_lo,
+                            c2_hi,
+                            &mut sv_s,
+                            svb,
+                            nice_out,
+                            nice_count,
+                            nice_cap,
+                            base,
+                            limbs,
+                            chunk_digits,
+                            chunk_div,
+                            wide_chunk,
+                            pre_limbs,
+                            pre_chunk_digits,
+                            pre_chunk_div,
+                            probe,
+                        );
+                    }
+                    // Stage-1 reads (and second-queue writes) are ordered
+                    // before the check below and the next iteration's writes.
+                    sync_plane();
+                }
+                if affine_two_stage {
+                    // Stage 2: the full check on a dense wave of affine
+                    // survivors.
+                    let mut take2 = 0u32;
+                    if q2n >= PLANE_DIM {
+                        take2 = PLANE_DIM;
+                    } else if done && qn == 0u32 {
+                        take2 = q2n;
+                    }
+                    if take2 != 0u32 {
+                        if lane_in_plane < take2 {
+                            let s2 = (qbase + q2n - take2 + lane_in_plane) as usize;
+                            candidate_check(
+                                q2_lo[s2],
+                                q2_hi[s2],
+                                &mut sv_s,
+                                svb,
+                                nice_out,
+                                nice_count,
+                                nice_cap,
+                                base,
+                                limbs,
+                                chunk_digits,
+                                chunk_div,
+                                wide_chunk,
+                                pre_limbs,
+                                pre_chunk_digits,
+                                pre_chunk_div,
+                                probe,
+                            );
+                        }
+                        q2n -= take2;
+                        sync_plane();
                     }
                 }
-                qn -= take;
-                let idx2 = plane_exclusive_sum(pf2);
-                let tot2 = plane_sum(pf2);
-                if pf2 != 0u32 {
-                    let dst2 = (qbase + q2n + idx2) as usize;
-                    q2_lo[dst2] = c2_lo;
-                    q2_hi[dst2] = c2_hi;
-                }
-                q2n += tot2;
-                // Second-queue writes (and the stage-1 reads) are ordered
-                // before the check below and the next iteration's writes.
-                sync_plane();
-                // Stage 2: the full check on a dense wave of affine survivors.
-                let mut take2 = 0u32;
-                if q2n >= PLANE_DIM {
-                    take2 = PLANE_DIM;
-                } else if done && qn == 0u32 {
-                    take2 = q2n;
-                }
-                if lane_in_plane < take2 {
-                    let s2 = (qbase + q2n - take2 + lane_in_plane) as usize;
-                    candidate_check(
-                        q2_lo[s2],
-                        q2_hi[s2],
-                        &mut sv_s,
-                        svb,
-                        nice_out,
-                        nice_count,
-                        nice_cap,
-                        base,
-                        limbs,
-                        chunk_digits,
-                        chunk_div,
-                        wide_chunk,
-                        pre_limbs,
-                        pre_chunk_digits,
-                        pre_chunk_div,
-                        probe,
-                    );
-                }
-                q2n -= take2;
-                sync_plane();
                 if done && qn == 0u32 && q2n == 0u32 {
                     break;
                 }
@@ -2644,6 +2684,20 @@ pub struct NiceonlyPlan {
     /// (`NICE_CUBECL_AFFINE=0` opts out; requires `cross` and a base where
     /// both powers have six guaranteed digits — see `gpu_config::affine_params`).
     affine: Option<AffineParams>,
+    /// How the plane-scoped path drains the affine survivors.
+    affine_stages: AffineStages,
+}
+
+/// Plane-scoped path: what happens to a cross survivor that passes the
+/// affine test on the drained wave.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AffineStages {
+    /// Checked in place on that wave (the CUDA kernel's shape; 8 KB of
+    /// shared memory for the filter).
+    One,
+    /// Compacted into a second queue and checked in dense waves (16 KB).
+    /// `NICE_CUBECL_AFFINE_STAGES=1|2` selects; the default is two.
+    Two,
 }
 
 /// Whether the compacted niceonly paths' shared memory still fits the device
@@ -2659,6 +2713,7 @@ fn affine_shared_memory_fits<R: cubecl::prelude::Runtime>(
     base: u32,
     compact: bool,
     plane_compact: bool,
+    two_stage: bool,
 ) -> bool {
     if !compact {
         return true;
@@ -2667,7 +2722,7 @@ fn affine_shared_memory_fits<R: cubecl::prelude::Runtime>(
     let slots = 2 * u64::from(WORKGROUP_SIZE);
     let scan_scratch = u64::from(WORKGROUP_SIZE) * ((3 * limbs) | 1) * 4;
     let queues = 2 * slots * 8;
-    let affine_words = if plane_compact { 4 } else { 2 } * slots * 8;
+    let affine_words = if plane_compact && two_stage { 4 } else { 2 } * slots * 8;
     let plane_totals = if plane_compact {
         0
     } else {
@@ -2761,9 +2816,21 @@ impl NiceonlyPlan {
         };
         let low_masks = client.create(cubecl::bytes::Bytes::from_elems(mask_words));
         let residues = client.create(cubecl::bytes::Bytes::from_elems(table.valid_residues));
+        let affine_stages = if std::env::var("NICE_CUBECL_AFFINE_STAGES").is_ok_and(|v| v == "1") {
+            AffineStages::One
+        } else {
+            AffineStages::Two
+        };
         let affine = if cross && std::env::var("NICE_CUBECL_AFFINE").map_or(true, |v| v != "0") {
-            affine_params(base, GPU_LSD_K)
-                .filter(|_| affine_shared_memory_fits(client, base, compact, plane_compact))
+            affine_params(base, GPU_LSD_K).filter(|_| {
+                affine_shared_memory_fits(
+                    client,
+                    base,
+                    compact,
+                    plane_compact,
+                    affine_stages == AffineStages::Two,
+                )
+            })
         } else {
             None
         };
@@ -2777,6 +2844,7 @@ impl NiceonlyPlan {
             compact,
             plane_compact,
             affine,
+            affine_stages,
         })
     }
 }
@@ -2810,6 +2878,9 @@ struct CubeclNiceonlyRun<R: cubecl::prelude::Runtime> {
     /// where the plan has no parameters for it.
     #[cfg(test)]
     affine_override: Option<bool>,
+    /// Force the plane path's affine drain shape (device tests).
+    #[cfg(test)]
+    stages_override: Option<AffineStages>,
 }
 
 impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
@@ -2872,6 +2943,8 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
             plane_override: None,
             #[cfg(test)]
             affine_override: None,
+            #[cfg(test)]
+            stages_override: None,
         })
     }
 
@@ -2951,6 +3024,16 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
             return forced;
         }
         self.plan.compact && masks.iter().any(|&m| m != 0)
+    }
+
+    /// Whether the plane path compacts the affine survivors again before
+    /// checking them.
+    fn dispatch_two_stage(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.stages_override {
+            return forced == AffineStages::Two;
+        }
+        self.plan.affine_stages == AffineStages::Two
     }
 
     /// The affine filter parameters this dispatch compiles in, if any.
@@ -3131,6 +3214,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
                 compact,
                 self.dispatch_plane_scoped(compact),
                 affine.is_some(),
+                self.dispatch_two_stage(),
                 affine.map_or(0, |a| a.bk),
                 affine.map_or(0, |a| a.pow64_mod as u32),
                 affine.map_or(0, |a| (a.pow64_mod >> 32) as u32),
@@ -3581,7 +3665,7 @@ mod tests {
                 &[(true, false), (false, false)]
             };
             for &(forced_compact, forced_plane) in variants {
-                for affine_on in [false, true] {
+                for (affine_on, two_stage) in [(false, true), (true, true), (true, false)] {
                     let mut run =
                         CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
                     assert!(run.plan.affine.is_some(), "base {base}: no affine params");
@@ -3589,6 +3673,11 @@ mod tests {
                     run.compact_override = Some(forced_compact);
                     run.plane_override = Some(forced_plane);
                     run.affine_override = Some(affine_on);
+                    run.stages_override = Some(if two_stage {
+                        AffineStages::Two
+                    } else {
+                        AffineStages::One
+                    });
                     run.launch(0, &[0], &[len], &[mask]).expect("dispatch");
                     let mut got: Vec<u128> = run
                         .finish()
@@ -3601,7 +3690,7 @@ mod tests {
                     assert_eq!(
                         &got, want,
                         "base {base} compact={forced_compact} plane={forced_plane} \
-                         affine={affine_on}: cross-filtered survivor set mismatch"
+                         affine={affine_on} two_stage={two_stage}: cross-filtered survivor set mismatch"
                     );
                 }
             }
