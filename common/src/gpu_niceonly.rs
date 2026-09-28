@@ -304,7 +304,7 @@ const FLOOR_WAIT_THRESHOLD: f64 = 0.15;
 /// Anvil it ratcheted to the bypass and stayed there.
 ///
 /// `NICE_GPU_MSD_FLOOR` pins the floor and disables steering (floor sweeps,
-/// benchmarks); see [`pin_msd_floor_for_benchmark`].
+/// benchmarks); see [`benchmark_floor_pin`].
 pub struct FloorController {
     /// The floor as `f64` bits; workers read it per block, lock-free.
     floor_bits: AtomicU64,
@@ -340,6 +340,17 @@ impl FloorController {
     /// The floor in force right now.
     pub fn floor(&self) -> u128 {
         f64::from_bits(self.floor_bits.load(Ordering::Relaxed)) as u128
+    }
+
+    /// Which controller is in charge, for reports: `pinned` under
+    /// `NICE_GPU_MSD_FLOOR`, else `heuristic` (the wait fractions above).
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        if self.env_pinned {
+            "pinned"
+        } else {
+            "heuristic"
+        }
     }
 
     /// Record time the dispatch thread spent waiting for descriptors (the CPU
@@ -463,11 +474,64 @@ pub fn benchmark_floor_freeze() -> u128 {
     floor_controller().freeze()
 }
 
+/// Hold the floor at `floor` (the benchmark's pinned sweep). Returns `false`,
+/// and does nothing, under an explicit `NICE_GPU_MSD_FLOOR` pin, which the
+/// sweep must not disturb. Pair with [`benchmark_floor_thaw`] to steer again.
+#[allow(clippy::cast_precision_loss)]
+#[must_use]
+pub fn benchmark_floor_pin(floor: u128) -> bool {
+    let c = floor_controller();
+    if c.env_pinned {
+        return false;
+    }
+    c.floor_bits
+        .store((floor as f64).to_bits(), Ordering::Relaxed);
+    c.pinned.store(true, Ordering::Relaxed);
+    true
+}
+
+/// Floors the benchmark sweeps: from one chunk down to 11.7k, both of the
+/// recursion's configurations at every level.
+///
+/// The recursion halves a chunk until a node is no larger than the floor,
+/// and emits a node *without* analysing it when it is no larger than the
+/// floor but analyses it and emits it whole when it is larger than the floor
+/// yet smaller than twice the floor. So the floor picks one of two
+/// configurations per level: at exactly a power-of-two fraction `P` of a
+/// chunk the `P` nodes ship unanalysed (the halves of their analysed
+/// parents); at any floor strictly between `P/2` and `P` the `P` nodes are
+/// analysed and the passing ones ship whole. The second does the same host
+/// work as the pin at `P/2` and hands the device the same surviving volume
+/// in half as many descriptors. The wait heuristic settles on such
+/// in-between floors routinely (260-350k on an RTX 3060 host), which no
+/// power-of-two pin reproduces, so the sweep visits both configurations:
+/// three quarters of `chunk >> l` for `l` in `0..=6`, and the power-of-two
+/// floors in between (the heuristic's 500k cap and 62.5k clamp among them).
+/// The one power-of-two floor in that span not swept is 31.25k.
+pub const BENCHMARK_FLOOR_LADDER: usize = 12;
+
+/// See [`BENCHMARK_FLOOR_LADDER`]: 750k, 500k, 375k, 250k, 187.5k, 125k,
+/// 93.75k, 62.5k, 46.875k, 23.4k, 15.6k, 11.7k.
+#[must_use]
+pub fn benchmark_floor_candidates() -> [u128; BENCHMARK_FLOOR_LADDER] {
+    [
+        750_000, 500_000, 375_000, 250_000, 187_500, 125_000, 93_750, 62_500, 46_875, 23_437,
+        15_625, 11_718,
+    ]
+}
+
 /// The MSD floor currently in force, for reports. Initialises the controller
 /// if nothing has yet.
 #[must_use]
 pub fn msd_floor_in_use() -> u128 {
     floor_controller().floor()
+}
+
+/// Which floor controller this process runs (`pinned` or `heuristic`), for
+/// reports. Initialises the controller if nothing has yet.
+#[must_use]
+pub fn msd_floor_controller() -> &'static str {
+    floor_controller().name()
 }
 
 /// Fields the client keeps open in the pipeline at once: with two, the next

@@ -82,6 +82,10 @@ struct ScenarioResult {
     /// The MSD floor the GPU niceonly pipeline was held at for the measured
     /// windows, after steering to it in the warm-up; `None` elsewhere.
     msd_floor: Option<u128>,
+    /// GPU niceonly: the rate at each candidate floor, pinned in turn for a
+    /// short slice of the warm-up, so the report shows how far the
+    /// controller's choice sits from the best pinned floor on this machine.
+    floor_sweep: Vec<(u128, f64)>,
 }
 
 /// Seconds a GPU niceonly scenario steers its MSD floor before the floor is
@@ -89,6 +93,13 @@ struct ScenarioResult {
 /// second, so this is six steps: enough to go from the seed to either clamp.
 #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
 const STEER_WARMUP_SECS: f64 = 3.0;
+
+/// Seconds each candidate floor is pinned for in the warm-up sweep before
+/// steering starts: twelve candidates
+/// (`gpu_niceonly::BENCHMARK_FLOOR_LADDER`), so 9 s per GPU niceonly
+/// scenario, on top of `STEER_WARMUP_SECS` and outside the time budget.
+#[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+const SWEEP_SECS_PER_FLOOR: f64 = 0.75;
 
 /// Print a human-facing line: to stdout normally, to stderr under
 /// `--benchmark-json`, where stdout is reserved for the JSON document.
@@ -239,7 +250,7 @@ fn run_scenario(
     // this base, then hold it there for the timed windows. Every scenario
     // starts from the same seed, so the result does not depend on the
     // scenario before it. See `gpu_niceonly::benchmark_floor_thaw`.
-    let msd_floor = steer_floor(cli, gpu, def, start, window, table.as_ref());
+    let (msd_floor, floor_sweep) = steer_floor(cli, gpu, def, start, window, table.as_ref());
     let warmup_seconds = warmup_t0.elapsed().as_secs_f64();
 
     let scenario_start = Instant::now();
@@ -267,11 +278,15 @@ fn run_scenario(
         rate,
         warmup_seconds,
         msd_floor,
+        floor_sweep,
     }
 }
 
-/// Run windows with the floor steering for `STEER_WARMUP_SECS`, then freeze
-/// it and return it. `None` unless this is a GPU niceonly scenario.
+/// GPU niceonly warm-up: pin each candidate floor for [`SWEEP_SECS_PER_FLOOR`]
+/// and record its rate, then run windows with the floor steering for
+/// `STEER_WARMUP_SECS`, freeze it and return it with the sweep. `(None, [])`
+/// unless this is a GPU niceonly scenario; the sweep is empty under an
+/// explicit `NICE_GPU_MSD_FLOOR` pin.
 #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
 fn steer_floor(
     cli: &Arc<Cli>,
@@ -280,17 +295,36 @@ fn steer_floor(
     start: u128,
     window: u128,
     table: Option<&Arc<StrideTable>>,
-) -> Option<u128> {
-    use nice_common::gpu_niceonly::{benchmark_floor_freeze, benchmark_floor_thaw};
+) -> (Option<u128>, Vec<(u128, f64)>) {
+    use nice_common::gpu_niceonly::{
+        benchmark_floor_candidates, benchmark_floor_freeze, benchmark_floor_pin,
+        benchmark_floor_thaw,
+    };
     if !(cli.gpu && cli.mode == SearchMode::Niceonly) {
-        return None;
+        return (None, Vec::new());
+    }
+    let mut sweep = Vec::new();
+    for floor in benchmark_floor_candidates() {
+        if !benchmark_floor_pin(floor) {
+            break;
+        }
+        let t0 = Instant::now();
+        let mut windows = 0u32;
+        while t0.elapsed().as_secs_f64() < SWEEP_SECS_PER_FLOOR {
+            run_window(cli, gpu, def, start, window, table);
+            windows += 1;
+        }
+        sweep.push((
+            floor,
+            approx_f64(window) * f64::from(windows) / t0.elapsed().as_secs_f64().max(1e-4),
+        ));
     }
     benchmark_floor_thaw();
     let t0 = Instant::now();
     while t0.elapsed().as_secs_f64() < STEER_WARMUP_SECS {
         run_window(cli, gpu, def, start, window, table);
     }
-    Some(benchmark_floor_freeze())
+    (Some(benchmark_floor_freeze()), sweep)
 }
 
 #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
@@ -301,8 +335,8 @@ fn steer_floor(
     _start: u128,
     _window: u128,
     _table: Option<&Arc<StrideTable>>,
-) -> Option<u128> {
-    None
+) -> (Option<u128>, Vec<(u128, f64)>) {
+    (None, Vec::new())
 }
 
 /// Process one window through the production path and return elapsed seconds.
@@ -405,6 +439,42 @@ fn print_report(
         );
     }
 
+    let swept: Vec<&ScenarioResult> = results
+        .iter()
+        .filter(|r| !r.floor_sweep.is_empty())
+        .collect();
+    if !swept.is_empty() {
+        println!(
+            "\nMSD floor sweep (numbers/sec at each pinned floor; held = the {} controller's choice):",
+            floor_controller_name(cli).unwrap_or("floor")
+        );
+        for r in swept {
+            let cells: Vec<String> = r
+                .floor_sweep
+                .iter()
+                .map(|(f, rate)| format!("{f}: {rate:.3e}"))
+                .collect();
+            let best = r
+                .floor_sweep
+                .iter()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map_or(0.0, |(_, rate)| *rate);
+            println!(
+                "{:<20} {}  held {} at {:.3e} ({:+.0}% vs best pinned)",
+                r.key,
+                cells.join("  "),
+                r.msd_floor
+                    .map_or_else(|| "-".to_string(), |f| f.to_string()),
+                r.rate,
+                if best > 0.0 {
+                    100.0 * (r.rate / best - 1.0)
+                } else {
+                    0.0
+                }
+            );
+        }
+    }
+
     let all_pings: Vec<f64> = ping_before
         .iter()
         .chain(ping_after)
@@ -456,6 +526,7 @@ fn build_report_json(
                 "rate": r.rate,
                 "warmup_seconds": r.warmup_seconds,
                 "msd_floor": r.msd_floor.map(|f| f.to_string()),
+                "floor_sweep": r.floor_sweep.iter().map(|(f, rate)| json!({"floor": f.to_string(), "rate": rate})).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -604,6 +675,11 @@ fn collect_hardware(cli: &Cli, gpu: &GpuCtx) -> Value {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
 
+    let (gpu_power_limit_w, gpu_sm_clock_max_mhz) = if cli.gpu {
+        nvidia_smi_power_and_clock(cli.gpu_device)
+    } else {
+        (None, None)
+    };
     json!({
         "cpu_model": parse_cpu_model(&cpuinfo),
         "cpu_threads_available": std::thread::available_parallelism().map(std::num::NonZero::get).ok(),
@@ -613,7 +689,52 @@ fn collect_hardware(cli: &Cli, gpu: &GpuCtx) -> Value {
         "os_pretty": parse_os_pretty(&os_release),
         "gpu_model": gpu_name(cli, gpu),
         "gpu_backend": gpu_backend(cli, gpu),
+        "gpu_power_limit_w": gpu_power_limit_w,
+        "gpu_sm_clock_max_mhz": gpu_sm_clock_max_mhz,
+        "msd_floor_controller": floor_controller_name(cli),
     })
+}
+
+/// Which MSD floor controller steered the GPU nice-only scenarios
+/// (`heuristic`, or `pinned` under `NICE_GPU_MSD_FLOOR`); `None` where no
+/// such controller ran. The floor alone moves a GPU rate by a quarter on
+/// some hosts (the sweep shows it), so the report has to say which it was.
+#[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+fn floor_controller_name(cli: &Cli) -> Option<&'static str> {
+    (cli.gpu && cli.mode == SearchMode::Niceonly)
+        .then(nice_common::gpu_niceonly::msd_floor_controller)
+}
+
+#[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
+fn floor_controller_name(_cli: &Cli) -> Option<&'static str> {
+    None
+}
+
+/// The NVIDIA device's power limit (W) and maximum SM clock (MHz) from
+/// `nvidia-smi`, where it exists: two "RTX 3080" hosts measured 1.5-2x apart
+/// on the same benchmark, and nothing else in the report could say why.
+/// `(None, None)` on other vendors or without the tool.
+fn nvidia_smi_power_and_clock(device: usize) -> (Option<f64>, Option<u32>) {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=power.limit,clocks.max.sm",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &device.to_string(),
+        ])
+        .output();
+    let Ok(output) = output else {
+        return (None, None);
+    };
+    parse_nvidia_smi_power_and_clock(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `nvidia-smi --query-gpu=power.limit,clocks.max.sm --format=csv,noheader,nounits`.
+fn parse_nvidia_smi_power_and_clock(line: &str) -> (Option<f64>, Option<u32>) {
+    let mut fields = line.lines().next().unwrap_or("").split(',').map(str::trim);
+    let power = fields.next().and_then(|p| p.parse::<f64>().ok());
+    let clock = fields.next().and_then(|c| c.parse::<u32>().ok());
+    (power, clock)
 }
 
 /// The first CPU model string in `/proc/cpuinfo` contents. x86 kernels use
@@ -711,6 +832,19 @@ fn parse_environ(data: &[u8]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvidia_smi_line_parses_and_tolerates_absence() {
+        assert_eq!(
+            parse_nvidia_smi_power_and_clock("320.00, 1710\n"),
+            (Some(320.0), Some(1710))
+        );
+        assert_eq!(
+            parse_nvidia_smi_power_and_clock("[N/A], [N/A]"),
+            (None, None)
+        );
+        assert_eq!(parse_nvidia_smi_power_and_clock(""), (None, None));
+    }
 
     #[test]
     fn cpu_model_x86_and_arm() {

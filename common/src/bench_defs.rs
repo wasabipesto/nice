@@ -102,6 +102,19 @@ pub const NICEONLY_SCENARIOS: &[ScenarioDef] = &[
         character: "msd-weak",
         single_thread: false,
     },
+    // Three u32 limbs for n (the checks are costliest here, so the filters
+    // matter most); an MSD-weak window found by scanning the range at the
+    // CPU floor (leaf fraction 0.47 against a range median of 0). Not scored
+    // (no reference rate yet), so it does not move NiceMark.
+    ScenarioDef {
+        key: "b57_msd_weak",
+        base: 57,
+        start: Some(58_549_892_695_752_322_464),
+        window_cpu: 20_000_000,
+        window_gpu: 4_000_000_000,
+        character: "msd-weak",
+        single_thread: false,
+    },
     // Same region and window as b50_msd_weak so the pair decomposes into
     // per-core rate × parallel efficiency. On very slow devices a single
     // repetition of this window may exceed the scenario share; one full
@@ -146,6 +159,11 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
         single_thread: true,
     },
 ];
+
+/// Scenarios that run and report but do not enter the score yet: no
+/// reference machine has measured them. Add a [`SCORE_REFERENCES`] row and
+/// remove the key here once one has.
+pub const UNSCORED_SCENARIOS: &[&str] = &["b57_msd_weak"];
 
 /// Reference rates (numbers/sec) for the synthetic score, pinned per client
 /// version: (scenario key, gpu, reference rate). CPU references were measured
@@ -233,8 +251,17 @@ mod tests {
 
     #[test]
     fn all_scenarios_have_cpu_references() {
-        // Every CPU scenario must be scoreable, or the score silently thins.
+        // Every CPU scenario must be scoreable, or the score silently thins
+        // — unless it is declared unscored, which keeps the omission explicit.
         for def in NICEONLY_SCENARIOS.iter().chain(DETAILED_SCENARIOS) {
+            if UNSCORED_SCENARIOS.contains(&def.key) {
+                assert!(
+                    !SCORE_REFERENCES.iter().any(|(k, _, _)| k == &def.key),
+                    "{} is listed as unscored but has a reference",
+                    def.key
+                );
+                continue;
+            }
             assert!(
                 SCORE_REFERENCES
                     .iter()
