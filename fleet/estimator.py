@@ -27,6 +27,12 @@ DETAIL_TOKENS = ("sxm", "sxm2", "sxm3", "sxm4", "sxm5", "pcie", "nvl")
 
 BENCHMARK_SCHEMA_VERSION = 1
 
+# Scenarios that report but are not scored yet: `UNSCORED_SCENARIOS` in
+# common/src/bench_defs.rs (test_estimator.py checks the two agree). They stay
+# out of the blended index, which would otherwise move for the same hardware
+# when a client version adds one.
+UNSCORED_SCENARIOS = frozenset({"b57_msd_weak"})
+
 # Minimum matched samples from the requested client version before the
 # estimate restricts itself to that version's rates (mirrors the Rust).
 MIN_VERSION_SAMPLES = 3
@@ -401,7 +407,8 @@ def estimate(samples, inp):
         """Geometric mean over the multi-thread scenarios: one ranking index
         that no single base can dominate."""
         logs = [math.log(pick(s)) for s in scenarios
-                if not s["key"].endswith("_1t") and pick(s) > 0.0]
+                if not s["key"].endswith("_1t")
+                and s["key"] not in UNSCORED_SCENARIOS and pick(s) > 0.0]
         return math.exp(sum(logs) / len(logs)) if logs else None
 
     return {

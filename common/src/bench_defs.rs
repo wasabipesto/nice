@@ -103,9 +103,10 @@ pub const NICEONLY_SCENARIOS: &[ScenarioDef] = &[
         single_thread: false,
     },
     // Three u32 limbs for n (the checks are costliest here, so the filters
-    // matter most); an MSD-weak window found by scanning the range at the
-    // CPU floor (leaf fraction 0.47 against a range median of 0). Not scored
-    // (no reference rate yet), so it does not move NiceMark.
+    // matter most); an MSD-weak window found by scanning the range: about
+    // half of it survives the CPU recursion (0.47-0.60 depending on the
+    // floor), where the median over the range is 0. Not scored (no reference
+    // rate yet), so it does not move NiceMark or the estimator's blend.
     ScenarioDef {
         key: "b57_msd_weak",
         base: 57,
@@ -160,9 +161,9 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
     },
 ];
 
-/// Scenarios that run and report but do not enter the score yet: no
-/// reference machine has measured them. Add a [`SCORE_REFERENCES`] row and
-/// remove the key here once one has.
+/// Scenarios that run and report but do not enter the score, or the
+/// estimator's blended index, yet: they have no reference rate. Add a
+/// [`SCORE_REFERENCES`] row and remove the key here once one is pinned.
 pub const UNSCORED_SCENARIOS: &[&str] = &["b57_msd_weak"];
 
 /// Reference rates (numbers/sec) for the synthetic score, pinned per client
@@ -247,6 +248,19 @@ mod tests {
         assert!((score - 1000.0).abs() < 1e-6);
         // An unmeasured scenario contributes nothing either.
         assert_eq!(compute_score([("b50_msd_weak", 0.0)], false), None);
+    }
+
+    #[test]
+    fn unscored_scenarios_exist() {
+        for key in UNSCORED_SCENARIOS {
+            assert!(
+                NICEONLY_SCENARIOS
+                    .iter()
+                    .chain(DETAILED_SCENARIOS)
+                    .any(|d| d.key == *key),
+                "{key} is listed as unscored but is not a scenario"
+            );
+        }
     }
 
     #[test]

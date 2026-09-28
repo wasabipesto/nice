@@ -405,6 +405,19 @@ impl FloorController {
 }
 
 impl FloorController {
+    /// Hold the floor at `floor` until the next thaw. Returns `false`, and
+    /// does nothing, under an environment pin.
+    #[allow(clippy::cast_precision_loss)]
+    fn pin(&self, floor: u128) -> bool {
+        if self.env_pinned {
+            return false;
+        }
+        self.floor_bits
+            .store((floor as f64).to_bits(), Ordering::Relaxed);
+        self.pinned.store(true, Ordering::Relaxed);
+        true
+    }
+
     /// Stop steering and hold the current floor. Returns it. A floor pinned
     /// by the environment is unaffected (it is already held).
     fn freeze(&self) -> u128 {
@@ -480,18 +493,12 @@ pub fn benchmark_floor_freeze() -> u128 {
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub fn benchmark_floor_pin(floor: u128) -> bool {
-    let c = floor_controller();
-    if c.env_pinned {
-        return false;
-    }
-    c.floor_bits
-        .store((floor as f64).to_bits(), Ordering::Relaxed);
-    c.pinned.store(true, Ordering::Relaxed);
-    true
+    floor_controller().pin(floor)
 }
 
-/// Floors the benchmark sweeps: from one chunk down to 11.7k, both of the
-/// recursion's configurations at every level.
+/// Floors the benchmark sweeps: from 750k (each chunk analysed once and
+/// shipped whole) down to 11.7k, both of the recursion's configurations at
+/// every level.
 ///
 /// The recursion halves a chunk until a node is no larger than the floor,
 /// and emits a node *without* analysing it when it is no larger than the
@@ -1887,6 +1894,34 @@ mod tests {
         let d = device.lock().unwrap();
         assert_eq!(d.opened, vec![0]);
         assert_eq!(d.closed, vec![0]);
+    }
+
+    /// The benchmark's pin holds a floor through any wait signal until the
+    /// thaw, which resumes steering from the seed; under an environment pin
+    /// it does nothing.
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn benchmark_pin_holds_until_thaw_and_yields_to_the_environment() {
+        let interval = FLOOR_ADJUST_INTERVAL;
+        let c = FloorController::new(MSD_FLOOR_SEED, false);
+        assert!(c.pin(93_750));
+        assert_eq!(c.floor(), 93_750);
+        // A pinned floor ignores the wait signal however one-sided it is.
+        c.state.lock().unwrap().interval_start = Instant::now()
+            .checked_sub(interval + Duration::from_micros(10))
+            .unwrap();
+        c.observe(interval, Duration::ZERO);
+        assert_eq!(c.floor(), 93_750);
+        // Thaw resumes steering from the seed.
+        c.thaw(MSD_FLOOR_SEED);
+        assert_eq!(c.floor(), MSD_FLOOR_SEED as u128);
+        assert!(!c.pinned.load(Ordering::Relaxed));
+        // An environment pin is never disturbed.
+        let env = FloorController::new(77_000.0, true);
+        assert!(!env.pin(93_750));
+        assert_eq!(env.floor(), 77_000);
+        assert_eq!(env.name(), "pinned");
+        assert_eq!(c.name(), "heuristic");
     }
 
     /// The controller moves toward whichever side waited, holds when neither
