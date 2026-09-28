@@ -719,8 +719,8 @@ fn collect_hardware(cli: &Cli, gpu: &GpuCtx) -> Value {
     })
 }
 
-/// Which MSD floor controller steered the GPU nice-only scenarios
-/// (`heuristic`, or `pinned` under `NICE_GPU_MSD_FLOOR`); `None` where no
+/// Which MSD floor controller steered the GPU nice-only scenarios (`search`,
+/// `heuristic`, or `pinned` under `NICE_GPU_MSD_FLOOR`); `None` where no
 /// such controller ran. The floor alone moves a GPU rate by a quarter on
 /// some hosts (the sweep shows it), so the report has to say which it was.
 #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]

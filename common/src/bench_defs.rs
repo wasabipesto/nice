@@ -177,7 +177,8 @@ pub const UNSCORED_SCENARIOS: &[&str] = &["b57_msd_weak"];
 ///
 /// The GPU niceonly references predate the benchmark steering the MSD floor
 /// to convergence before each scenario (`gpu_niceonly::benchmark_floor_thaw`);
-/// they were measured under the earlier per-field controller and are due for
+/// they were measured under the earlier per-field controller (and before the
+/// measured search became the default floor controller) and are due for
 /// re-pinning at the next reference bump.
 pub const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
     ("b40_msd_strong", false, 1.0e12),
