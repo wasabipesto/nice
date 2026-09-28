@@ -458,27 +458,66 @@ enum Phase1Impl {
     Avx512,
 }
 
-/// The best implementation this CPU supports, detected once. `NICE_SIMD`
-/// caps it for A/B testing: `0` forces the scalar loop, `avx2` the AVX2
-/// one; anything else (or unset) takes the best available.
+/// The best implementation this CPU supports, detected once and logged.
+/// `NICE_SIMD` caps it for A/B testing: `0`, `off` or `scalar` forces the
+/// scalar loop, `avx2` the AVX2 one, `avx512` (or unset) takes the best
+/// available; anything else is reported and ignored.
 fn phase1_impl() -> Phase1Impl {
     static IMPL: std::sync::OnceLock<Phase1Impl> = std::sync::OnceLock::new();
     *IMPL.get_or_init(|| {
-        let cap = std::env::var("NICE_SIMD").unwrap_or_default();
-        if cap == "0" {
-            return Phase1Impl::Scalar;
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            if cap != "avx2" && std::arch::is_x86_feature_detected!("avx512f") {
-                return Phase1Impl::Avx512;
+        let cap = std::env::var("NICE_SIMD")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let (scalar_only, no_avx512) = match cap.as_str() {
+            "" | "avx512" => (false, false),
+            "0" | "off" | "scalar" => (true, true),
+            "avx2" => (false, true),
+            other => {
+                log::warn!("ignoring unknown NICE_SIMD '{other}' (0, avx2 or avx512)");
+                (false, false)
             }
-            if std::arch::is_x86_feature_detected!("avx2") {
-                return Phase1Impl::Avx2;
-            }
-        }
-        Phase1Impl::Scalar
+        };
+        let chosen = if scalar_only {
+            Phase1Impl::Scalar
+        } else {
+            best_phase1_impl(no_avx512)
+        };
+        log::debug!("stride walk phase 1: {chosen:?}");
+        chosen
     })
+}
+
+/// The fastest phase 1 this CPU can run, AVX-512 excluded if asked.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+fn best_phase1_impl(no_avx512: bool) -> Phase1Impl {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        // The AVX-512 function is also compiled with AVX2 enabled (rustc's
+        // avx512f implies it), so require both: a VM can expose one without
+        // the other.
+        if !no_avx512 && avx2 && std::arch::is_x86_feature_detected!("avx512f") {
+            return Phase1Impl::Avx512;
+        }
+        if avx2 {
+            return Phase1Impl::Avx2;
+        }
+    }
+    Phase1Impl::Scalar
+}
+
+/// The phase-1 implementation this process runs, for telemetry:
+/// `"avx512"`, `"avx2"` or `"scalar"`.
+#[must_use]
+pub fn simd_tier() -> &'static str {
+    match phase1_impl() {
+        Phase1Impl::Scalar => "scalar",
+        #[cfg(target_arch = "x86_64")]
+        Phase1Impl::Avx2 => "avx2",
+        #[cfg(target_arch = "x86_64")]
+        Phase1Impl::Avx512 => "avx512",
+    }
 }
 
 /// Run phase 1 over at most one block of candidates from `cursor`, writing
@@ -494,6 +533,10 @@ fn phase1(
     high_mask: u64,
     bufs: &mut SurvivorBufs,
 ) -> (usize, Cursor) {
+    // The SIMD loads are bounded by `gaps.len()` alone, and the AVX2 path's
+    // signed offset compares need `end_off < 2^62` (the caller's bound).
+    assert_eq!(gaps.len(), masks.len());
+    debug_assert!(end_off < 1 << 62);
     match phase1_impl() {
         Phase1Impl::Scalar => {
             phase1_scalar(gaps, masks, cursor, end_off, b2k, high_mask, bufs, 0, BLOCK)
@@ -983,12 +1026,38 @@ mod tests {
         assert!(results.iter().any(|r| r.number == 69));
     }
 
-    /// Phase 1 must hand phase 2 exactly the cross-end survivors a plain
-    /// walk finds — in count and content, through both the scalar and (where
-    /// the CPU has it) the AVX-512 implementation, on production windows of
-    /// every specialized base, including the residue table's wrap.
     type Phase1Fn = fn(&[u32], &[u64], Cursor, u64, u64, u64, &mut SurvivorBufs) -> (usize, Cursor);
 
+    /// Every phase-1 implementation this CPU can run: the dispatched one,
+    /// scalar with full blocks, and AVX2 / AVX-512 where detected.
+    fn phase1_impls() -> Vec<(&'static str, Phase1Fn)> {
+        #[allow(unused_mut)]
+        let mut impls: Vec<(&'static str, Phase1Fn)> = vec![
+            ("dispatch", phase1),
+            ("scalar", |g, m, c, e, b, h, bufs| {
+                phase1_scalar(g, m, c, e, b, h, bufs, 0, BLOCK)
+            }),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                impls.push(("avx2", |g, m, c, e, b, h, bufs| unsafe {
+                    phase1_avx2(g, m, c, e, b, h, bufs)
+                }));
+            }
+            if std::arch::is_x86_feature_detected!("avx512f") {
+                impls.push(("avx512", |g, m, c, e, b, h, bufs| unsafe {
+                    phase1_avx512(g, m, c, e, b, h, bufs)
+                }));
+            }
+        }
+        impls
+    }
+
+    /// Phase 1 must hand phase 2 exactly the cross-end survivors a plain
+    /// walk finds, in count and content, through every implementation the
+    /// CPU can run, on production windows of every specialized base,
+    /// including the residue table's wrap.
     #[test_log::test]
     #[allow(clippy::cast_possible_truncation)]
     fn two_phase_walk_matches_plain_walk() {
@@ -1029,21 +1098,7 @@ mod tests {
                     nmod: (n0 % u128::from(b2k)) as u64,
                 };
                 let mut bufs = SurvivorBufs::new();
-                let mut impls: Vec<(&str, Phase1Fn)> = vec![("dispatch", phase1)];
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if std::arch::is_x86_feature_detected!("avx2") {
-                        impls.push(("avx2", |g, m, c, e, b, h, bufs| unsafe {
-                            phase1_avx2(g, m, c, e, b, h, bufs)
-                        }));
-                    }
-                    if std::arch::is_x86_feature_detected!("avx512f") {
-                        impls.push(("avx512", |g, m, c, e, b, h, bufs| unsafe {
-                            phase1_avx512(g, m, c, e, b, h, bufs)
-                        }));
-                    }
-                }
-                for (name, imp) in &impls {
+                for (name, imp) in &phase1_impls() {
                     let mut cur = start_cursor;
                     let mut got: Vec<(u64, u64, u64)> = Vec::new();
                     while cur.off < end_off {
@@ -1089,6 +1144,295 @@ mod tests {
                 checked += want.len();
             }
             assert!(checked > 100, "b{base}: too few survivors exercised");
+        }
+    }
+
+    /// Survivor buffers between canaries, so a store past either end shows.
+    #[repr(C)]
+    struct Guarded {
+        pre: [u64; 16],
+        bufs: SurvivorBufs,
+        post: [u64; 64],
+    }
+
+    const CANARY: u64 = 0xA5A5_5A5A_DEAD_BEEF;
+
+    impl Guarded {
+        fn new() -> Box<Self> {
+            Box::new(Self {
+                pre: [CANARY; 16],
+                bufs: SurvivorBufs::new(),
+                post: [CANARY; 64],
+            })
+        }
+    }
+
+    /// Drive `imp` over `[cur, end_off)`, poisoning the buffers before every
+    /// block (so a stale read shows as a sentinel) and checking the canaries
+    /// and the cursor after it.
+    #[allow(clippy::too_many_arguments)]
+    fn drive(
+        imp: Phase1Fn,
+        table: &StrideTable,
+        mut cur: Cursor,
+        end_off: u64,
+        b2k: u64,
+        hi: u64,
+        g: &mut Guarded,
+    ) -> Vec<(u64, u64, u64)> {
+        let mut got = Vec::new();
+        while cur.off < end_off {
+            g.bufs.offs.fill(u64::MAX);
+            g.bufs.nmods.fill(u64::MAX);
+            g.bufs.lows.fill(u64::MAX);
+            let (cnt, next) = imp(
+                &table.gap_table,
+                &table.low_digit_masks,
+                cur,
+                end_off,
+                b2k,
+                hi,
+                &mut g.bufs,
+            );
+            assert!(
+                g.pre.iter().chain(&g.post).all(|&c| c == CANARY),
+                "canary clobbered"
+            );
+            assert!(next.off > cur.off, "no progress");
+            assert!(next.idx < table.gap_table.len());
+            assert!(next.nmod < b2k, "n mod b^6 not reduced");
+            // A SIMD step may finish up to 7 candidates past the block.
+            assert!(cnt <= BLOCK + 7);
+            got.extend((0..cnt).map(|i| (g.bufs.offs[i], g.bufs.nmods[i], g.bufs.lows[i])));
+            cur = next;
+        }
+        got
+    }
+
+    /// Cross-end survivors of `leaf` by plain stepping and `%`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn plain_survivors(
+        table: &StrideTable,
+        leaf: &FieldSize,
+        b2k: u64,
+        hi: u64,
+    ) -> Vec<(u64, u64, u64)> {
+        let mut out = Vec::new();
+        let (mut n, mut idx) = table.first_valid_at_or_after(leaf.start());
+        while n < leaf.end() {
+            let low = table.low_digit_masks[idx];
+            if low & hi == 0 {
+                out.push(((n - leaf.start()) as u64, (n % u128::from(b2k)) as u64, low));
+            }
+            n += u128::from(table.gap_table[idx]);
+            idx = (idx + 1) % table.gap_table.len();
+        }
+        out
+    }
+
+    /// Every implementation, scalar in `small_block`-candidate blocks, and
+    /// phase 2 (through `walk_masked` with a recorder in place of the nice
+    /// check) against the plain walk, on one (leaf, hi).
+    #[allow(clippy::cast_possible_truncation)]
+    fn check_leaf(
+        table: &StrideTable,
+        leaf: &FieldSize,
+        base: u32,
+        hi: u64,
+        small_block: usize,
+        g: &mut Guarded,
+    ) -> usize {
+        let b2k = u64::from(base).pow(6);
+        let want = plain_survivors(table, leaf, b2k, hi);
+        let end_off = (leaf.end() - leaf.start()) as u64;
+        let (n0, idx0) = table.first_valid_at_or_after(leaf.start());
+        let c0 = Cursor {
+            idx: idx0,
+            off: (n0 - leaf.start()) as u64,
+            nmod: (n0 % u128::from(b2k)) as u64,
+        };
+        for (name, imp) in phase1_impls() {
+            assert_eq!(
+                drive(imp, table, c0, end_off, b2k, hi, g),
+                want,
+                "b{base} {leaf:?} hi={hi:#x} ({name})"
+            );
+        }
+        let mut cur = c0;
+        let mut got = Vec::new();
+        while cur.off < end_off {
+            let (cnt, next) = phase1_scalar(
+                &table.gap_table,
+                &table.low_digit_masks,
+                cur,
+                end_off,
+                b2k,
+                hi,
+                &mut g.bufs,
+                0,
+                small_block,
+            );
+            got.extend((0..cnt).map(|i| (g.bufs.offs[i], g.bufs.nmods[i], g.bufs.lows[i])));
+            cur = next;
+        }
+        assert_eq!(
+            got, want,
+            "b{base} {leaf:?} hi={hi:#x} (scalar, blocks of {small_block})"
+        );
+        let mut checked = Vec::new();
+        let _ = table.walk_masked(leaf, base, hi, true, |n, _| {
+            checked.push(n);
+            false
+        });
+        let want2: Vec<u128> = want
+            .iter()
+            .filter(|&&(_, nmod, low)| affine_filter::survives(base, nmod, low | hi))
+            .map(|&(off, _, _)| leaf.start() + u128::from(off))
+            .collect();
+        assert_eq!(checked, want2, "b{base} {leaf:?} hi={hi:#x}: phase 2");
+        want.len()
+    }
+
+    /// A small xorshift, so the tests are reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        }
+    }
+
+    /// Start `j` residues before the end of the residue table, for every `j`
+    /// up to a block and a bit, so the table's wrap lands on every SIMD lane
+    /// and on the block boundary; end exactly on a candidate (excluded) and
+    /// one past it; with no, one and several certificate digits.
+    #[test_log::test]
+    fn phase1_matches_plain_at_every_wrap_and_block_alignment() {
+        let mut g = Guarded::new();
+        for base in [40u32, 50, 64] {
+            let table = StrideTable::new(base, 3);
+            let glen = table.gap_table.len();
+            let m = table.modulus;
+            let range = get_base_range_u128(base).unwrap().unwrap();
+            let period = (range.start() / m + 7) * m - m;
+            for j in 1..=(BLOCK + 20) {
+                let start = period + u128::from(table.valid_residues[glen - j]);
+                let mut idx = glen - j;
+                let mut end = start;
+                for _ in 0..(j + 40) {
+                    end += u128::from(table.gap_table[idx]);
+                    idx = (idx + 1) % glen;
+                }
+                let several = 0x0F0F_0F0F & (u64::MAX >> (64 - base));
+                for hi in [0u64, 1u64 << (j as u64 % u64::from(base)), several] {
+                    for extra in [0u128, 1] {
+                        let leaf = FieldSize::new(start, end + extra);
+                        check_leaf(&table, &leaf, base, hi, 1 + j % 40, &mut g);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Random ranges on every base that takes the two-phase walk: starts at,
+    /// just before and well before a multiple of the stride modulus, lengths
+    /// from one number to one and a half periods, any certificate.
+    #[test_log::test]
+    fn phase1_matches_plain_on_random_ranges_of_every_base() {
+        let mut g = Guarded::new();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let bases: Vec<u32> = (10..=64u32)
+            .filter(|&b| affine_filter::supports(b, 3))
+            .filter(|&b| !StrideTable::new(b, 3).gap_table.is_empty())
+            .collect();
+        assert_eq!(bases.len(), 15);
+        let mut total = 0;
+        for &base in &bases {
+            let table = StrideTable::new(base, 3);
+            let m = table.modulus;
+            let m64 = u64::try_from(m).unwrap();
+            let range = get_base_range_u128(base).unwrap().unwrap();
+            for _ in 0..12 {
+                let anywhere =
+                    range.start() + u128::from(rng.below(u64::MAX)) % (range.size() - 100 * m);
+                let next_period = (anywhere / m + 1) * m;
+                let start = match rng.below(4) {
+                    0 => anywhere,
+                    1 => next_period,
+                    2 => next_period - u128::from(rng.below(m64 / 50 + 1)),
+                    _ => next_period - u128::from(rng.below(m64 / 5 + 1)),
+                };
+                let len = match rng.below(4) {
+                    0 => 1 + u128::from(rng.below(3)),
+                    1 => 1 + u128::from(rng.below(40_000)),
+                    2 => 1 + u128::from(rng.below(m64 + m64 / 2)),
+                    _ => 1 + u128::from(rng.below(300_000)),
+                };
+                let hi = match rng.below(4) {
+                    0 => 0,
+                    1 => u64::MAX >> (64 - base),
+                    2 => 1u64 << rng.below(u64::from(base)),
+                    _ => (0..=rng.below(10))
+                        .fold(0u64, |h, _| h | 1u64 << rng.below(u64::from(base))),
+                };
+                let small_block = 1 + usize::try_from(rng.below(40)).unwrap();
+                total += check_leaf(
+                    &table,
+                    &FieldSize::new(start, start + len),
+                    base,
+                    hi,
+                    small_block,
+                    &mut g,
+                );
+            }
+        }
+        assert!(total > 10_000, "only {total} survivors compared");
+    }
+
+    /// Offsets at the top of the permitted range (a range under `2^62`).
+    #[test_log::test]
+    fn phase1_matches_plain_at_large_offsets() {
+        let mut g = Guarded::new();
+        let mut rng = Rng(777);
+        for base in [40u32, 57, 64] {
+            let table = StrideTable::new(base, 3);
+            let glen = table.gap_table.len();
+            let b2k = u64::from(base).pow(6);
+            for _ in 0..100 {
+                let end_off = (1u64 << 62) - 1 - rng.below(3);
+                let cur = Cursor {
+                    idx: usize::try_from(rng.below(glen as u64)).unwrap(),
+                    off: end_off - 1 - rng.below(100_000),
+                    nmod: rng.below(b2k),
+                };
+                let hi = if rng.below(2) == 0 {
+                    0
+                } else {
+                    1u64 << rng.below(u64::from(base))
+                };
+                let mut want = Vec::new();
+                let mut c = cur;
+                while c.off < end_off {
+                    let low = table.low_digit_masks[c.idx];
+                    if low & hi == 0 {
+                        want.push((c.off, c.nmod, low));
+                    }
+                    let gap = u64::from(table.gap_table[c.idx]);
+                    c.off += gap;
+                    c.nmod = (c.nmod + gap) % b2k;
+                    c.idx = (c.idx + 1) % glen;
+                }
+                for (name, imp) in phase1_impls() {
+                    assert_eq!(
+                        drive(imp, &table, cur, end_off, b2k, hi, &mut g),
+                        want,
+                        "b{base} ({name})"
+                    );
+                }
+            }
         }
     }
 

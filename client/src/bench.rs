@@ -607,6 +607,7 @@ fn collect_hardware(cli: &Cli, gpu: &GpuCtx) -> Value {
     json!({
         "cpu_model": parse_cpu_model(&cpuinfo),
         "cpu_threads_available": std::thread::available_parallelism().map(std::num::NonZero::get).ok(),
+        "cpu_simd": nice_common::stride_filter::simd_tier(),
         "mem_total_kb": parse_meminfo_total_kb(&meminfo),
         "arch": std::env::consts::ARCH,
         "os": std::env::consts::OS,
