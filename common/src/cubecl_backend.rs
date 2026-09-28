@@ -811,38 +811,43 @@ fn candidate_check(
     }
 }
 
-/// `lanes = 1 << lane_shift` threads cooperate on each range, striding
-/// through its candidates by index — pure index arithmetic, no subgroup ops.
-/// The g-th valid candidate at or after a range start is
-/// `B0 + (g / R) * M + residues[g % R]`.
-///
-/// The stride modulus `M` and residue count `R` depend only on the base, so
-/// they ride along as comptime parameters: every division below is by a
-/// comptime constant, including the range offset's chunked Horner reduction
-/// (`offset_chunk_bits` wide, u32 throughout — the construct RADV cannot
-/// strength-reduce at 64 bits, avoided the same way the WGSL avoids it).
 /// The affine middle-digit filter's per-range constants: `s0 = B0 mod b^3`
 /// and `t0 = (B0 div b^3) mod b^3` for the range's enumeration base
 /// `B0 = b0_hi·2^64 + b0_lo`, packed as `t0 << 32 | s0`. Every candidate of
 /// the range is `B0 + cycle·M + residue`, and since `M = (b-1)·b^3` the
-/// candidate's own `(s, t)` follow from these by 32-bit digit arithmetic —
-/// this is the one place the filter divides a 64-bit value, once per range.
+/// candidate's own `(s, t)` follow from these by 32-bit digit arithmetic.
 ///
-/// `b0_hi` is below 2^12 for every base the filter is enabled on (n < 2^77
-/// at base 64), so `b0_hi·pow64 < 2^48` and nothing here overflows.
+/// Byte-wise long division of `B0` by `b^3`, most significant byte first,
+/// with each quotient byte folded into `t0` by Horner as it comes out. Every
+/// divisor is the comptime `b^3 <= 2^18`, so `(r << 8) | byte < 2^26`, each
+/// quotient byte is below 2^8 and nothing leaves u32. No 64-bit division on
+/// purpose: naga's MSL backend (wgpu 29) guards one with an ill-typed
+/// `metal::select(ulong, uint, bool)` that Metal refuses to compile, and RADV
+/// does not strength-reduce it. `b0_hi` is below 2^12 for every base the
+/// filter is enabled on (n < 2^77 at base 64), so its low word is all of it.
 #[cube]
-fn affine_range_base(
-    b0_lo: u64,
-    b0_hi: u64,
-    #[comptime] aff_bk: u32,
-    #[comptime] aff_pow64_lo: u32,
-    #[comptime] aff_pow64_hi: u32,
-) -> u64 {
-    let bk = u64::cast_from(aff_bk);
-    let b2k = bk * bk;
-    let pow64 = (u64::cast_from(aff_pow64_hi) << 32u64) | u64::cast_from(aff_pow64_lo);
-    let bm = (b0_hi * pow64 + b0_lo % b2k) % b2k;
-    ((bm / bk) << 32u64) | (bm % bk)
+fn affine_range_base(b0_lo: u64, b0_hi: u64, #[comptime] aff_bk: u32) -> u64 {
+    let w2 = u32::cast_from(b0_hi);
+    let w1 = u32::cast_from(b0_lo >> 32u64);
+    let w0 = u32::cast_from(b0_lo);
+    let mut r = 0u32;
+    let mut t = 0u32;
+    #[unroll]
+    for k in 0..12u32 {
+        let word = if comptime!(k < 4) {
+            w2
+        } else if comptime!(k < 8) {
+            w1
+        } else {
+            w0
+        };
+        let shift = comptime!(24 - (k % 4) * 8);
+        let cur = (r << 8u32) | ((word >> shift) & 0xFFu32);
+        let q = cur / aff_bk;
+        r = cur - q * aff_bk;
+        t = ((t << 8u32) | q) % aff_bk;
+    }
+    (u64::cast_from(t) << 32u64) | u64::cast_from(r)
 }
 
 /// Affine middle-digit filter (the device form of `crate::affine_filter`).
@@ -935,6 +940,16 @@ fn affine_survives(s: u32, t: u32, known: u64, #[comptime] base: u32) -> bool {
     !dup && ((mq | mc) & known) == 0u64 && (mq & mc) == 0u64
 }
 
+/// `lanes = 1 << lane_shift` threads cooperate on each range, striding
+/// through its candidates by index — pure index arithmetic, no subgroup ops.
+/// The g-th valid candidate at or after a range start is
+/// `B0 + (g / R) * M + residues[g % R]`.
+///
+/// The stride modulus `M` and residue count `R` depend only on the base, so
+/// they ride along as comptime parameters: every division below is by a
+/// comptime constant, including the range offset's chunked Horner reduction
+/// (`offset_chunk_bits` wide, u32 throughout — the construct RADV cannot
+/// strength-reduce at 64 bits, avoided the same way the WGSL avoids it).
 #[cube(launch_unchecked)]
 // The single-character and lookalike names (m, g, j, rs/re, ...) deliberately
 // match the generated WGSL, so the two kernels review side by side.
@@ -986,8 +1001,6 @@ fn niceonly_kernel(
     #[comptime] affine: bool, // affine middle-digit filter on cross survivors
     #[comptime] affine_two_stage: bool, // plane path: compact the affine survivors again before the check
     #[comptime] aff_bk: u32,            // base^3 (0 when `affine` is off)
-    #[comptime] aff_pow64_lo: u32,      // 2^64 mod base^6, low word
-    #[comptime] aff_pow64_hi: u32,      // 2^64 mod base^6, high word
 ) {
     let cu_limbs = comptime!(3 * limbs);
     let base_m1 = comptime!(base - 1);
@@ -1098,7 +1111,7 @@ fn niceonly_kernel(
                     b0_hi -= 1u64;
                 }
                 if affine {
-                    let ab = affine_range_base(b0_lo, b0_hi, aff_bk, aff_pow64_lo, aff_pow64_hi);
+                    let ab = affine_range_base(b0_lo, b0_hi, aff_bk);
                     aff_s0 = u32::cast_from(ab);
                     aff_t0 = u32::cast_from(ab >> 32u64);
                 }
@@ -1421,7 +1434,7 @@ fn niceonly_kernel(
                     b0_hi -= 1u64;
                 }
                 if affine {
-                    let ab = affine_range_base(b0_lo, b0_hi, aff_bk, aff_pow64_lo, aff_pow64_hi);
+                    let ab = affine_range_base(b0_lo, b0_hi, aff_bk);
                     aff_s0 = u32::cast_from(ab);
                     aff_t0 = u32::cast_from(ab >> 32u64);
                 }
@@ -1649,7 +1662,7 @@ fn niceonly_kernel(
             let mut aff_s0 = 0u32;
             let mut aff_t0 = 0u32;
             if affine {
-                let ab = affine_range_base(b0_lo, b0_hi, aff_bk, aff_pow64_lo, aff_pow64_hi);
+                let ab = affine_range_base(b0_lo, b0_hi, aff_bk);
                 aff_s0 = u32::cast_from(ab);
                 aff_t0 = u32::cast_from(ab >> 32u64);
             }
@@ -3216,8 +3229,6 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
                 affine.is_some(),
                 self.dispatch_two_stage(),
                 affine.map_or(0, |a| a.bk),
-                affine.map_or(0, |a| a.pow64_mod as u32),
-                affine.map_or(0, |a| (a.pow64_mod >> 32) as u32),
             );
         }
         Ok(())
