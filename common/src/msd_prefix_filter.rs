@@ -170,7 +170,7 @@ struct Endpoint {
 }
 
 /// Compute an endpoint's digit arrays. `b40` fits `n³` in `u128`
-/// (`(40^8 - 1)³ < 40^24 ≈ 1.76e38 < u128::MAX`); every other specialized
+/// (`(40^8 - 1)³ < 40^24 ≈ 2.81e38 < u128::MAX ≈ 3.40e38`); every other specialized
 /// base needs U256. Chosen at compile time from `BASE`.
 #[inline(always)]
 fn endpoint_const<const BASE: u32>(n: u128) -> Endpoint {
@@ -290,8 +290,8 @@ fn hall_augment(i: usize, doms: &[u64], visited: &mut u64, owner: &mut [usize; 6
 /// domains can leave one of them a singleton too, which then joins the set
 /// (repeat to closure). Only the domains still wider than one digit need
 /// the matching, and they are few. Same verdict as running Kuhn on the full
-/// set, at 1-1.6x lower cost on bases 50-60 (the codebase's pinned tests
-/// compare the two).
+/// set, at up to 1.6x lower cost on bases 50-60 (the codebase's pinned
+/// tests compare the two).
 fn has_distinct_assignment_closure(doms: &[u64]) -> bool {
     let mut single: u64 = 0;
     let mut rest = [0u64; HALL_MAX_POSITIONS];
@@ -594,7 +594,7 @@ pub fn analyze_range(range: FieldSize, base: u32, fixed_lsd_k: usize) -> MsdAnal
     // heap alloc + multi-limb arithmetic). Profile evidence puts the
     // malachite/heap work at ~17% of total cycles on xlarge benchmark.
     //
-    // b40 fits in u128 (max n³ < 1.77e38 < u128::MAX = 3.40e38). All
+    // b40 fits in u128 (max n³ ≈ 2.81e38 < u128::MAX ≈ 3.40e38). All
     // other production bases overflow u128 and need U256.
     match base {
         40 => return analyze_range_const::<40>(range, fixed_lsd_k),
@@ -878,6 +878,12 @@ pub fn get_valid_ranges_recursive_masked(
     inherited_mask: u64,
     out: &mut Vec<(FieldSize, u64)>,
 ) {
+    // A root that is already a leaf is emitted without analysis; check that
+    // before paying for its endpoints.
+    if current_depth >= params.max_depth || range.size() <= params.min_range_size {
+        out.push((range, inherited_mask));
+        return;
+    }
     macro_rules! fw {
         ($($b:literal),*) => {
             match params.base {
@@ -939,6 +945,14 @@ fn recurse_fw<const BASE: u32>(
             sub_start + chunk_size
         };
         if sub_start < sub_end {
+            // A child that is a leaf is emitted unanalysed: skip its
+            // endpoints (at a power-of-two floor, every child of the last
+            // analysed level is one).
+            if current_depth + 1 >= params.max_depth || sub_end - sub_start <= params.min_range_size
+            {
+                out.push((FieldSize::new(sub_start, sub_end), mask));
+                continue;
+            }
             let new_lo;
             let sub_lo: &Endpoint = if i == 0 {
                 lo
@@ -1524,8 +1538,12 @@ mod tests {
         }
     }
 
-    /// Singleton closure must agree with the plain matching on every domain
-    /// set the analysis produces (and on hand-built cases).
+    /// Singleton closure must agree with the plain matching and with Hall's
+    /// condition checked by brute force (every subset of positions offers at
+    /// least as many digits as it has positions), on hand-built cases and on
+    /// random sets of cyclic-interval domains like the ones the analysis
+    /// builds: 1-10 positions, intervals of 1-4 digits, alphabets of 8, 16
+    /// and 64 digits (the last reaching bit 63).
     #[test_log::test]
     #[allow(clippy::cast_possible_truncation)]
     fn closure_matching_agrees_with_kuhn() {
@@ -1549,29 +1567,55 @@ mod tests {
             0b11 << 7,
             0b11 << 8
         ]));
+        // Hall's condition by brute force over all 2^m subsets.
+        let hall = |doms: &[u64]| {
+            (1u32..1 << doms.len()).all(|set| {
+                let (mut union, mut count) = (0u64, 0u32);
+                for (i, d) in doms.iter().enumerate() {
+                    if set >> i & 1 == 1 {
+                        union |= d;
+                        count += 1;
+                    }
+                }
+                union.count_ones() >= count
+            })
+        };
         let mut x: u128 = 0x1234_5678_9abc_def0_0fed_cba9_8765_4321;
-        for _ in 0..20_000 {
+        let mut next = || {
             x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            let m = 2 + (x as usize % 6);
-            let mut doms = [0u64; 8];
+            // The high half only: a power-of-two LCG's low bits cycle with
+            // short periods.
+            (x >> 64) as u64
+        };
+        let (mut accepted, mut rejected) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            let m = 1 + (next() % 10) as usize;
+            let alphabet = [8u64, 16, 64][(next() % 3) as usize];
+            let mut doms = [0u64; 10];
             for d in doms.iter_mut().take(m) {
-                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                // Cyclic intervals of 1-3 digits over an 8-digit alphabet.
-                let lo = (x >> 64) as u32 % 8;
-                let size = 1 + ((x >> 96) as u32 % 3);
+                let lo = next() % alphabet;
+                let size = 1 + next() % 4;
                 let mut mask = 0u64;
                 for t in 0..size {
-                    mask |= 1u64 << ((lo + t) % 8);
+                    mask |= 1u64 << ((lo + t) % alphabet);
                 }
                 *d = mask;
             }
-            assert_eq!(
-                has_distinct_assignment_closure(&doms[..m]),
-                has_distinct_assignment(&doms[..m]),
-                "{:?}",
-                &doms[..m]
-            );
+            let doms = &doms[..m];
+            let expected = hall(doms);
+            assert_eq!(has_distinct_assignment_closure(doms), expected, "{doms:?}");
+            assert_eq!(has_distinct_assignment(doms), expected, "{doms:?}");
+            if expected {
+                accepted += 1;
+            } else {
+                rejected += 1;
+            }
         }
+        // Both verdicts well represented.
+        assert!(
+            accepted > 2_000 && rejected > 2_000,
+            "{accepted} / {rejected}"
+        );
     }
 
     /// The masked recursion must traverse identically to the unmasked one:
