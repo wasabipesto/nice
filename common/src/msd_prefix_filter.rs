@@ -895,9 +895,11 @@ pub const PROFILE_DEPTHS: usize = 24;
 /// return). So that run hands on `2 · passing[d-1]` leaves with total volume
 /// `passing_volume[d-1]`, after analyzing `analyzed[0] + … + analyzed[d-1]`
 /// nodes, so one deep run yields the rejection-versus-floor curve for every
-/// coarser floor at once. The GPU pipeline's measured floor search reads
-/// `passing_volume[0]`, the part of a block whose chunks pass their first
-/// analysis, as the difficulty of the stretch it just measured.
+/// coarser floor at once. In production only `passing_volume[0]` is read:
+/// the GPU pipeline recurses from whole MSD blocks, so it is the block's
+/// size if the block passed its first analysis and 0 if not, and the
+/// measured floor search uses it as the difficulty of the stretch it just
+/// measured. The rest is there for tests and diagnostics.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DepthProfile {
     /// Ranges analyzed (endpoint digits extracted, Hall check run) per depth.

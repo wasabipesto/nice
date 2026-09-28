@@ -10,8 +10,8 @@
 //! The pipeline is continuous across fields ([`NiceonlyPipeline`]): the MSD
 //! workers start on the next field while the device is still draining the
 //! previous one, and the device never waits for a field boundary either. The
-//! floor is steered by which side is behind — see [`FloorController`] — so
-//! neither side idles in steady state. [`run_range_pipeline`] is the one-field
+//! floor is steered at run time by measured throughput (or, optionally, by
+//! which side is behind) — see [`FloorController`]. [`run_range_pipeline`] is the one-field
 //! synchronous form of the same machinery, for backends whose device handle
 //! cannot leave the calling thread and for tests.
 //!
@@ -30,7 +30,7 @@ use crate::{FieldResults, FieldSize, NiceNumberSimple, msd_prefix_filter, residu
 use anyhow::{Result, anyhow};
 use log::{debug, warn};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -89,14 +89,17 @@ const PIPELINE_DEPTH: usize = 64;
 /// count by two to three orders of magnitude at every floor.
 const WORKER_BATCH_RANGES: usize = 4096;
 
-/// Work units (blocks of [`MSD_BLOCK_CHUNKS_LOG2`] chunks) a worker folds
-/// into one batch before sending, whatever its size.
+/// Work units (MSD blocks of `2^MSD_BLOCK_CHUNKS_LOG2` chunks, fewer on small
+/// fields; see [`BlockTiling`]) a worker folds into one batch before
+/// sending, whatever its size. (The name predates blocks.) A block whose
+/// descriptors overflow [`WORKER_BATCH_RANGES`] counts once per batch it
+/// spills into.
 ///
 /// Bounds the field span a batch covers, so that at coarse floors or in
 /// MSD-strong regions, where a unit yields a descriptor or two,
 /// [`WORKER_BATCH_RANGES`] alone cannot hold back thousands of blocks' worth
 /// of device work, nor let the workers run that far ahead of the device
-/// (see [`LAUNCH_BATCH_UNITS`]). 64 blocks are 4e9 numbers.
+/// (see [`LAUNCH_BATCH_UNITS`]). 64 full blocks are 4e9 numbers.
 const WORKER_BATCH_CHUNKS: usize = 64;
 
 /// Work units the consumer folds into one launch, whatever its descriptor
@@ -109,10 +112,14 @@ const WORKER_BATCH_CHUNKS: usize = 64;
 /// worker side, the wait heuristic's "device is behind" and the measured
 /// search's numbers per second, saw the host racing ahead instead of the
 /// device's rate: on a live base-57 client the search's per-level readings
-/// swung 2.5x within a minute and it settled at the cap. 128 blocks are
-/// 8e9 numbers, a few milliseconds of device time, so with
-/// `NICE_GPU_BATCHES_IN_FLIGHT` launches outstanding the workers lead the
-/// device by well under a tick of the controller.
+/// swung 2.5x within a minute and it settled at the cap. 128 full blocks
+/// are 8e9 numbers, a few milliseconds of device time. A launch closes on
+/// the message that crosses the bound, so it holds up to 191 units. With
+/// `NICE_GPU_BATCHES_IN_FLIGHT` (16) launches outstanding plus the worker
+/// channel ([`PIPELINE_DEPTH`] batches of up to 64 units) the workers lead a
+/// device-bound pipeline by about 5e11 numbers: under a tick at 5e12 n/s,
+/// but a few ticks on the slowest hosts measured (1-2e12 n/s), which the
+/// search's settle ticks and its smoothing absorb.
 const LAUNCH_BATCH_UNITS: usize = 128;
 
 /// Log2 of the number of chunks one MSD work unit (a *block*) spans.
@@ -228,8 +235,11 @@ fn msd_blocks(range: &FieldSize, min_blocks: usize) -> Vec<FieldSize> {
     (0..tiling.len()).filter_map(|i| tiling.get(i)).collect()
 }
 
-/// Minimum MSD recursion floor the controller may reach: a sixteenth of a
-/// [`PROCESSING_CHUNK_SIZE`] chunk.
+/// Minimum MSD recursion floor the wait heuristic may reach: a sixteenth of a
+/// [`PROCESSING_CHUNK_SIZE`] chunk. (The measured search has its own ladder,
+/// which goes below this: it can see a finer floor stop paying, so it needs
+/// no clamp, and on some weak-device, many-core hosts it settled at 46.9k,
+/// 23.4k or 11.7k.)
 ///
 /// Below roughly this, a finer floor stops paying: survivors barely
 /// decrease (the recursion already stops where the analysis rejects, so
@@ -242,16 +252,17 @@ fn msd_blocks(range: &FieldSize, min_blocks: usize) -> Vec<FieldSize> {
 /// device that is behind stays behind when the floor drops — and on the M4
 /// it steered to 20k and a third of the throughput before this clamp.
 /// Every optimum measured (M4 60k, RTX 3060 ~100k, 9070 XT 250k, 4090 and
-/// A100 at the cap) is at or above this value.
+/// A100 at the cap) with this controller was at or above this value.
 ///
 /// An explicit `NICE_GPU_MSD_FLOOR` pin is not clamped.
 #[allow(clippy::cast_precision_loss)]
 const MSD_FLOOR_MIN: f64 = (PROCESSING_CHUNK_SIZE / 16) as f64;
 
-/// Maximum MSD recursion floor the controller may reach: half a
+/// Maximum MSD recursion floor the wait heuristic may reach: half a
 /// [`PROCESSING_CHUNK_SIZE`] chunk, i.e. one level of subdivision below the
 /// whole-chunk check ([`msd_prefix_filter::MSD_RECURSIVE_SUBDIVISION_FACTOR`]
-/// is 2).
+/// is 2). (The measured search's top level, 750k, analyses each chunk once
+/// and ships it whole, which is not the bypass either.)
 ///
 /// One whole chunk is the explicit no-MSD bypass ([`descriptors_for_chunk`]
 /// ships every chunk as one descriptor with no endpoint analysis). At the
@@ -273,7 +284,7 @@ const MSD_FLOOR_MIN: f64 = (PROCESSING_CHUNK_SIZE / 16) as f64;
 #[allow(clippy::cast_precision_loss)]
 const MSD_FLOOR_MAX: f64 = (PROCESSING_CHUNK_SIZE / 2) as f64;
 
-/// Where the controller starts: half the cap. On a many-core host paired with
+/// Where the wait heuristic starts: half the cap. On a many-core host paired with
 /// a strong device the balance point measured on Anvil sits right about here
 /// (250k), and on a weak host the controller raises it within seconds. Not
 /// derived from the core count: a low seed costs whole fields (a 1e13 field
@@ -304,10 +315,9 @@ const FLOOR_WAIT_THRESHOLD: f64 = 0.15;
 //
 // The wait heuristic optimises a proxy (nobody waiting) and cannot see that
 // a finer floor has stopped paying. The search measures the objective
-// itself: numbers per second
-// through the MSD workers, which the span-bounded work in flight
-// ([`LAUNCH_BATCH_UNITS`]) ties to the pipeline's throughput on every
-// backend.
+// itself: numbers per second through the MSD workers, which the
+// span-bounded work in flight ([`LAUNCH_BATCH_UNITS`]) ties to the
+// pipeline's throughput on every backend.
 //
 // Throughput is not comparable across moments, though. A base-57 claim's
 // seventh digit changes every 1.95e12 numbers, well under a second at
@@ -315,10 +325,10 @@ const FLOOR_WAIT_THRESHOLD: f64 = 0.15;
 // whether a stretch dies on the host at once or goes to the device: measured
 // live, the rate swung 2x within a minute at one floor and 2.5x from one
 // claim to the next. So every tick is tagged with the fraction of its span
-// that survived the recursion's chunk-level (depth-0) analysis, which every
-// ladder level computes, and levels are compared only within bins of that
-// fraction: stretches of like difficulty against stretches of like
-// difficulty.
+// that survived the recursion's first analysis, of the whole MSD block (the
+// workers' unit; depth 0 of the recursion), which every ladder level
+// computes, and levels are compared only within bins of that fraction:
+// stretches of like difficulty against stretches of like difficulty.
 //
 // Per base the search visits each level once (the sweep), holds the best,
 // and every [`SEARCH_HOLD`] tries one neighbour, adopting it when the
@@ -337,7 +347,7 @@ const FLOOR_WAIT_THRESHOLD: f64 = 0.15;
 /// the wait heuristic's 500k cap, which ships the chunk's halves instead.
 /// It is there for hosts with almost no CPU: on an RTX 3080 with a 1.3-core
 /// i3 it is the best pinned floor on five of the benchmark's six windows,
-/// 2-12% above the cap. The bottom two levels are below the heuristic's
+/// 2-12% above the cap. The bottom three levels are below the heuristic's
 /// 62.5k clamp (the worse configuration of the level above it) and are for
 /// the opposite host, a weak device with many cores: a GTX 1660 Ti with 20
 /// Xeon cores, live, read 11.7k 9-20% above 23.4k and held it against every
@@ -369,21 +379,33 @@ const SEARCH_HOLD: Duration = Duration::from_secs(60);
 /// A neighbour must measure faster than the held level by this fraction,
 /// within like-difficulty bins, to be adopted.
 const SEARCH_HYSTERESIS: f64 = 0.05;
-/// Difficulty bins over the chunk-level (depth-0) survival fraction of a
-/// tick's span: the fraction of it whose chunks passed the recursion's
+/// Difficulty bins over the block-level (depth-0) survival fraction of a
+/// tick's span: the fraction of it whose MSD blocks passed the recursion's
 /// first analysis, which every level performs.
 const SEARCH_BINS: usize = 6;
 const SEARCH_BIN_EDGES: [f64; SEARCH_BINS - 1] = [0.02, 0.1, 0.25, 0.5, 0.75];
 /// Ticks a level needs in a bin before that bin counts in a comparison.
 const SEARCH_MIN_BIN_TICKS: u32 = 2;
-/// Home samples this old still take part in a trial's comparison; the held
-/// level keeps sampling, so in practice the last minute of it is compared.
+/// Home samples this old still take part in a trial's comparison. A bin's
+/// sample is a moving average ([`SEARCH_RATE_ALPHA`], about a second of
+/// memory) of home's latest run of ticks in that bin, so what a trial is
+/// compared against is home's most recent stretch of each difficulty seen
+/// in the last minute.
 const SEARCH_COMPARE_WINDOW: Duration = Duration::from_secs(60);
 /// A bin's sample this old is replaced by the next tick rather than averaged
 /// with it (the pipeline was elsewhere in between).
 const SEARCH_BLEND_WITHIN: Duration = Duration::from_secs(2);
 /// Weight of a new clean tick in a bin's rate estimate.
 const SEARCH_RATE_ALPHA: f64 = 0.25;
+/// An idle spell with no field open at least this long restarts the tick
+/// when the next field opens; shorter gaps (the benchmark's back-to-back
+/// windows, a queued field's hand-over) are part of running.
+const SEARCH_IDLE_GAP: Duration = Duration::from_millis(50);
+/// A tick longer than this spanned a stall (the pipeline idle between
+/// fields, a claim late) and is not a sample. Far above any tick of a
+/// running pipeline, whose ticks end at the first dispatcher event 150 ms
+/// in (at most one launch later, under a second on the slowest devices).
+const SEARCH_MAX_TICK: Duration = Duration::from_secs(2);
 /// Levels a thaw needs samples for before it starts from the best of them
 /// instead of sweeping: the benchmark pins every level, so anything less
 /// means its sweep was cut short, and three still beat re-learning inside
@@ -402,7 +424,7 @@ fn search_level(floor: f64) -> Option<usize> {
     (0..SEARCH_LEVELS).find(|&l| (search_floor(l) - floor).abs() <= 0.01 * search_floor(l))
 }
 
-/// The difficulty bin of a tick whose span survived the chunk-level
+/// The difficulty bin of a tick whose span survived the block-level
 /// analysis in fraction `phi`.
 fn difficulty_bin(phi: f64) -> usize {
     SEARCH_BIN_EDGES.iter().take_while(|&&e| phi >= e).count()
@@ -581,7 +603,16 @@ impl BaseSearch {
                 Some((best, "sweep done"))
             }
             SearchPhase::Hold { since, dir } => {
-                if now.duration_since(since) < SEARCH_HOLD {
+                // Try a neighbour once the hold is up and home has a fresh
+                // comparison sample (after a return to this base, its last
+                // ones may have aged out while it was away).
+                let fresh = now.checked_sub(SEARCH_COMPARE_WINDOW).unwrap_or(since);
+                if now.duration_since(since) < SEARCH_HOLD
+                    || !self.bins[level]
+                        .iter()
+                        .flatten()
+                        .any(|b| b.at >= fresh && b.ticks >= SEARCH_MIN_BIN_TICKS)
+                {
                     return None;
                 }
                 let neighbour = |d: i8| {
@@ -651,6 +682,9 @@ struct LadderSearch {
     epoch: Instant,
     current_base: Option<u32>,
     bases: HashMap<u32, BaseSearch>,
+    /// When the dispatcher last closed its only open field, if it has not
+    /// opened another since.
+    idle_since: Option<Instant>,
 }
 
 impl LadderSearch {
@@ -663,6 +697,7 @@ impl LadderSearch {
             epoch: now,
             current_base: None,
             bases: HashMap::new(),
+            idle_since: None,
         }
     }
 
@@ -672,6 +707,15 @@ impl LadderSearch {
         self.tick_start = now;
         self.floor_at_tick = floor;
         self.settle = SEARCH_SETTLE_TICKS;
+    }
+
+    /// The pipeline was idle (no field open) and resumes: start a fresh tick
+    /// now, so the idle time is not charged to the level in force, and
+    /// discard the first tick while the new field fills the pipeline.
+    fn resume(&mut self, now: Instant, floor: f64) {
+        self.tick_start = now;
+        self.floor_at_tick = floor;
+        self.settle = self.settle.max(1);
     }
 
     /// The benchmark pinned a floor: learn again, and if this is the first
@@ -699,10 +743,10 @@ impl LadderSearch {
     }
 
     /// One accounting tick: `numbers` went through the workers since the
-    /// last tick, of which `passing` survived the chunk-level analysis, at
-    /// `floor`. Returns
-    /// the floor to be at and why, if the search has a decision (the floor
-    /// may be the current one); never while `pinned`, when it only learns.
+    /// last tick, of which `passing` survived the block-level analysis, at
+    /// `floor`. Returns the floor to be at and why, if the search has a
+    /// decision (the floor may be the current one); never while `pinned`,
+    /// when it only learns.
     #[allow(clippy::cast_precision_loss)]
     fn tick(
         &mut self,
@@ -720,6 +764,13 @@ impl LadderSearch {
             self.settle = SEARCH_SETTLE_TICKS;
             return None;
         }
+        if elapsed > SEARCH_MAX_TICK {
+            // The pipeline stalled inside this tick (no field open, a claim
+            // late): the work it counts was done in a fraction of it. Not a
+            // sample, and the next one settles.
+            self.settle = self.settle.max(1);
+            return None;
+        }
         if self.settle > 0 {
             self.settle -= 1;
             return None;
@@ -729,8 +780,12 @@ impl LadderSearch {
             // or the benchmark is measuring: not a sample of any level.
             return None;
         }
-        let level = search_level(floor)?;
         let st = self.bases.get_mut(&self.current_base?)?;
+        let Some(level) = search_level(floor) else {
+            // A floor no level realises and nobody pins: go back to this
+            // base's level.
+            return (!pinned).then(|| (search_floor(st.level), String::from("realign")));
+        };
         let bin = difficulty_bin(passing as f64 / numbers as f64);
         st.record(
             level,
@@ -740,6 +795,12 @@ impl LadderSearch {
         );
         if pinned {
             return None;
+        }
+        if level != st.level {
+            // The floor in force is another level than this base's (a base
+            // switch raced a thaw): the tick counts for the level it
+            // measured, then go back.
+            return Some((search_floor(st.level), String::from("realign")));
         }
         let (target, why) = st.step(level, now)?;
         Some((
@@ -834,9 +895,12 @@ pub struct FloorController {
     search_enabled: bool,
     search: Mutex<LadderSearch>,
     /// Numbers through the MSD workers since the search's last tick, and
-    /// how many of them survived the recursion's chunk-level analysis.
+    /// how many of them survived the recursion's block-level analysis.
     numbers_seen: AtomicU64,
     passing_seen: AtomicU64,
+    /// The base of the last block the search was told about, so the workers
+    /// take the search lock only on a base switch.
+    search_base: AtomicU32,
 }
 
 struct FloorState {
@@ -860,6 +924,7 @@ impl FloorController {
             search: Mutex::new(LadderSearch::new(Instant::now(), floor)),
             numbers_seen: AtomicU64::new(0),
             passing_seen: AtomicU64::new(0),
+            search_base: AtomicU32::new(u32::MAX),
         }
     }
 
@@ -892,8 +957,12 @@ impl FloorController {
         }
         self.numbers_seen.fetch_add(numbers, Ordering::Relaxed);
         self.passing_seen.fetch_add(passing, Ordering::Relaxed);
+        if self.search_base.load(Ordering::Relaxed) == base {
+            return;
+        }
         let now = Instant::now();
         let mut search = self.search.lock().unwrap();
+        self.search_base.store(base, Ordering::Relaxed);
         if let Some(floor) = search.note_block(base, now)
             && !self.pinned.load(Ordering::Relaxed)
         {
@@ -986,6 +1055,35 @@ impl FloorController {
         true
     }
 
+    /// The dispatcher closed its last open field.
+    fn pipeline_idle(&self) {
+        if self.search_enabled() {
+            self.search.lock().unwrap().idle_since = Some(Instant::now());
+        }
+    }
+
+    /// The dispatcher opens a field with none open. If the pipeline sat idle
+    /// long enough to matter (a claim late, not the benchmark's back-to-back
+    /// windows), restart the search's tick: see [`LadderSearch::resume`].
+    /// What the workers counted meanwhile (the tail of the last field) is
+    /// dropped with the settling tick.
+    fn pipeline_resumed(&self) {
+        if !self.search_enabled() {
+            return;
+        }
+        let now = Instant::now();
+        let mut search = self.search.lock().unwrap();
+        if search
+            .idle_since
+            .take()
+            .is_some_and(|t| now.duration_since(t) >= SEARCH_IDLE_GAP)
+        {
+            self.numbers_seen.store(0, Ordering::Relaxed);
+            self.passing_seen.store(0, Ordering::Relaxed);
+            search.resume(now, f64::from_bits(self.floor_bits.load(Ordering::Relaxed)));
+        }
+    }
+
     /// The search's accounting: every [`SEARCH_TICK`], attribute the numbers
     /// that went through the workers to the level in force, and move if the
     /// search asks to. Under a pin (the benchmark's sweep or freeze) it only
@@ -1038,16 +1136,18 @@ impl FloorController {
         st.cpu_wait = Duration::ZERO;
         st.device_wait = Duration::ZERO;
         drop(st);
-        let seed = if self.search_enabled() {
+        if self.search_enabled() {
+            // Under the search lock, which a worker's base switch also takes,
+            // so the switch cannot land between the new floor and the unpin.
             let now = Instant::now();
             let mut search = self.search.lock().unwrap();
             let (floor, why) = search.on_thaw(now);
             debug!("GPU MSD floor: thaw → {floor:.0} (search: {why})");
             search.floor_changed(now, floor);
-            floor
-        } else {
-            seed
-        };
+            self.floor_bits.store(floor.to_bits(), Ordering::Relaxed);
+            self.pinned.store(false, Ordering::Relaxed);
+            return;
+        }
         self.floor_bits.store(seed.to_bits(), Ordering::Relaxed);
         self.pinned.store(false, Ordering::Relaxed);
     }
@@ -1087,17 +1187,18 @@ fn floor_controller() -> &'static FloorController {
     })
 }
 
-/// Let the benchmark steer a scenario's floor from the production seed:
-/// resets the controller and resumes steering. Call before a scenario's
-/// warm-up; pair with [`benchmark_floor_freeze`] before its measured
-/// windows. An explicit `NICE_GPU_MSD_FLOOR` still wins, so floor sweeps
-/// under `--benchmark` remain possible: both calls are then no-ops.
+/// Let the benchmark steer a scenario's floor: resumes steering, the
+/// measured search from the best level of the pinned sweep that preceded it,
+/// the wait heuristic from its seed. Call after the scenario's pinned sweep;
+/// pair with [`benchmark_floor_freeze`] before its measured windows. An
+/// explicit `NICE_GPU_MSD_FLOOR` still wins, so floor sweeps under
+/// `--benchmark` remain possible: both calls are then no-ops.
 ///
 /// Why not simply pin: a steered floor is what production runs at, and it
 /// differs by machine in both directions (measured: an RTX 4090 with six
 /// cores settles at the cap, an RTX 3060 with nineteen near 100k, and the
 /// pinned cap undersold the latter by a third). Why not steer through the
-/// measurement: the controller moves every half second and the windows are
+/// measurement: the controllers move within a second and the windows are
 /// tens of milliseconds, so a moving floor would make the rate depend on
 /// where in the controller's cycle the window fell. Steer to convergence
 /// first, then hold.
@@ -1182,7 +1283,9 @@ pub fn fields_in_flight() -> usize {
 /// thread. This is the device-side queue depth: deep enough that the device
 /// never runs dry between batches, shallow enough that a backed-up device is
 /// felt as `launch` blocking within a fraction of a second, which is the
-/// controller's "device is behind" signal. `NICE_GPU_BATCHES_IN_FLIGHT`.
+/// wait heuristic's "device is behind" signal, and small enough that the
+/// work in flight stays near the device's own pace, which the measured
+/// search reads. `NICE_GPU_BATCHES_IN_FLIGHT`.
 #[must_use]
 pub fn batches_in_flight() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
@@ -1394,7 +1497,8 @@ fn descriptors_for_block(
     descriptors_for_block_profiled(block, base, floor, field_start, &mut profile)
 }
 
-/// [`descriptors_for_block`], also filling the recursion's depth profile.
+/// Descriptors for one block (the no-MSD bypass goes chunk by chunk), also
+/// filling the recursion's depth profile.
 fn descriptors_for_block_profiled(
     block: FieldSize,
     base: u32,
@@ -1418,7 +1522,7 @@ fn descriptors_for_block_profiled(
 }
 
 /// Descriptors for one block, and how many of its numbers survived the
-/// recursion's chunk-level (depth-0) analysis: the measured search's
+/// recursion's block-level (depth-0) analysis: the measured search's
 /// difficulty index.
 #[allow(clippy::type_complexity)]
 fn msd_block(
@@ -1725,6 +1829,9 @@ impl<S: RangeSink> Dispatcher<'_, S> {
     fn handle(&mut self, msg: Msg) -> Option<FieldReady<S::Pending>> {
         match msg {
             Msg::Begin { seq, base, range } => {
+                if self.open.is_empty() {
+                    self.controller.pipeline_resumed();
+                }
                 if let Err(e) = self.sink.begin_field(seq, base, &range)
                     && self.first_error.is_none()
                 {
@@ -1776,6 +1883,9 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                     self.flush_launch();
                 }
                 let open = self.open.remove(&seq)?;
+                if self.open.is_empty() {
+                    self.controller.pipeline_idle();
+                }
                 let pending = match self.first_error.take() {
                     Some(e) => Err(e),
                     None => self.sink.end_field(seq),
@@ -2274,7 +2384,8 @@ mod tests {
                 &mut leaves,
                 &mut profile,
             );
-            // Halving 1e6 seven times leaves 7812 and 7813; a leaf is either.
+            // Halving 1e6 `depth` times leaves two sizes one apart; a leaf is
+            // either.
             let leaf_size = PROCESSING_CHUNK_SIZE >> depth;
             assert!(
                 leaves
@@ -2319,7 +2430,7 @@ mod tests {
                 .any(|&f| search_level(f as f64) == Some(level));
             assert!(swept, "level {level} not swept by the benchmark");
         }
-        // Difficulty bins over the depth-1 survival fraction.
+        // Difficulty bins over the block-level survival fraction.
         assert_eq!(difficulty_bin(0.0), 0);
         assert_eq!(difficulty_bin(0.019), 0);
         assert_eq!(difficulty_bin(0.02), 1);
@@ -2330,8 +2441,9 @@ mod tests {
         assert_eq!(difficulty_bin(1.0), 5);
     }
 
-    /// Synthetic throughput of `level` on a stretch whose depth-1 survival
-    /// is `phi`: the level's base rate, scaled by how easy the stretch is.
+    /// Synthetic throughput of `level` on a stretch whose block-level
+    /// survival is `phi`: the level's base rate, scaled by how easy the
+    /// stretch is.
     fn synthetic_rate(base: &[f64; SEARCH_LEVELS], level: usize, phi: f64) -> f64 {
         base[level] * (1.6 - phi)
     }
@@ -2721,6 +2833,111 @@ mod tests {
         assert!(
             matches!(st.phase, SearchPhase::Hold { dir: -1, .. }),
             "void trial keeps its direction: {:?}",
+            st.phase
+        );
+    }
+
+    /// A tick that spans a stall is not a sample (and the next settles); a
+    /// resume after an idle spell discards the first tick; a floor that is
+    /// not the base's level, with nobody pinning it, is steered back.
+    #[test]
+    fn search_discards_stalls_and_realigns() {
+        let mut now = Instant::now();
+        let mut s = LadderSearch::new(now, search_floor(1));
+        let floor = s.note_block(40, now).unwrap();
+        s.floor_changed(now, floor);
+        let tick = |s: &mut LadderSearch, now: &mut Instant, floor: f64, dt: Duration| {
+            *now += dt;
+            s.tick(*now, floor, 1_000_000_000, 500_000_000, false)
+        };
+        let samples = |s: &LadderSearch| -> Vec<(usize, u32)> {
+            s.bases[&40].bins[0]
+                .iter()
+                .enumerate()
+                .filter_map(|(b, x)| x.map(|x| (b, x.ticks)))
+                .collect()
+        };
+        for _ in 0..SEARCH_SETTLE_TICKS {
+            assert!(tick(&mut s, &mut now, floor, SEARCH_TICK).is_none());
+        }
+        assert!(samples(&s).is_empty(), "settling ticks are not samples");
+        tick(&mut s, &mut now, floor, SEARCH_TICK);
+        let one = samples(&s);
+        assert_eq!(one.len(), 1, "a clean tick is a sample");
+        // A stalled tick: not recorded, and the next one settles.
+        assert!(tick(&mut s, &mut now, floor, SEARCH_MAX_TICK + SEARCH_TICK).is_none());
+        tick(&mut s, &mut now, floor, SEARCH_TICK);
+        assert_eq!(samples(&s), one, "stall and its settle recorded nothing");
+        // After an idle spell the first tick is discarded too.
+        s.resume(now, floor);
+        tick(&mut s, &mut now, floor, SEARCH_TICK);
+        assert_eq!(samples(&s), one, "resume settles");
+        // Someone else's floor (a level, or none): back to the base's level
+        // once the new floor has settled.
+        for other in [search_floor(3), 500_000.0] {
+            assert!(tick(&mut s, &mut now, other, SEARCH_TICK).is_none());
+            for _ in 0..SEARCH_SETTLE_TICKS {
+                assert!(tick(&mut s, &mut now, other, SEARCH_TICK).is_none());
+            }
+            let (to, why) = tick(&mut s, &mut now, other, SEARCH_TICK).unwrap();
+            assert_eq!(why, "realign");
+            assert!((to - floor).abs() < 1e-9);
+        }
+    }
+
+    /// A neighbour that measures faster by less than the hysteresis is not
+    /// adopted.
+    #[test]
+    fn search_trial_needs_to_clear_the_hysteresis() {
+        let sweep = [4.5e11, 5.0e11, 6.0e11, 7.0e11, 6.9e11, 5.0e11, 4.0e11];
+        let mut now = Instant::now();
+        let mut s = LadderSearch::new(now, search_floor(1));
+        let mut floor = s.note_block(40, now).unwrap();
+        s.floor_changed(now, floor);
+        let mut cur = 0usize;
+        let sweep_ticks = SEARCH_LEVELS
+            * (usize::from(SEARCH_SETTLE_TICKS) + usize::from(SEARCH_VISIT_TICKS))
+            + 16;
+        drive_search(
+            &mut s,
+            &mut now,
+            &mut floor,
+            &sweep,
+            &PHIS,
+            &mut cur,
+            sweep_ticks,
+            false,
+        );
+        assert_eq!(s.bases[&40].level, 3);
+        // The finer neighbour is now 3% faster than home: still not enough.
+        let close = [4.5e11, 5.0e11, 6.0e11, 7.0e11, 7.21e11, 5.0e11, 4.0e11];
+        let is_trial = |p: &SearchPhase| matches!(p, SearchPhase::Trial { .. });
+        assert!(drive_until(
+            &mut s,
+            &mut now,
+            &mut floor,
+            &close,
+            &PHIS,
+            &mut cur,
+            hold_cycle_ticks(),
+            is_trial
+        ));
+        assert_eq!(s.bases[&40].level, 4);
+        drive_search(
+            &mut s,
+            &mut now,
+            &mut floor,
+            &close,
+            &PHIS,
+            &mut cur,
+            usize::from(SEARCH_SETTLE_TICKS) + usize::from(SEARCH_VISIT_TICKS) + 2,
+            false,
+        );
+        let st = &s.bases[&40];
+        assert_eq!(st.level, 3, "a 3% gain is inside the hysteresis");
+        assert!(
+            matches!(st.phase, SearchPhase::Hold { dir: -1, .. }),
+            "{:?}",
             st.phase
         );
     }

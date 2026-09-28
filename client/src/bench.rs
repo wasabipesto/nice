@@ -101,8 +101,10 @@ struct FloorPin {
 }
 
 /// Seconds a GPU niceonly scenario steers its MSD floor before the floor is
-/// frozen and the windows are timed. The controller steps every half
-/// second, so this is six steps: enough to go from the seed to either clamp.
+/// frozen and the windows are timed. The measured search starts from the
+/// best level of the pinned sweep and only needs to settle; the wait
+/// heuristic steps every half second, so this is six of its steps: enough
+/// to go from its seed to either clamp.
 #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
 const STEER_WARMUP_SECS: f64 = 3.0;
 
@@ -259,9 +261,10 @@ fn run_scenario(
     let warmup_t0 = Instant::now();
     run_window(cli, gpu, def, start, warmup_window, table.as_ref());
 
-    // GPU niceonly: steer the MSD floor to where this machine balances on
-    // this base, then hold it there for the timed windows. Every scenario
-    // starts from the same seed, so the result does not depend on the
+    // GPU niceonly: sweep the pinned floors, steer the MSD floor to where
+    // this machine does best on this base, then hold it there for the timed
+    // windows. Every scenario starts from its own sweep (the search) or the
+    // same seed (the heuristic), so the result does not depend on the
     // scenario before it. See `gpu_niceonly::benchmark_floor_thaw`.
     let (msd_floor, floor_sweep) = steer_floor(cli, gpu, def, start, window, table.as_ref());
     let floor_sweep_seconds: f64 = floor_sweep.iter().map(|p| p.seconds).sum();
