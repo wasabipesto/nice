@@ -194,9 +194,21 @@ pub struct AffineParams {
 /// (see [`guaranteed_low_digits`]), and the digit masks it compares against
 /// are one u64 word, so the base must be at most 64. It rides on the
 /// cross-end filter's masks, which exist under the same base bound.
+///
+/// It also compares those positions against the range certificate, which
+/// must then hold no digit from positions `k..2k-1` itself. A certificate
+/// comes from an analysed range of two or more numbers, so that holds once
+/// the base's legal range starts at or above `b^{2k-1}`: consecutive squares
+/// there differ by more than `b^{2k-1}`. The same gate as the CPU walk
+/// (`StrideTable::iterate_range_masked`); it disables the bases below 27
+/// (long searched, and none of them has a nice number) and nothing above.
 #[must_use]
 pub fn affine_params(base: u32, k: u32) -> Option<AffineParams> {
     if k != 3 || base > 64 || guaranteed_low_digits(base)? < 2 * k {
+        return None;
+    }
+    let range_start = crate::base_range::get_base_range_u128(base).ok()??.start();
+    if range_start < u128::from(base).pow(2 * k - 1) {
         return None;
     }
     let bk = u64::from(base).pow(k);
@@ -301,6 +313,33 @@ mod tests {
             assert_eq!(u64::from(p.bk), u64::from(base).pow(3));
             assert_eq!(p.b2k, u64::from(base).pow(6));
             assert_eq!(u128::from(p.pow64_mod), (1u128 << 64) % u128::from(p.b2k));
+        }
+    }
+
+    /// The certificate gate: six guaranteed digits are not enough, the
+    /// base's legal range must also start at or above `b^5` so the range
+    /// certificate cannot hold a digit from the positions the filter tests.
+    /// That turns off the bases below 27 and nothing above.
+    #[test]
+    fn affine_params_gate_on_the_certificate_bound() {
+        for base in [19u32, 20, 22, 24, 25] {
+            assert!(
+                guaranteed_low_digits(base).is_some_and(|d| d >= 6),
+                "b{base}"
+            );
+            assert!(affine_params(base, 3).is_none(), "b{base}");
+        }
+        for base in 10..=64u32 {
+            if affine_params(base, 3).is_some() {
+                let start = crate::base_range::get_base_range_u128(base)
+                    .unwrap()
+                    .unwrap()
+                    .start();
+                assert!(start >= u128::from(base).pow(5), "b{base}");
+            }
+        }
+        for base in [27u32, 28, 30, 38, 40, 52, 64] {
+            assert!(affine_params(base, 3).is_some(), "b{base}");
         }
     }
 

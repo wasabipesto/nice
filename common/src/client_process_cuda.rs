@@ -1455,38 +1455,64 @@ mod tests {
         !dup && (((mq | mc) & known) | (mq & mc)) == 0
     }
 
+    /// Base-`base` digits of `n²` and `n³`, least significant first.
+    fn power_digits(n: u128, base: u32) -> (Vec<u32>, Vec<u32>) {
+        let mut sq = crate::fixed_width::U256::mul_u128_u128(n, n);
+        let mut cu = sq.mul_u128_truncating(n);
+        let (mut sqd, mut cud) = (Vec::new(), Vec::new());
+        while !sq.is_zero() {
+            sqd.push(sq.div_assign_rem_u32(base));
+        }
+        while !cu.is_zero() {
+            cud.push(cu.div_assign_rem_u32(base));
+        }
+        (sqd, cud)
+    }
+
+    /// The kernel's reduction and affine arithmetic, mirrored, on every base
+    /// the host emits AFFINE for (the CPU-only bases 40-64 and the GPU-only
+    /// ones below 40, base 64 included), random `n` in the legal range plus
+    /// the word extremes: the reduction must give `n mod b^6`, and the
+    /// verdict must be exactly "the six true middle digits (wide arithmetic)
+    /// are distinct and miss `known`", for arbitrary `known`.
     #[test_log::test]
-    fn affine_mirror_matches_cpu_filter() {
-        for base in MIRROR_TEST_BASES {
+    fn affine_mirror_matches_true_digits() {
+        let mut bases = 0;
+        for base in 10..=64u32 {
             let Some(aff) = affine_params(base, GPU_LSD_K) else {
                 continue;
             };
-            let Ok(Some(base_range)) = base_range::get_base_range_u128(base) else {
-                continue;
-            };
+            bases += 1;
+            let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
             let b6 = u128::from(base).pow(6);
             assert_eq!(u128::from(aff.b2k), b6);
             let span = base_range.range_end - base_range.range_start;
+            let bk = u128::from(aff.bk);
+            let block = (base_range.range_start / b6 + 1) * b6;
+            let edges = [0, 1, 2, bk / 2, bk - 2, bk - 1];
+            let extremes = edges
+                .iter()
+                .flat_map(|&s| edges.iter().map(move |&t| block + s + bk * t));
             let mut x: u128 = 0x5eed_1234_abcd_0f0f_9876_5432_10fe_dcba;
-            let mut rejected = 0u32;
-            for i in 0..3000u128 {
+            let random = (0..3000u128).map(move |i| {
                 x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
-                let n = base_range.range_start + (x % span);
-                // The device reduction is n mod b^6.
+                base_range.range_start + (x % span)
+            });
+            let mut y: u64 = 0x0123_4567_89ab_cdef;
+            let mut rejected = 0u32;
+            for n in extremes.chain(random) {
                 let (n_lo, n_hi) = split_u128(n);
                 assert_eq!(
                     u128::from(mirror_reduce_pre(n_hi, n_lo, aff.b2k, aff.pow64_mod)),
                     n % b6,
                     "reduce_b2k mismatch b{base} n={n}"
                 );
-                let known = ((x >> 64) as u64) & (u64::MAX >> (64 - base));
-                let nmod = (n % b6) as u64;
-                // Reference verdict from the CPU module's digit formula: six
-                // real digits, pairwise distinct and disjoint from `known`.
-                let (sq, cu) = crate::affine_filter::middle_digits(base, nmod);
+                y = y.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let known = y & (u64::MAX >> (64 - base));
+                let (sq, cu) = power_digits(n, base);
                 let mut seen = known;
                 let mut ok = true;
-                for &d in sq.iter().chain(cu.iter()) {
+                for &d in sq[3..6].iter().chain(&cu[3..6]) {
                     ok &= seen & (1u64 << d) == 0;
                     seen |= 1u64 << d;
                 }
@@ -1496,18 +1522,15 @@ mod tests {
                     "affine mirror mismatch b{base} n={n} known={known:#x}"
                 );
                 if crate::affine_filter::supports(base, GPU_LSD_K) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let nmod = (n % b6) as u64;
                     assert_eq!(crate::affine_filter::survives(base, nmod, known), ok);
                 }
-                if !device {
-                    rejected += 1;
-                    assert!(
-                        !client_process::get_is_nice(n, base),
-                        "affine filter rejected a nice number: b{base} n={n}"
-                    );
-                }
+                rejected += u32::from(!device);
             }
             assert!(rejected > 0, "b{base}: affine mirror never rejected");
         }
+        assert!(bases >= 25, "only {bases} bases emit AFFINE");
     }
 
     #[test_log::test]

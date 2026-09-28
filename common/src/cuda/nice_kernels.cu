@@ -43,7 +43,8 @@
 //     counts accumulate in per-warp shared-memory histograms.
 
 // Standalone fallbacks so the file can be syntax-checked without the host's
-// define injection (values match base 40, k=2).
+// define injection (values match base 40: stride and prefilter with k=2, the
+// affine filter's AFF_* with its fixed k=3).
 #if !defined(NICEONLY) && !defined(DETAILED)
 #define NICEONLY
 #define DETAILED
@@ -424,9 +425,13 @@ __device__ __forceinline__ u64 reduce_b2k(u64 hi, u64 lo) {
 // 3..5 are the base-BASE digits of (s^2 div B + 2 s t) mod B and
 // (s^3 div B + 3 s^2 t) mod B, so six fresh digits come out of word
 // arithmetic with constant divisors. `known` is the candidate's exact low
-// digit mask OR the range's high certificate; those positions are disjoint
-// from the six tested here. Rejects ~97% of cross-end survivors without the
-// multi-limb square, so it runs before candidate_is_nice.
+// digit mask (positions 0..2) OR the range's high certificate. The
+// certificate holds no digit from positions 3..5 because the host only
+// emits AFFINE for bases whose legal range starts at or above BASE^5
+// (gpu_config::affine_params): a certificate comes from an analysed range of
+// two or more numbers, and consecutive squares there differ by more than
+// BASE^5. Rejects ~95-97% of cross-end survivors without the multi-limb
+// square, so it runs before candidate_is_nice.
 __device__ __forceinline__ bool affine_survives(u64 n_lo, u64 n_hi, u64 known) {
     u64 nmod = reduce_b2k(n_hi, n_lo);
     u64 s = nmod % AFF_BK;
@@ -556,7 +561,11 @@ extern "C" __global__ void niceonly_ranges_kernel(
             // No certificate (no-MSD bypass emits mask 0, and some analyzed
             // ranges genuinely have none): the ballot/queue machinery can
             // only cost here (~7% measured at the bypass floor), so run the
-            // plain enumeration for this range instead.
+            // plain enumeration for this range instead. The affine filter
+            // is deliberately skipped here too: against the low digits
+            // alone 24-43% of candidates survive it (b40-b64), so nearly
+            // every warp would still run the full check on some lane, and
+            // the test would only add cost.
             for (u32 g = idx0 + lane;; g += 32) {
                 u32 cycle = g / STRIDE_R;
                 u32 j = g - cycle * STRIDE_R;
