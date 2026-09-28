@@ -811,11 +811,14 @@ fn candidate_check(
     }
 }
 
-/// The affine middle-digit filter's per-range constants: `s0 = B0 mod b^3`
-/// and `t0 = (B0 div b^3) mod b^3` for the range's enumeration base
-/// `B0 = b0_hi·2^64 + b0_lo`, packed as `t0 << 32 | s0`. Every candidate of
-/// the range is `B0 + cycle·M + residue`, and since `M = (b-1)·b^3` the
-/// candidate's own `(s, t)` follow from these by 32-bit digit arithmetic.
+/// The affine middle-digit filter's per-range constant
+/// `t0 = (B0 div b^3) mod b^3` for the range's enumeration base
+/// `B0 = b0_hi·2^64 + b0_lo`. Every candidate of the range is
+/// `B0 + cycle·M + residue` with `M = (b-1)·b^3`, and `B0` is a multiple of
+/// `M` (it is the range start minus the start's residue mod `M`), so a
+/// candidate's `s = n mod b^3` is `residue mod b^3` and its
+/// `t = (n div b^3) mod b^3` is `t0 + cycle·(b-1) + residue div b^3`, mod
+/// `b^3`: 32-bit digit arithmetic per candidate.
 ///
 /// Byte-wise long division of `B0` by `b^3`, most significant byte first,
 /// with each quotient byte folded into `t0` by Horner as it comes out. Every
@@ -826,7 +829,7 @@ fn candidate_check(
 /// does not strength-reduce it. `b0_hi` is below 2^12 for every base the
 /// filter is enabled on (n < 2^77 at base 64), so its low word is all of it.
 #[cube]
-fn affine_range_base(b0_lo: u64, b0_hi: u64, #[comptime] aff_bk: u32) -> u64 {
+fn affine_range_base(b0_lo: u64, b0_hi: u64, #[comptime] aff_bk: u32) -> u32 {
     let w2 = u32::cast_from(b0_hi);
     let w1 = u32::cast_from(b0_lo >> 32u64);
     let w0 = u32::cast_from(b0_lo);
@@ -847,7 +850,7 @@ fn affine_range_base(b0_lo: u64, b0_hi: u64, #[comptime] aff_bk: u32) -> u64 {
         r = cur - q * aff_bk;
         t = ((t << 8u32) | q) % aff_bk;
     }
-    (u64::cast_from(t) << 32u64) | u64::cast_from(r)
+    t
 }
 
 /// Affine middle-digit filter (the device form of `crate::affine_filter`).
@@ -860,8 +863,12 @@ fn affine_range_base(b0_lo: u64, b0_hi: u64, #[comptime] aff_bk: u32) -> u64 {
 /// 32-bit compile-time constant `base` — the wgpu backends do not
 /// strength-reduce 64-bit division (see `chunk_constants_u16`), and this
 /// keeps the filter cheap on all of them. `known` holds the residue's exact
-/// low digits and the range certificate; the six positions tested here are
-/// disjoint from both. Returns true when the candidate survives: six
+/// low digits and the range certificate. Neither holds a digit from the six
+/// positions tested here: the low digits are positions 0..2, and
+/// `gpu_config::affine_params` only enables the filter for bases whose
+/// legal range starts at or above `b^5`, where no analysed range (two or
+/// more numbers) can hold positions 3..5 fixed. Returns true when the
+/// candidate survives: six
 /// pairwise-distinct digits, none in `known`.
 #[cube]
 #[allow(clippy::similar_names, clippy::many_single_char_names)]
@@ -1066,7 +1073,6 @@ fn niceonly_kernel(
         let mut re_hi = 0u64;
         let mut b0_lo = 0u64;
         let mut b0_hi = 0u64;
-        let mut aff_s0 = 0u32;
         let mut aff_t0 = 0u32;
         let mut g = 0u32;
         let mut qn = 0u32;
@@ -1111,9 +1117,7 @@ fn niceonly_kernel(
                     b0_hi -= 1u64;
                 }
                 if affine {
-                    let ab = affine_range_base(b0_lo, b0_hi, aff_bk);
-                    aff_s0 = u32::cast_from(ab);
-                    aff_t0 = u32::cast_from(ab >> 32u64);
+                    aff_t0 = affine_range_base(b0_lo, b0_hi, aff_bk);
                 }
                 let mut lb_lo = 0u32;
                 let mut lb_hi = stride_r.runtime();
@@ -1174,13 +1178,8 @@ fn niceonly_kernel(
                     if affine {
                         if !masked {
                             let res = residues[j as usize];
-                            let mut sa = aff_s0 + res % aff_bk;
-                            let mut carry = 0u32;
-                            if sa >= aff_bk {
-                                sa -= aff_bk;
-                                carry = 1u32;
-                            }
-                            let ta = (aff_t0 + cycle * base_m1 + res / aff_bk + carry) % aff_bk;
+                            let sa = res % aff_bk;
+                            let ta = (aff_t0 + cycle * base_m1 + res / aff_bk) % aff_bk;
                             cand_st = (u64::cast_from(ta) << 32u64) | u64::cast_from(sa);
                             cand_known = lm | rmask;
                         }
@@ -1389,7 +1388,6 @@ fn niceonly_kernel(
         let mut re_hi = 0u64;
         let mut b0_lo = 0u64;
         let mut b0_hi = 0u64;
-        let mut aff_s0 = 0u32;
         let mut aff_t0 = 0u32;
         let mut g = 0u32;
         let mut qn = 0u32;
@@ -1434,9 +1432,7 @@ fn niceonly_kernel(
                     b0_hi -= 1u64;
                 }
                 if affine {
-                    let ab = affine_range_base(b0_lo, b0_hi, aff_bk);
-                    aff_s0 = u32::cast_from(ab);
-                    aff_t0 = u32::cast_from(ab >> 32u64);
+                    aff_t0 = affine_range_base(b0_lo, b0_hi, aff_bk);
                 }
                 let mut lb_lo = 0u32;
                 let mut lb_hi = stride_r.runtime();
@@ -1497,13 +1493,8 @@ fn niceonly_kernel(
                     if affine {
                         if !masked {
                             let res = residues[j as usize];
-                            let mut sa = aff_s0 + res % aff_bk;
-                            let mut carry = 0u32;
-                            if sa >= aff_bk {
-                                sa -= aff_bk;
-                                carry = 1u32;
-                            }
-                            let ta = (aff_t0 + cycle * base_m1 + res / aff_bk + carry) % aff_bk;
+                            let sa = res % aff_bk;
+                            let ta = (aff_t0 + cycle * base_m1 + res / aff_bk) % aff_bk;
                             cand_st = (u64::cast_from(ta) << 32u64) | u64::cast_from(sa);
                             cand_known = lm | rmask;
                         }
@@ -1659,12 +1650,9 @@ fn niceonly_kernel(
             if rs_lo < u64::cast_from(m) {
                 b0_hi -= 1u64;
             }
-            let mut aff_s0 = 0u32;
             let mut aff_t0 = 0u32;
             if affine {
-                let ab = affine_range_base(b0_lo, b0_hi, aff_bk);
-                aff_s0 = u32::cast_from(ab);
-                aff_t0 = u32::cast_from(ab >> 32u64);
+                aff_t0 = affine_range_base(b0_lo, b0_hi, aff_bk);
             }
 
             // First residue index at or after m: lower_bound over the sorted table.
@@ -1712,13 +1700,8 @@ fn niceonly_kernel(
                 if affine {
                     if !masked {
                         let res = residues[j as usize];
-                        let mut sa = aff_s0 + res % aff_bk;
-                        let mut carry = 0u32;
-                        if sa >= aff_bk {
-                            sa -= aff_bk;
-                            carry = 1u32;
-                        }
-                        let ta = (aff_t0 + cycle * base_m1 + res / aff_bk + carry) % aff_bk;
+                        let sa = res % aff_bk;
+                        let ta = (aff_t0 + cycle * base_m1 + res / aff_bk) % aff_bk;
                         if !affine_survives(sa, ta, lm | rmask, base) {
                             masked = true;
                         }
@@ -2814,7 +2797,7 @@ impl NiceonlyPlan {
         debug!(
             "CubeCL niceonly plan base {base}: cross {cross}, compact {compact} \
              (plane ops {plane_ok}), plane-scoped {plane_compact} (plane sync {plane_sync}), \
-             affine {}",
+             affine params {}",
             affine_params(base, GPU_LSD_K).is_some()
         );
         #[allow(clippy::cast_possible_truncation)]
@@ -2847,6 +2830,14 @@ impl NiceonlyPlan {
         } else {
             None
         };
+        debug!(
+            "CubeCL niceonly plan base {base}: affine filter {}",
+            match (affine, affine_stages) {
+                (None, _) => "off",
+                (Some(_), AffineStages::One) => "on, one stage",
+                (Some(_), AffineStages::Two) => "on, two stages",
+            }
+        );
         Ok(Self {
             stride_m,
             stride_r,
@@ -3587,6 +3578,7 @@ mod tests {
     /// no nice number) shows up as a missing survivor here.
     #[test]
     #[ignore = "requires a wgpu device"]
+    #[allow(clippy::too_many_lines)]
     fn cubecl_cross_filter_survivors_match_the_host_mirror() {
         let ctx = CubeclContext::new_default().expect("CubeCL init");
         #[allow(irrefutable_let_patterns)]
@@ -3596,13 +3588,16 @@ mod tests {
         // b40: prefilter base, digits reach 39 (bits in both mask words).
         // b50: no prefilter, so probe reports pure cross-filter survivors;
         // digits reach 49.
+        // b57: three limbs, and n above 2^64, so the range base's high word
+        // (and the affine constant's long division through it) is live.
         for (base, mask) in [
             (40u32, (1u64 << 5) | (1u64 << 39)),
             (50, (1u64 << 3) | (1u64 << 45)),
+            (57, (1u64 << 7) | (1u64 << 52)),
         ] {
             let pre = vulkan_prefilter_params(base);
             let table = StrideTable::new(base, GPU_LSD_K);
-            let start = crate::base_range::get_base_range_u128(base)
+            let range_start = crate::base_range::get_base_range_u128(base)
                 .unwrap()
                 .unwrap()
                 .range_start;
@@ -3610,6 +3605,9 @@ mod tests {
             // fit the output buffer with wide margin (probe reports every
             // survivor, not just nice numbers).
             let len: u32 = 400_000;
+            // Straddle a multiple of the stride modulus, so candidates run
+            // on both sides of a cycle boundary (cycle 0 and 1 of the range).
+            let start = (range_start / table.modulus + 1) * table.modulus - u128::from(len / 2);
 
             // Host mirror: every stride candidate whose residue's exact low
             // digits miss the certificate and (where present) whose low
@@ -3657,6 +3655,15 @@ mod tests {
             assert!(
                 want_plain.len() < NICEONLY_OUT_CAPACITY / 2,
                 "base {base}: {} probe survivors would risk the output buffer; shrink the window",
+                want_plain.len()
+            );
+            // The filter must both pass and reject survivors of this window,
+            // or the comparisons below could not tell it from a no-op or a
+            // filter that rejects everything.
+            assert!(
+                !want_affine.is_empty() && want_affine.len() < want_plain.len(),
+                "base {base}: affine mirror kept {} of {}",
+                want_affine.len(),
                 want_plain.len()
             );
 
@@ -3729,72 +3736,77 @@ mod tests {
                 .range_start;
             let len: u32 = 5_000_000;
 
-            // Every lane width, over the identical range: the tiling is pure
-            // index arithmetic, so a width the host never happens to choose is
-            // exactly where an off-by-one would hide.
-            let mut per_width = Vec::new();
-            for shift in 0..=MAX_LANES_PER_RANGE.ilog2() {
-                let mut run =
-                    CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
-                assert!(
-                    run.plan.prefilter.is_some(),
-                    "base {base}: no prefilter params"
-                );
-                run.probe = true;
-                run.lane_shift_override = Some(shift);
-                run.launch(0, &[0], &[len], &[0]).expect("dispatch");
-                per_width.push(
-                    run.finish()
-                        .expect("results")
-                        .iter()
-                        .map(|n| n.number)
-                        .collect::<Vec<u128>>(),
-                );
-            }
             // Every stride candidate in the range, filtered by the mirror:
-            // the affine filter (certificate 0, so against the residue's own
-            // low digits) and the prefilter, as the default plan runs them.
+            // the prefilter alone, and with the affine filter (certificate 0,
+            // so against the residue's own low digits) as the default plan
+            // runs them.
             let end = start + u128::from(len);
             let (mut n, mut idx) = table.first_valid_at_or_after(start);
-            let mut want = Vec::new();
+            let (mut want_pre, mut want_both) = (Vec::new(), Vec::new());
             let mut candidates = 0u32;
             while n < end {
                 candidates += 1;
-                if affine_mirror(n, base, table.low_digit_masks[idx])
-                    && prefilter_mirror(n, base, &pre)
-                {
-                    want.push(n);
+                if prefilter_mirror(n, base, &pre) {
+                    want_pre.push(n);
+                    if affine_mirror(n, base, table.low_digit_masks[idx]) {
+                        want_both.push(n);
+                    }
                 }
                 n += u128::from(table.gap_table[idx]);
                 idx = (idx + 1) % table.gap_table.len();
             }
-
-            // Each lane width against the CPU mirror, not merely against
-            // each other: if the tiling drops or duplicates candidates at one
-            // width, comparing widths only says they disagree, while this says
-            // which one is wrong.
-            for (shift, got) in per_width.iter().enumerate() {
-                assert_eq!(
-                    got,
-                    &want,
-                    "base {base}: {} lanes disagree with the CPU mirror \
-                     ({} survivors vs {})",
-                    1 << shift,
-                    got.len(),
-                    want.len()
-                );
-            }
-            assert!(!want.is_empty(), "base {base}: the mirror passed nothing");
             assert!(
-                want.len() < candidates as usize,
+                !want_both.is_empty(),
+                "base {base}: the mirror passed nothing"
+            );
+            assert!(
+                want_pre.len() < candidates as usize,
                 "base {base}: the prefilter rejected nothing"
             );
+
+            // Every lane width, over the identical range, with the filter off
+            // and on: the tiling is pure index arithmetic, so a width the
+            // host never happens to choose is exactly where an off-by-one
+            // would hide. Each width is compared against the CPU mirror, not
+            // merely against the others: if the tiling drops or duplicates
+            // candidates at one width, comparing widths only says they
+            // disagree, while this says which one is wrong.
+            for (affine_on, want) in [(false, &want_pre), (true, &want_both)] {
+                for shift in 0..=MAX_LANES_PER_RANGE.ilog2() {
+                    let mut run =
+                        CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
+                    assert!(
+                        run.plan.prefilter.is_some(),
+                        "base {base}: no prefilter params"
+                    );
+                    run.probe = true;
+                    run.lane_shift_override = Some(shift);
+                    run.affine_override = Some(affine_on);
+                    run.launch(0, &[0], &[len], &[0]).expect("dispatch");
+                    let got: Vec<u128> = run
+                        .finish()
+                        .expect("results")
+                        .iter()
+                        .map(|n| n.number)
+                        .collect();
+                    assert_eq!(
+                        &got,
+                        want,
+                        "base {base}: {} lanes, affine {affine_on}, disagree with the CPU \
+                         mirror ({} survivors vs {})",
+                        1 << shift,
+                        got.len(),
+                        want.len()
+                    );
+                }
+            }
             #[allow(clippy::cast_precision_loss)]
             {
                 println!(
-                    "base {base}: {} of {candidates} candidates survive ({:.2}%), device agrees",
-                    want.len(),
-                    100.0 * want.len() as f64 / f64::from(candidates)
+                    "base {base}: {} of {candidates} candidates pass the prefilter, {} also \
+                     the affine filter; device agrees",
+                    want_pre.len(),
+                    want_both.len()
                 );
             }
         }
