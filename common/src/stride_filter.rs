@@ -201,12 +201,23 @@ impl StrideTable {
     /// one AND on a mask this loop already loads.
     ///
     /// Survivors of that test then go through the affine middle-digit
-    /// filter ([`affine_filter`]): the next three digits of each power,
-    /// computed from `n mod b^{2k}` with word arithmetic, are tested against
-    /// the union of both masks before the full check runs.
+    /// filter ([`affine_filter`]): the next `k` digits of each power
+    /// (positions `k..2k`), computed from `n mod b^{2k}` with word
+    /// arithmetic, are tested against the union of both masks before the
+    /// full check runs.
     ///
-    /// Sound only when `high_mask` excludes positions below `k` (which
-    /// `analyze_range(_, _, k)` guarantees); pass 0 to disable.
+    /// `high_mask` must be the certificate of an analysed range that
+    /// contains `range` and has at least two numbers (what
+    /// `msd_prefix_filter`'s recursion hands out: it only analyses ranges
+    /// larger than its floor), with positions below `k` excluded (which
+    /// `analyze_range(_, _, k)` guarantees); pass 0 to disable. The affine
+    /// filter additionally needs the certificate to hold no digit from
+    /// positions `k..2k`. That holds whenever the range starts at or above
+    /// `b^{2k-1}`: two consecutive squares there already differ by more
+    /// than `b^{2k-1}`, so none of those positions can be the same across
+    /// the analysed range. The filter is only enabled for such ranges, which
+    /// covers every legal range of every supported base (`b^5` is at most
+    /// 1.1e9; legal ranges start above 1e12).
     #[must_use]
     pub fn iterate_range_masked(
         &self,
@@ -214,18 +225,16 @@ impl StrideTable {
         base: u32,
         high_mask: u64,
     ) -> Vec<NiceNumberSimple> {
-        self.iterate_range_impl(
-            range,
-            base,
-            high_mask,
-            affine_filter::supports(base, self.k),
-        )
+        let use_affine = affine_filter::supports(base, self.k)
+            && range.start() >= u128::from(base).pow(2 * self.k - 1);
+        self.iterate_range_impl(range, base, high_mask, use_affine)
     }
 
     /// [`StrideTable::iterate_range_masked`] without the affine middle-digit
-    /// filter; the reference path for parity tests and A/B measurements.
+    /// filter (the stride table and the cross-end test still apply): the
+    /// reference path for parity tests and A/B measurements.
     #[must_use]
-    pub fn iterate_range_masked_unfiltered(
+    pub fn iterate_range_masked_without_affine(
         &self,
         range: &FieldSize,
         base: u32,
@@ -242,6 +251,24 @@ impl StrideTable {
         high_mask: u64,
         use_affine: bool,
     ) -> Vec<NiceNumberSimple> {
+        self.walk_masked(range, base, high_mask, use_affine, |n, low| {
+            get_is_nice_with_known_lsd(n, base, self.k, low)
+        })
+    }
+
+    /// The masked walk with the seeded nice check injected: `check(n, low)`
+    /// runs on exactly the candidates that pass the cross-end test and, with
+    /// `use_affine`, the affine filter. Production passes the seeded nice
+    /// check; tests pass a recorder to see which candidates got through.
+    #[inline]
+    fn walk_masked(
+        &self,
+        range: &FieldSize,
+        base: u32,
+        high_mask: u64,
+        use_affine: bool,
+        mut check: impl FnMut(u128, u64) -> bool,
+    ) -> Vec<NiceNumberSimple> {
         let mut results = Vec::new();
         let (mut n, mut idx) = self.first_valid_at_or_after(range.start());
 
@@ -252,10 +279,11 @@ impl StrideTable {
         // always 0 — the analysis never emits mask bits there.)
         let masks = &self.low_digit_masks;
 
-        // `n mod b^{2k}`, tracked incrementally for the affine filter: the
-        // modulus fits u64 whenever the filter is supported (b ≤ 64, k = 3),
-        // and every gap is below the stride modulus `(b-1)·b^k < b^{2k}`, so
-        // one conditional subtraction keeps it reduced.
+        // `n mod b^{2k}`, tracked incrementally for the affine filter only:
+        // the modulus fits u64 whenever the filter is supported (b ≤ 64,
+        // k = 3), and every gap is at most the stride modulus
+        // `(b-1)·b^k < b^{2k}`, so one conditional subtraction keeps it
+        // reduced. Without the filter it is neither needed nor updated.
         let b2k: u64 = if use_affine {
             u64::from(base).pow(2 * self.k)
         } else {
@@ -271,7 +299,7 @@ impl StrideTable {
                 let low = masks[idx];
                 let rejected = low & high_mask != 0
                     || (use_affine && !affine_filter::survives(base, nmod, low | high_mask));
-                !rejected && get_is_nice_with_known_lsd(n, base, self.k, low)
+                !rejected && check(n, low)
             };
             if is_nice {
                 results.push(NiceNumberSimple {
@@ -281,9 +309,11 @@ impl StrideTable {
             }
             let gap = self.gap_table[idx];
             n += u128::from(gap);
-            nmod += u64::from(gap);
-            if nmod >= b2k {
-                nmod -= b2k;
+            if use_affine {
+                nmod += u64::from(gap);
+                if nmod >= b2k {
+                    nmod -= b2k;
+                }
             }
             idx += 1;
             if idx == self.gap_table.len() {
@@ -300,6 +330,85 @@ mod tests {
     use super::*;
     use crate::base_range::get_base_range_u128;
     use crate::client_process::get_is_nice;
+
+    /// Base-`base` digits of `n²` and `n³`, least significant first.
+    fn power_digits(n: u128, base: u32) -> (Vec<u32>, Vec<u32>) {
+        let mut sq = crate::fixed_width::U256::mul_u128_u128(n, n);
+        let mut cu = sq.mul_u128_truncating(n);
+        let (mut sqd, mut cud) = (Vec::new(), Vec::new());
+        while !sq.is_zero() {
+            sqd.push(sq.div_assign_rem_u32(base));
+        }
+        while !cu.is_zero() {
+            cud.push(cu.div_assign_rem_u32(base));
+        }
+        (sqd, cud)
+    }
+
+    /// The masked walk with the affine filter lets through exactly the
+    /// cross-end survivors whose *true* middle digits (positions 3..5 of
+    /// `n²` and `n³`, from wide arithmetic) are pairwise distinct and miss
+    /// the residue's low digits and the range certificate. Checked on every
+    /// candidate of real MSD leaves, over windows long enough to wrap the
+    /// gap table, so a drift in the walk's incremental `n mod b^6` shows up
+    /// as a disagreement rather than as an empty nice set on both sides.
+    #[test_log::test]
+    fn affine_walk_decisions_match_true_digits() {
+        // The benchmark's MSD-weak windows (`bench_defs`): production
+        // regions with plenty of cross-end survivors.
+        for (base, start) in [
+            (40u32, 5_007_828_088_304u128),
+            (50, 73_940_161_512_353_211),
+            (52, 407_887_399_136_188_818),
+        ] {
+            assert!(affine_filter::supports(base, 3));
+            let table = StrideTable::new(base, 3);
+            // Longer than the gap table's period M = (b-1)·b³, so every leaf
+            // sequence crosses the table's wrap at least once.
+            let len = table.modulus + 1_000_000;
+            let range = FieldSize::new(start, start + len);
+            let (mut crossed, mut passed) = (0usize, 0usize);
+            for (leaf, high) in crate::msd_prefix_filter::get_valid_ranges_masked(range, base, 3) {
+                let mut cross = Vec::new();
+                let _ = table.walk_masked(&leaf, base, high, false, |n, low| {
+                    cross.push((n, low));
+                    false
+                });
+                let mut through = Vec::new();
+                let _ = table.walk_masked(&leaf, base, high, true, |n, _| {
+                    through.push(n);
+                    false
+                });
+                let mut it = through.iter().peekable();
+                for (n, low) in cross {
+                    let (sq, cu) = power_digits(n, base);
+                    let mut seen = low | high;
+                    let mut fresh = true;
+                    for &d in sq[3..6].iter().chain(&cu[3..6]) {
+                        fresh &= seen & (1u64 << d) == 0;
+                        seen |= 1u64 << d;
+                    }
+                    let got = it.next_if_eq(&&n).is_some();
+                    assert_eq!(got, fresh, "b{base} n={n}: walk and true digits disagree");
+                    crossed += 1;
+                    passed += usize::from(got);
+                }
+                assert!(
+                    it.next().is_none(),
+                    "b{base}: filtered walk visited extra candidates"
+                );
+            }
+            // Not vacuous: plenty of cross-end survivors, most of them killed.
+            assert!(
+                crossed > 5_000,
+                "b{base}: only {crossed} cross-end survivors"
+            );
+            assert!(
+                passed * 10 < crossed,
+                "b{base}: {passed} of {crossed} passed the affine filter"
+            );
+        }
+    }
 
     #[test_log::test]
     fn test_stride_table_base10_k1() {

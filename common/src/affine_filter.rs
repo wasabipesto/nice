@@ -36,11 +36,32 @@
 //! reject roughly 97% of cross-end survivors before the full check runs
 //! (measured 96.6-97.3% on bases 40-60).
 //!
-//! Soundness needs the six positions to be real digits of `n²` and `n³`,
-//! i.e. both powers must have at least `2k` digits. Inside a legal base
-//! range `n²` has `2⌊b/5⌋` or more digits, so `k = 3` is sound for every
-//! base `≥ 15`; the specialized dispatch below only covers bases 40-64, and
-//! [`supports`] reports exactly when the filter may be used.
+//! Soundness: the filter rejects only when two of the six digits coincide
+//! or one of them is in `known`. Both are genuine repeats, which no nice
+//! number has, provided that
+//!
+//! 1. the six positions are real digits of `n²` and `n³`, and
+//! 2. every digit of `known` occurs in `n²` or `n³` at some position other
+//!    than the six tested here.
+//!
+//! (1) fails only when `n²` has fewer than six digits (`n² < b^5`); then
+//! `n³ < b^8`, so the two powers have at most 13 digits between them and
+//! `n` cannot be nice in any base the filter supports (`b ≥ 40` digits are
+//! needed). A zero-padded position can only ever reject a number that was
+//! not nice anyway.
+//!
+//! (2) holds for the residue's low digits by construction (positions
+//! `0..k`). The range certificate holds the digits at positions `j ≥ k`
+//! that are the same for every `n` in an analysed range; the MSD recursion
+//! only analyses ranges larger than its floor (at least 1), so such a range
+//! holds some `x` and `x ± 1`, and a position `j` can only be the same for
+//! both if `b^j > 2x - 1`. The stride walk enables the filter only for
+//! ranges starting at or above `b^5`, where that rules out positions 3..5
+//! (see `StrideTable::iterate_range_masked`); every legal range of every
+//! supported base starts far above it (pinned by the test
+//! `legal_ranges_start_above_the_gate`). The gate also puts `n²` at eleven
+//! digits or more, so (1) never even arises. A caller that builds `known`
+//! any other way must keep positions 3..5 out of it.
 
 /// Whether the affine filter has a sound, specialized path for this base
 /// and stride depth. When this is false, callers must skip the filter.
@@ -52,9 +73,10 @@ pub const fn supports(base: u32, k: u32) -> bool {
 /// Test the six middle digits of `n²` and `n³` against `known`.
 ///
 /// `nmod` is `n mod b^{2k}` and `known` the union of the residue's low-digit
-/// mask and the range's high certificate (both position-disjoint from the
-/// six middle positions). Returns `true` when the candidate survives, i.e.
-/// the six digits are pairwise distinct and avoid `known`.
+/// mask and the range's high certificate, whose digits must all sit at
+/// positions other than the six middle ones (see the module docs for why
+/// the MSD certificate satisfies this). Returns `true` when the candidate
+/// survives, i.e. the six digits are pairwise distinct and avoid `known`.
 ///
 /// Callers must check [`supports`] first; other bases return `true`
 /// (no filtering).
@@ -123,10 +145,15 @@ fn middle_masks_const<const BASE: u32>(nmod: u64) -> (u64, u64) {
     (mask_sq, mask_cu)
 }
 
-/// The six middle digits themselves, for tests and mirrors:
-/// `(n² digits at positions 3,4,5, n³ digits at positions 3,4,5)`.
+/// The six middle digits themselves, for tests and the GPU kernels' host
+/// mirrors: `(n² digits at positions 3,4,5, n³ digits at positions 3,4,5)`.
+/// Requires `2 ≤ base ≤ 64` and `nmod < base^6`, so that `nmod³` fits
+/// `u64`.
+#[cfg(test)]
 #[must_use]
-pub fn middle_digits(base: u32, nmod: u64) -> ([u32; 3], [u32; 3]) {
+pub(crate) fn middle_digits(base: u32, nmod: u64) -> ([u32; 3], [u32; 3]) {
+    debug_assert!((2..=64).contains(&base));
+    debug_assert!(u128::from(nmod) < u128::from(base).pow(6));
     let base = u64::from(base);
     let bk = base * base * base;
     let suffix = nmod % bk;
@@ -155,7 +182,6 @@ mod tests {
     use crate::FieldSize;
     use crate::base_range::get_base_range_u128;
     use crate::fixed_width::U256;
-    use crate::msd_prefix_filter::get_valid_ranges_masked;
     use crate::stride_filter::StrideTable;
 
     fn true_digits(n: u128, base: u32) -> (Vec<u32>, Vec<u32>) {
@@ -225,6 +251,47 @@ mod tests {
         }
     }
 
+    /// The stride walk enables the filter only from `b^5` up (see the module
+    /// docs); every supported base's legal range starts above that, so the
+    /// gate never switches the filter off in production.
+    #[test_log::test]
+    fn legal_ranges_start_above_the_gate() {
+        for base in (2..=64u32).filter(|&b| supports(b, 3)) {
+            let r = get_base_range_u128(base).unwrap().unwrap();
+            assert!(
+                r.start() >= u128::from(base).pow(5),
+                "b{base}: range start {} is below b^5",
+                r.start()
+            );
+        }
+    }
+
+    /// The word arithmetic at its extremes: `s` and `t` at 0, 1, 2, `B/2`,
+    /// `B-2` and `B-1` (`B = b³`) for every specialized base, on numbers
+    /// inside the legal range, against wide arithmetic.
+    #[test_log::test]
+    fn middle_digits_at_the_word_extremes() {
+        for base in (2..=64u32).filter(|&b| supports(b, 3)) {
+            let r = get_base_range_u128(base).unwrap().unwrap();
+            let bk = u128::from(base).pow(3);
+            let b6 = bk * bk;
+            // First multiple of b^6 inside the range, with room to spare.
+            let block = (r.start() / b6 + 1) * b6;
+            assert!(block + b6 < r.end(), "b{base}: range too short");
+            let edges = [0, 1, 2, bk / 2, bk - 2, bk - 1];
+            for &s in &edges {
+                for &t in &edges {
+                    let n = block + s + bk * t;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let (sq, cu) = middle_digits(base, (n % b6) as u64);
+                    let (tsq, tcu) = true_digits(n, base);
+                    assert_eq!(sq, tsq[3..6], "b{base} s={s} t={t}: square");
+                    assert_eq!(cu, tcu[3..6], "b{base} s={s} t={t}: cube");
+                }
+            }
+        }
+    }
+
     #[test_log::test]
     fn unsupported_bases_never_filter() {
         assert!(!supports(10, 3));
@@ -237,22 +304,40 @@ mod tests {
     #[test_log::test]
     fn masked_iteration_with_filter_matches_without_on_windows() {
         // End-to-end: the filtered stride iteration must return exactly the
-        // same nice set as the plain seeded check on real production
-        // windows.
-        for (base, start) in [
-            (40u32, 5_007_828_088_304u128),
-            (52, 407_887_399_136_188_818),
-        ] {
+        // same set as the plain seeded check. No base the filter supports
+        // has a nice number anywhere near its legal range, so this runs just
+        // above the filter's `b^5` gate instead: there `n²` and `n³` have
+        // fewer than `b` digits between them, and the seeded check accepts
+        // every candidate whose digits do not repeat, which is common. With
+        // a fine floor (64) the certificates are rich. Every rejection by the
+        // affine filter has to be a genuine repeat for the sets to agree.
+        for base in [52u32, 64] {
             let table = StrideTable::new(base, 3);
-            let range = FieldSize::new(start, start + 2_000_000);
-            let leaves = get_valid_ranges_masked(range, base, 3);
+            let start = u128::from(base).pow(5) * 7 / 3 + 12_345;
+            let range = FieldSize::new(start, start + 4_000_000);
+            let mut leaves = Vec::new();
+            crate::msd_prefix_filter::get_valid_ranges_recursive_masked(
+                range,
+                &crate::msd_prefix_filter::MaskedRecursion {
+                    base,
+                    fixed_lsd_k: 3,
+                    max_depth: crate::msd_prefix_filter::MSD_RECURSIVE_MAX_DEPTH,
+                    min_range_size: 64,
+                    subdivision_factor: 2,
+                },
+                0,
+                0,
+                &mut leaves,
+            );
+            assert!(!leaves.is_empty(), "b{base}: window fully rejected");
             let mut with = Vec::new();
             let mut without = Vec::new();
             for (leaf, hi) in leaves {
                 with.extend(table.iterate_range_masked(&leaf, base, hi));
-                without.extend(table.iterate_range_masked_unfiltered(&leaf, base, hi));
+                without.extend(table.iterate_range_masked_without_affine(&leaf, base, hi));
             }
-            assert_eq!(with, without);
+            assert!(!without.is_empty(), "b{base}: nothing to compare");
+            assert_eq!(with, without, "b{base}");
         }
     }
 }
