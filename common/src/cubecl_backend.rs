@@ -3684,6 +3684,21 @@ mod tests {
             };
             for &(forced_compact, forced_plane) in variants {
                 for (affine_on, two_stage) in [(false, true), (true, true), (true, false)] {
+                    // The plan never runs the filter in a shape whose queues
+                    // exceed the device's shared memory (the plane-scoped
+                    // two-stage drain at three limbs needs 33 KB, over
+                    // Metal's 32 KB); a forced variant must not either.
+                    if affine_on
+                        && !affine_shared_memory_fits(
+                            client,
+                            base,
+                            forced_compact,
+                            forced_compact && forced_plane,
+                            two_stage,
+                        )
+                    {
+                        continue;
+                    }
                     let mut run =
                         CubeclNiceonlyRun::new(client, base, start, false).expect("probe run");
                     assert!(run.plan.affine.is_some(), "base {base}: no affine params");
