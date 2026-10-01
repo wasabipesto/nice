@@ -8,9 +8,12 @@ here.
 Run: python3 -m unittest discover fleet
 """
 
+import pathlib
+import re
 import unittest
 
 from estimator import (
+    UNSCORED_SCENARIOS,
     decode_sample,
     estimate,
     family_key,
@@ -242,6 +245,23 @@ class BlendTests(unittest.TestCase):
         samples = [sample(False, "AMD EPYC 7763", None, 8, 2.0e9, 3.0e8)]
         out = estimate(samples, inp(False, cpu="AMD EPYC 7763", threads=8))
         self.assertLess(abs(out["blended_rate_p50"] - 2.0e9), 1.0)
+
+    def test_unscored_scenarios_excluded_from_blend(self):
+        # An unscored scenario (here b57_msd_weak) reports but must not move
+        # the blended index, or adding it to the suite would re-rank
+        # hardware across client versions.
+        s = sample(False, "AMD EPYC 7763", None, 8, 2.0e9, 3.0e8)
+        s.scenarios.append({"key": "b57_msd_weak", "base": 57, "threads": 8, "rate": 5.0e8})
+        out = estimate([s], inp(False, cpu="AMD EPYC 7763", threads=8))
+        self.assertLess(abs(out["blended_rate_p50"] - 2.0e9), 1.0)
+
+    def test_unscored_list_matches_bench_defs(self):
+        # The Rust list is the source of truth.
+        src = (pathlib.Path(__file__).resolve().parent.parent
+               / "common" / "src" / "bench_defs.rs").read_text()
+        m = re.search(r"pub const UNSCORED_SCENARIOS: &\[&str\] = &\[(.*?)\];", src, re.S)
+        self.assertIsNotNone(m)
+        self.assertEqual(set(re.findall(r'"([^"]+)"', m.group(1))), set(UNSCORED_SCENARIOS))
 
     def test_base_filter_restricts_scenarios(self):
         s = sample(False, "AMD EPYC 7763", None, 8, 2.0e9, 3.0e8)

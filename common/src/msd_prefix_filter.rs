@@ -878,6 +878,68 @@ pub fn get_valid_ranges_recursive_masked(
     inherited_mask: u64,
     out: &mut Vec<(FieldSize, u64)>,
 ) {
+    recurse_masked(range, params, current_depth, inherited_mask, out, None);
+}
+
+/// Deepest recursion level [`DepthProfile`] records.
+pub const PROFILE_DEPTHS: usize = 24;
+
+/// What the masked recursion saw at each depth: how many ranges it analyzed,
+/// how many of those passed (were not rejected), and the passing ranges'
+/// total size.
+///
+/// For a block split in two at every level down to a floor that is an exact
+/// power-of-two fraction of it (the GPU pipeline's tiling), a run with the
+/// floor at depth `d` analyzes depths `0..d` and emits the two children of
+/// every passing depth-`d-1` node *unanalyzed* (they hit the size-floor early
+/// return). So that run hands on `2 · passing[d-1]` leaves with total volume
+/// `passing_volume[d-1]`, after analyzing `analyzed[0] + … + analyzed[d-1]`
+/// nodes, so one deep run yields the rejection-versus-floor curve for every
+/// coarser floor at once. In production only `passing_volume[0]` is read:
+/// the GPU pipeline recurses from whole MSD blocks, so it is the block's
+/// size if the block passed its first analysis and 0 if not, and the
+/// measured floor search uses it as the difficulty of the stretch it just
+/// measured. The rest is there for tests and diagnostics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DepthProfile {
+    /// Ranges analyzed (endpoint digits extracted, Hall check run) per depth.
+    pub analyzed: [u64; PROFILE_DEPTHS],
+    /// Ranges that passed the analysis per depth.
+    pub passing: [u64; PROFILE_DEPTHS],
+    /// Total size of the passing ranges per depth.
+    pub passing_volume: [u128; PROFILE_DEPTHS],
+}
+
+impl DepthProfile {
+    fn record(&mut self, depth: u32, size: u128, passed: bool) {
+        let d = (depth as usize).min(PROFILE_DEPTHS - 1);
+        self.analyzed[d] += 1;
+        if passed {
+            self.passing[d] += 1;
+            self.passing_volume[d] += size;
+        }
+    }
+}
+
+/// [`get_valid_ranges_recursive_masked`] that also fills a [`DepthProfile`].
+/// Same traversal, same output.
+pub fn get_valid_ranges_recursive_masked_profiled(
+    range: FieldSize,
+    params: &MaskedRecursion,
+    out: &mut Vec<(FieldSize, u64)>,
+    profile: &mut DepthProfile,
+) {
+    recurse_masked(range, params, 0, 0, out, Some(profile));
+}
+
+fn recurse_masked(
+    range: FieldSize,
+    params: &MaskedRecursion,
+    current_depth: u32,
+    inherited_mask: u64,
+    out: &mut Vec<(FieldSize, u64)>,
+    profile: Option<&mut DepthProfile>,
+) {
     // A root that is already a leaf is emitted without analysis; check that
     // before paying for its endpoints.
     if current_depth >= params.max_depth || range.size() <= params.min_range_size {
@@ -890,7 +952,7 @@ pub fn get_valid_ranges_recursive_masked(
                 $($b => {
                     let lo = endpoint_const::<$b>(range.first());
                     let hi = endpoint_const::<$b>(range.last());
-                    recurse_fw::<$b>(range, &lo, &hi, params, current_depth, inherited_mask, out);
+                    recurse_fw::<$b>(range, &lo, &hi, params, current_depth, inherited_mask, out, profile);
                     return;
                 })*
                 _ => {}
@@ -900,7 +962,7 @@ pub fn get_valid_ranges_recursive_masked(
     fw!(
         40, 42, 43, 44, 45, 47, 48, 49, 50, 52, 53, 54, 55, 57, 58, 59, 60, 62, 64
     );
-    recurse_generic(range, params, current_depth, inherited_mask, out);
+    recurse_generic(range, params, current_depth, inherited_mask, out, profile);
 }
 
 /// The masked recursion for a specialized base, carrying each range's two
@@ -910,6 +972,7 @@ pub fn get_valid_ranges_recursive_masked(
 /// endpoints as analyzing every child from scratch (measured 47-49% of
 /// endpoints are shared on production windows). Identical traversal and
 /// output to [`recurse_generic`].
+#[allow(clippy::too_many_arguments)]
 fn recurse_fw<const BASE: u32>(
     range: FieldSize,
     lo: &Endpoint,
@@ -918,6 +981,7 @@ fn recurse_fw<const BASE: u32>(
     current_depth: u32,
     inherited_mask: u64,
     out: &mut Vec<(FieldSize, u64)>,
+    mut profile: Option<&mut DepthProfile>,
 ) {
     if current_depth >= params.max_depth || range.size() <= params.min_range_size {
         out.push((range, inherited_mask));
@@ -928,6 +992,13 @@ fn recurse_fw<const BASE: u32>(
     } else {
         analyze_endpoints::<BASE>(lo, hi, params.fixed_lsd_k)
     };
+    if let Some(p) = profile.as_deref_mut() {
+        p.record(
+            current_depth,
+            range.size(),
+            !matches!(analysis, MsdAnalysis::Rejected),
+        );
+    }
     let mask = match analysis {
         MsdAnalysis::Rejected => return,
         MsdAnalysis::Live { fixed_mask } => inherited_mask | fixed_mask,
@@ -975,6 +1046,7 @@ fn recurse_fw<const BASE: u32>(
                 current_depth + 1,
                 mask,
                 out,
+                profile.as_deref_mut(),
             );
         }
     }
@@ -988,12 +1060,21 @@ fn recurse_generic(
     current_depth: u32,
     inherited_mask: u64,
     out: &mut Vec<(FieldSize, u64)>,
+    mut profile: Option<&mut DepthProfile>,
 ) {
     if current_depth >= params.max_depth || range.size() <= params.min_range_size {
         out.push((range, inherited_mask));
         return;
     }
-    let mask = match analyze_range(range, params.base, params.fixed_lsd_k) {
+    let analysis = analyze_range(range, params.base, params.fixed_lsd_k);
+    if let Some(p) = profile.as_deref_mut() {
+        p.record(
+            current_depth,
+            range.size(),
+            !matches!(analysis, MsdAnalysis::Rejected),
+        );
+    }
+    let mask = match analysis {
         MsdAnalysis::Rejected => return,
         MsdAnalysis::Live { fixed_mask } => inherited_mask | fixed_mask,
     };
@@ -1016,6 +1097,7 @@ fn recurse_generic(
                 current_depth + 1,
                 mask,
                 out,
+                profile.as_deref_mut(),
             );
         }
     }
@@ -1609,7 +1691,7 @@ mod tests {
             let mut reused = Vec::new();
             get_valid_ranges_recursive_masked(slice, &params, 0, 0, &mut reused);
             let mut scratch = Vec::new();
-            recurse_generic(slice, &params, 0, 0, &mut scratch);
+            recurse_generic(slice, &params, 0, 0, &mut scratch, None);
             assert_eq!(reused, scratch, "b{base} floor {floor}");
             assert!(!reused.is_empty());
         }
@@ -1786,6 +1868,79 @@ mod tests {
                 brute, found,
                 "nice set changed at base {base}, floor {floor}"
             );
+        }
+    }
+
+    /// One deep run's per-depth passing counts and volumes give exactly the
+    /// leaves (and their total size) of a run whose floor sits at any coarser
+    /// power-of-two depth: that run analyzes depths `0..d` and emits the two
+    /// unanalyzed children of every passing depth `d-1` node.
+    #[test_log::test]
+    fn depth_profile_matches_shallower_runs() {
+        for base in [40u32, 50, 52, 57] {
+            let params = |floor: u128| MaskedRecursion {
+                base,
+                fixed_lsd_k: 3,
+                max_depth: MSD_RECURSIVE_MAX_DEPTH,
+                min_range_size: floor,
+                subdivision_factor: 2,
+            };
+            // The MSD filter rejects many 64e6 blocks outright; take the
+            // first of several evenly spaced ones with something to profile.
+            let range = crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap();
+            let (block, deep, profile) = (1..50)
+                .map(|step| {
+                    let start = range.start() + range.size() / 50 * step;
+                    let block = FieldSize::new(start, start + 64_000_000);
+                    let mut deep = Vec::new();
+                    let mut profile = DepthProfile::default();
+                    get_valid_ranges_recursive_masked_profiled(
+                        block,
+                        &params(62_500),
+                        &mut deep,
+                        &mut profile,
+                    );
+                    (block, deep, profile)
+                })
+                .find(|(_, _, profile)| profile.passing[6] > 0)
+                .unwrap_or_else(|| panic!("b{base}: every probed block fully rejected"));
+            let deep_volume: u128 = deep.iter().map(|(r, _)| r.size()).sum();
+            assert_eq!(
+                2 * profile.passing[9],
+                deep.len() as u64,
+                "b{base}: floor 62500 leaves"
+            );
+            assert_eq!(
+                profile.passing_volume[9], deep_volume,
+                "b{base}: floor 62500 volume"
+            );
+            assert_eq!(
+                profile.analyzed[10], 0,
+                "b{base}: the leaf level is never analyzed"
+            );
+            for (depth, floor) in [(7usize, 500_000u128), (8, 250_000), (9, 125_000)] {
+                let mut leaves = Vec::new();
+                get_valid_ranges_recursive_masked(block, &params(floor), 0, 0, &mut leaves);
+                let volume: u128 = leaves.iter().map(|(r, _)| r.size()).sum();
+                assert_eq!(
+                    2 * profile.passing[depth - 1],
+                    leaves.len() as u64,
+                    "b{base} floor {floor}: leaf count"
+                );
+                assert_eq!(
+                    profile.passing_volume[depth - 1],
+                    volume,
+                    "b{base} floor {floor}: volume"
+                );
+                // Every analyzed node at depth d is a child of a passing node at d-1.
+                assert_eq!(
+                    profile.analyzed[depth],
+                    2 * profile.passing[depth - 1],
+                    "b{base}: fan-out into {depth}"
+                );
+            }
         }
     }
 }

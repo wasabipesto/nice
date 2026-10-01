@@ -102,6 +102,20 @@ pub const NICEONLY_SCENARIOS: &[ScenarioDef] = &[
         character: "msd-weak",
         single_thread: false,
     },
+    // Three u32 limbs for n (the checks are costliest here, so the filters
+    // matter most); an MSD-weak window found by scanning the range: about
+    // half of it survives the CPU recursion (0.47-0.60 depending on the
+    // floor), where the median over the range is 0. Not scored (no reference
+    // rate yet), so it does not move NiceMark or the estimator's blend.
+    ScenarioDef {
+        key: "b57_msd_weak",
+        base: 57,
+        start: Some(58_549_892_695_752_322_464),
+        window_cpu: 20_000_000,
+        window_gpu: 4_000_000_000,
+        character: "msd-weak",
+        single_thread: false,
+    },
     // Same region and window as b50_msd_weak so the pair decomposes into
     // per-core rate × parallel efficiency. On very slow devices a single
     // repetition of this window may exceed the scenario share; one full
@@ -147,6 +161,11 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
     },
 ];
 
+/// Scenarios that run and report but do not enter the score, or the
+/// estimator's blended index, yet: they have no reference rate. Add a
+/// [`SCORE_REFERENCES`] row and remove the key here once one is pinned.
+pub const UNSCORED_SCENARIOS: &[&str] = &["b57_msd_weak"];
+
 /// Reference rates (numbers/sec) for the synthetic score, pinned per client
 /// version: (scenario key, gpu, reference rate). CPU references were measured
 /// on a 4-core `x86_64` dev box, GPU references on an RTX 3060; a score of 1000
@@ -158,7 +177,8 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
 ///
 /// The GPU niceonly references predate the benchmark steering the MSD floor
 /// to convergence before each scenario (`gpu_niceonly::benchmark_floor_thaw`);
-/// they were measured under the earlier per-field controller and are due for
+/// they were measured under the earlier per-field controller (and before the
+/// measured search became the default floor controller) and are due for
 /// re-pinning at the next reference bump.
 pub const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
     ("b40_msd_strong", false, 1.0e12),
@@ -232,9 +252,31 @@ mod tests {
     }
 
     #[test]
+    fn unscored_scenarios_exist() {
+        for key in UNSCORED_SCENARIOS {
+            assert!(
+                NICEONLY_SCENARIOS
+                    .iter()
+                    .chain(DETAILED_SCENARIOS)
+                    .any(|d| d.key == *key),
+                "{key} is listed as unscored but is not a scenario"
+            );
+        }
+    }
+
+    #[test]
     fn all_scenarios_have_cpu_references() {
-        // Every CPU scenario must be scoreable, or the score silently thins.
+        // Every CPU scenario must be scoreable, or the score silently thins
+        // — unless it is declared unscored, which keeps the omission explicit.
         for def in NICEONLY_SCENARIOS.iter().chain(DETAILED_SCENARIOS) {
+            if UNSCORED_SCENARIOS.contains(&def.key) {
+                assert!(
+                    !SCORE_REFERENCES.iter().any(|(k, _, _)| k == &def.key),
+                    "{} is listed as unscored but has a reference",
+                    def.key
+                );
+                continue;
+            }
             assert!(
                 SCORE_REFERENCES
                     .iter()

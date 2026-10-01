@@ -515,6 +515,14 @@ pub const MIN_VERSION_SAMPLES: usize = 3;
 /// Produce the estimate. `samples` should be recent decoded reports; order
 /// does not matter.
 #[must_use]
+/// Whether a scenario enters the blended ranking index: multi-thread ones
+/// only (the `_1t` anchors would drag it down), and not the unscored ones,
+/// which a client version can add; the fleet ranks offers on this index
+/// across client versions, so it must not move for the same hardware.
+fn blends(key: &str) -> bool {
+    !key.ends_with("_1t") && !crate::bench_defs::UNSCORED_SCENARIOS.contains(&key)
+}
+
 pub fn estimate(samples: &[BenchmarkSample], input: &EstimateInput) -> EstimateOutcome {
     let mut matched = match_stage(samples, input);
 
@@ -604,11 +612,11 @@ pub fn estimate(samples: &[BenchmarkSample], input: &EstimateInput) -> EstimateO
     }
     scenarios.sort_by(|a, b| a.key.cmp(&b.key));
 
-    // Blended ranking index: geometric mean over multi-thread scenarios.
+    // Blended ranking index: geometric mean over the blended scenarios.
     let blend = |pick: fn(&ScenarioEstimate) -> f64| -> Option<f64> {
         let logs: Vec<f64> = scenarios
             .iter()
-            .filter(|s| !s.key.ends_with("_1t") && pick(s) > 0.0)
+            .filter(|s| blends(&s.key) && pick(s) > 0.0)
             .map(|s| pick(s).ln())
             .collect();
         #[allow(clippy::cast_precision_loss)]
@@ -680,6 +688,22 @@ mod tests {
             base: None,
             client_version: None,
         }
+    }
+
+    #[test]
+    fn unscored_scenarios_excluded_from_blend() {
+        // An unscored scenario (here b57_msd_weak) reports but must not move
+        // the blended index, or adding it to the suite would re-rank
+        // hardware across client versions.
+        let mut s = sample(false, "AMD EPYC 7763", None, 8, 2.0e9, 3.0e8);
+        s.scenarios.push(ScenarioSample {
+            key: "b57_msd_weak".to_string(),
+            base: 57,
+            threads: 8,
+            rate: 5.0e8,
+        });
+        let out = estimate(&[s], &input(false, Some("AMD EPYC 7763"), None, Some(8)));
+        assert!((out.blended_rate_p50.unwrap() - 2.0e9).abs() < 1.0);
     }
 
     #[test]
