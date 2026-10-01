@@ -2070,7 +2070,13 @@ mod tests {
         assert_eq!(masks, vec![0]);
 
         // A sub-bypass floor produces the masked recursion's leaves.
-        let (offsets, lens, masks) = descriptors_for_chunk(chunk, base, 8000, start).unwrap();
+        let (offsets, lens, masks) = descriptors_for_chunk(
+            chunk,
+            base,
+            msd_prefix_filter::MSD_RECURSIVE_MIN_RANGE_SIZE,
+            start,
+        )
+        .unwrap();
         let leaves = msd_prefix_filter::get_valid_ranges_masked(chunk, base, GPU_LSD_K as usize);
         assert_eq!(offsets.len(), leaves.len());
         assert_eq!(masks.len(), leaves.len());

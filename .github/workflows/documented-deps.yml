@@ -20,6 +20,7 @@ on:
 
 env:
     CARGO_TERM_COLOR: always
+    NICE_BUILD_SHA: ${{ github.sha }}
     # Build checks, not benchmarks: debug profile, no incremental state to cache.
     CARGO_INCREMENTAL: 0
 
