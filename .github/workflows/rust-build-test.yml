@@ -47,13 +47,9 @@ jobs:
             - name: Run tests
               run: cargo test --locked --release --no-fail-fast
 
-    # Host-side tests of the GPU code: the CUDA backend's host logic, the
-    # nice-only pipeline and its floor controllers (`gpu_niceonly`, which
-    # only compiles with a GPU feature), and NVRTC compiles of every base's
-    # kernel. None of it needs a GPU; the jobs above build without GPU
-    # features and the parity workflow runs only `--ignored` device tests,
-    # so nothing else runs these. NVRTC comes from NVIDIA's PyPI wheel
-    # (just the shared libraries, no toolkit install).
+    # Host-side tests of the GPU glue code which don't require GPUs themselves.
+    # Checks everything not tagged with #[ignore] under the GPU umbrellla.
+    # Still requires NVRTC which is downloaded from NVIDIA's PyPI wheel.
     test-gpu-host:
         name: Test GPU host code (cuda feature, NVRTC)
         runs-on: ubuntu-latest
@@ -71,7 +67,7 @@ jobs:
             - name: Run tests
               env:
                   NICE_REQUIRE_NVRTC: 1
-              run: cargo test --locked --release -p nice_common --features cuda --lib
+              run: cargo test --locked --release -p nice_common --features gpu --lib
 
     build:
         name: Build ${{ matrix.platform.build_name }}
