@@ -531,6 +531,11 @@ pub struct NiceonlyStats {
     /// Device time actually spent on this field's batches, where the backend
     /// can measure it (CUDA, from per-batch events); `None` elsewhere.
     pub device_busy_secs: Option<f64>,
+    /// The field went through the overlap join (`crate::cubecl_join`)
+    /// instead of the MSD/stride pipeline: then `msd_secs` is the join's host
+    /// setup, `num_ranges` its partitions, `valid_numbers` the candidates it
+    /// fully checked and `floor` is 0.
+    pub overlap_join: bool,
 }
 
 impl NiceonlyStats {
@@ -552,6 +557,7 @@ impl NiceonlyStats {
             "num_ranges": self.num_ranges,
             "valid_numbers": self.valid_numbers,
             "launches": self.launches,
+            "overlap_join": self.overlap_join,
         })
     }
 }
@@ -1056,6 +1062,7 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                         cpu_wait_secs: open.cpu_wait.as_secs_f64(),
                         device_wait_secs: open.device_wait.as_secs_f64(),
                         device_busy_secs: None,
+                        overlap_join: false,
                     },
                     pushed_at: open.pushed_at,
                 })

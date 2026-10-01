@@ -50,6 +50,8 @@ use nice_common::cubecl_backend::{
     CUBECL_BATCH_SIZE, CubeclContext, begin_niceonly_cubecl, finish_niceonly_cubecl,
     process_range_detailed_cubecl, process_range_niceonly_cubecl,
 };
+#[cfg(feature = "cubecl")]
+use nice_common::overlap_join::join_params_for;
 #[cfg(feature = "vulkan")]
 use nice_common::vulkan::VulkanContext;
 
@@ -97,6 +99,18 @@ enum GpuHandle {
     Vulkan(VulkanContext),
     #[cfg(feature = "cubecl")]
     Cubecl(CubeclContext),
+    /// NVIDIA nice-only under `--gpu-backend auto`: hand-CUDA for ordinary
+    /// fields (and every benchmark window), `CubeCL`'s CUDA runtime for the
+    /// fields the overlap join takes (`overlap_join::join_params_for`), where
+    /// it is several times faster. `routes` records which of the two each
+    /// begun, unfinished field went to (`true`: the join), oldest first, so
+    /// fields still finish in the order they were begun.
+    #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+    CudaJoin {
+        cuda: CudaContext,
+        join: CubeclContext,
+        routes: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    },
 }
 
 impl GpuHandle {
@@ -125,6 +139,8 @@ impl GpuHandle {
                 GpuHandle::Cuda(_) => cudarc::driver::CudaContext::new(device)
                     .ok()
                     .and_then(|d| d.name().ok()),
+                #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+                GpuHandle::CudaJoin { join, .. } => Some(join.device_name()),
                 #[cfg(feature = "vulkan")]
                 GpuHandle::Vulkan(ctx) => Some(ctx.device_name.clone()),
                 #[cfg(feature = "cubecl")]
@@ -150,6 +166,11 @@ impl GpuHandle {
             match self {
                 #[cfg(feature = "cuda")]
                 GpuHandle::Cuda(_) => Some("cuda"),
+                // Hand-CUDA does everything but the join's fields, the
+                // benchmark included; those fields' own telemetry says
+                // `overlap_join`.
+                #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+                GpuHandle::CudaJoin { .. } => Some("cuda"),
                 #[cfg(feature = "vulkan")]
                 GpuHandle::Vulkan(_) => Some("vulkan"),
                 #[cfg(feature = "cubecl")]
@@ -428,7 +449,12 @@ fn guarded_init<T>(
 /// - **Niceonly**: `cuda` → `cubecl` → `vulkan`. Hand-CUDA keeps a slim edge
 ///   at the b50+ bases where long-run wall time concentrates; everywhere
 ///   without a toolkit, `CubeCL` is the best available (wins RADV b50+ and
-///   NVIDIA-over-wgpu outright, runs out of the box on Apple).
+///   NVIDIA-over-wgpu outright, runs out of the box on Apple). Both `CubeCL`
+///   runtimes also carry the overlap join, which takes production-size
+///   fields at the frontier (`overlap_join::join_params_for`) and is several
+///   times faster there; so on NVIDIA, a build with `cubecl-cuda` pairs the
+///   hand-CUDA context with a `CubeCL` CUDA one (`GpuHandle::CudaJoin`) and
+///   routes each field to the faster of the two.
 ///
 /// An **explicitly named** backend that fails to initialize is fatal rather
 /// than falling back: for a distributed compute client, silently dropping to
@@ -513,6 +539,31 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                     && let Ok(name) = device.name()
                 {
                     info!("  GPU: {name}");
+                }
+                // Nice-only auto also brings up CubeCL's CUDA runtime for the
+                // overlap join, which takes production-size fields; without
+                // it every field stays on hand-CUDA.
+                #[cfg(feature = "cubecl-cuda")]
+                if want == GpuBackend::Auto {
+                    let attempt =
+                        guarded_init("the CubeCL CUDA runtime could not be started", || {
+                            CubeclContext::new_cuda(cli.gpu_device)
+                        });
+                    match attempt {
+                        Ok(join) => {
+                            info!("  overlap join: CubeCL CUDA runtime ready for large fields");
+                            return Some(Arc::new(GpuHandle::CudaJoin {
+                                cuda: ctx,
+                                join,
+                                routes: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                            }));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "  overlap join unavailable, every field stays on hand-CUDA: {e:#}"
+                            );
+                        }
+                    }
                 }
                 return Some(Arc::new(GpuHandle::Cuda(ctx)));
             }
@@ -671,6 +722,18 @@ fn process_field_sync(
                         process_range_niceonly_cuda(ctx, &range, claim_data.base)
                     }
                 },
+                #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+                GpuHandle::CudaJoin { cuda, join, .. } => match mode {
+                    SearchMode::Detailed => {
+                        process_range_detailed_cuda(cuda, &range, claim_data.base)
+                    }
+                    SearchMode::Niceonly if join_params_for(claim_data.base, &range).is_some() => {
+                        process_range_niceonly_cubecl(join, &range, claim_data.base)
+                    }
+                    SearchMode::Niceonly => {
+                        process_range_niceonly_cuda(cuda, &range, claim_data.base)
+                    }
+                },
                 #[cfg(feature = "vulkan")]
                 GpuHandle::Vulkan(ctx) => match mode {
                     SearchMode::Detailed => {
@@ -793,6 +856,20 @@ fn begin_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Field
             GpuHandle::Cuda(ctx) => begin_niceonly_cuda(ctx, &range, claim_data.base),
             #[cfg(feature = "cubecl")]
             GpuHandle::Cubecl(ctx) => begin_niceonly_cubecl(ctx, &range, claim_data.base),
+            #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+            GpuHandle::CudaJoin { cuda, join, routes } => {
+                let mut routes = routes.lock().unwrap();
+                let joined = join_params_for(claim_data.base, &range).is_some();
+                let started = if joined {
+                    begin_niceonly_cubecl(join, &range, claim_data.base)
+                } else {
+                    begin_niceonly_cuda(cuda, &range, claim_data.base)
+                };
+                if matches!(started, Ok(NiceonlyStarted::Queued)) {
+                    routes.push_back(joined);
+                }
+                started
+            }
             // The Vulkan sink cannot leave the calling thread, so it has no
             // pipeline: the field is done by the time this returns.
             #[cfg(feature = "vulkan")]
@@ -839,6 +916,15 @@ fn finish_field_sync(
                     GpuHandle::Cuda(ctx) => finish_niceonly_cuda(ctx),
                     #[cfg(feature = "cubecl")]
                     GpuHandle::Cubecl(ctx) => finish_niceonly_cubecl(ctx),
+                    #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+                    GpuHandle::CudaJoin { cuda, join, routes } => {
+                        let route = routes.lock().unwrap().pop_front();
+                        match route {
+                            Some(true) => finish_niceonly_cubecl(join),
+                            Some(false) => finish_niceonly_cuda(cuda),
+                            None => Err(anyhow!("no queued GPU field to finish")),
+                        }
+                    }
                     #[cfg(feature = "vulkan")]
                     GpuHandle::Vulkan(_) => unreachable!("Vulkan fields are never queued"),
                 };

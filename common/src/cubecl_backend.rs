@@ -27,6 +27,7 @@
 )]
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
+use crate::cubecl_join::JoinPipeline;
 use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
@@ -36,12 +37,13 @@ use crate::gpu_niceonly::{
     stride_chunk_bits,
 };
 use crate::number_stats::get_near_miss_cutoff;
+use crate::overlap_join::{JoinParams, join_params_for};
 use crate::stride_filter::StrideTable;
 use crate::{FieldResults, FieldSize, NiceNumberSimple, UniquesDistributionSimple};
 use anyhow::{Context as _, Result, ensure};
 use cubecl::prelude::*;
 use log::{debug, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use web_time::Instant;
 
@@ -371,7 +373,7 @@ const NICEONLY_OUT_CAPACITY: usize = 1 << 16;
     clippy::collapsible_if,
     clippy::fn_params_excessive_bools
 )]
-fn candidate_check(
+pub(crate) fn candidate_check(
     n_lo: u64,
     n_hi: u64,
     sv_s: &mut SharedMemory<u32>,
@@ -1413,6 +1415,12 @@ pub enum CubeclContext {
         /// The continuous niceonly pipeline, started on the first niceonly field.
         niceonly_pipeline:
             Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::wgpu::WgpuRuntime>>>>,
+        /// The overlap join's pipeline, started on the first field it takes
+        /// (see [`crate::overlap_join::join_params_for`]).
+        join_pipeline: Mutex<Option<JoinPipeline>>,
+        /// Which pipeline each begun, unfinished niceonly field went to,
+        /// oldest first (`true`: the join), so fields finish in begin order.
+        niceonly_routes: Mutex<VecDeque<bool>>,
     },
     #[cfg(feature = "cubecl-cuda")]
     Cuda {
@@ -1424,6 +1432,12 @@ pub enum CubeclContext {
         /// The continuous niceonly pipeline, started on the first niceonly field.
         niceonly_pipeline:
             Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::cuda::CudaRuntime>>>>,
+        /// The overlap join's pipeline, started on the first field it takes
+        /// (see [`crate::overlap_join::join_params_for`]).
+        join_pipeline: Mutex<Option<JoinPipeline>>,
+        /// Which pipeline each begun, unfinished niceonly field went to,
+        /// oldest first (`true`: the join), so fields finish in begin order.
+        niceonly_routes: Mutex<VecDeque<bool>>,
     },
     #[cfg(feature = "cubecl-hip")]
     Hip {
@@ -1435,6 +1449,12 @@ pub enum CubeclContext {
         /// The continuous niceonly pipeline, started on the first niceonly field.
         niceonly_pipeline:
             Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::hip::HipRuntime>>>>,
+        /// The overlap join's pipeline, started on the first field it takes
+        /// (see [`crate::overlap_join::join_params_for`]).
+        join_pipeline: Mutex<Option<JoinPipeline>>,
+        /// Which pipeline each begun, unfinished niceonly field went to,
+        /// oldest first (`true`: the join), so fields finish in begin order.
+        niceonly_routes: Mutex<VecDeque<bool>>,
     },
 }
 
@@ -1549,6 +1569,8 @@ impl CubeclContext {
             device_name: device_name.clone(),
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
+            join_pipeline: Mutex::new(None),
+            niceonly_routes: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -1590,6 +1612,8 @@ impl CubeclContext {
             device_name: device_name.clone(),
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
+            join_pipeline: Mutex::new(None),
+            niceonly_routes: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -1635,6 +1659,8 @@ impl CubeclContext {
             device_name: cuda_device_name(device_index),
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
+            join_pipeline: Mutex::new(None),
+            niceonly_routes: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -1672,6 +1698,8 @@ impl CubeclContext {
             device_name: format!("cubecl-hip device {device_index}"),
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
+            join_pipeline: Mutex::new(None),
+            niceonly_routes: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -1761,7 +1789,9 @@ pub async fn process_range_detailed_cubecl_async(
 /// `NICE_CUBECL_WIDE=1` opts in for A/B runs on devices where it is legal;
 /// `NICE_CUBECL_WIDE=0` forces split16 anywhere. A forced wide flavor on a
 /// device without u64 fails at shader compile time, loudly.
-fn wide_chunk_for<R: cubecl::prelude::Runtime>(client: &cubecl::prelude::ComputeClient<R>) -> bool {
+pub(crate) fn wide_chunk_for<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+) -> bool {
     let name = R::name(client);
     let cuda = name.contains("cuda");
     let direct = name.contains("spirv") || name.contains("msl") || name == "hip";
@@ -2030,54 +2060,81 @@ pub fn begin_niceonly_cubecl(
             range, base, &table,
         )));
     }
+    begin_routed(ctx, range, base, join_params_for(base, range))
+}
+
+/// [`begin_niceonly_cubecl`] past its CPU short-cuts, with the route chosen
+/// by the caller: the overlap join with `join`'s parameters, or the stride
+/// pipeline for `None`.
+pub(crate) fn begin_routed(
+    ctx: &CubeclContext,
+    range: &FieldSize,
+    base: u32,
+    join: Option<JoinParams>,
+) -> Result<NiceonlyStarted> {
     let software = is_software_rasterizer(&ctx.device_name());
     match ctx {
         CubeclContext::Wgpu {
             client,
             niceonly_plans,
             niceonly_pipeline,
+            join_pipeline,
+            niceonly_routes,
             ..
         } => begin_impl(
             client,
             niceonly_plans,
             niceonly_pipeline,
+            join_pipeline,
+            niceonly_routes,
             software,
             range,
             base,
+            join,
         ),
         #[cfg(feature = "cubecl-cuda")]
         CubeclContext::Cuda {
             client,
             niceonly_plans,
             niceonly_pipeline,
+            join_pipeline,
+            niceonly_routes,
             ..
         } => begin_impl(
             client,
             niceonly_plans,
             niceonly_pipeline,
+            join_pipeline,
+            niceonly_routes,
             software,
             range,
             base,
+            join,
         ),
         #[cfg(feature = "cubecl-hip")]
         CubeclContext::Hip {
             client,
             niceonly_plans,
             niceonly_pipeline,
+            join_pipeline,
+            niceonly_routes,
             ..
         } => begin_impl(
             client,
             niceonly_plans,
             niceonly_pipeline,
+            join_pipeline,
+            niceonly_routes,
             software,
             range,
             base,
+            join,
         ),
     }
 }
 
 /// Wait for the oldest field begun with [`begin_niceonly_cubecl`] that went
-/// into the pipeline, and return its results.
+/// into a pipeline, and return its results.
 ///
 /// # Errors
 /// The field's device error, or an output buffer overflow.
@@ -2087,16 +2144,25 @@ pub fn begin_niceonly_cubecl(
 pub fn finish_niceonly_cubecl(ctx: &CubeclContext) -> Result<(FieldResults, NiceonlyStats)> {
     match ctx {
         CubeclContext::Wgpu {
-            niceonly_pipeline, ..
-        } => finish_impl(niceonly_pipeline),
+            niceonly_pipeline,
+            join_pipeline,
+            niceonly_routes,
+            ..
+        } => finish_impl(niceonly_pipeline, join_pipeline, niceonly_routes),
         #[cfg(feature = "cubecl-cuda")]
         CubeclContext::Cuda {
-            niceonly_pipeline, ..
-        } => finish_impl(niceonly_pipeline),
+            niceonly_pipeline,
+            join_pipeline,
+            niceonly_routes,
+            ..
+        } => finish_impl(niceonly_pipeline, join_pipeline, niceonly_routes),
         #[cfg(feature = "cubecl-hip")]
         CubeclContext::Hip {
-            niceonly_pipeline, ..
-        } => finish_impl(niceonly_pipeline),
+            niceonly_pipeline,
+            join_pipeline,
+            niceonly_routes,
+            ..
+        } => finish_impl(niceonly_pipeline, join_pipeline, niceonly_routes),
     }
 }
 
@@ -2119,15 +2185,29 @@ pub fn process_range_niceonly_cubecl(
     }
 }
 
-/// Runtime-generic body of [`begin_niceonly_cubecl`].
+/// Runtime-generic body of [`begin_routed`].
+#[allow(clippy::too_many_arguments)]
 fn begin_impl<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     plans: &Arc<Mutex<HashMap<u32, Arc<NiceonlyPlan>>>>,
     pipeline: &Mutex<Option<NiceonlyPipeline<CubeclPendingField<R>>>>,
+    join_pipeline: &Mutex<Option<JoinPipeline>>,
+    routes: &Mutex<VecDeque<bool>>,
     software: bool,
     range: &FieldSize,
     base: u32,
+    join: Option<JoinParams>,
 ) -> Result<NiceonlyStarted> {
+    // Held across the push so the route order is the push order.
+    let mut routes = routes.lock().unwrap();
+    if let Some(jp) = join {
+        let mut guard = join_pipeline.lock().unwrap();
+        guard
+            .get_or_insert_with(|| JoinPipeline::start(client.clone()))
+            .push(base, range, jp)?;
+        routes.push_back(true);
+        return Ok(NiceonlyStarted::Queued);
+    }
     let mut guard = pipeline.lock().unwrap();
     let pipeline = guard.get_or_insert_with(|| {
         NiceonlyPipeline::start(
@@ -2143,24 +2223,42 @@ fn begin_impl<R: cubecl::prelude::Runtime>(
         )
     });
     pipeline.push(base, range)?;
+    routes.push_back(false);
     Ok(NiceonlyStarted::Queued)
 }
 
 /// Runtime-generic body of [`finish_niceonly_cubecl`].
 fn finish_impl<R: cubecl::prelude::Runtime>(
     pipeline: &Mutex<Option<NiceonlyPipeline<CubeclPendingField<R>>>>,
+    join_pipeline: &Mutex<Option<JoinPipeline>>,
+    routes: &Mutex<VecDeque<bool>>,
 ) -> Result<(FieldResults, NiceonlyStats)> {
-    let mut guard = pipeline.lock().unwrap();
-    let pipeline = guard
-        .as_mut()
+    let joined = routes
+        .lock()
+        .unwrap()
+        .pop_front()
         .ok_or_else(|| anyhow::anyhow!("no niceonly field has been begun"))?;
-    let (stats, nice_numbers) = pipeline.next_result()?;
-    debug!(
-        "CubeCL niceonly pipeline: {} ranges in {} dispatches, found {}",
-        stats.num_ranges,
-        stats.launches,
-        nice_numbers.len()
-    );
+    let (stats, nice_numbers) = if joined {
+        join_pipeline
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no overlap join field has been begun"))?
+            .next_result()?
+    } else {
+        let mut guard = pipeline.lock().unwrap();
+        let pipeline = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no niceonly field has been begun"))?;
+        let (stats, nice_numbers) = pipeline.next_result()?;
+        debug!(
+            "CubeCL niceonly pipeline: {} ranges in {} dispatches, found {}",
+            stats.num_ranges,
+            stats.launches,
+            nice_numbers.len()
+        );
+        (stats, nice_numbers)
+    };
     Ok((
         FieldResults {
             distribution: Vec::new(),
@@ -2177,11 +2275,11 @@ fn finish_impl<R: cubecl::prelude::Runtime>(
 /// registration*; polling immediately pins it to the work queued up to this
 /// launch, so awaiting it later does not also wait for whatever was launched
 /// since.
-type LaunchFence = cubecl::future::DynFut<Result<(), cubecl::server::ServerError>>;
+pub(crate) type LaunchFence = cubecl::future::DynFut<Result<(), cubecl::server::ServerError>>;
 
 /// Take a fence on everything the client has queued so far. `None` if it
 /// resolved on the spot (nothing pending).
-fn launch_fence<R: cubecl::prelude::Runtime>(
+pub(crate) fn launch_fence<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
 ) -> Result<Option<LaunchFence>> {
     use std::task::{Context, Poll, Waker};

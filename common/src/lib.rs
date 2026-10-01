@@ -12,6 +12,7 @@ pub mod client_process_cuda;
 pub mod client_process_vulkan;
 pub mod consensus;
 pub mod cubecl_backend;
+pub mod cubecl_join;
 pub mod cubecl_web;
 #[cfg(feature = "database")]
 pub mod db_util;
@@ -25,6 +26,7 @@ pub mod gpu_niceonly;
 pub mod lsd_filter;
 pub mod msd_prefix_filter;
 pub mod number_stats;
+pub mod overlap_join;
 pub mod residue_filter;
 pub mod stride_filter;
 pub mod vulkan;
