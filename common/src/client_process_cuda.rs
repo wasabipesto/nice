@@ -1437,6 +1437,12 @@ mod tests {
             )
         });
         if !matches!(probe, Ok(Ok(_))) {
+            // CI installs NVRTC and sets this, so a broken install fails
+            // there instead of passing as a skip.
+            assert!(
+                std::env::var_os("NICE_REQUIRE_NVRTC").is_none(),
+                "NICE_REQUIRE_NVRTC is set but NVRTC could not be loaded"
+            );
             println!("NVRTC not available, skipping compile test");
             return;
         }

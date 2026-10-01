@@ -47,6 +47,32 @@ jobs:
             - name: Run tests
               run: cargo test --locked --release --no-fail-fast
 
+    # Host-side tests of the GPU code: the CUDA backend's host logic, the
+    # nice-only pipeline and its floor controllers (`gpu_niceonly`, which
+    # only compiles with a GPU feature), and NVRTC compiles of every base's
+    # kernel. None of it needs a GPU; the jobs above build without GPU
+    # features and the parity workflow runs only `--ignored` device tests,
+    # so nothing else runs these. NVRTC comes from NVIDIA's PyPI wheel
+    # (just the shared libraries, no toolkit install).
+    test-gpu-host:
+        name: Test GPU host code (cuda feature, NVRTC)
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - uses: dtolnay/rust-toolchain@stable
+            - name: Fetch NVRTC
+              run: |
+                  python3 -m pip download --no-deps --only-binary=:all: \
+                      --dest "$RUNNER_TEMP/nvrtc" nvidia-cuda-nvrtc-cu12==12.9.86
+                  python3 -m zipfile -e "$RUNNER_TEMP"/nvrtc/*.whl "$RUNNER_TEMP/nvrtc/x"
+                  lib="$RUNNER_TEMP/nvrtc/x/nvidia/cuda_nvrtc/lib"
+                  test -f "$lib/libnvrtc.so.12"
+                  echo "LD_LIBRARY_PATH=$lib" >> "$GITHUB_ENV"
+            - name: Run tests
+              env:
+                  NICE_REQUIRE_NVRTC: 1
+              run: cargo test --locked --release -p nice_common --features cuda --lib
+
     build:
         name: Build ${{ matrix.platform.build_name }}
         runs-on: ${{ matrix.platform.runs_on }}
@@ -219,7 +245,7 @@ jobs:
     release:
         name: Publish GitHub Release
         runs-on: ubuntu-latest
-        needs: [test-workspace, build]
+        needs: [test-workspace, test-gpu-host, build]
         if: startsWith(github.ref, 'refs/tags/v')
 
         steps:
