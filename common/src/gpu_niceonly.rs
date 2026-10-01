@@ -1798,7 +1798,7 @@ mod tests {
             let _ = tx.send(first.is_err());
         });
         let errored = rx
-            .recv_timeout(Duration::from_secs(120))
+            .recv_timeout(Duration::from_mins(2))
             .expect("the pipeline hung on error or on drop");
         assert!(errored, "the launch failure must reach next_result");
     }
