@@ -21,6 +21,11 @@
 //   PRE_DIGITS    - digits checked per value in the modular prefilter
 //   PRE_MOD       - BASE^PRE_DIGITS (u64, <= 2^48)
 //   POW64_MOD_PRE - 2^64 mod PRE_MOD
+// Optionally for the niceonly kernel (define AFFINE; requires CROSS_FILTER;
+// host enables it only when n^2 and n^3 are guaranteed at least 6 digits):
+//   AFF_BK        - BASE^3, the stride suffix modulus
+//   AFF_B2K       - BASE^6 (u64)
+//   POW64_MOD_B2K - 2^64 mod AFF_B2K
 // For the detailed kernel (define DETAILED):
 //   NEAR_MISS_CUTOFF - num_uniques above which a number is reported
 //
@@ -38,7 +43,8 @@
 //     counts accumulate in per-warp shared-memory histograms.
 
 // Standalone fallbacks so the file can be syntax-checked without the host's
-// define injection (values match base 40, k=2).
+// define injection (values match base 40: stride and prefilter with k=2, the
+// affine filter's AFF_* with its fixed k=3).
 #if !defined(NICEONLY) && !defined(DETAILED)
 #define NICEONLY
 #define DETAILED
@@ -51,6 +57,12 @@
 #define PRE_DIGITS 9
 #define PRE_MOD 262144000000000ull
 #define POW64_MOD_PRE 195081709551616ull
+#define CROSS_FILTER
+#define COMPACT
+#define AFFINE
+#define AFF_BK 64000u
+#define AFF_B2K 4096000000ull
+#define POW64_MOD_B2K 1517551616ull
 #endif
 #ifndef BASE
 #define BASE 40
@@ -395,6 +407,69 @@ __device__ __forceinline__ bool candidate_is_nice(u64 n_lo, u64 n_hi) {
     return check_is_nice(n_lo, n_hi);
 }
 
+#ifdef AFFINE
+
+// Reduce value = hi*2^64 + lo mod AFF_B2K; same shape as reduce_pre.
+__device__ __forceinline__ u64 reduce_b2k(u64 hi, u64 lo) {
+    while (hi != 0) {
+        u64 p_lo = hi * POW64_MOD_B2K;
+        u64 p_hi = __umul64hi(hi, POW64_MOD_B2K);
+        lo += p_lo;
+        hi = p_hi + (lo < p_lo ? 1 : 0);
+    }
+    return lo % AFF_B2K; // const divisor -> multiply-high
+}
+
+// Affine middle-digit filter (mirrors the CPU's `affine_filter`). Writing
+// n = s + B*t with B = BASE^3, the digits of n^2 and n^3 at output positions
+// 3..5 are the base-BASE digits of (s^2 div B + 2 s t) mod B and
+// (s^3 div B + 3 s^2 t) mod B, so six fresh digits come out of word
+// arithmetic with constant divisors. `known` is the candidate's exact low
+// digit mask (positions 0..2) OR the range's high certificate. The
+// certificate holds no digit from positions 3..5 because the host only
+// emits AFFINE for bases whose legal range starts at or above BASE^5
+// (gpu_config::affine_params): a certificate comes from an analysed range of
+// two or more numbers, and consecutive squares there differ by more than
+// BASE^5. Rejects ~95-97% of cross-end survivors without the multi-limb
+// square, so it runs before candidate_is_nice.
+__device__ __forceinline__ bool affine_survives(u64 n_lo, u64 n_hi, u64 known) {
+    u64 nmod = reduce_b2k(n_hi, n_lo);
+    u64 s = nmod % AFF_BK;
+    u64 t = nmod / AFF_BK;
+    u64 s2 = s * s;            // < BASE^6 < 2^36
+    u64 s3 = s2 * s;           // < BASE^9 < 2^54
+    u32 q = (u32)((s2 / AFF_BK + 2 * s * t) % AFF_BK);   // 2st < 2*BASE^6
+    u32 c = (u32)((s3 / AFF_BK + 3 * s2 * t) % AFF_BK);  // 3s^2t < 2^56
+    u32 q0 = q % BASE;
+    u32 q12 = q / BASE;
+    u32 q1 = q12 % BASE;
+    u32 q2 = q12 / BASE;
+    u32 c0 = c % BASE;
+    u32 c12 = c / BASE;
+    u32 c1 = c12 % BASE;
+    u32 c2 = c12 / BASE;
+    u64 mq = (1ull << q0) | (1ull << q1) | (1ull << q2);
+    u64 mc = (1ull << c0) | (1ull << c1) | (1ull << c2);
+    bool dup = (__popcll(mq) != 3) | (__popcll(mc) != 3);
+    return !dup && (((mq | mc) & known) | (mq & mc)) == 0;
+}
+
+#endif // AFFINE
+
+// Full check for a candidate whose `known` digits (exact low digits of its
+// residue plus the range certificate) are available: the affine filter runs
+// first when compiled in.
+__device__ __forceinline__ bool candidate_is_nice_known(u64 n_lo, u64 n_hi, u64 known) {
+#ifdef AFFINE
+    if (!affine_survives(n_lo, n_hi, known)) {
+        return false;
+    }
+#else
+    (void)known;
+#endif
+    return candidate_is_nice(n_lo, n_hi);
+}
+
 // First index in residues[0..STRIDE_R) with residues[idx] >= m, or STRIDE_R.
 __device__ __forceinline__ u32 lower_bound_residue(
     const u32* __restrict__ residues, u32 m
@@ -486,7 +561,11 @@ extern "C" __global__ void niceonly_ranges_kernel(
             // No certificate (no-MSD bypass emits mask 0, and some analyzed
             // ranges genuinely have none): the ballot/queue machinery can
             // only cost here (~7% measured at the bypass floor), so run the
-            // plain enumeration for this range instead.
+            // plain enumeration for this range instead. The affine filter
+            // is deliberately skipped here too: against the low digits
+            // alone 24-43% of candidates survive it (b40-b64), so nearly
+            // every warp would still run the full check on some lane, and
+            // the test would only add cost.
             for (u32 g = idx0 + lane;; g += 32) {
                 u32 cycle = g / STRIDE_R;
                 u32 j = g - cycle * STRIDE_R;
@@ -540,7 +619,7 @@ extern "C" __global__ void niceonly_ranges_kernel(
                     u64 ad = (u64)cy * STRIDE_M + residues[jj];
                     u64 c_lo = b0_lo + ad;
                     u64 c_hi = b0_hi + (c_lo < b0_lo ? 1 : 0);
-                    if (candidate_is_nice(c_lo, c_hi)) {
+                    if (candidate_is_nice_known(c_lo, c_hi, low_masks[jj] | rmask)) {
                         u32 pos = atomicAdd(nice_count, 1);
                         if (pos < nice_capacity) {
                             nice_out[2 * (size_t)pos] = c_lo;
@@ -571,8 +650,10 @@ extern "C" __global__ void niceonly_ranges_kernel(
             if ((low_masks[j] & rmask) != 0) {
                 continue;
             }
-#endif
+            if (candidate_is_nice_known(n_lo, n_hi, low_masks[j] | rmask)) {
+#else
             if (candidate_is_nice(n_lo, n_hi)) {
+#endif
                 u32 pos = atomicAdd(nice_count, 1);
                 if (pos < nice_capacity) {
                     nice_out[2 * (size_t)pos] = n_lo;

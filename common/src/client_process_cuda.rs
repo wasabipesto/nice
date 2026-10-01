@@ -37,7 +37,7 @@
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
 use crate::gpu_config::{
-    MAX_GPU_DIGIT_MASK_BASE, chunk_constants, gpu_supports_base, prefilter_params,
+    MAX_GPU_DIGIT_MASK_BASE, affine_params, chunk_constants, gpu_supports_base, prefilter_params,
 };
 use crate::gpu_niceonly::{
     DeviceResult, NiceonlyPipeline, NiceonlyStarted, NiceonlyStats, PendingField, RangeSink,
@@ -304,6 +304,16 @@ fn niceonly_defines(base: u32) -> Result<(Vec<String>, stride_filter::StrideTabl
         defines.push("CROSS_FILTER".to_string());
         if std::env::var("NICE_CUDA_COMPACT").map_or(true, |v| v != "0") {
             defines.push("COMPACT".to_string());
+        }
+        // Affine middle-digit filter on the cross survivors (NICE_CUDA_AFFINE=0
+        // disables it for A/B measurement).
+        if let Some(aff) = affine_params(base, GPU_LSD_K)
+            && std::env::var("NICE_CUDA_AFFINE").map_or(true, |v| v != "0")
+        {
+            defines.push("AFFINE".to_string());
+            defines.push(format!("AFF_BK={}u", aff.bk));
+            defines.push(format!("AFF_B2K={}ull", aff.b2k));
+            defines.push(format!("POW64_MOD_B2K={}ull", aff.pow64_mod));
         }
     }
     Ok((defines, table))
@@ -831,7 +841,7 @@ pub fn process_niceonly_cuda(
 mod tests {
     use super::*;
     use crate::client_process;
-    use crate::gpu_config::PrefilterParams;
+    use crate::gpu_config::{AffineParams, PrefilterParams};
     use crate::residue_filter;
     use crate::stride_filter::StrideTable;
 
@@ -1419,6 +1429,139 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Mirror of the kernel's affine middle-digit filter (niceonly, AFFINE)
+    // ------------------------------------------------------------------
+
+    /// Rust mirror of `affine_survives` in `nice_kernels.cu`: the same
+    /// (hi, lo) reduction loop and the same word arithmetic.
+    #[allow(clippy::similar_names, clippy::many_single_char_names)]
+    fn mirror_affine_survives(n: u128, base: u32, aff: &AffineParams, known: u64) -> bool {
+        let (n_lo, n_hi) = split_u128(n);
+        let nmod = mirror_reduce_pre(n_hi, n_lo, aff.b2k, aff.pow64_mod);
+        let bk = u64::from(aff.bk);
+        let s = nmod % bk;
+        let t = nmod / bk;
+        let s2 = s * s;
+        let s3 = s2 * s;
+        let q = ((s2 / bk + 2 * s * t) % bk) as u32;
+        let c = ((s3 / bk + 3 * s2 * t) % bk) as u32;
+        let (q0, q12) = (q % base, q / base);
+        let (q1, q2) = (q12 % base, q12 / base);
+        let (c0, c12) = (c % base, c / base);
+        let (c1, c2) = (c12 % base, c12 / base);
+        let mq = (1u64 << q0) | (1u64 << q1) | (1u64 << q2);
+        let mc = (1u64 << c0) | (1u64 << c1) | (1u64 << c2);
+        let dup = mq.count_ones() != 3 || mc.count_ones() != 3;
+        !dup && (((mq | mc) & known) | (mq & mc)) == 0
+    }
+
+    /// Base-`base` digits of `n²` and `n³`, least significant first.
+    fn power_digits(n: u128, base: u32) -> (Vec<u32>, Vec<u32>) {
+        let mut sq = crate::fixed_width::U256::mul_u128_u128(n, n);
+        let mut cu = sq.mul_u128_truncating(n);
+        let (mut sqd, mut cud) = (Vec::new(), Vec::new());
+        while !sq.is_zero() {
+            sqd.push(sq.div_assign_rem_u32(base));
+        }
+        while !cu.is_zero() {
+            cud.push(cu.div_assign_rem_u32(base));
+        }
+        (sqd, cud)
+    }
+
+    /// The kernel's reduction and affine arithmetic, mirrored, on every base
+    /// the host emits AFFINE for (the CPU-only bases 40-64 and the GPU-only
+    /// ones below 40, base 64 included), random `n` in the legal range plus
+    /// the word extremes: the reduction must give `n mod b^6`, and the
+    /// verdict must be exactly "the six true middle digits (wide arithmetic)
+    /// are distinct and miss `known`", for arbitrary `known`.
+    #[test_log::test]
+    fn affine_mirror_matches_true_digits() {
+        let mut bases = 0;
+        for base in 10..=64u32 {
+            let Some(aff) = affine_params(base, GPU_LSD_K) else {
+                continue;
+            };
+            bases += 1;
+            let base_range = base_range::get_base_range_u128(base).unwrap().unwrap();
+            let b6 = u128::from(base).pow(6);
+            assert_eq!(u128::from(aff.b2k), b6);
+            let span = base_range.range_end - base_range.range_start;
+            let bk = u128::from(aff.bk);
+            let block = (base_range.range_start / b6 + 1) * b6;
+            let edges = [0, 1, 2, bk / 2, bk - 2, bk - 1];
+            let extremes = edges
+                .iter()
+                .flat_map(|&s| edges.iter().map(move |&t| block + s + bk * t));
+            let mut x: u128 = 0x5eed_1234_abcd_0f0f_9876_5432_10fe_dcba;
+            let random = (0..3000u128).map(move |i| {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
+                base_range.range_start + (x % span)
+            });
+            let mut y: u64 = 0x0123_4567_89ab_cdef;
+            let mut rejected = 0u32;
+            for n in extremes.chain(random) {
+                let (n_lo, n_hi) = split_u128(n);
+                assert_eq!(
+                    u128::from(mirror_reduce_pre(n_hi, n_lo, aff.b2k, aff.pow64_mod)),
+                    n % b6,
+                    "reduce_b2k mismatch b{base} n={n}"
+                );
+                y = y.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let known = y & (u64::MAX >> (64 - base));
+                let (sq, cu) = power_digits(n, base);
+                let mut seen = known;
+                let mut ok = true;
+                for &d in sq[3..6].iter().chain(&cu[3..6]) {
+                    ok &= seen & (1u64 << d) == 0;
+                    seen |= 1u64 << d;
+                }
+                let device = mirror_affine_survives(n, base, &aff, known);
+                assert_eq!(
+                    device, ok,
+                    "affine mirror mismatch b{base} n={n} known={known:#x}"
+                );
+                if crate::affine_filter::supports(base, GPU_LSD_K) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let nmod = (n % b6) as u64;
+                    assert_eq!(crate::affine_filter::survives(base, nmod, known), ok);
+                }
+                rejected += u32::from(!device);
+            }
+            assert!(rejected > 0, "b{base}: affine mirror never rejected");
+        }
+        assert!(bases >= 25, "only {bases} bases emit AFFINE");
+    }
+
+    #[test_log::test]
+    fn affine_define_follows_cross_filter_availability() {
+        // Too few guaranteed digits: never emitted.
+        for base in [10u32, 12] {
+            assert!(affine_params(base, GPU_LSD_K).is_none());
+            let (defines, _) = niceonly_defines(base).unwrap();
+            assert!(!defines.iter().any(|d| d == "AFFINE"), "b{base}");
+        }
+        // Production bases with low masks: emitted with its constants.
+        for base in [40u32, 52, 62, 64] {
+            let (defines, _) = niceonly_defines(base).unwrap();
+            assert!(defines.iter().any(|d| d == "AFFINE"), "b{base}");
+            assert!(defines.iter().any(|d| d.starts_with("AFF_BK=")), "b{base}");
+            assert!(defines.iter().any(|d| d.starts_with("AFF_B2K=")), "b{base}");
+            assert!(
+                defines.iter().any(|d| d.starts_with("POW64_MOD_B2K=")),
+                "b{base}"
+            );
+            assert!(defines.iter().any(|d| d == "CROSS_FILTER"), "b{base}");
+        }
+        // No low-mask table above 64, so no cross filter and no affine filter.
+        for base in [68u32, 70] {
+            let (defines, _) = niceonly_defines(base).unwrap();
+            assert!(!defines.iter().any(|d| d == "CROSS_FILTER"), "b{base}");
+            assert!(!defines.iter().any(|d| d == "AFFINE"), "b{base}");
+        }
+    }
+
+    // ------------------------------------------------------------------
     // NVRTC compile tests: need libnvrtc but NO GPU device, so they run
     // on any machine with the CUDA runtime libraries installed (e.g. inside
     // the nvidia/cuda docker image). Skipped gracefully when NVRTC is absent.
@@ -1470,9 +1613,17 @@ mod tests {
                     compile_kernel_ptx(&no_compact).unwrap_or_else(|e| {
                         panic!("no-compact niceonly kernel failed for b{base}: {e:?}")
                     });
+                    let is_affine = |d: &String| {
+                        d == "AFFINE" || d.starts_with("AFF_") || d.starts_with("POW64_MOD_B2K")
+                    };
+                    let no_affine: Vec<String> =
+                        defines.iter().filter(|d| !is_affine(d)).cloned().collect();
+                    compile_kernel_ptx(&no_affine).unwrap_or_else(|e| {
+                        panic!("no-affine niceonly kernel failed for b{base}: {e:?}")
+                    });
                     let plain: Vec<String> = defines
                         .iter()
-                        .filter(|d| *d != "COMPACT" && *d != "CROSS_FILTER")
+                        .filter(|d| *d != "COMPACT" && *d != "CROSS_FILTER" && !is_affine(d))
                         .cloned()
                         .collect();
                     compile_kernel_ptx(&plain).unwrap_or_else(|e| {

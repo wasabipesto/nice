@@ -174,6 +174,55 @@ pub fn prefilter_params(base: u32) -> Option<PrefilterParams> {
     })
 }
 
+/// Parameters for the niceonly kernels' affine middle-digit filter
+/// (see [`crate::affine_filter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AffineParams {
+    /// `base^k`, the stride suffix modulus (k is the stride depth, 3).
+    pub bk: u32,
+    /// `base^{2k}`: candidates are reduced to this before the affine maps.
+    pub b2k: u64,
+    /// `2^64 mod b2k`, for reducing a (hi, lo) u128 on the device.
+    pub pow64_mod: u64,
+}
+
+/// Compute the affine filter's parameters for a base, or `None` when the
+/// filter must stay disabled.
+///
+/// The filter tests output positions `k..2k-1` of `n²` and `n³`, so both
+/// powers must be guaranteed at least `2k` digits everywhere in the range
+/// (see [`guaranteed_low_digits`]), and the digit masks it compares against
+/// are one u64 word, so the base must be at most 64. It rides on the
+/// cross-end filter's masks, which exist under the same base bound.
+///
+/// It also compares those positions against the range certificate, which
+/// must then hold no digit from positions `k..2k-1` itself. A certificate
+/// comes from an analysed range of two or more numbers, so that holds once
+/// the base's legal range starts at or above `b^{2k-1}`: consecutive squares
+/// there differ by more than `b^{2k-1}`. The same gate as the CPU walk
+/// (`StrideTable::iterate_range_masked`); it disables the bases below 27
+/// (long searched, and none of them has a nice number) and nothing above.
+#[must_use]
+pub fn affine_params(base: u32, k: u32) -> Option<AffineParams> {
+    if k != 3 || base > 64 || guaranteed_low_digits(base)? < 2 * k {
+        return None;
+    }
+    let range_start = crate::base_range::get_base_range_u128(base).ok()??.start();
+    if range_start < u128::from(base).pow(2 * k - 1) {
+        return None;
+    }
+    let bk = u64::from(base).pow(k);
+    let b2k = bk * bk;
+    #[allow(clippy::cast_possible_truncation)]
+    let pow64_mod = ((1u128 << 64) % u128::from(b2k)) as u64;
+    Some(AffineParams {
+        #[allow(clippy::cast_possible_truncation)]
+        bk: bk as u32,
+        b2k,
+        pow64_mod,
+    })
+}
+
 /// Parameters for the Vulkan niceonly shader's low-digit prefilter.
 ///
 /// Same idea as [`PrefilterParams`], different number representation. CUDA
@@ -252,6 +301,47 @@ pub fn vulkan_prefilter_params(base: u32) -> Option<VulkanPrefilterParams> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affine_params_gate_and_constants() {
+        // Too few guaranteed digits at tiny bases; masks overflow past 64.
+        assert!(affine_params(10, 3).is_none());
+        assert!(affine_params(65, 3).is_none());
+        assert!(affine_params(40, 2).is_none());
+        for base in [40u32, 45, 52, 57, 62, 64] {
+            let p = affine_params(base, 3).unwrap();
+            assert_eq!(u64::from(p.bk), u64::from(base).pow(3));
+            assert_eq!(p.b2k, u64::from(base).pow(6));
+            assert_eq!(u128::from(p.pow64_mod), (1u128 << 64) % u128::from(p.b2k));
+        }
+    }
+
+    /// The certificate gate: six guaranteed digits are not enough, the
+    /// base's legal range must also start at or above `b^5` so the range
+    /// certificate cannot hold a digit from the positions the filter tests.
+    /// That turns off the bases below 27 and nothing above.
+    #[test]
+    fn affine_params_gate_on_the_certificate_bound() {
+        for base in [19u32, 20, 22, 24, 25] {
+            assert!(
+                guaranteed_low_digits(base).is_some_and(|d| d >= 6),
+                "b{base}"
+            );
+            assert!(affine_params(base, 3).is_none(), "b{base}");
+        }
+        for base in 10..=64u32 {
+            if affine_params(base, 3).is_some() {
+                let start = crate::base_range::get_base_range_u128(base)
+                    .unwrap()
+                    .unwrap()
+                    .start();
+                assert!(start >= u128::from(base).pow(5), "b{base}");
+            }
+        }
+        for base in [27u32, 28, 30, 38, 40, 52, 64] {
+            assert!(affine_params(base, 3).is_some(), "b{base}");
+        }
+    }
 
     #[test]
     fn chunk_constants_are_maximal() {
