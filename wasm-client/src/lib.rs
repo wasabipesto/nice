@@ -29,6 +29,12 @@ pub fn client_version() -> String {
     nice_common::CLIENT_VERSION.to_string()
 }
 
+/// The git commit the wasm module was built from, for benchmark reports.
+#[wasm_bindgen]
+pub fn build_sha() -> String {
+    nice_common::BUILD_SHA.to_string()
+}
+
 /// Process a chunk of numbers and return nice numbers and distribution updates
 #[wasm_bindgen]
 pub fn process_chunk_wasm(range_start_str: &str, range_end_str: &str, base: u32) -> String {

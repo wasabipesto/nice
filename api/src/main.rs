@@ -131,6 +131,7 @@ fn status(
     Json(json!({
         "status": "ok",
         "build_version": env!("CARGO_PKG_VERSION"),
+        "build_sha": nice_common::BUILD_SHA,
         "start_time": started.0.to_rfc3339(),
         "pool_connections_active": active_connections,
         "pool_connections_idle": pool_state.idle_connections,

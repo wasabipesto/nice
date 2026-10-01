@@ -17,3 +17,10 @@ image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5"
 
 [target.aarch64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
+
+# The build commit is stamped in by nice_common's build script from this
+# variable; cross starts the container with a clean environment, so pass it
+# through (the fallback, `git rev-parse` inside the container, is not
+# reliable there: git may be missing or refuse the bind-mounted checkout).
+[build.env]
+passthrough = ["NICE_BUILD_SHA"]

@@ -2,6 +2,7 @@
 
 #![warn(clippy::all, clippy::pedantic)]
 
+pub mod affine_filter;
 pub mod base_range;
 pub mod bench_defs;
 #[cfg(any(feature = "openssl-tls", feature = "rustls-tls"))]
@@ -35,6 +36,7 @@ use std::env;
 use std::fmt;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const BUILD_SHA: &str = env!("NICE_BUILD_SHA");
 pub const NEAR_MISS_CUTOFF_PERCENT: f32 = 0.9;
 pub const DOWNSAMPLE_CUTOFF_PERCENT: f32 = 0.2;
 pub const CLAIM_DURATION_HOURS: i64 = 1;

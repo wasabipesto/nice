@@ -240,7 +240,8 @@ pub struct Cli {
     #[arg(short, long, env = "NICE_NO_PROGRESS", value_parser = FalseyValueParser::new())]
     no_progress: bool,
 
-    /// Run parallel with this many threads
+    /// Run parallel with this many threads. 0 means every logical CPU
+    /// the process can see
     #[arg(short, long, default_value_t = 4, env = "NICE_THREADS")]
     threads: usize,
 
@@ -1424,6 +1425,13 @@ async fn main() -> Result<()> {
     if benchmark_implied {
         cli.benchmark = true;
     }
+    // Resolve `--threads 0` here, once, so that every consumer (the rayon
+    // pool, the startup banner, benchmark reports and telemetry) sees the
+    // real count instead of a zero that each would interpret its own way.
+    let threads_resolved = cli.threads == 0;
+    if threads_resolved {
+        cli.threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    }
     let cli = Arc::new(cli);
 
     // Set up logger. The default filter quiets the wgpu stack's adapter and
@@ -1439,6 +1447,9 @@ async fn main() -> Result<()> {
 
     if gpu_implied {
         debug!("--gpu implied by an explicit --gpu-* option");
+    }
+    if threads_resolved {
+        debug!("--threads 0 resolved to {} available threads", cli.threads);
     }
     if benchmark_implied {
         debug!("--benchmark implied by an explicit --benchmark-* option");

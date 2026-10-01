@@ -8,6 +8,7 @@ let shouldStop = false;
 // The workspace version, read from the wasm build at init so payloads
 // report what is actually running; the suffix tells the backends apart.
 let clientVersion = "unknown";
+let buildSha = "unknown";
 
 // The wasm side serialises near-miss numbers as exact u128 values, but
 // JSON.parse turns every number into a double, and anything above 2^53 is
@@ -49,6 +50,9 @@ async function initWasm(sharedModule) {
         if (wasm.client_version) {
             clientVersion = wasm.client_version();
         }
+        if (wasm.build_sha) {
+            buildSha = wasm.build_sha();
+        }
 
         // Send initialization success message. The version rides along so
         // the pool can stamp its aggregated submission with it (the pool
@@ -57,6 +61,7 @@ async function initWasm(sharedModule) {
             type: "initialized",
             success: true,
             version: clientVersion,
+            buildSha: buildSha,
         });
     } catch (error) {
         self.postMessage({
