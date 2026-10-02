@@ -23,6 +23,8 @@ pub mod generate_chunks;
 pub mod generate_fields;
 pub mod gpu_config;
 pub mod gpu_niceonly;
+pub mod gpu_route;
+pub mod join_plan;
 pub mod lsd_filter;
 pub mod msd_prefix_filter;
 pub mod number_stats;

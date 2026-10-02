@@ -35,14 +35,14 @@
 #![cfg(feature = "cuda")]
 #![allow(clippy::cast_possible_truncation)]
 
-use crate::client_process::{process_range_detailed, process_range_niceonly};
+use crate::client_process::process_range_detailed;
 use crate::gpu_config::{
     MAX_GPU_DIGIT_MASK_BASE, affine_params, chunk_constants, gpu_supports_base, prefilter_params,
 };
 use crate::gpu_niceonly::{
-    DeviceResult, NiceonlyPipeline, NiceonlyStarted, NiceonlyStats, PendingField, RangeSink,
-    batches_in_flight, residue_empty_result,
+    DeviceResult, NiceonlyPipeline, NiceonlyStats, PendingField, RangeSink, batches_in_flight,
 };
+use crate::gpu_route::{FieldTicket, NiceonlyGpu};
 use crate::{
     CLIENT_VERSION, DataToClient, DataToServer, FieldResults, FieldSize, NiceNumberSimple,
     UniquesDistributionSimple,
@@ -346,103 +346,79 @@ fn combine_u64(lo: u64, hi: u64) -> u128 {
 // Niceonly
 // ============================================================================
 
-/// GPU implementation of `process_range_niceonly`.
-///
-/// Runs the MSD prefix filter on the CPU (all cores), then checks the
-/// surviving ranges' stride-valid candidates on the GPU. Produces the exact
-/// same nice-number set as the CPU path.
-///
-/// **Range semantics**: half-open [`range_start`, `range_end`).
-///
-/// # Errors
-/// Returns an error on any CUDA failure or if the output buffer overflows.
-/// Start one niceonly field: hand it to the continuous pipeline, or answer it
-/// on the spot for a base the device cannot take. Pair with
-/// [`finish_niceonly_cuda`], which returns fields in the order they were
-/// begun.
-///
-/// # Errors
-/// Returns an error if the pipeline's dispatch thread has died.
-///
-/// # Panics
-/// Panics if the pipeline mutex was poisoned by an earlier panic.
-pub fn begin_niceonly_cuda(
-    ctx: &CudaContext,
-    range: &FieldSize,
-    base: u32,
-) -> Result<NiceonlyStarted> {
-    if !gpu_supports_base(base) {
-        warn!("base {base} not supported on GPU, falling back to CPU for this field");
-        let stride_table = stride_filter::StrideTable::new(base, GPU_LSD_K);
-        return Ok(NiceonlyStarted::Immediate(process_range_niceonly(
-            range,
-            base,
-            &stride_table,
-        )));
+/// The hand-CUDA nice-only path: the MSD prefix filter runs on the CPU (all
+/// cores), and the GPU checks the surviving ranges' stride-valid candidates.
+/// It finds exactly the nice numbers the CPU path finds. Fields start
+/// through [`crate::gpu_route::begin_niceonly`]; hand-CUDA has no overlap
+/// join (yet), so every field it takes goes to the stride pipeline.
+impl NiceonlyGpu for CudaContext {
+    fn begin_stride(&self, range: &FieldSize, base: u32) -> Result<FieldTicket> {
+        let mut guard = self.niceonly_pipeline.lock().unwrap();
+        let pipeline = guard.get_or_insert_with(|| {
+            NiceonlyPipeline::start(
+                "GPU",
+                CudaNiceonlySink {
+                    shared: self.niceonly.clone(),
+                    open: HashMap::new(),
+                    inflight: VecDeque::new(),
+                },
+            )
+        });
+        pipeline.push(base, range)
     }
-    if let Some(empty) = residue_empty_result(base) {
-        return Ok(NiceonlyStarted::Immediate(empty));
-    }
-    let mut guard = ctx.niceonly_pipeline.lock().unwrap();
-    let pipeline = guard.get_or_insert_with(|| {
-        NiceonlyPipeline::start(
-            "GPU",
-            CudaNiceonlySink {
-                shared: ctx.niceonly.clone(),
-                open: HashMap::new(),
-                inflight: VecDeque::new(),
+
+    fn finish(&self, ticket: FieldTicket) -> Result<(FieldResults, NiceonlyStats)> {
+        let mut guard = self.niceonly_pipeline.lock().unwrap();
+        let pipeline = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no niceonly field has been begun"))?;
+        let (stats, nice_numbers) = pipeline.next_result(ticket)?;
+        debug!(
+            "GPU niceonly pipeline: {} ranges in {} launches, found {}",
+            stats.num_ranges,
+            stats.launches,
+            nice_numbers.len()
+        );
+        Ok((
+            FieldResults {
+                distribution: Vec::new(),
+                nice_numbers,
             },
-        )
-    });
-    pipeline.push(base, range)?;
-    Ok(NiceonlyStarted::Queued)
+            stats,
+        ))
+    }
 }
 
-/// Wait for the oldest field begun with [`begin_niceonly_cuda`] that went
-/// into the pipeline, and return its results.
-///
-/// # Errors
-/// The field's device error, or an output buffer overflow.
-///
-/// # Panics
-/// Panics if the pipeline mutex was poisoned by an earlier panic.
-pub fn finish_niceonly_cuda(ctx: &CudaContext) -> Result<(FieldResults, NiceonlyStats)> {
-    let mut guard = ctx.niceonly_pipeline.lock().unwrap();
-    let pipeline = guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("no niceonly field has been begun"))?;
-    let (stats, nice_numbers) = pipeline.next_result()?;
-    debug!(
-        "GPU niceonly pipeline: {} ranges in {} launches, found {}",
-        stats.num_ranges,
-        stats.launches,
-        nice_numbers.len()
-    );
-    Ok((
-        FieldResults {
-            distribution: Vec::new(),
-            nice_numbers,
-        },
-        stats,
-    ))
+/// NVIDIA nice-only with the overlap join: hand-CUDA's stride pipeline, and
+/// `CubeCL`'s CUDA runtime for the join, which hand-CUDA does not have yet.
+/// Each field's ticket says which of the two holds it. The client uses this
+/// under `--gpu-backend auto`; an explicit `cuda` keeps every field on
+/// hand-CUDA.
+#[cfg(feature = "cubecl-cuda")]
+pub struct CudaWithJoin {
+    pub cuda: CudaContext,
+    pub join: crate::cubecl_backend::CubeclContext,
 }
 
-/// One field, begun and finished: the synchronous form, for callers that
-/// process a single field at a time (the benchmark sweep, tests).
-///
-/// # Errors
-/// See [`begin_niceonly_cuda`] and [`finish_niceonly_cuda`].
-///
-/// # Panics
-/// Panics if the pipeline mutex was poisoned by an earlier panic.
-pub fn process_range_niceonly_cuda(
-    ctx: &CudaContext,
-    range: &FieldSize,
-    base: u32,
-) -> Result<FieldResults> {
-    match begin_niceonly_cuda(ctx, range, base)? {
-        NiceonlyStarted::Immediate(results) => Ok(results),
-        NiceonlyStarted::Queued => finish_niceonly_cuda(ctx).map(|(results, _)| results),
+#[cfg(feature = "cubecl-cuda")]
+impl NiceonlyGpu for CudaWithJoin {
+    fn join_limits(&self) -> Option<crate::join_plan::JoinLimits> {
+        self.join.join_limits()
+    }
+
+    fn begin_stride(&self, range: &FieldSize, base: u32) -> Result<FieldTicket> {
+        self.cuda.begin_stride(range, base)
+    }
+
+    fn begin_join(&self, field: crate::join_plan::JoinField) -> Result<FieldTicket> {
+        self.join.begin_join(field)
+    }
+
+    fn finish(&self, ticket: FieldTicket) -> Result<(FieldResults, NiceonlyStats)> {
+        match ticket.route() {
+            crate::gpu_route::Route::Stride => self.cuda.finish(ticket),
+            crate::gpu_route::Route::Join => self.join.finish(ticket),
+        }
     }
 }
 
@@ -809,7 +785,7 @@ pub fn process_niceonly_cuda(
     claim_data: &DataToClient,
     username: &String,
 ) -> Result<DataToServer> {
-    let results = process_range_niceonly_cuda(ctx, &claim_data.into(), claim_data.base)?;
+    let results = crate::gpu_route::process_niceonly(ctx, &claim_data.into(), claim_data.base)?;
 
     Ok(DataToServer {
         claim_id: claim_data.claim_id,
@@ -841,6 +817,7 @@ pub fn process_niceonly_cuda(
 mod tests {
     use super::*;
     use crate::client_process;
+    use crate::client_process::process_range_niceonly;
     use crate::gpu_config::{AffineParams, PrefilterParams};
     use crate::residue_filter;
     use crate::stride_filter::StrideTable;
@@ -855,7 +832,8 @@ mod tests {
     #[ignore = "requires an NVIDIA device; prints throughput"]
     #[allow(clippy::cast_precision_loss)]
     fn pipeline_throughput_fixed_fields() {
-        use crate::gpu_niceonly::{NiceonlyStarted, fields_in_flight, msd_floor_in_use};
+        use crate::gpu_niceonly::{fields_in_flight, msd_floor_in_use};
+        use crate::gpu_route::{NiceonlyStarted, begin_niceonly};
         // The parity workflow runs every ignored test in this module on a
         // software rasterizer; a throughput run there is hours of nothing.
         // Only run when asked for by name.
@@ -873,8 +851,8 @@ mod tests {
             .collect();
         // Warm up: plan build and first-field effects.
         let warm = FieldSize::new(start - size, start);
-        if let NiceonlyStarted::Queued = begin_niceonly_cuda(&ctx, &warm, base).unwrap() {
-            let (_, stats) = finish_niceonly_cuda(&ctx).unwrap();
+        if let NiceonlyStarted::Queued(ticket) = begin_niceonly(&ctx, &warm, base).unwrap() {
+            let (_, stats) = ctx.finish(ticket).unwrap();
             assert!(
                 stats.device_busy_secs.is_some_and(|s| s > 0.0),
                 "device busy time missing from the pipeline stats: {stats:?}"
@@ -882,20 +860,19 @@ mod tests {
         }
         let lookahead = fields_in_flight().saturating_sub(1);
         let t = Instant::now();
-        let mut queued = 0usize;
+        let mut queued = std::collections::VecDeque::new();
         let mut found = 0usize;
         for f in &fields {
-            if let NiceonlyStarted::Queued = begin_niceonly_cuda(&ctx, f, base).unwrap() {
-                queued += 1;
+            if let NiceonlyStarted::Queued(ticket) = begin_niceonly(&ctx, f, base).unwrap() {
+                queued.push_back(ticket);
             }
-            while queued > lookahead {
-                found += finish_niceonly_cuda(&ctx).unwrap().0.nice_numbers.len();
-                queued -= 1;
+            while queued.len() > lookahead {
+                let ticket = queued.pop_front().unwrap();
+                found += ctx.finish(ticket).unwrap().0.nice_numbers.len();
             }
         }
-        while queued > 0 {
-            found += finish_niceonly_cuda(&ctx).unwrap().0.nice_numbers.len();
-            queued -= 1;
+        for ticket in queued {
+            found += ctx.finish(ticket).unwrap().0.nice_numbers.len();
         }
         let secs = t.elapsed().as_secs_f64();
         eprintln!(
@@ -1707,7 +1684,7 @@ mod tests {
 
             let stride_table = StrideTable::new(base, GPU_LSD_K);
             let cpu = process_range_niceonly(&range, base, &stride_table);
-            let gpu = process_range_niceonly_cuda(&ctx, &range, base).expect("GPU failed");
+            let gpu = crate::gpu_route::process_niceonly(&ctx, &range, base).expect("GPU failed");
 
             let mut cpu_nice = cpu.nice_numbers;
             cpu_nice.sort_by_key(|n| n.number);
@@ -1716,6 +1693,55 @@ mod tests {
                 "niceonly mismatch at base {base}"
             );
         }
+    }
+
+    /// The NVIDIA pairing keeps hand-CUDA's stride fields and the `CubeCL`
+    /// join's fields apart by ticket, interleaved as the client runs them
+    /// (base 10's band, the join's parameters forced), and `begin_niceonly`
+    /// sends a production field to the join.
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cuda_with_join_finishes_both_pipelines_by_ticket() {
+        use crate::cubecl_backend::CubeclContext;
+        use crate::gpu_route::{NiceonlyStarted, Route, begin_niceonly};
+        use crate::join_plan::JoinField;
+        use crate::join_plan::test_fields::FRONTIER_57;
+        use crate::overlap_join::JoinParams;
+        let pair = CudaWithJoin {
+            cuda: CudaContext::new(0).expect("CUDA context"),
+            join: CubeclContext::new_cuda(0).expect("CubeCL CUDA context"),
+        };
+        let band = FieldSize::new(47, 100);
+        let lim = pair.join_limits().expect("the pairing has the join");
+        let join_field = || {
+            JoinField::prepare(10, &band, JoinParams { t: 2, k: 1, p: 0 }, lim)
+                .unwrap()
+                .expect("base 10 fits any device")
+        };
+        let tickets = [
+            pair.begin_join(join_field()).unwrap(),
+            pair.begin_stride(&band, 10).unwrap(),
+            pair.begin_join(join_field()).unwrap(),
+        ];
+        for ticket in tickets {
+            let route = ticket.route();
+            let (res, stats) = pair.finish(ticket).unwrap();
+            assert_eq!(stats.overlap_join, route == Route::Join);
+            let found: Vec<u128> = res.nice_numbers.iter().map(|n| n.number).collect();
+            assert_eq!(found, vec![69], "{route:?}");
+        }
+        let field = FieldSize::new(FRONTIER_57, FRONTIER_57 + 100_000_000_000_000);
+        let NiceonlyStarted::Queued(ticket) = begin_niceonly(&pair, &field, 57).unwrap() else {
+            panic!("a production field is queued");
+        };
+        assert_eq!(
+            ticket.route(),
+            Route::Join,
+            "the join takes a production field"
+        );
+        let (res, stats) = pair.finish(ticket).unwrap();
+        assert!(stats.overlap_join && res.nice_numbers.is_empty());
     }
 
     /// The pipeline sink's per-batch events must be timing-capable: v3.4.4
@@ -1736,11 +1762,12 @@ mod tests {
             .expect("base 40 has a range");
         let start = base_range.range_start;
         let range = FieldSize::new(start, start + 2_000_000_000);
-        let NiceonlyStarted::Queued = begin_niceonly_cuda(&ctx, &range, base).expect("begin")
+        let crate::gpu_route::NiceonlyStarted::Queued(ticket) =
+            crate::gpu_route::begin_niceonly(&ctx, &range, base).expect("begin")
         else {
             panic!("CUDA niceonly fields go through the pipeline");
         };
-        let (results, stats) = finish_niceonly_cuda(&ctx).expect("the field must finish");
+        let (results, stats) = ctx.finish(ticket).expect("the field must finish");
         let stride_table = StrideTable::new(base, GPU_LSD_K);
         let mut cpu = process_range_niceonly(&range, base, &stride_table).nice_numbers;
         cpu.sort_by_key(|n| n.number);
