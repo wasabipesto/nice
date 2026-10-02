@@ -27,7 +27,7 @@
 )]
 
 use crate::client_process::{process_range_detailed, process_range_niceonly};
-use crate::cubecl_join::JoinPipeline;
+use crate::cubecl_join::{JoinField, JoinLimits, JoinPipeline};
 use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
@@ -37,7 +37,7 @@ use crate::gpu_niceonly::{
     stride_chunk_bits,
 };
 use crate::number_stats::get_near_miss_cutoff;
-use crate::overlap_join::{JoinParams, join_params_for};
+use crate::overlap_join::join_params_for;
 use crate::stride_filter::StrideTable;
 use crate::{FieldResults, FieldSize, NiceNumberSimple, UniquesDistributionSimple};
 use anyhow::{Context as _, Result, ensure};
@@ -1727,6 +1727,17 @@ impl CubeclContext {
             Self::Hip { .. } => "cubecl-hip",
         }
     }
+
+    /// What this device allows the overlap join.
+    pub(crate) fn join_limits(&self) -> JoinLimits {
+        match self {
+            Self::Wgpu { client, .. } => JoinLimits::of(client),
+            #[cfg(feature = "cubecl-cuda")]
+            Self::Cuda { client, .. } => JoinLimits::of(client),
+            #[cfg(feature = "cubecl-hip")]
+            Self::Hip { client, .. } => JoinLimits::of(client),
+        }
+    }
 }
 
 /// `CubeCL` implementation of `process_range_detailed`.
@@ -2060,17 +2071,115 @@ pub fn begin_niceonly_cubecl(
             range, base, &table,
         )));
     }
-    begin_routed(ctx, range, base, join_params_for(base, range))
+    let join = plan_join(ctx, base, range);
+    begin_routed(ctx, range, base, join)
+}
+
+/// The overlap join's verdict on a niceonly field for this device: the field
+/// prepared for the join, or `None` for the stride pipeline. The join takes
+/// production-size fields at bases 40-64
+/// ([`crate::overlap_join::join_params_for`]) of which this device can hold
+/// at least one partition (`cubecl_join::JoinPlan::for_field`); a device that
+/// cannot is said so once in the log, and its fields stay on the stride
+/// pipeline. Preparing the field (its top layer and bottom prefixes, 20-110
+/// ms) happens here, on the caller's thread, so it overlaps the device's
+/// work on the previous field.
+#[must_use]
+pub fn plan_join(ctx: &CubeclContext, base: u32, range: &FieldSize) -> Option<JoinField> {
+    static TOO_SMALL: std::sync::Once = std::sync::Once::new();
+    if residue_empty_result(base).is_some() {
+        return None;
+    }
+    let jp = join_params_for(base, range)?;
+    let lim = ctx.join_limits();
+    match JoinField::prepare(base, range, jp, lim) {
+        Ok(Some(field)) => Some(field),
+        Ok(None) => {
+            TOO_SMALL.call_once(|| {
+                warn!(
+                    "overlap join: this device ({} MiB buffer limit, {} MiB budget) cannot hold \
+                     one partition of a base-{base} field; those fields use the stride pipeline",
+                    lim.max_binding >> 20,
+                    lim.budget >> 20
+                );
+            });
+            None
+        }
+        Err(e) => {
+            warn!(
+                "overlap join cannot take base {base} {range:?} ({e:#}); using the stride pipeline"
+            );
+            None
+        }
+    }
+}
+
+/// Start a field that [`plan_join`] prepared, in the join's pipeline. Pair
+/// with [`finish_niceonly_cubecl`], like [`begin_niceonly_cubecl`].
+///
+/// # Errors
+/// Returns an error if the join's worker thread has died.
+///
+/// # Panics
+/// Panics if a pipeline mutex was poisoned by an earlier panic.
+pub fn begin_join(ctx: &CubeclContext, field: JoinField) -> Result<NiceonlyStarted> {
+    let (base, range) = (field.base(), field.range());
+    begin_routed(ctx, &range, base, Some(field))
+}
+
+/// The join's own account (re-runs, layout, survivor counts) of the last
+/// field [`finish_niceonly_cubecl`] returned from the join.
+#[cfg(test)]
+pub(crate) fn last_join_stats(ctx: &CubeclContext) -> Option<crate::cubecl_join::JoinFieldStats> {
+    let pipeline = match ctx {
+        CubeclContext::Wgpu { join_pipeline, .. } => join_pipeline,
+        #[cfg(feature = "cubecl-cuda")]
+        CubeclContext::Cuda { join_pipeline, .. } => join_pipeline,
+        #[cfg(feature = "cubecl-hip")]
+        CubeclContext::Hip { join_pipeline, .. } => join_pipeline,
+    };
+    pipeline
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(JoinPipeline::last_field_stats)
+}
+
+/// Device memory the context's client has in use and has reserved, bytes.
+#[cfg(test)]
+pub(crate) fn memory_usage(ctx: &CubeclContext) -> Option<(u64, u64)> {
+    let usage = match ctx {
+        CubeclContext::Wgpu { client, .. } => client.memory_usage(),
+        #[cfg(feature = "cubecl-cuda")]
+        CubeclContext::Cuda { client, .. } => client.memory_usage(),
+        #[cfg(feature = "cubecl-hip")]
+        CubeclContext::Hip { client, .. } => client.memory_usage(),
+    }
+    .ok()?;
+    Some((usage.bytes_in_use, usage.bytes_reserved))
+}
+
+/// [`begin_join`] and [`finish_niceonly_cubecl`] in one, for callers that
+/// process one field at a time (as [`process_range_niceonly_cubecl`]).
+///
+/// # Errors
+/// See [`begin_join`] and [`finish_niceonly_cubecl`].
+///
+/// # Panics
+/// Panics if a pipeline mutex was poisoned by an earlier panic.
+pub fn process_join(ctx: &CubeclContext, field: JoinField) -> Result<FieldResults> {
+    begin_join(ctx, field)?;
+    finish_niceonly_cubecl(ctx).map(|(results, _)| results)
 }
 
 /// [`begin_niceonly_cubecl`] past its CPU short-cuts, with the route chosen
-/// by the caller: the overlap join with `join`'s parameters, or the stride
+/// by the caller: the overlap join for a prepared field, or the stride
 /// pipeline for `None`.
 pub(crate) fn begin_routed(
     ctx: &CubeclContext,
     range: &FieldSize,
     base: u32,
-    join: Option<JoinParams>,
+    join: Option<JoinField>,
 ) -> Result<NiceonlyStarted> {
     let software = is_software_rasterizer(&ctx.device_name());
     match ctx {
@@ -2196,15 +2305,15 @@ fn begin_impl<R: cubecl::prelude::Runtime>(
     software: bool,
     range: &FieldSize,
     base: u32,
-    join: Option<JoinParams>,
+    join: Option<JoinField>,
 ) -> Result<NiceonlyStarted> {
     // Held across the push so the route order is the push order.
     let mut routes = routes.lock().unwrap();
-    if let Some(jp) = join {
+    if let Some(field) = join {
         let mut guard = join_pipeline.lock().unwrap();
         guard
             .get_or_insert_with(|| JoinPipeline::start(client.clone()))
-            .push(base, range, jp)?;
+            .push(field)?;
         routes.push_back(true);
         return Ok(NiceonlyStarted::Queued);
     }

@@ -77,6 +77,7 @@ pub struct JoinParams {
 }
 
 /// Digits of `x` in base `b` (`0` has none).
+#[must_use]
 pub fn ndigits(mut x: u128, b: u32) -> u32 {
     let mut n = 0;
     while x > 0 {
@@ -93,6 +94,7 @@ impl JoinParams {
     /// the prefilter's `P mod b^(k+2−f0)` must fit `u32`, a bottom residue
     /// `b^k` fits 40 bits, and the cube of the largest residue fits `u128`
     /// (the reference arithmetic).
+    #[must_use]
     pub fn for_length(base: u32, l: u32) -> Option<Self> {
         if !(JOIN_MIN_BASE..=JOIN_MAX_BASE).contains(&base) || l < 7 {
             return None;
@@ -106,6 +108,9 @@ impl JoinParams {
     }
 
     /// Whether the GPU stage can run these parameters at digit length `l`.
+    #[must_use]
+    // t, k, p, o and f0 are the module docs' names.
+    #[allow(clippy::many_single_char_names)]
     pub fn supported(&self, base: u32, l: u32) -> bool {
         let (t, k, p) = (self.t, self.k, self.p);
         if base > JOIN_MAX_BASE || t + k <= l || t > l || k >= l {
@@ -127,6 +132,7 @@ impl JoinParams {
 /// stride pipeline: outside [`JOIN_MIN_BASE`]..=[`JOIN_MAX_BASE`], smaller
 /// than [`JOIN_MIN_FIELD_SIZE`], crossing a digit-length boundary of `n`,
 /// `n²` or `n³`, or past the device stage's 96-bit `n`.
+#[must_use]
 pub fn join_params_for(base: u32, range: &FieldSize) -> Option<JoinParams> {
     if range.size() < JOIN_MIN_FIELD_SIZE || range.last() >= 1u128 << 96 {
         return None;
@@ -142,8 +148,12 @@ pub fn join_params_for(base: u32, range: &FieldSize) -> Option<JoinParams> {
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct W4(pub [u64; 4]);
 
+// Word arithmetic: every `as u64` keeps the low word on purpose, and the
+// loops carry across parallel word arrays by index.
+#[allow(clippy::cast_possible_truncation, clippy::needless_range_loop)]
 impl W4 {
     #[inline]
+    #[must_use]
     pub fn mul_u128_u128(a: u128, b: u128) -> Self {
         let (a0, a1, b0, b1) = (u128::from(a as u64), a >> 64, u128::from(b as u64), b >> 64);
         let p00 = a0 * b0;
@@ -195,6 +205,7 @@ impl W4 {
     }
 
     #[inline]
+    #[must_use]
     pub fn lt(&self, o: &W4) -> bool {
         for i in (0..4).rev() {
             if self.0[i] != o.0[i] {
@@ -205,6 +216,7 @@ impl W4 {
     }
 
     #[inline]
+    #[must_use]
     pub fn to_u128(&self) -> u128 {
         debug_assert!(self.0[2] == 0 && self.0[3] == 0);
         (u128::from(self.0[1]) << 64) | u128::from(self.0[0])
@@ -221,7 +233,10 @@ pub struct Div64 {
     v: u64,
 }
 
+// The same: `as u64` takes the low word of a 128-bit product or quotient.
+#[allow(clippy::cast_possible_truncation)]
 impl Div64 {
+    #[must_use]
     pub fn new(d: u64) -> Self {
         let shift = d.leading_zeros();
         let dn = d << shift;
@@ -230,7 +245,7 @@ impl Div64 {
     }
 
     /// (u1:u0) / dn with u1 < dn -> (q, r)
-    #[inline(always)]
+    #[inline]
     fn div2by1(&self, u1: u64, u0: u64) -> (u64, u64) {
         let q = (u128::from(self.v) * u128::from(u1))
             .wrapping_add((u128::from(u1) << 64) | u128::from(u0));
@@ -275,6 +290,7 @@ impl Div64 {
     }
 
     #[inline]
+    #[must_use]
     pub fn divrem_u128(&self, x: u128) -> (u128, u64) {
         let mut w = W4([x as u64, (x >> 64) as u64, 0, 0]);
         let r = self.divrem_w4(&mut w);
@@ -284,6 +300,7 @@ impl Div64 {
 
 /// Per-base arithmetic for one field: digit lengths, digit-sum roots and
 /// power tables.
+#[derive(Clone)]
 pub struct Base {
     pub b: u32,
     /// Digits of every n in the field.
@@ -303,6 +320,7 @@ pub struct Base {
 impl Base {
     /// `lo..=hi` must share the digit length of n, n² and n³ (true inside
     /// any field of a nice band); `None` otherwise.
+    #[must_use]
     pub fn try_new(b: u32, lo: u128, hi: u128) -> Option<Self> {
         if !(3..=JOIN_MAX_BASE).contains(&b) || lo == 0 || lo > hi {
             return None;
@@ -320,28 +338,37 @@ impl Base {
             })
             .collect();
         let mut pow = vec![1u128];
+        let mut x = 1u128;
         while pow.len() < 40 {
-            match pow.last().unwrap().checked_mul(u128::from(b)) {
-                Some(x) => pow.push(x),
+            match x.checked_mul(u128::from(b)) {
+                Some(y) => {
+                    pow.push(y);
+                    x = y;
+                }
                 None => break,
             }
         }
         let mut poww = vec![W4([1, 0, 0, 0])];
+        let mut last = poww[0];
         for _ in 0..60 {
-            let last = *poww.last().unwrap();
             if last.0[3] >= (u64::MAX / u64::from(b)) {
                 break;
             }
-            poww.push(last.mul_u128(u128::from(b)));
+            last = last.mul_u128(u128::from(b));
+            poww.push(last);
         }
         let mut pow64 = vec![1u64];
-        while let Some(x) = pow64.last().unwrap().checked_mul(u64::from(b)) {
-            pow64.push(x);
+        let mut x64 = 1u64;
+        while let Some(y) = x64.checked_mul(u64::from(b)) {
+            pow64.push(y);
+            x64 = y;
         }
-        let chd = (pow64.len() - 1) as u32;
+        // Both tables hold at most 64 entries.
+        let chd = u32::try_from(pow64.len() - 1).ok()?;
+        let nw = u32::try_from(poww.len()).ok()?;
         let digits_w = |x: &W4| {
             let mut n = 0u32;
-            while n + 1 < poww.len() as u32 && !x.lt(&poww[n as usize]) {
+            while n + 1 < nw && !x.lt(&poww[n as usize]) {
                 n += 1;
             }
             n
@@ -374,11 +401,13 @@ impl Base {
 
     /// b^i (i < 40, and b^i < 2^128).
     #[inline]
+    #[must_use]
     pub fn powu(&self, i: u32) -> u128 {
         self.pow[i as usize]
     }
 
     /// b^i as four little-endian u64 words (i < the 256-bit power table).
+    #[must_use]
     pub fn poww_words(&self, i: u32) -> [u64; 4] {
         self.poww[i as usize].0
     }
@@ -395,7 +424,8 @@ impl Base {
                 lo = mid + 1;
             }
         }
-        lo as u32
+        // An index into the power table (< 64 entries).
+        u32::try_from(lo).unwrap_or(u32::MAX)
     }
 
     /// floor(x / b^c).
@@ -413,6 +443,8 @@ impl Base {
 
     /// Digits of x (least significant first), exactly `len` of them
     /// (x < b^len).
+    // Digits are below b <= 64, so `as u8` is exact; x fits u64 by then.
+    #[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
     #[inline]
     fn digits_w(&self, mut x: W4, len: u32, out: &mut [u8; 48]) {
         let b = u64::from(self.b);
@@ -437,7 +469,7 @@ impl Base {
             q = hi;
         }
         let mut r = q as u64;
-        while (n as u32) < len {
+        while n < len as usize {
             out[n] = (r % b) as u8;
             r /= b;
             n += 1;
@@ -452,6 +484,7 @@ impl Base {
     /// digits of `a^j` and `e^j`, scanned down to the first disagreement.
     /// The scan starts at `ndig(e^j − a^j)`: the two cannot agree on every
     /// position `>= i` unless `e^j − a^j < b^i`.
+    #[must_use]
     pub fn cert(&self, a: u128, e: u128, cap: u32) -> Option<u64> {
         let a2 = W4::mul_u128_u128(a, a);
         let e2 = W4::mul_u128_u128(e, e);
@@ -487,6 +520,7 @@ impl Base {
     /// Lowest output position the certificate of `[a, e]` (cap `cap`) can
     /// cover, over both powers: every certified digit of n² (n³) sits at a
     /// position `>= max(cap, ndig(e² − a²))` (resp. the cube).
+    #[must_use]
     pub fn cert_floor(&self, a: u128, e: u128, cap: u32) -> u32 {
         let a2 = W4::mul_u128_u128(a, a);
         let e2 = W4::mul_u128_u128(e, e);
@@ -500,6 +534,8 @@ impl Base {
     /// Top prefixes of depth `depth` meeting `[s, e_incl]` whose certificate
     /// (cap `cap`) passes, breadth first; a failing prefix's children all
     /// fail (a sub-interval's common digits include its parent's).
+    #[must_use]
+    #[allow(clippy::many_single_char_names)] // b, w, p, a, e as in the docs
     pub fn top_layer(&self, s: u128, e_incl: u128, depth: u32, cap: u32) -> Vec<(u128, u64)> {
         let b = u128::from(self.b);
         let mut level: Vec<(u128, u64)> = vec![(0, 0)];
@@ -529,6 +565,13 @@ impl Base {
     /// depth `k`, with positions `[f0, f0 + pp)` forced to the digits of `v`.
     /// Digit `j` of `(r + d·b^j)²` is `(⌊r²/b^j⌋ + 2d·(r mod b)) mod b` and of
     /// the cube `(⌊r³/b^j⌋ + 3d·(r mod b)²) mod b` (`d²`, `d³` at `j = 0`).
+    // The recursion's state is the argument list; a residue is below
+    // b^k < 2^40 (`JoinParams::supported`), so it fits u64.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::cast_possible_truncation,
+        clippy::many_single_char_names
+    )]
     pub fn bot_dfs(
         &self,
         r: u128,
@@ -594,6 +637,19 @@ pub struct JoinStats {
 /// = all `b^p`): every survivor is fully checked with `get_is_nice`, and
 /// recorded in `record` if given. The GPU stage must produce exactly these
 /// survivors.
+///
+/// # Panics
+/// If `jp` does not fit the field's digit length (`t + k > L`, `t <= L`,
+/// `k < L`, `p <= t + k - L`).
+// The arithmetic is in the module docs' names (t, k, p, o, ...); residues
+// below b^k < 2^40 and bucket indices fit their narrower types. Some callers
+// want only `record`.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::must_use_candidate
+)]
 pub fn join_range(
     base: &Base,
     s: u128,
@@ -710,6 +766,178 @@ mod tests {
         v
     }
 
+    /// A splitmix64 stream for the property tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// Below `n` (> 0), near enough uniform for a test.
+        fn below(&mut self, n: u128) -> u128 {
+            ((u128::from(self.next()) << 64) | u128::from(self.next())) % n
+        }
+    }
+
+    /// The digit values of n² and n³ at positions `>= cap`, and whether one
+    /// of them repeats.
+    fn top_digits(base: &Base, n: u128, cap: u32) -> (u64, bool) {
+        let b = u128::from(base.b);
+        let (mut seen, mut repeat) = (0u64, false);
+        for (x, len) in [(n * n, base.s2), (n * n * n, base.s3)] {
+            for d in digits(x, b, len as usize).into_iter().skip(cap as usize) {
+                let bit = 1u64 << d;
+                repeat |= seen & bit != 0;
+                seen |= bit;
+            }
+        }
+        (seen, repeat)
+    }
+
+    /// `cert` against its definition, for every n of random intervals: a
+    /// mask only if every n has all of its digits among those of n² and n³
+    /// at positions `>= cap` (so the join's rejection of a bottom digit in
+    /// it is a real repeat), and `None` only if every n repeats a digit
+    /// there. Raising the cap to `cert_floor` changes nothing, which is what
+    /// lets the prefilter treat the certificate as sitting at or above it.
+    #[test]
+    fn certificates_hold_for_every_n_of_their_interval() {
+        let mut rng = Rng(0x0BAD_5EED);
+        let (mut masks, mut collisions) = (0, 0);
+        for b in [5u32, 7, 10, 12, 16, 20, 23, 31, 40] {
+            let Ok(Some(r)) = get_base_range_u128(b) else {
+                continue;
+            };
+            let span = r.range_end - r.range_start;
+            for _ in 0..60 {
+                let len = 1 + rng.below(span.min(400));
+                let a = r.range_start + rng.below(span - len + 1);
+                let e = a + len - 1;
+                let Some(base) = Base::try_new(b, a, e) else {
+                    continue; // n² or n³ changes length inside the interval
+                };
+                let cap = u32::try_from(rng.below(u128::from(base.s3) + 1)).unwrap();
+                let cert = base.cert(a, e, cap);
+                let floor = base.cert_floor(a, e, cap);
+                assert_eq!(base.cert(a, e, floor), cert, "b{b} [{a}, {e}] cap {cap}");
+                match cert {
+                    Some(_) => masks += 1,
+                    None => collisions += 1,
+                }
+                for n in a..=e {
+                    let (seen, repeat) = top_digits(&base, n, cap);
+                    match cert {
+                        Some(m) => assert_eq!(
+                            m & !seen,
+                            0,
+                            "b{b} [{a}, {e}] cap {cap}: {n} lacks a certified digit"
+                        ),
+                        None => assert!(
+                            repeat,
+                            "b{b} [{a}, {e}] cap {cap}: {n} has no repeat at those positions"
+                        ),
+                    }
+                }
+            }
+        }
+        assert!(
+            masks > 50 && collisions > 50,
+            "{masks} certificates, {collisions} collisions: a case is barely tested"
+        );
+    }
+
+    /// `bot_dfs` against brute force: exactly the residues r mod b^k whose
+    /// digits `f0..f0 + pp` are v's and whose k low digits of r² and of r³
+    /// are 2k distinct values, each with that set as its mask.
+    #[test]
+    fn bottom_residues_match_their_definition() {
+        for (b, k, f0, pp) in [
+            (7u32, 3u32, 1u32, 1u32),
+            (10, 3, 0, 2),
+            (12, 3, 1, 1),
+            (16, 3, 2, 1),
+            (20, 3, 1, 2),
+            (31, 2, 0, 1),
+        ] {
+            // The bottom list depends on the base alone, not on a field.
+            let base = Base::try_new(b, u128::from(b), u128::from(b)).unwrap();
+            let bb = u128::from(b);
+            let bk = bb.pow(k);
+            let (wf, wp) = (bb.pow(f0), bb.pow(pp));
+            for v in [0, 1, wp / 2, wp - 1] {
+                let mut got = Vec::new();
+                base.bot_dfs(0, 0, 0, k, f0, pp, v, &mut got);
+                got.sort_unstable();
+                let mut want = Vec::new();
+                for x in (0..bk).filter(|x| (x / wf) % wp == v) {
+                    let low = digits(x * x % bk, bb, k as usize).into_iter().chain(digits(
+                        x * x * x % bk,
+                        bb,
+                        k as usize,
+                    ));
+                    let (mut mask, mut distinct) = (0u64, true);
+                    for d in low {
+                        distinct &= mask & (1 << d) == 0;
+                        mask |= 1 << d;
+                    }
+                    if distinct {
+                        want.push((u64::try_from(x).unwrap(), mask));
+                    }
+                }
+                assert_eq!(got, want, "b{b} k {k} f0 {f0} pp {pp} v {v}");
+            }
+        }
+    }
+
+    /// The top layer keeps the prefix of every n whose digits of n² and n³
+    /// at positions `>= cap` are distinct, with a mask that n really has.
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn top_layer_keeps_every_viable_prefix() {
+        let mut rng = Rng(0x7095);
+        let mut viable = 0u64;
+        for b in [10u32, 12, 16, 20, 23] {
+            let Ok(Some(r)) = get_base_range_u128(b) else {
+                continue;
+            };
+            let span = r.range_end - r.range_start;
+            for _ in 0..4 {
+                let len = span.min(5_000);
+                let s = r.range_start + rng.below(span - len + 1);
+                let e = s + len - 1;
+                let Some(base) = Base::try_new(b, s, e) else {
+                    continue;
+                };
+                for depth in 1..base.l.min(5) {
+                    let cap = u32::try_from(rng.below(u128::from(base.s2))).unwrap();
+                    let layer: std::collections::HashMap<u128, u64> =
+                        base.top_layer(s, e, depth, cap).into_iter().collect();
+                    let w = u128::from(b).pow(base.l - depth);
+                    for n in s..=e {
+                        let (seen, repeat) = top_digits(&base, n, cap);
+                        if repeat {
+                            continue;
+                        }
+                        viable += 1;
+                        let m = layer.get(&(n / w)).unwrap_or_else(|| {
+                            panic!("b{b} depth {depth} cap {cap}: the prefix of {n} was dropped")
+                        });
+                        assert_eq!(m & !seen, 0, "b{b} depth {depth} cap {cap}: {n}");
+                    }
+                }
+            }
+        }
+        assert!(
+            viable > 1_000,
+            "only {viable} viable n: the test is not testing"
+        );
+    }
+
     /// The survivors of the same certificates, n by n: the residue class,
     /// the k low digits of n² and n³, the top certificate of n's prefix
     /// block, and the AND. Returns (pairs matched, survivors).
@@ -820,7 +1048,7 @@ mod tests {
             let (bm, bs) = brute(&base, s, e, jp);
             assert_eq!(rec, bs, "b{b} [{s}, {e}) {jp:?}: survivors differ");
             assert_eq!(st.matches, bm, "b{b} [{s}, {e}) {jp:?}: matches differ");
-            assert_eq!(st.survivors as usize, rec.len());
+            assert_eq!(st.survivors, u64::try_from(rec.len()).unwrap());
         }
     }
 

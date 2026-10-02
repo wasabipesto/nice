@@ -6,8 +6,9 @@
 //! `overlap-join/gpu` in `danstoyell/nice_numbers_research` at `ba53f5c`),
 //! ported with the device-side top certification as the only path. Per field
 //! the host builds the top layer at depth `t − p` and the class-sorted `bpre`
-//! list (the bottom list up to depth `f0`), about 20 ms, and then every
-//! partition value goes through the device in batches:
+//! list (the bottom list up to depth `f0`), 20-110 ms on the thread that
+//! begins the field, and then every partition value goes through the device
+//! in batches:
 //!
 //! 1. [`top_kernel`], [`top_scan_kernel`], [`top_fill_kernel`]: certify each
 //!    top `P = P0·b^p + v` of the slot's partition `v` (96-bit endpoint
@@ -20,7 +21,7 @@
 //!    memory, `ept` entries per thread in registers, a branch-free AND over
 //!    32 tops at a time, survivors staged in shared memory. As a stage is
 //!    flushed the whole cube applies the middle-digit prefilter
-//!    ([`mid_pass`]): digits `0..k+2` of `n²` and `n³` from `n`'s low `k + 2`
+//!    (`mid_pass`): digits `0..k+2` of `n²` and `n³` from `n`'s low `k + 2`
 //!    digits must be distinct, and disjoint from the top certificate when it
 //!    provably sits above them. It keeps about 6% at bases 57-64, and only
 //!    those are written out. (Dan's design ran the prefilter as a separate
@@ -28,8 +29,13 @@
 //!    that placement to compare the join's own survivor set.)
 //! 4. [`check_kernel`]: the client's own `candidate_check`.
 //!
-//! Every list is bounded and checked; a batch whose survivors overflow is
-//! re-run one partition at a time with larger lists.
+//! Buffers are sized per field to the device ([`JoinPlan`]): each within the
+//! device's largest binding and all of them within a budget. A device that
+//! cannot hold one partition does not get the join, and its fields stay on
+//! the stride pipeline (`cubecl_backend::plan_join`). Every list is bounded
+//! and checked: a batch whose survivors overflow is re-run one partition at
+//! a time with a longer list, and a partition that overflows that is re-run
+//! on halves of its top layer.
 #![cfg(feature = "cubecl")]
 // The cube macro evaluates comptime! expressions host-side, where fn-level
 // allows do not reach; the rest is ported arithmetic with deliberate casts.
@@ -62,7 +68,7 @@ use crate::gpu_config::{chunk_constants, chunk_constants_u16, n_limbs};
 use crate::gpu_niceonly::{NiceonlyStats, fields_in_flight};
 use crate::overlap_join::{Base, JoinParams};
 use crate::{FieldSize, NiceNumberSimple};
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, ensure};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use log::debug;
@@ -96,12 +102,28 @@ const BATCHES_IN_FLIGHT: usize = 4;
 const SURV_CAP: u32 = 1 << 24;
 /// The same for the overflow re-run (one partition per launch).
 const SURV_CAP_RETRY: u32 = 1 << 26;
+/// The smallest survivor list the overflow re-run may have; a device that
+/// cannot hold one partition with a list this long does not get the join.
+/// A partition that overflows the re-run's list is re-run on halves of its
+/// top layer, down to single top prefixes if need be, and one top of one
+/// partition is one block of `b^f0` numbers: at most 2^18 at base 64 with
+/// the production `f0 = 3`, so this always fits it.
+const MIN_RETRY_CAP: u32 = 1 << 18;
 /// Nice numbers one field may report.
 const NICE_CAP: u32 = 1 << 10;
 /// Cubes for the prefilter and check kernels (grid-stride loops).
 const CHECK_CUBES: u32 = 1024;
-/// Device memory the per-slot buffers may take, which bounds the slots.
-const SLOT_MEMORY: usize = 768 << 20;
+/// The join's whole device working set (every buffer of [`JoinDevice`]) may
+/// take at most this much; a field at bases 40-64 needs 0.3-0.9 GiB at 16
+/// partitions per launch. See [`JoinLimits`].
+const JOIN_MEMORY: usize = 1 << 30;
+/// How deep the halving of an overflowing partition's top layer may go: a
+/// layer of up to 2^32 prefixes reaches single prefixes well within it.
+const MAX_SPLITS: u32 = 32;
+
+// ---------------------------------------------------------------------------
+// Device kernels
+// ---------------------------------------------------------------------------
 
 /// Flush the shared survivor stage to the global list. Must be called by the
 /// whole cube at a point where no thread is still appending (after a
@@ -1293,7 +1315,16 @@ pub fn check_kernel(
 // Host side
 // ---------------------------------------------------------------------------
 
+/// `x` as little-endian `u32` words, the device's limb layout.
+fn u32_words(x: u128) -> [u32; 4] {
+    let b = x.to_le_bytes();
+    std::array::from_fn(|i| {
+        u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
+    })
+}
+
 /// Everything about a field that does not depend on the partition value.
+#[derive(Clone)]
 pub(crate) struct FieldSetup {
     pub base: Base,
     pub b: u32,
@@ -1329,8 +1360,18 @@ pub(crate) struct FieldSetup {
 }
 
 impl FieldSetup {
+    /// The same field with only the top-layer prefixes `tlay` (a subset of
+    /// its own). The tops keep their intervals, so a partition's survivors
+    /// split exactly between complementary subsets.
+    fn with_tops(&self, tlay: Vec<(u128, u64)>) -> Self {
+        let mut sub = self.clone();
+        sub.tlay = tlay;
+        sub
+    }
+
     /// # Errors
     /// A field or parameters the device stage cannot take.
+    #[allow(clippy::many_single_char_names)] // b, s, e, t, k, o, w as in `overlap_join`
     pub fn new(b: u32, s: u128, e: u128, jp: JoinParams) -> Result<Self> {
         let t0 = Instant::now();
         ensure!(s < e, "empty field");
@@ -1354,12 +1395,16 @@ impl FieldSetup {
         bpre.sort_unstable_by_key(|&(r, _)| (r % u64::from(m1), r));
         let mut seg = vec![0u32; m1 as usize + 1];
         for &(r, _) in &bpre {
-            seg[(r % u64::from(m1)) as usize + 1] += 1;
+            seg[usize::try_from(r % u64::from(m1))? + 1] += 1;
         }
         for c in 0..m1 as usize {
             seg[c + 1] += seg[c];
         }
-        let bp_r = bpre.iter().map(|&(r, _)| r as u32).collect();
+        // Residues below b^f0 < 2^32 (`JoinParams::supported`).
+        let bp_r = bpre
+            .iter()
+            .map(|&(r, _)| u32::try_from(r))
+            .collect::<Result<_, _>>()?;
         let bp_m = bpre.iter().map(|&(_, m)| m).collect();
         let keyspace = base.powu(o - pp);
         // The prefilter tests digits k..k2 too; it needs both powers to have
@@ -1399,6 +1444,254 @@ impl FieldSetup {
             secs: t0.elapsed().as_secs_f64(),
             base,
         })
+    }
+}
+
+/// What a device allows the join: its largest buffer, and a budget for all
+/// of one field's buffers together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JoinLimits {
+    pub max_binding: usize,
+    pub budget: usize,
+}
+
+impl JoinLimits {
+    /// The largest buffer is the runtime's `max_page_size`: on wgpu the
+    /// adapter's `max_storage_buffer_binding_size` (128 MiB on lavapipe, 1-4
+    /// GiB on desktop drivers); on CUDA, and on Vulkan with 64-bit indexing,
+    /// a quarter of the device's memory. The budget is [`JOIN_MEMORY`] but at
+    /// most twice that: half the device where the runtime knows its size, and
+    /// a small working set where buffers are small (software rasterizers,
+    /// embedded GPUs).
+    pub(crate) fn of<R: Runtime>(client: &ComputeClient<R>) -> Self {
+        let page = usize::try_from(client.properties().memory.max_page_size)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        Self {
+            max_binding: page,
+            budget: JOIN_MEMORY.min(page.saturating_mul(2)),
+        }
+    }
+}
+
+/// Bytes in each of one field's device buffers, as [`JoinDevice::new`]
+/// allocates them: per slot for those that grow with the partitions per
+/// launch, then the field's own tables.
+#[derive(Clone, Copy, Debug)]
+struct Footprint {
+    ext_m: usize,
+    ext_pk: usize,
+    lists: usize,
+    counts: usize,
+    /// Each of `top_p`, `top_m`, `top_r` and `top_x`.
+    top: usize,
+    top_b: usize,
+    tl: usize,
+    work: usize,
+    cursor: usize,
+    /// What a launched batch allocates for itself (`bucket_cnt`), for every
+    /// batch in flight.
+    scratch: usize,
+    /// The field's tables and the output list.
+    fixed: usize,
+    largest_fixed: usize,
+}
+
+impl Footprint {
+    fn of(fs: &FieldSetup, nice_cap: u32) -> Self {
+        let b = fs.b as usize;
+        let nbp = fs.bp_r.len();
+        let ntl = fs.tlay.len().max(1);
+        let nroots = fs.base.roots.len();
+        let nkeys = if fs.key_level { b } else { 1 };
+        let nl3 = 3 * n_limbs(fs.b).unwrap_or(3) as usize;
+        let tables = [
+            nbp * 4,                                          // bp_r
+            nbp * 8,                                          // bp_m
+            fs.seg.len() * 4,                                 // seg
+            fs.tlay.len() * 5 * 4,                            // tlay
+            10 * 4,                                           // fb
+            (fs.base.s3 as usize + 1) * nl3 * 4,              // pw
+            nroots * 4,                                       // roots
+            nice_cap as usize * NICEONLY_STRIDE as usize * 4, // nice_out
+            4,                                                // nice_count
+        ];
+        Self {
+            ext_m: nbp * 8,
+            ext_pk: nbp.max(1) * 4,
+            lists: nbp * b * 4,
+            counts: nkeys * (b - 1) * 4,
+            top: ntl * 8,
+            top_b: ntl * 4,
+            tl: ntl * nroots * 4,
+            work: fs.nb * 16,
+            cursor: fs.nb * 4,
+            scratch: fs.nb * 4 * BATCHES_IN_FLIGHT,
+            fixed: tables.iter().sum(),
+            largest_fixed: tables.into_iter().max().unwrap_or(0),
+        }
+    }
+
+    fn per_slot(&self) -> usize {
+        self.ext_m
+            + self.ext_pk
+            + self.lists
+            + self.counts
+            + 4 * self.top
+            + self.top_b
+            + self.tl
+            + self.work
+            + self.cursor
+            + self.scratch
+    }
+
+    /// The largest buffer one slot adds to (all of them grow linearly).
+    fn largest_per_slot(&self) -> usize {
+        [
+            self.ext_m,
+            self.ext_pk,
+            self.lists,
+            self.counts,
+            self.top,
+            self.top_b,
+            self.tl,
+            self.work,
+            self.cursor,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+    }
+}
+
+/// One field's layout on a device: partitions per launch and the lengths
+/// of the survivor lists, chosen so that every buffer fits the device's
+/// binding limit and all of them together fit the budget ([`JoinLimits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JoinPlan {
+    /// Partitions per launch.
+    pub slots: usize,
+    /// The prefilter runs in the join kernel's flush (production) instead
+    /// of as a separate pass (the tests' cross-check).
+    pub fused: bool,
+    /// The join's own survivor list; fused, none is written (0).
+    pub surv_cap: u32,
+    /// The list the full check reads: the prefilter's survivors, or the
+    /// join's own when there is no prefilter.
+    pub list2_cap: u32,
+    pub nice_cap: u32,
+    /// Every buffer of the field together, the batches in flight included.
+    pub bytes: usize,
+}
+
+impl JoinPlan {
+    /// The layout for `fs` with at most `slots` partitions per launch and
+    /// survivor lists of at most `cap` entries, fitted to `lim`: the lists
+    /// get at most `list_budget` bytes, then as many slots as fit the rest
+    /// of the budget. `None` if one slot with lists of `min_cap` does not.
+    pub(crate) fn new(
+        fs: &FieldSetup,
+        lim: JoinLimits,
+        slots: usize,
+        fused: bool,
+        cap: u32,
+        min_cap: u32,
+        list_budget: usize,
+    ) -> Option<Self> {
+        let fused = fused && fs.mid > 0;
+        let fp = Footprint::of(fs, NICE_CAP);
+        // Fused: the prefilter's list only. Unfused: the join's own list and,
+        // with a prefilter, its output, a quarter as long for long lists (the
+        // prefilter keeps ~6% at bases 57-64; short lists keep their full
+        // length for the weak seeds of small bases).
+        let per_entry = if fused || fs.mid == 0 { 8 } else { 16 };
+        let cap = u32::try_from(
+            (cap as usize)
+                .min(lim.max_binding / 8)
+                .min(list_budget.saturating_sub(16) / per_entry),
+        )
+        .unwrap_or(u32::MAX);
+        if cap < min_cap.max(1) || fp.largest_fixed > lim.max_binding {
+            return None;
+        }
+        let (surv_cap, list2_cap) = if fused {
+            (0, cap)
+        } else if fs.mid == 0 {
+            (cap, 0)
+        } else if cap <= 1 << 22 {
+            (cap, cap)
+        } else {
+            (cap, cap / 4)
+        };
+        // An unused list is still an 8-byte buffer.
+        let lists = (surv_cap as usize * 8).max(8) + (list2_cap as usize * 8).max(8);
+        let room = lim.budget.checked_sub(fp.fixed + lists)?;
+        let slots = slots
+            .min(lim.max_binding / fp.largest_per_slot().max(1))
+            .min(room / fp.per_slot().max(1));
+        (slots > 0).then(|| JoinPlan {
+            slots,
+            fused,
+            surv_cap,
+            list2_cap,
+            nice_cap: NICE_CAP,
+            bytes: fp.fixed + lists + slots * fp.per_slot(),
+        })
+    }
+
+    /// The production layout of `fs` on a device with `lim` (the lists get
+    /// a quarter of the budget), and the one for re-running a partition that
+    /// overflowed it: one slot, and the longest list that fits beside it.
+    /// `None` if the device cannot hold one partition with a re-run list of
+    /// [`MIN_RETRY_CAP`].
+    pub(crate) fn for_field(fs: &FieldSetup, lim: JoinLimits) -> Option<(Self, Self)> {
+        let main = Self::new(fs, lim, SLOTS, true, SURV_CAP, 1, lim.budget / 4)?;
+        let fp = Footprint::of(fs, NICE_CAP);
+        let spare = lim.budget.saturating_sub(fp.fixed + fp.per_slot());
+        let retry = Self::new(fs, lim, 1, true, SURV_CAP_RETRY, MIN_RETRY_CAP, spare)?;
+        Some((main, retry))
+    }
+}
+
+/// A niceonly field ready for the join on one device: its host-side setup
+/// (the top layer and the bottom prefixes) and its two device layouts.
+/// Preparing it decides the field's route (see
+/// `cubecl_backend::plan_join`), and the join's worker thread then has no
+/// host work left before its first launch.
+pub struct JoinField {
+    fs: FieldSetup,
+    plan: JoinPlan,
+    retry: JoinPlan,
+}
+
+impl JoinField {
+    /// Prepare `[range)` at `base` with parameters `jp` for a device with
+    /// `lim`; `Ok(None)` if the device cannot hold one partition of it.
+    ///
+    /// # Errors
+    /// A field or parameters the join cannot take.
+    pub(crate) fn prepare(
+        base: u32,
+        range: &FieldSize,
+        jp: JoinParams,
+        lim: JoinLimits,
+    ) -> Result<Option<Self>> {
+        let fs = FieldSetup::new(base, range.start(), range.end(), jp)?;
+        Ok(JoinPlan::for_field(&fs, lim).map(|(plan, retry)| Self { fs, plan, retry }))
+    }
+
+    pub(crate) fn base(&self) -> u32 {
+        self.fs.b
+    }
+
+    pub(crate) fn range(&self) -> FieldSize {
+        FieldSize::new(self.fs.s, self.fs.e)
+    }
+
+    /// A field with layouts of the test's choosing.
+    #[cfg(test)]
+    fn with_plans(fs: FieldSetup, plan: JoinPlan, retry: JoinPlan) -> Self {
+        Self { fs, plan, retry }
     }
 }
 
@@ -1473,14 +1766,9 @@ pub(crate) struct BatchRec {
 impl<R: Runtime> JoinDevice<R> {
     /// # Errors
     /// A base without a `u128` range, or `n` too wide for device tops.
-    pub fn new(
-        client: &ComputeClient<R>,
-        fs: &FieldSetup,
-        max_slots: usize,
-        fused: bool,
-        surv_cap: u32,
-        nice_cap: u32,
-    ) -> Result<Self> {
+    // One buffer per line, as the plan sized them.
+    #[allow(clippy::too_many_lines)]
+    pub fn new(client: &ComputeClient<R>, fs: &FieldSetup, plan: &JoinPlan) -> Result<Self> {
         let limbs = n_limbs(fs.b).ok_or_else(|| anyhow!("base {} has no u128 range", fs.b))?;
         ensure!(limbs <= 3, "device tops: n must fit 96 bits");
         let wide = wide_chunk_for(client);
@@ -1493,41 +1781,19 @@ impl<R: Runtime> JoinDevice<R> {
         let bp_m_words: Vec<u32> = fs
             .bp_m
             .iter()
-            .flat_map(|&m| [m as u32, (m >> 32) as u32])
+            .flat_map(|&m| {
+                let w = u32_words(u128::from(m));
+                [w[0], w[1]]
+            })
             .collect();
-        // Every buffer must fit the device's largest binding (on wgpu the
-        // adapter's `max_storage_buffer_binding_size`: 128 MiB unless the
-        // adapter allows more, less on some software rasterizers).
-        let max_binding = usize::try_from(client.properties().memory.max_page_size)
-            .unwrap_or(usize::MAX)
-            .max(1);
-        // Per slot: extended entries (12 B each) and the bucket lists (b
-        // index slots per entry), the largest per-slot buffer.
-        let per_slot_lists = nbp * fs.b as usize * 4;
-        let per_slot = nbp * 12 + per_slot_lists;
-        ensure!(
-            per_slot_lists <= max_binding,
-            "one partition's bucket lists ({per_slot_lists} B) exceed the device's \
-             {max_binding} B buffer limit"
-        );
-        let max_slots = max_slots
-            .min(SLOT_MEMORY / per_slot.max(1))
-            .min(max_binding / per_slot_lists.max(1))
-            .max(1);
+        // Sizes and capacities come from the plan, which fitted them to the
+        // device (`JoinPlan::new`); `fp` is the same table it used.
+        let fp = Footprint::of(fs, plan.nice_cap);
+        let max_slots = plan.slots;
+        ensure!(max_slots > 0, "a join plan with no slots");
         let nkeys = if fs.key_level { fs.b } else { 1 };
-        let slots_entries = max_slots * nbp;
-        let surv_cap = surv_cap.min(u32::try_from(max_binding / 8).unwrap_or(u32::MAX));
-        // Fused (production): the join kernel prefilters as it flushes, so the
-        // only survivor list is the prefilter's, `surv_cap` long. Unfused (the
-        // tests' cross-check): the join's own list is `surv_cap` long, and the
-        // prefilter keeps ~6% of it at bases 57-64; small runs get the full
-        // capacity (weak seeds at small bases).
-        let fused = fused && fs.mid > 0;
-        let list2_cap = if fused || surv_cap <= 1 << 22 {
-            surv_cap
-        } else {
-            surv_cap / 4
-        };
+        let (fused, surv_cap, list2_cap, nice_cap) =
+            (plan.fused, plan.surv_cap, plan.list2_cap, plan.nice_cap);
 
         // Device-side tops: the top layer with its residues, the field
         // bounds, the power table and the per-slot top and bucket lists.
@@ -1536,26 +1802,27 @@ impl<R: Runtime> JoinDevice<R> {
         let p0mod = fs.base.powu(fs.k2 - fs.f0 - pp);
         let mut tl = Vec::with_capacity(5 * fs.tlay.len());
         for &(p0, _) in &fs.tlay {
-            let p0u = u64::try_from(p0).map_err(|_| anyhow!("top-layer prefix exceeds u64"))?;
+            let w = u32_words(p0);
+            ensure!(w[2] == 0 && w[3] == 0, "top-layer prefix exceeds u64");
+            // p0mod = b^(k2 - f0 - p) < 2^32, as `FieldSetup::new` chose k2.
             tl.extend_from_slice(&[
-                p0u as u32,
-                (p0u >> 32) as u32,
-                (p0 % m1) as u32,
-                (p0 % b128) as u32,
-                (p0 % p0mod) as u32,
+                w[0],
+                w[1],
+                u32::try_from(p0 % m1)?,
+                u32::try_from(p0 % b128)?,
+                u32::try_from(p0 % p0mod)?,
             ]);
         }
-        let limb3 = |x: u128| [x as u32, (x >> 32) as u32, (x >> 64) as u32];
-        let mut fb = Vec::new();
-        fb.extend_from_slice(&limb3(fs.s));
-        fb.extend_from_slice(&limb3(fs.e - 1));
-        let (plo, phi) = (u64::try_from(fs.plo)?, u64::try_from(fs.phi)?);
-        fb.extend_from_slice(&[
-            plo as u32,
-            (plo >> 32) as u32,
-            phi as u32,
-            (phi >> 32) as u32,
-        ]);
+        // n < 2^96 (`FieldSetup::new`) and the prefix blocks below 2^64.
+        let (s_w, e_w) = (u32_words(fs.s), u32_words(fs.e - 1));
+        let (plo, phi) = (u32_words(fs.plo), u32_words(fs.phi));
+        ensure!(
+            plo[2..] == [0, 0] && phi[2..] == [0, 0],
+            "prefix blocks exceed u64"
+        );
+        let fb = vec![
+            s_w[0], s_w[1], s_w[2], e_w[0], e_w[1], e_w[2], plo[0], plo[1], phi[0], phi[1],
+        ];
         let nl3 = 3 * limbs as usize;
         let s3 = fs.base.s3;
         let mut pw = Vec::with_capacity((s3 as usize + 1) * nl3);
@@ -1563,7 +1830,10 @@ impl<R: Runtime> JoinDevice<R> {
             let words = fs.base.poww_words(i);
             let mut l32: Vec<u32> = words
                 .iter()
-                .flat_map(|&w| [w as u32, (w >> 32) as u32])
+                .flat_map(|&w| {
+                    let w = u32_words(u128::from(w));
+                    [w[0], w[1]]
+                })
                 .collect();
             l32.resize(nl3.max(8), 0);
             ensure!(
@@ -1597,14 +1867,16 @@ impl<R: Runtime> JoinDevice<R> {
             bp_r: client.create(cubecl::bytes::Bytes::from_elems(fs.bp_r.clone())),
             bp_m: client.create(cubecl::bytes::Bytes::from_elems(bp_m_words)),
             seg: client.create(cubecl::bytes::Bytes::from_elems(fs.seg.clone())),
-            ext_m: client.empty(slots_entries * 2 * 4),
-            ext_pk: client.empty(slots_entries.max(1) * 4),
-            lists: client.empty(slots_entries * fs.b as usize * 4),
-            counts: client.empty(max_slots * nkeys as usize * (fs.b as usize - 1) * 4),
+            ext_m: client.empty(max_slots * fp.ext_m),
+            ext_pk: client.empty(max_slots * fp.ext_pk),
+            lists: client.empty(max_slots * fp.lists),
+            counts: client.empty(max_slots * fp.counts),
             nkeys,
-            surv: client.empty(if fused { 8 } else { surv_cap as usize * 2 * 4 }),
+            // An unused list (fused: the join's own; no prefilter: its
+            // output) is a placeholder.
+            surv: client.empty((surv_cap as usize * 8).max(8)),
             surv_cap,
-            list2: client.empty(list2_cap as usize * 2 * 4),
+            list2: client.empty((list2_cap as usize * 8).max(8)),
             list2_cap,
             nice_out: client.create(cubecl::bytes::Bytes::from_elems(vec![
                 0u32;
@@ -1620,21 +1892,21 @@ impl<R: Runtime> JoinDevice<R> {
             s2: fs.base.s2,
             s3,
             pdiv: u32::try_from(pdiv)?,
-            pdiv_m1: (pdiv % m1) as u32,
+            pdiv_m1: u32::try_from(pdiv % m1)?,
             full_floor: fs.full_floor,
             tlay: client.create(cubecl::bytes::Bytes::from_elems(tl)),
             fb: client.create(cubecl::bytes::Bytes::from_elems(fb)),
             pw_len: pw.len(),
             pw: client.create(cubecl::bytes::Bytes::from_elems(pw)),
             roots: client.create(cubecl::bytes::Bytes::from_elems(roots)),
-            top_p: client.empty(max_slots * ntlay.max(1) * 2 * 4),
-            top_m: client.empty(max_slots * ntlay.max(1) * 2 * 4),
-            top_r: client.empty(max_slots * ntlay.max(1) * 2 * 4),
-            top_x: client.empty(max_slots * ntlay.max(1) * 2 * 4),
-            top_b: client.empty(max_slots * ntlay.max(1) * 4),
-            tl: client.empty(max_slots * ntlay.max(1) * nroots * 4),
-            work: client.empty(max_slots * nb * 4 * 4),
-            cursor: client.empty(max_slots * nb * 4),
+            top_p: client.empty(max_slots * fp.top),
+            top_m: client.empty(max_slots * fp.top),
+            top_r: client.empty(max_slots * fp.top),
+            top_x: client.empty(max_slots * fp.top),
+            top_b: client.empty(max_slots * fp.top_b),
+            tl: client.empty(max_slots * fp.tl),
+            work: client.empty(max_slots * fp.work),
+            cursor: client.empty(max_slots * fp.cursor),
         })
     }
 
@@ -1645,6 +1917,8 @@ impl<R: Runtime> JoinDevice<R> {
     ///
     /// # Errors
     /// An empty or oversized batch, or a failed flush.
+    // The launch sequence of one batch, kernel after kernel with its bindings.
+    #[allow(clippy::too_many_lines)]
     pub fn launch_batch(&mut self, vs: &[u32], probe: bool) -> Result<BatchRec> {
         let nslots = vs.len();
         ensure!(
@@ -1652,11 +1926,13 @@ impl<R: Runtime> JoinDevice<R> {
             "batch of {nslots} slots (max {})",
             self.max_slots
         );
+        let nslots_u32 = u32::try_from(nslots)?;
         let c = &self.client;
         let nbp = self.nbp as usize;
         let ntl = self.ntlay as usize;
         let nb = self.nb as usize;
         let nwork = nslots * nb;
+        let nwork_u32 = u32::try_from(nwork)?;
         let max_slots = self.max_slots;
         let tl_len = max_slots * ntl * self.nroots as usize;
         let vs_h = c.create(cubecl::bytes::Bytes::from_elems(vs.to_vec()));
@@ -1672,7 +1948,7 @@ impl<R: Runtime> JoinDevice<R> {
         unsafe {
             top_kernel::launch_unchecked::<R>(
                 c,
-                CubeCount::Static(self.ntlay.div_ceil(JOIN_WG).max(1), nslots as u32, 1),
+                CubeCount::Static(self.ntlay.div_ceil(JOIN_WG).max(1), nslots_u32, 1),
                 CubeDim::new_1d(JOIN_WG),
                 ArrayArg::from_raw_parts(self.tlay.clone(), 5 * ntl),
                 ArrayArg::from_raw_parts(vs_h.clone(), nslots),
@@ -1705,17 +1981,17 @@ impl<R: Runtime> JoinDevice<R> {
             );
             top_scan_kernel::launch_unchecked::<R>(
                 c,
-                CubeCount::Static(nslots as u32, 1, 1),
+                CubeCount::Static(nslots_u32, 1, 1),
                 CubeDim::new_1d(JOIN_WG),
                 ArrayArg::from_raw_parts(bucket_cnt.clone(), nslots * nb),
                 ArrayArg::from_raw_parts(self.cursor.clone(), max_slots * nb),
                 ArrayArg::from_raw_parts(self.work.clone(), 4 * max_slots * nb),
-                (ntl * self.nroots as usize) as u32,
+                self.ntlay * self.nroots,
                 self.nb,
             );
             top_fill_kernel::launch_unchecked::<R>(
                 c,
-                CubeCount::Static(self.ntlay.div_ceil(JOIN_WG).max(1), nslots as u32, 1),
+                CubeCount::Static(self.ntlay.div_ceil(JOIN_WG).max(1), nslots_u32, 1),
                 CubeDim::new_1d(JOIN_WG),
                 ArrayArg::from_raw_parts(self.top_b.clone(), max_slots * ntl),
                 ArrayArg::from_raw_parts(top_count.clone(), nslots),
@@ -1729,7 +2005,7 @@ impl<R: Runtime> JoinDevice<R> {
             );
             bucket_kernel::launch_unchecked::<R>(
                 c,
-                CubeCount::Static(self.b - 1, nslots as u32, 1),
+                CubeCount::Static(self.b - 1, nslots_u32, 1),
                 CubeDim::new_1d(JOIN_WG),
                 ArrayArg::from_raw_parts(self.bp_r.clone(), nbp),
                 ArrayArg::from_raw_parts(self.bp_m.clone(), 2 * nbp),
@@ -1752,7 +2028,7 @@ impl<R: Runtime> JoinDevice<R> {
             );
             join_kernel::launch_unchecked::<R>(
                 c,
-                CubeCount::Static((nwork as u32).min(65_535), 1, 1),
+                CubeCount::Static(nwork_u32.min(65_535), 1, 1),
                 CubeDim::new_1d(JOIN_WG),
                 ArrayArg::from_raw_parts(self.ext_m.clone(), 2 * nbp * max_slots),
                 ArrayArg::from_raw_parts(self.ext_pk.clone(), (nbp * max_slots).max(1)),
@@ -1785,7 +2061,7 @@ impl<R: Runtime> JoinDevice<R> {
                 ),
                 ArrayArg::from_raw_parts(self.top_x.clone(), 2 * max_slots * ntl),
                 ArrayArg::from_raw_parts(staged.clone(), 1),
-                nwork as u32,
+                nwork_u32,
                 self.nbp,
                 if fused { self.list2_cap } else { self.surv_cap },
                 self.b,
@@ -1857,6 +2133,17 @@ impl<R: Runtime> JoinDevice<R> {
         })
     }
 
+    /// Whether a batch dropped survivors past the end of a list, from its
+    /// two counts (`BatchRec::surv_count`, `BatchRec::list2_count`).
+    fn overflowed(&self, rec: &BatchRec, surv: u32, checked: u32) -> bool {
+        (!rec.fused && surv > self.surv_cap) || checked > self.list2_cap
+    }
+
+    /// How many survivors the full check read, from a batch's two counts.
+    fn checked_of(&self, surv: u32, checked: u32) -> u32 {
+        if self.mid > 0 { checked } else { surv }
+    }
+
     fn read_u32(&self, h: &Handle) -> Result<Vec<u32>> {
         let bytes = self
             .client
@@ -1922,33 +2209,52 @@ pub(crate) struct JoinFieldStats {
     pub device_wait_secs: f64,
     pub partitions: usize,
     pub batches: u32,
+    /// Partitions per launch, and the bytes of the field's buffers.
+    pub slots: usize,
+    pub bytes: usize,
+    /// Pairs that passed the join's AND, and the prefilter's survivors
+    /// (what the full check read). Both depend only on the field and the
+    /// parameters, not on the device or the layout, unless a wave overflows
+    /// the join kernel's shared stage: then the overflow goes to the list
+    /// unprefiltered and uncounted. No production field has done so (the
+    /// counts agree across layouts and prefilter placements), and the full
+    /// check is exact either way.
     pub survivors: u64,
     pub checked: u64,
     pub retried_partitions: usize,
+    /// Halvings of a re-run partition's top layer (normally none).
+    pub splits: u32,
 }
 
-/// Run one field through the join on `client`: every partition value in
-/// batches, then every batch's survivor counts are checked and any batch
-/// that overflowed its lists is re-run a partition at a time.
+/// Run one prepared field through the join on `client`: every partition
+/// value in batches, then every batch's survivor counts are checked and any
+/// batch that overflowed its list is re-run a partition at a time, on
+/// halves of its top layer if one partition alone overflows (see
+/// [`run_partition`]). A field whose top layer is empty has no candidates
+/// and needs no device work at all; about a third of random 1e14 fields at
+/// bases 57-64 are such.
 ///
 /// # Errors
-/// Device failures, unsupported parameters, or a single partition that
-/// overflows even the retry lists.
+/// Device failures, or a single top prefix of one partition that overflows
+/// the re-run's list (which [`MIN_RETRY_CAP`] rules out).
 pub(crate) fn run_field<R: Runtime>(
     client: &ComputeClient<R>,
-    base: u32,
-    range: &FieldSize,
-    jp: JoinParams,
+    field: &JoinField,
 ) -> Result<(Vec<NiceNumberSimple>, JoinFieldStats)> {
-    let fs = FieldSetup::new(base, range.start(), range.end(), jp)?;
+    let fs = &field.fs;
     let mut st = JoinFieldStats {
         setup_secs: fs.secs,
         ..JoinFieldStats::default()
     };
+    if fs.tlay.is_empty() {
+        return Ok((Vec::new(), st));
+    }
     let t0 = Instant::now();
     let parts: Vec<u32> = (0..u32::try_from(fs.nparts)?).collect();
     st.partitions = parts.len();
-    let mut dev = JoinDevice::new(client, &fs, SLOTS, true, SURV_CAP, NICE_CAP)?;
+    st.slots = field.plan.slots;
+    st.bytes = field.plan.bytes;
+    let mut dev = JoinDevice::new(client, fs, &field.plan)?;
     let mut inflight: VecDeque<LaunchFence> = VecDeque::new();
     let mut recs = Vec::new();
     for batch in parts.chunks(dev.max_slots) {
@@ -1976,11 +2282,11 @@ pub(crate) fn run_field<R: Runtime>(
     for (i, (batch, rec)) in recs.iter().enumerate() {
         let surv = u32::from_bytes(&counts[2 * i])[0];
         let checked = u32::from_bytes(&counts[2 * i + 1])[0];
-        if (!rec.fused && surv > dev.surv_cap) || checked > dev.list2_cap {
+        if dev.overflowed(rec, surv, checked) {
             retry.extend_from_slice(batch);
         } else {
             st.survivors += u64::from(surv);
-            st.checked += u64::from(if dev.mid > 0 { checked } else { surv });
+            st.checked += u64::from(dev.checked_of(surv, checked));
         }
     }
     let mut hits = dev.read_hits()?;
@@ -1990,28 +2296,14 @@ pub(crate) fn run_field<R: Runtime>(
         // batch runs again; hits it already found come back again and are
         // deduplicated below.
         debug!(
-            "overlap join b{base}: {} partitions overflowed a survivor list, re-running one at a time",
+            "overlap join b{}: {} partitions overflowed a survivor list, re-running one at a time",
+            fs.b,
             retry.len()
         );
         st.retried_partitions = retry.len();
-        let mut dev = JoinDevice::new(client, &fs, 1, true, SURV_CAP_RETRY, NICE_CAP)?;
         for &v in &retry {
-            let rec = dev.launch_batch(&[v], false)?;
-            let surv = dev.read_u32(&rec.surv_count)?[0];
-            let checked = dev.read_u32(&rec.list2_count)?[0];
-            if (!rec.fused && surv > dev.surv_cap) || checked > dev.list2_cap {
-                bail!(
-                    "overlap join b{base} [{}, {}): partition {v} has {surv} survivors, \
-                     more than the retry list holds ({})",
-                    range.start(),
-                    range.end(),
-                    dev.surv_cap
-                );
-            }
-            st.survivors += u64::from(surv);
-            st.checked += u64::from(if dev.mid > 0 { checked } else { surv });
+            run_partition(client, fs, &field.retry, v, 0, &mut st, &mut hits)?;
         }
-        hits.extend(dev.read_hits()?);
         hits.sort_unstable();
         hits.dedup();
     }
@@ -2020,20 +2312,70 @@ pub(crate) fn run_field<R: Runtime>(
         .into_iter()
         .map(|number| NiceNumberSimple {
             number,
-            num_uniques: base,
+            num_uniques: fs.b,
         })
         .collect();
     Ok((nice, st))
 }
 
+/// Partition `v` of `fs`'s field alone, with `plan` (one slot). If its
+/// survivors overflow the list, its top layer is halved and each half runs
+/// the partition again: the halves' survivors are exactly the whole's, split,
+/// and a single top prefix of one partition always fits the re-run's list
+/// (see [`MIN_RETRY_CAP`]).
+fn run_partition<R: Runtime>(
+    client: &ComputeClient<R>,
+    fs: &FieldSetup,
+    plan: &JoinPlan,
+    v: u32,
+    depth: u32,
+    st: &mut JoinFieldStats,
+    hits: &mut Vec<u128>,
+) -> Result<()> {
+    let mut dev = JoinDevice::new(client, fs, plan)?;
+    let rec = dev.launch_batch(&[v], false)?;
+    st.batches += 1;
+    let surv = dev.read_u32(&rec.surv_count)?[0];
+    let checked = dev.read_u32(&rec.list2_count)?[0];
+    if !dev.overflowed(&rec, surv, checked) {
+        st.survivors += u64::from(surv);
+        st.checked += u64::from(dev.checked_of(surv, checked));
+        hits.extend(dev.read_hits()?);
+        return Ok(());
+    }
+    drop(dev);
+    ensure!(
+        depth < MAX_SPLITS && fs.tlay.len() >= 2,
+        "overlap join b{} [{}, {}): partition {v} overflows its survivor list on {} top \
+         prefixes ({surv} join survivors, {checked} after the prefilter, room for {})",
+        fs.b,
+        fs.s,
+        fs.e,
+        fs.tlay.len(),
+        plan.list2_cap.max(plan.surv_cap)
+    );
+    st.splits += 1;
+    let (lo, hi) = fs.tlay.split_at(fs.tlay.len() / 2);
+    for half in [lo, hi] {
+        run_partition(
+            client,
+            &fs.with_tops(half.to_vec()),
+            plan,
+            v,
+            depth + 1,
+            st,
+            hits,
+        )?;
+    }
+    Ok(())
+}
+
 struct JoinJob {
-    base: u32,
-    range: FieldSize,
-    jp: JoinParams,
+    field: JoinField,
     pushed_at: Instant,
 }
 
-type JoinDone = Result<(NiceonlyStats, Vec<NiceNumberSimple>)>;
+type JoinDone = Result<(NiceonlyStats, Vec<NiceNumberSimple>, JoinFieldStats)>;
 
 /// The join's side of the niceonly pipeline: a thread that takes fields in
 /// order, runs each through [`run_field`] and hands the results back in the
@@ -2047,6 +2389,10 @@ pub struct JoinPipeline {
     results: Option<Receiver<JoinDone>>,
     outstanding: usize,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The join's own account of the field `next_result` last returned,
+    /// for the throughput harness.
+    #[cfg(test)]
+    last: Option<JoinFieldStats>,
 }
 
 impl JoinPipeline {
@@ -2056,7 +2402,8 @@ impl JoinPipeline {
         let (results_tx, results) = sync_channel::<JoinDone>(depth);
         let thread = std::thread::spawn(move || {
             while let Ok(job) = jobs.recv() {
-                let out = run_field(&client, job.base, &job.range, job.jp).map(|(hits, js)| {
+                let (base, jp) = (job.field.fs.b, job.field.fs.jp);
+                let out = run_field(&client, &job.field).map(|(hits, js)| {
                     let stats = NiceonlyStats {
                         msd_secs: js.setup_secs,
                         device_secs: js.device_secs,
@@ -2071,20 +2418,22 @@ impl JoinPipeline {
                         overlap_join: true,
                     };
                     debug!(
-                        "overlap join b{} {:?}: setup {:.3}s, device {:.3}s ({} partitions, {} batches), \
-                         {} survivors, {} checked, {} re-run, total {:.3}s",
-                        job.base,
-                        job.jp,
+                        "overlap join b{base} {jp:?}: setup {:.3}s, device {:.3}s ({} partitions, \
+                         {} batches of {}, {} MiB), {} survivors, {} checked, {} re-run, \
+                         {} splits, total {:.3}s",
                         js.setup_secs,
                         js.device_secs,
                         js.partitions,
                         js.batches,
+                        js.slots,
+                        js.bytes >> 20,
                         js.survivors,
                         js.checked,
                         js.retried_partitions,
+                        js.splits,
                         stats.total_secs
                     );
-                    (stats, hits)
+                    (stats, hits, js)
                 });
                 if results_tx.send(out).is_err() {
                     return;
@@ -2096,22 +2445,22 @@ impl JoinPipeline {
             results: Some(results),
             outstanding: 0,
             thread: Some(thread),
+            #[cfg(test)]
+            last: None,
         }
     }
 
-    /// Queue a field. Returns at once unless the queue is full.
+    /// Queue a prepared field. Returns at once unless the queue is full.
     ///
     /// # Errors
     /// The worker thread has exited.
-    pub(crate) fn push(&mut self, base: u32, range: &FieldSize, jp: JoinParams) -> Result<()> {
+    pub(crate) fn push(&mut self, field: JoinField) -> Result<()> {
         let tx = self
             .tx
             .as_ref()
             .ok_or_else(|| anyhow!("overlap join pipeline is shut down"))?;
         tx.send(JoinJob {
-            base,
-            range: *range,
-            jp,
+            field,
             pushed_at: Instant::now(),
         })
         .map_err(|_| anyhow!("overlap join worker is gone"))?;
@@ -2129,11 +2478,26 @@ impl JoinPipeline {
             "no field outstanding in the overlap join"
         );
         self.outstanding -= 1;
-        self.results
+        let (stats, hits, js) = self
+            .results
             .as_ref()
             .ok_or_else(|| anyhow!("overlap join pipeline is shut down"))?
             .recv()
-            .map_err(|_| anyhow!("overlap join worker is gone"))?
+            .map_err(|_| anyhow!("overlap join worker is gone"))??;
+        #[cfg(test)]
+        {
+            self.last = Some(js);
+        }
+        #[cfg(not(test))]
+        let _ = js;
+        Ok((stats, hits))
+    }
+
+    /// The join's own account (re-runs, layout) of the field
+    /// [`Self::next_result`] last returned.
+    #[cfg(test)]
+    pub(crate) fn last_field_stats(&self) -> Option<JoinFieldStats> {
+        self.last
     }
 }
 
@@ -2151,7 +2515,7 @@ impl Drop for JoinPipeline {
 mod tests {
     use super::*;
     use crate::cubecl_backend::{
-        CubeclContext, begin_niceonly_cubecl, finish_niceonly_cubecl, process_range_niceonly_cubecl,
+        CubeclContext, finish_niceonly_cubecl, process_range_niceonly_cubecl,
     };
     use crate::overlap_join::join_range;
 
@@ -2168,6 +2532,7 @@ mod tests {
     /// The prefilter by its definition: the digits at positions `0..k2` of
     /// n² and n³ (mod `b^k2` in u128) are distinct, and disjoint from the
     /// top certificate when every certified position is `>= k2`.
+    #[allow(clippy::many_single_char_names)] // b, n, r, p, a as in the docs
     fn mid_mirror(fs: &FieldSetup, n: u128) -> bool {
         let b = u128::from(fs.b);
         let bk = b.pow(fs.k2);
@@ -2207,12 +2572,102 @@ mod tests {
     /// Partition values that hold at least one top prefix of the field.
     fn live_partitions(fs: &FieldSetup) -> Vec<u32> {
         let mut v: Vec<u32> = (fs.plo..=fs.phi)
-            .map(|p| (p % fs.nparts) as u32)
-            .take(fs.nparts as usize + 1)
+            .map(|p| u32::try_from(p % fs.nparts).expect("b^p < 2^32"))
+            .take(usize::try_from(fs.nparts).expect("b^p < 2^32") + 1)
             .collect();
         v.sort_unstable();
         v.dedup();
         v
+    }
+
+    /// A layout for `slots` partitions per launch whose lists hold every
+    /// survivor of a production batch (a base-57 partition has 1.5-2.7e6
+    /// join survivors), since the tests compare whole lists: the device's
+    /// binding limit, but a larger budget than production's.
+    fn test_plan(fs: &FieldSetup, lim: JoinLimits, slots: usize, fused: bool) -> JoinPlan {
+        let lim = JoinLimits {
+            max_binding: lim.max_binding,
+            budget: 4 << 30,
+        };
+        JoinPlan::new(fs, lim, slots, fused, 1 << 24, 1, 2 << 30).expect("the test layout fits")
+    }
+
+    /// Production-size fields at bases 42-64 (gate-sized at 42, 1e14
+    /// elsewhere), from the middle of their bands and the frontier.
+    const PLAN_FIELDS: &[(u32, u128, u128)] = &[
+        (42, 9_682_651_996_416, 10_000_000_000_000),
+        (50, 62_082_117_268_529_817, 100_000_000_000_000),
+        (57, FRONTIER_57, 100_000_000_000_000),
+        (60, 1_366_405_974_057_412_100_454, 100_000_000_000_000),
+        (62, 7_997_740_455_941_656_911_841, 100_000_000_000_000),
+        (64, 41_242_006_262_957_161_709_568, 100_000_000_000_000),
+    ];
+
+    fn plan_field(base: u32, start: u128, size: u128) -> FieldSetup {
+        let range = FieldSize::new(start, start + size);
+        let jp = crate::overlap_join::join_params_for(base, &range).expect("a join field");
+        FieldSetup::new(base, range.start(), range.end(), jp).expect("field setup")
+    }
+
+    /// On a desktop GPU (CUDA reports a quarter of an 8 GB card as its
+    /// largest buffer) every production field gets the measured layout: 16
+    /// partitions per launch and full lists, within the budget.
+    #[test]
+    fn production_fields_get_the_full_layout() {
+        let lim = JoinLimits {
+            max_binding: 2 << 30,
+            budget: JOIN_MEMORY,
+        };
+        for &(base, start, size) in PLAN_FIELDS {
+            let fs = plan_field(base, start, size);
+            let (plan, retry) = JoinPlan::for_field(&fs, lim).expect("fits a desktop GPU");
+            assert_eq!(
+                (plan.slots, plan.fused, plan.list2_cap),
+                (SLOTS, true, SURV_CAP),
+                "b{base}"
+            );
+            assert_eq!(
+                (retry.slots, retry.list2_cap),
+                (1, SURV_CAP_RETRY),
+                "b{base}"
+            );
+            assert!(
+                plan.bytes <= lim.budget && retry.bytes <= lim.budget,
+                "b{base}"
+            );
+        }
+    }
+
+    /// A device with small buffers gets a smaller layout that respects them,
+    /// and one that cannot hold a single partition gets none (its fields
+    /// stay on the stride pipeline).
+    #[test]
+    fn small_devices_get_smaller_layouts_or_none() {
+        let fs = plan_field(57, FRONTIER_57, 100_000_000_000_000);
+        let fp = Footprint::of(&fs, NICE_CAP);
+        // lavapipe and other software rasterizers: 128 MiB buffers.
+        let lim = JoinLimits {
+            max_binding: 128 << 20,
+            budget: 256 << 20,
+        };
+        let (plan, retry) = JoinPlan::for_field(&fs, lim).expect("lavapipe holds base 57");
+        assert!((1..SLOTS).contains(&plan.slots), "{plan:?}");
+        assert!(plan.slots * fp.largest_per_slot() <= lim.max_binding);
+        assert!(plan.list2_cap as usize * 8 <= lim.max_binding);
+        assert!(retry.list2_cap >= MIN_RETRY_CAP);
+        assert!(plan.bytes <= lim.budget && retry.bytes <= lim.budget);
+        // Buffers smaller than one partition's bucket lists (29 MiB here).
+        let lim = JoinLimits {
+            max_binding: 16 << 20,
+            budget: 1 << 30,
+        };
+        assert_eq!(JoinPlan::for_field(&fs, lim), None);
+        // A budget smaller than one partition and the re-run's list.
+        let lim = JoinLimits {
+            max_binding: 1 << 30,
+            budget: 32 << 20,
+        };
+        assert_eq!(JoinPlan::for_field(&fs, lim), None);
     }
 
     /// GPU survivors (after the AND, and after the prefilter) and hits must
@@ -2236,8 +2691,8 @@ mod tests {
         // Both prefilter placements: unfused, the join's own survivor set is
         // compared too; fused (production), what reaches the full check.
         for fused in [false, true] {
-            // A production partition at base 57 has ~1.5e6 join survivors.
-            let mut dev = JoinDevice::new(client, &fs, 4, fused, 1 << 24, 1 << 10).expect("device");
+            let plan = test_plan(&fs, JoinLimits::of(client), 4, fused);
+            let mut dev = JoinDevice::new(client, &fs, &plan).expect("device");
             let mut cpu_hits = Vec::new();
             for batch in parts.chunks(dev.max_slots) {
                 let vs: Vec<u128> = batch.iter().map(|&v| u128::from(v)).collect();
@@ -2271,6 +2726,71 @@ mod tests {
                 dev.read_hits().unwrap(),
                 cpu_hits,
                 "b{b} [{s}, {e}) {jp:?} fused={fused}: hits differ"
+            );
+        }
+    }
+
+    /// Layouts far tighter than production's, against the CPU reference over
+    /// every partition of a window: the batches' list holds half the densest
+    /// partition, so batches re-run their partitions one at a time, and the
+    /// re-run's list holds only the densest single top prefix, so the
+    /// densest partition's top layer is halved down to prefixes that fit.
+    /// Hits, join survivors and prefilter survivors must come out exactly as
+    /// the reference has them.
+    fn check_tight_layouts<R: Runtime>(client: &ComputeClient<R>, name: &str) {
+        let lim = JoinLimits::of(client);
+        for &(b, s, e, t, k, p) in WINDOWS {
+            let jp = JoinParams { t, k, p };
+            let fs = FieldSetup::new(b, s, e, jp).expect("field setup");
+            if fs.nparts > 64 {
+                continue; // keeps a software rasterizer's run short
+            }
+            // Width of a top-layer prefix, to count the survivors per prefix.
+            let pw = fs.base.powu(fs.base.l - (t - p));
+            let (mut survivors, mut checked, mut hits) = (0u64, 0u64, Vec::new());
+            let (mut densest, mut single) = (0usize, 0usize);
+            for v in 0..fs.nparts {
+                let mut rec = Vec::new();
+                let st = join_range(&fs.base, s, e, jp, Some(&[v]), Some(&mut rec));
+                if fs.mid > 0 {
+                    rec.retain(|&n| mid_mirror(&fs, n));
+                }
+                survivors += st.survivors;
+                checked += rec.len() as u64;
+                hits.extend(st.hits);
+                densest = densest.max(rec.len());
+                let mut per_top: std::collections::HashMap<u128, usize> =
+                    std::collections::HashMap::new();
+                for n in &rec {
+                    *per_top.entry(n / pw).or_default() += 1;
+                }
+                single = single.max(per_top.into_values().max().unwrap_or(0));
+            }
+            if densest <= single.max(1) {
+                continue; // nothing to split
+            }
+            let cap = |c: usize| u32::try_from(c.max(1)).expect("a small window");
+            let plan = JoinPlan::new(&fs, lim, 2, true, cap(densest / 2), 1, lim.budget)
+                .expect("a two-slot layout fits");
+            let retry = JoinPlan::new(&fs, lim, 1, true, cap(single), 1, lim.budget).expect("fits");
+            let field = JoinField::with_plans(fs, plan, retry);
+            let (nice, st) = run_field(client, &field).expect("tight run");
+            hits.sort_unstable();
+            hits.dedup();
+            let got: Vec<u128> = nice.iter().map(|n| n.number).collect();
+            assert_eq!(got, hits, "b{b} [{s}, {e}) {jp:?}: hits differ");
+            assert_eq!(
+                (st.survivors, st.checked),
+                (survivors, checked),
+                "b{b} [{s}, {e}) {jp:?}: survivor counts differ"
+            );
+            assert!(
+                st.retried_partitions > 0 && st.splits > 0,
+                "b{b} [{s}, {e}) {jp:?}: the tight layouts did not bite ({st:?})"
+            );
+            println!(
+                "{name}: b{b} [{s}, {e}) {jp:?} tight layouts agree ({} partitions re-run, {} splits)",
+                st.retried_partitions, st.splits
             );
         }
     }
@@ -2342,7 +2862,11 @@ mod tests {
 
     fn check_all<R: Runtime>(client: &ComputeClient<R>, name: &str) {
         let jp = JoinParams { t: 2, k: 1, p: 0 };
-        let (hits, _) = run_field(client, 10, &FieldSize::new(47, 100), jp).expect("join run");
+        let band = FieldSize::new(47, 100);
+        let field = JoinField::prepare(10, &band, jp, JoinLimits::of(client))
+            .expect("field setup")
+            .expect("base 10 fits any device");
+        let (hits, _) = run_field(client, &field).expect("join run");
         assert_eq!(hits.iter().map(|n| n.number).collect::<Vec<_>>(), vec![69]);
         check_window(client, 10, 47, 100, jp, None);
         for &(b, s, e, t, k, p) in WINDOWS {
@@ -2360,6 +2884,7 @@ mod tests {
             Some(vec![0, 1_000, 3_248]),
         );
         println!("{name}: b57 frontier field {jp:?}, partitions 0, 1000, 3248 agree");
+        check_tight_layouts(client, name);
     }
 
     #[test]
@@ -2395,8 +2920,13 @@ mod tests {
         let jp = JoinParams { t: 2, k: 1, p: 0 };
         let routes = [Some(jp), None, Some(jp)];
         for &r in &routes {
+            let field = r.map(|jp| {
+                JoinField::prepare(10, &band, jp, ctx.join_limits())
+                    .unwrap()
+                    .expect("base 10 fits any device")
+            });
             assert!(matches!(
-                begin_routed(&ctx, &band, 10, r).unwrap(),
+                begin_routed(&ctx, &band, 10, field).unwrap(),
                 NiceonlyStarted::Queued
             ));
         }
@@ -2424,39 +2954,250 @@ mod tests {
         );
     }
 
-    /// Throughput of production fields through the backend's begin/finish
-    /// (the join): `NICE_TEST_JOIN_FIELDS` 1e14 fields of base 57 from the
-    /// frontier, after one untimed warm-up field. The variable is also the
-    /// opt-in, since the parity workflow runs this module's ignored tests on
-    /// lavapipe.
+    /// The client's route on one field: `plan_join` must take it, and the
+    /// join's results and own account come back.
+    fn run_routed(
+        ctx: &CubeclContext,
+        base: u32,
+        range: &FieldSize,
+    ) -> (Vec<u128>, NiceonlyStats, JoinFieldStats) {
+        use crate::cubecl_backend::{begin_join, last_join_stats, plan_join};
+        let field = plan_join(ctx, base, range).expect("the join takes the field");
+        begin_join(ctx, field).expect("begin");
+        let (res, stats) = finish_niceonly_cubecl(ctx).expect("finish");
+        let js = last_join_stats(ctx).expect("join stats");
+        (
+            res.nice_numbers.iter().map(|n| n.number).collect(),
+            stats,
+            js,
+        )
+    }
+
+    /// The stride pipeline on the same field (the client's path before the
+    /// join).
+    fn run_stride(ctx: &CubeclContext, base: u32, range: &FieldSize) -> Vec<u128> {
+        use crate::cubecl_backend::begin_routed;
+        begin_routed(ctx, range, base, None).expect("begin");
+        let (res, _) = finish_niceonly_cubecl(ctx).expect("finish");
+        let mut v: Vec<u128> = res.nice_numbers.iter().map(|n| n.number).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Opt-in (`NICE_TEST_JOIN_FULL_FIELD=1`; minutes of CPU): one whole
+    /// production-size field (base 42, 1e13, the gate's smallest) through
+    /// the client's route, against the CPU reference over every partition
+    /// (threaded) — the same hits, join survivors and prefilter survivors —
+    /// and against the stride pipeline, which must find the same nice
+    /// numbers.
+    fn full_field_check(ctx: &CubeclContext) {
+        if std::env::var("NICE_TEST_JOIN_FULL_FIELD").is_err() {
+            eprintln!("skipping: set NICE_TEST_JOIN_FULL_FIELD to run the whole-field comparison");
+            return;
+        }
+        let (base, start, size) = PLAN_FIELDS[0];
+        let range = FieldSize::new(start, start + size);
+        let jp = crate::overlap_join::join_params_for(base, &range).expect("a join field");
+        let fs = FieldSetup::new(base, range.start(), range.end(), jp).expect("field setup");
+        let t = std::time::Instant::now();
+        let threads = std::thread::available_parallelism().map_or(4, usize::from);
+        let parts: Vec<u128> = (0..fs.nparts).collect();
+        let (survivors, checked, mut hits) = std::thread::scope(|sc| {
+            let fs = &fs;
+            let workers: Vec<_> = parts
+                .chunks(parts.len().div_ceil(threads))
+                .map(|chunk| {
+                    sc.spawn(move || {
+                        // One partition at a time: a whole field's survivors
+                        // (4.5e8 at base 42) would not fit in memory.
+                        let (mut survivors, mut kept, mut hits) = (0u64, 0u64, Vec::new());
+                        let mut rec = Vec::new();
+                        for &v in chunk {
+                            rec.clear();
+                            let st =
+                                join_range(&fs.base, fs.s, fs.e, fs.jp, Some(&[v]), Some(&mut rec));
+                            survivors += st.survivors;
+                            hits.extend(st.hits);
+                            kept += if fs.mid > 0 {
+                                rec.iter().filter(|&&n| mid_mirror(fs, n)).count() as u64
+                            } else {
+                                rec.len() as u64
+                            };
+                        }
+                        (survivors, kept, hits)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("reference worker"))
+                .fold((0u64, 0u64, Vec::new()), |(a, b, mut h), (x, y, z)| {
+                    h.extend(z);
+                    (a + x, b + y, h)
+                })
+        });
+        hits.sort_unstable();
+        let cpu_secs = t.elapsed().as_secs_f64();
+        let (got, _, js) = run_routed(ctx, base, &range);
+        assert_eq!(got, hits, "b{base} {range:?}: hits differ");
+        assert_eq!(
+            (js.survivors, js.checked),
+            (survivors, checked),
+            "b{base} {range:?}: survivor counts differ"
+        );
+        let t = std::time::Instant::now();
+        let stride = run_stride(ctx, base, &range);
+        assert_eq!(
+            stride, hits,
+            "b{base} {range:?}: the stride pipeline differs"
+        );
+        eprintln!(
+            "FULL FIELD device={} b{base} {range:?} {jp:?}: {} partitions, {survivors} join \
+             survivors, {checked} checked, hits {hits:?}; reference {cpu_secs:.0}s on {threads} \
+             threads, join {:.2}s, stride {:.2}s",
+            ctx.device_name(),
+            fs.nparts,
+            js.device_secs,
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu device; opt-in, minutes of CPU"]
+    fn join_matches_the_reference_on_a_whole_field() {
+        full_field_check(&CubeclContext::new_default().expect("CubeCL init"));
+    }
+
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device; opt-in, minutes of CPU"]
+    fn cubecl_cuda_join_matches_the_reference_on_a_whole_field() {
+        full_field_check(&CubeclContext::new_cuda(0).expect("CubeCL CUDA init"));
+    }
+
+    /// Fields of 1e14 per base for the throughput harness: consecutive from
+    /// the base-57 frontier, and from one of Dan Stoyell's benchmark fields
+    /// at bases 60 and 64.
+    const THROUGHPUT_STARTS: &[(u32, u128)] = &[
+        (57, FRONTIER_57),
+        (60, 1_573_714_731_429_953_349_518),
+        (64, 41_242_006_262_957_161_709_568),
+    ];
+
+    /// Throughput of production fields through the client's route
+    /// (`plan_join`, then the join's pipeline with `fields_in_flight()`
+    /// fields queued, as the client runs them): `NICE_TEST_JOIN_FIELDS`
+    /// fields per base (also the opt-in, since the parity workflow runs this
+    /// module's ignored tests on lavapipe) after one untimed warm-up field,
+    /// for the bases in `NICE_TEST_JOIN_BASES` (default 57,60,64). Prints per
+    /// base the rate, per-field wall, setup and device seconds, the layout
+    /// (partitions per launch, MiB), re-runs, survivor counts and the
+    /// device's memory. `NICE_TEST_JOIN_COMPARE=1` also runs every field
+    /// through the stride pipeline and asserts the same nice numbers.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn join_throughput(ctx: &CubeclContext) {
-        use crate::gpu_niceonly::NiceonlyStarted;
+        use crate::cubecl_backend::{begin_join, last_join_stats, memory_usage, plan_join};
+        use crate::gpu_niceonly::fields_in_flight;
         let Ok(n) = std::env::var("NICE_TEST_JOIN_FIELDS") else {
             eprintln!("skipping: set NICE_TEST_JOIN_FIELDS to run the throughput harness");
             return;
         };
         let n: u128 = n.parse().expect("NICE_TEST_JOIN_FIELDS must be a count");
-        let (base, size) = (57, 100_000_000_000_000u128);
-        let start = FRONTIER_57;
-        let warm = FieldSize::new(start - size, start);
-        if let NiceonlyStarted::Queued = begin_niceonly_cubecl(ctx, &warm, base).unwrap() {
-            finish_niceonly_cubecl(ctx).unwrap();
-        }
-        let t = std::time::Instant::now();
-        let mut found = 0usize;
-        for i in 0..n {
-            let f = FieldSize::new(start + i * size, start + (i + 1) * size);
-            if let NiceonlyStarted::Queued = begin_niceonly_cubecl(ctx, &f, base).unwrap() {
-                found += finish_niceonly_cubecl(ctx).unwrap().0.nice_numbers.len();
+        let bases: Vec<u32> = std::env::var("NICE_TEST_JOIN_BASES")
+            .unwrap_or_else(|_| "57,60,64".into())
+            .split(',')
+            .map(|b| b.trim().parse().expect("NICE_TEST_JOIN_BASES: bases"))
+            .collect();
+        let compare = std::env::var("NICE_TEST_JOIN_COMPARE").is_ok();
+        let size = 100_000_000_000_000u128;
+        let mib = |b: u64| b >> 20;
+        for base in bases {
+            let &(_, start) = THROUGHPUT_STARTS
+                .iter()
+                .find(|&&(b, _)| b == base)
+                .expect("a base with throughput fields (57, 60, 64)");
+            let warm = FieldSize::new(start - size, start);
+            run_routed(ctx, base, &warm);
+            let fields: Vec<FieldSize> = (0..n)
+                .map(|i| FieldSize::new(start + i * size, start + (i + 1) * size))
+                .collect();
+            let lookahead = fields_in_flight().saturating_sub(1);
+            let t = std::time::Instant::now();
+            let (mut queued, mut found) = (0usize, Vec::new());
+            let mut per_field: Vec<(NiceonlyStats, JoinFieldStats)> = Vec::new();
+            // Device memory, sampled while the next field is on the device.
+            let mut peak = (0u64, 0u64);
+            let mut finish = |found: &mut Vec<u128>| {
+                if let Some((in_use, reserved)) = memory_usage(ctx) {
+                    peak = (peak.0.max(in_use), peak.1.max(reserved));
+                }
+                let (res, stats) = finish_niceonly_cubecl(ctx).expect("finish");
+                found.extend(res.nice_numbers.iter().map(|x| x.number));
+                per_field.push((stats, last_join_stats(ctx).expect("join stats")));
+            };
+            for f in &fields {
+                let field = plan_join(ctx, base, f).expect("the join takes the field");
+                begin_join(ctx, field).expect("begin");
+                queued += 1;
+                while queued > lookahead {
+                    finish(&mut found);
+                    queued -= 1;
+                }
+            }
+            while queued > 0 {
+                finish(&mut found);
+                queued -= 1;
+            }
+            let secs = t.elapsed().as_secs_f64();
+            let nf = per_field.len() as f64;
+            let mean = |f: &dyn Fn(&(NiceonlyStats, JoinFieldStats)) -> f64| {
+                per_field.iter().map(f).sum::<f64>() / nf
+            };
+            let sum =
+                |f: &dyn Fn(&JoinFieldStats) -> u64| per_field.iter().map(|x| f(&x.1)).sum::<u64>();
+            let (in_use, reserved) = peak;
+            eprintln!(
+                "JOIN THROUGHPUT device={} base={base} fields={n} in_flight={} secs={secs:.2} \
+                 per_field={:.3} rate={:.3e} n/s | setup={:.3}s device={:.3}s wall={:.3}s \
+                 batches={:.0} slots={} plan_mib={} | empty_top={} retried={} splits={} \
+                 survivors={} checked={} found={} | peak_in_use_mib={} peak_reserved_mib={}",
+                ctx.device_name(),
+                fields_in_flight(),
+                secs / nf,
+                (n * size) as f64 / secs,
+                mean(&|x| x.0.msd_secs),
+                mean(&|x| x.0.device_secs),
+                mean(&|x| x.0.total_secs),
+                mean(&|x| f64::from(x.0.launches)),
+                per_field.iter().map(|x| x.1.slots).max().unwrap_or(0),
+                per_field.iter().map(|x| x.1.bytes >> 20).max().unwrap_or(0),
+                per_field.iter().filter(|x| x.1.partitions == 0).count(),
+                sum(&|x| x.retried_partitions as u64),
+                sum(&|x| u64::from(x.splits)),
+                sum(&|x| x.survivors),
+                sum(&|x| x.checked),
+                found.len(),
+                mib(in_use),
+                mib(reserved),
+            );
+            if compare {
+                let t = std::time::Instant::now();
+                let mut stride = Vec::new();
+                for f in &fields {
+                    stride.extend(run_stride(ctx, base, f));
+                }
+                found.sort_unstable();
+                stride.sort_unstable();
+                assert_eq!(stride, found, "b{base}: the stride pipeline differs");
+                eprintln!(
+                    "STRIDE base={base} fields={n} secs={:.2} per_field={:.3} (one at a time) \
+                     found={}",
+                    t.elapsed().as_secs_f64(),
+                    t.elapsed().as_secs_f64() / nf,
+                    stride.len()
+                );
             }
         }
-        let secs = t.elapsed().as_secs_f64();
-        eprintln!(
-            "JOIN THROUGHPUT device={} fields={n} secs={secs:.2} per_field={:.2} rate={:.3e} n/s found={found}",
-            ctx.device_name(),
-            secs / n as f64,
-            (n * size) as f64 / secs
-        );
     }
 
     #[test]
