@@ -42,6 +42,8 @@
 
 use crate::FieldSize;
 use crate::client_process::get_is_nice;
+use anyhow::{Result, anyhow, ensure};
+use std::time::Instant;
 
 /// Smallest base the join is used for. Below this the stride pipeline is as
 /// fast or faster and long finished anyway.
@@ -611,6 +613,131 @@ impl Base {
     }
 }
 
+/// The host side of a field: everything that does not depend on the
+/// partition value.
+#[derive(Clone)]
+pub struct FieldSetup {
+    pub base: Base,
+    pub b: u32,
+    pub s: u128,
+    pub e: u128,
+    pub jp: JoinParams,
+    pub f0: u32,
+    pub key_level: bool,
+    /// `b^f0`: the width of one top prefix block.
+    pub w: u128,
+    /// `b^p`: the number of partition values.
+    pub nparts: u128,
+    pub m1: u32,
+    /// Buckets per partition: key values × digit-sum classes.
+    pub nb: usize,
+    pub plo: u128,
+    pub phi: u128,
+    /// Top layer at depth `t − p`.
+    pub tlay: Vec<(u128, u64)>,
+    /// `bpre`: residues mod `b^f0` whose `2·f0` low output digits are
+    /// distinct, sorted by digit-sum class mod `b − 1`; `seg[c]..seg[c + 1]`
+    /// is class `c`.
+    pub bp_r: Vec<u32>,
+    pub bp_m: Vec<u64>,
+    pub seg: Vec<u32>,
+    /// The prefilter tests the output digits below `k2` (1 or 2 more than
+    /// the bottom list's `k`).
+    pub k2: u32,
+    /// Certificate floor of every full-width block in the field (monotone in
+    /// `P`, so the first full block bounds them all).
+    pub full_floor: u32,
+    pub secs: f64,
+}
+
+impl FieldSetup {
+    /// Set up `[s, e)` at base `b` with parameters `jp`.
+    ///
+    /// # Errors
+    /// A field or parameters the join cannot take: an empty field, one that
+    /// crosses a digit-length boundary, parameters `jp` does not support at
+    /// this length, `n` of 2^96 or more, or no room for the prefilter.
+    #[allow(clippy::many_single_char_names)] // b, s, e, t, k, o, w as in `overlap_join`
+    pub fn new(b: u32, s: u128, e: u128, jp: JoinParams) -> Result<Self> {
+        let t0 = Instant::now();
+        ensure!(s < e, "empty field");
+        let base = Base::try_new(b, s, e - 1)
+            .ok_or_else(|| anyhow!("[{s}, {e}) crosses a digit-length boundary in base {b}"))?;
+        let l = base.l;
+        ensure!(
+            jp.supported(b, l),
+            "{jp:?} not supported at base {b}, L = {l}"
+        );
+        ensure!(e - 1 < 1 << 96, "device tops need n < 2^96");
+        let (t, k, pp) = (jp.t, jp.k, jp.p);
+        let f0 = l - t;
+        let o = t + k - l;
+        let w = base.powu(f0);
+        let tlay = base.top_layer(s, e - 1, t - pp, k);
+        let mut bpre: Vec<(u64, u64)> = Vec::new();
+        base.bot_dfs(0, 0, 0, f0, f0, 0, 0, &mut bpre);
+        ensure!(!bpre.is_empty(), "empty bottom list");
+        let m1 = b - 1;
+        bpre.sort_unstable_by_key(|&(r, _)| (r % u64::from(m1), r));
+        let mut seg = vec![0u32; m1 as usize + 1];
+        for &(r, _) in &bpre {
+            seg[usize::try_from(r % u64::from(m1))? + 1] += 1;
+        }
+        for c in 0..m1 as usize {
+            seg[c + 1] += seg[c];
+        }
+        // Residues below b^f0 < 2^32 (`JoinParams::supported`).
+        let bp_r = bpre
+            .iter()
+            .map(|&(r, _)| u32::try_from(r))
+            .collect::<Result<_, _>>()?;
+        let bp_m = bpre.iter().map(|&(_, m)| m).collect();
+        let keyspace = base.powu(o - pp);
+        // The prefilter tests digits k..k2 too; it needs both powers to have
+        // at least k2 digits and P mod b^(k2 - f0) to fit u32.
+        let mut mid = 2;
+        while mid > 0
+            && (k + mid > base.s2 || u64::from(b).pow(k + mid - f0) >= 1 << 32 || k + mid > 12)
+        {
+            mid -= 1;
+        }
+        // The device stage always prefilters (every field the gate takes, and
+        // every test window, has a depth of 2).
+        ensure!(
+            mid > 0,
+            "{jp:?} at base {b} leaves no room for the prefilter"
+        );
+        let first_full = s.div_ceil(w);
+        let full_floor = if first_full * w + w - 1 < e {
+            base.cert_floor(first_full * w, first_full * w + w - 1, k)
+        } else {
+            0
+        };
+        Ok(Self {
+            k2: k + mid,
+            full_floor,
+            b,
+            s,
+            e,
+            jp,
+            f0,
+            key_level: o - pp == 1,
+            w,
+            nparts: base.powu(pp),
+            m1,
+            nb: keyspace as usize * m1 as usize,
+            plo: s / w,
+            phi: (e - 1) / w,
+            tlay,
+            bp_r,
+            bp_m,
+            seg,
+            secs: t0.elapsed().as_secs_f64(),
+            base,
+        })
+    }
+}
+
 /// What the reference join found on a set of partitions.
 #[derive(Default, Debug, Clone)]
 pub struct JoinStats {
@@ -737,6 +864,184 @@ pub fn join_range(
         }
     }
     st
+}
+
+/// Fields the tests share: production-size fields that the join takes.
+#[cfg(test)]
+pub(crate) mod test_fields {
+    use super::FieldSetup;
+
+    /// A frontier field of base 57.
+    pub(crate) const FRONTIER_57: u128 = 28_151_599_893_042_801_193;
+
+    /// Production-size fields at bases 42-64 (gate-sized at 42, 1e14
+    /// elsewhere), from the middle of their bands and the frontier.
+    pub(crate) const PLAN_FIELDS: &[(u32, u128, u128)] = &[
+        (42, 9_682_651_996_416, 10_000_000_000_000),
+        (50, 62_082_117_268_529_817, 100_000_000_000_000),
+        (57, FRONTIER_57, 100_000_000_000_000),
+        (60, 1_366_405_974_057_412_100_454, 100_000_000_000_000),
+        (62, 7_997_740_455_941_656_911_841, 100_000_000_000_000),
+        (64, 41_242_006_262_957_161_709_568, 100_000_000_000_000),
+    ];
+
+    /// Dan Stoyell's exactness windows: several shapes, aligned and
+    /// unaligned, some where the client's MSD filter lets candidates through.
+    pub(crate) const WINDOWS: &[(u32, u128, u128, u32, u32, u32)] = &[
+        (20, 58_945, 160_000, 3, 2, 0),
+        (20, 58_945, 160_000, 2, 3, 1),
+        (20, 60_001, 150_003, 2, 3, 1),
+        (25, 3_339_797, 4_339_797, 4, 3, 1),
+        (25, 5_000_123, 5_700_456, 3, 4, 2),
+        (30, 300_000_000, 301_000_000, 5, 4, 2),
+        (34, 12_000_000_017, 12_001_000_017, 5, 5, 2),
+        (40, 3_000_000_000_000, 3_000_002_000_000, 6, 5, 2),
+        (40, 3_000_000_000_000, 3_000_002_000_000, 7, 4, 2),
+        (
+            57,
+            30_000_000_000_000_000_000,
+            30_000_000_000_000_300_000,
+            10,
+            4,
+            1,
+        ),
+        (
+            57,
+            20_635_899_893_042_801_193,
+            20_635_899_893_043_101_193,
+            9,
+            5,
+            1,
+        ),
+        (
+            57,
+            78_920_310_198_429_586_458,
+            78_920_310_198_429_886_458,
+            9,
+            5,
+            2,
+        ),
+        (
+            58,
+            114_041_927_169_846_138_720,
+            114_041_927_169_846_438_720,
+            10,
+            4,
+            2,
+        ),
+        (
+            60,
+            1_573_714_731_429_953_349_518,
+            1_573_714_731_429_953_649_518,
+            10,
+            4,
+            2,
+        ),
+        (
+            64,
+            52_125_117_810_081_128_433_988,
+            52_125_117_810_081_128_733_988,
+            11,
+            4,
+            2,
+        ),
+    ];
+
+    /// Partition values that hold at least one top prefix of the field.
+    pub(crate) fn live_partitions(fs: &FieldSetup) -> Vec<u32> {
+        let mut v: Vec<u32> = (fs.plo..=fs.phi)
+            .map(|p| u32::try_from(p % fs.nparts).expect("b^p < 2^32"))
+            .take(usize::try_from(fs.nparts).expect("b^p < 2^32") + 1)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The prefilter by its definition: the digits at positions `0..k2` of
+    /// n² and n³ (mod `b^k2` in u128) are distinct, and disjoint from the
+    /// top certificate when every certified position is `>= k2`.
+    #[allow(clippy::many_single_char_names)] // b, n, r, p, a as in the docs
+    pub(crate) fn mid_mirror(fs: &FieldSetup, n: u128) -> bool {
+        let b = u128::from(fs.b);
+        let bk = b.pow(fs.k2);
+        let r = n % bk;
+        let sq = r * r % bk;
+        let cu = sq * r % bk;
+        let p = n / fs.w;
+        let a = (p * fs.w).max(fs.s);
+        let ee = (p * fs.w + fs.w - 1).min(fs.e - 1);
+        let mut seen = 0u64;
+        let floor = if a == p * fs.w && ee == p * fs.w + fs.w - 1 {
+            fs.full_floor
+        } else {
+            fs.base.cert_floor(a, ee, fs.jp.k)
+        };
+        if floor >= fs.k2 {
+            seen = fs
+                .base
+                .cert(a, ee, fs.jp.k)
+                .expect("a survivor's top is certified");
+        }
+        let (mut x2, mut x3) = (sq, cu);
+        for _ in 0..fs.k2 {
+            for d in [x2 % b, x3 % b] {
+                let bit = 1u64 << d;
+                if seen & bit != 0 {
+                    return false;
+                }
+                seen |= bit;
+            }
+            x2 /= b;
+            x3 /= b;
+        }
+        true
+    }
+
+    /// The reference join over every partition of a field, on every core:
+    /// its join survivors, prefilter survivors (by [`mid_mirror`]) and hits,
+    /// sorted. Minutes of CPU for a production-size field.
+    pub(crate) fn reference_field(fs: &FieldSetup) -> (u64, u64, Vec<u128>) {
+        let threads = std::thread::available_parallelism().map_or(4, usize::from);
+        let parts: Vec<u128> = (0..fs.nparts).collect();
+        let (survivors, checked, mut hits) = std::thread::scope(|sc| {
+            let workers: Vec<_> = parts
+                .chunks(parts.len().div_ceil(threads))
+                .map(|chunk| {
+                    sc.spawn(move || {
+                        // One partition at a time: a whole field's survivors
+                        // (4.5e8 at base 42) would not fit in memory.
+                        let (mut survivors, mut checked, mut hits) = (0u64, 0u64, Vec::new());
+                        let mut rec = Vec::new();
+                        for &v in chunk {
+                            rec.clear();
+                            let st = super::join_range(
+                                &fs.base,
+                                fs.s,
+                                fs.e,
+                                fs.jp,
+                                Some(&[v]),
+                                Some(&mut rec),
+                            );
+                            survivors += st.survivors;
+                            hits.extend(st.hits);
+                            checked += rec.iter().filter(|&&n| mid_mirror(fs, n)).count() as u64;
+                        }
+                        (survivors, checked, hits)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("reference worker"))
+                .fold((0u64, 0u64, Vec::new()), |(a, b, mut h), (x, y, z)| {
+                    h.extend(z);
+                    (a + x, b + y, h)
+                })
+        });
+        hits.sort_unstable();
+        (survivors, checked, hits)
+    }
 }
 
 #[cfg(test)]

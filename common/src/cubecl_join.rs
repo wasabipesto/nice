@@ -43,8 +43,9 @@ use crate::gpu_config::{chunk_constants, chunk_constants_u16, n_limbs};
 use crate::gpu_niceonly::{NiceonlyStats, fields_in_flight};
 use crate::gpu_route::{FieldTicket, Route};
 use crate::join_plan::{
-    BATCHES_IN_FLIGHT, FieldSetup, Footprint, JoinField, JoinLimits, JoinPlan, NICE_RECORD_BYTES,
+    BATCHES_IN_FLIGHT, Footprint, JoinField, JoinLimits, JoinPlan, NICE_RECORD_BYTES,
 };
+use crate::overlap_join::FieldSetup;
 use anyhow::{Result, anyhow, ensure};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -1752,6 +1753,15 @@ pub(crate) fn run_field<R: Runtime>(
     Ok((nice, st))
 }
 
+/// The same field with only the top-layer prefixes `tlay` (a subset of its
+/// own). The tops keep their intervals, so a partition's survivors split
+/// exactly between complementary subsets.
+fn with_tops(fs: &FieldSetup, tlay: Vec<(u128, u64)>) -> FieldSetup {
+    let mut sub = fs.clone();
+    sub.tlay = tlay;
+    sub
+}
+
 /// Partition `v` of `fs`'s field alone, with `plan` (one slot). If its
 /// survivors overflow the list, its top layer is halved and each half runs
 /// the partition again: the halves' survivors are exactly the whole's, split,
@@ -1793,7 +1803,7 @@ fn run_partition<R: Runtime>(
     for half in [lo, hi] {
         run_partition(
             client,
-            &fs.with_tops(half.to_vec()),
+            &with_tops(fs, half.to_vec()),
             plan,
             v,
             depth + 1,
@@ -1962,7 +1972,9 @@ mod tests {
     use crate::FieldSize;
     use crate::cubecl_backend::{CubeclContext, last_join_stats};
     use crate::gpu_route::{NiceonlyGpu, NiceonlyStarted, begin_niceonly, process_niceonly};
-    use crate::join_plan::test_fields::{FRONTIER_57, PLAN_FIELDS};
+    use crate::overlap_join::test_fields::{
+        FRONTIER_57, PLAN_FIELDS, WINDOWS, live_partitions, mid_mirror, reference_field,
+    };
     use crate::overlap_join::{JoinParams, join_range};
 
     fn client() -> (ComputeClient<cubecl::wgpu::WgpuRuntime>, String) {
@@ -1973,57 +1985,6 @@ mod tests {
             unreachable!("new_default is wgpu")
         };
         (client, name)
-    }
-
-    /// The prefilter by its definition: the digits at positions `0..k2` of
-    /// n² and n³ (mod `b^k2` in u128) are distinct, and disjoint from the
-    /// top certificate when every certified position is `>= k2`.
-    #[allow(clippy::many_single_char_names)] // b, n, r, p, a as in the docs
-    fn mid_mirror(fs: &FieldSetup, n: u128) -> bool {
-        let b = u128::from(fs.b);
-        let bk = b.pow(fs.k2);
-        let r = n % bk;
-        let sq = r * r % bk;
-        let cu = sq * r % bk;
-        let p = n / fs.w;
-        let a = (p * fs.w).max(fs.s);
-        let ee = (p * fs.w + fs.w - 1).min(fs.e - 1);
-        let mut seen = 0u64;
-        let floor = if a == p * fs.w && ee == p * fs.w + fs.w - 1 {
-            fs.full_floor
-        } else {
-            fs.base.cert_floor(a, ee, fs.jp.k)
-        };
-        if floor >= fs.k2 {
-            seen = fs
-                .base
-                .cert(a, ee, fs.jp.k)
-                .expect("a survivor's top is certified");
-        }
-        let (mut x2, mut x3) = (sq, cu);
-        for _ in 0..fs.k2 {
-            for d in [x2 % b, x3 % b] {
-                let bit = 1u64 << d;
-                if seen & bit != 0 {
-                    return false;
-                }
-                seen |= bit;
-            }
-            x2 /= b;
-            x3 /= b;
-        }
-        true
-    }
-
-    /// Partition values that hold at least one top prefix of the field.
-    fn live_partitions(fs: &FieldSetup) -> Vec<u32> {
-        let mut v: Vec<u32> = (fs.plo..=fs.phi)
-            .map(|p| u32::try_from(p % fs.nparts).expect("b^p < 2^32"))
-            .take(usize::try_from(fs.nparts).expect("b^p < 2^32") + 1)
-            .collect();
-        v.sort_unstable();
-        v.dedup();
-        v
     }
 
     /// A layout for `slots` partitions per launch whose lists hold every
@@ -2149,68 +2110,6 @@ mod tests {
             );
         }
     }
-
-    /// Dan Stoyell's exactness windows: several shapes, aligned and
-    /// unaligned, some where the client's MSD filter lets candidates through.
-    const WINDOWS: &[(u32, u128, u128, u32, u32, u32)] = &[
-        (20, 58_945, 160_000, 3, 2, 0),
-        (20, 58_945, 160_000, 2, 3, 1),
-        (20, 60_001, 150_003, 2, 3, 1),
-        (25, 3_339_797, 4_339_797, 4, 3, 1),
-        (25, 5_000_123, 5_700_456, 3, 4, 2),
-        (30, 300_000_000, 301_000_000, 5, 4, 2),
-        (34, 12_000_000_017, 12_001_000_017, 5, 5, 2),
-        (40, 3_000_000_000_000, 3_000_002_000_000, 6, 5, 2),
-        (40, 3_000_000_000_000, 3_000_002_000_000, 7, 4, 2),
-        (
-            57,
-            30_000_000_000_000_000_000,
-            30_000_000_000_000_300_000,
-            10,
-            4,
-            1,
-        ),
-        (
-            57,
-            20_635_899_893_042_801_193,
-            20_635_899_893_043_101_193,
-            9,
-            5,
-            1,
-        ),
-        (
-            57,
-            78_920_310_198_429_586_458,
-            78_920_310_198_429_886_458,
-            9,
-            5,
-            2,
-        ),
-        (
-            58,
-            114_041_927_169_846_138_720,
-            114_041_927_169_846_438_720,
-            10,
-            4,
-            2,
-        ),
-        (
-            60,
-            1_573_714_731_429_953_349_518,
-            1_573_714_731_429_953_649_518,
-            10,
-            4,
-            2,
-        ),
-        (
-            64,
-            52_125_117_810_081_128_433_988,
-            52_125_117_810_081_128_733_988,
-            11,
-            4,
-            2,
-        ),
-    ];
 
     fn check_all<R: Runtime>(client: &ComputeClient<R>, name: &str) {
         let jp = JoinParams { t: 2, k: 1, p: 0 };
@@ -2351,39 +2250,7 @@ mod tests {
         let jp = crate::overlap_join::join_params_for(base, &range).expect("a join field");
         let fs = FieldSetup::new(base, range.start(), range.end(), jp).expect("field setup");
         let t = std::time::Instant::now();
-        let threads = std::thread::available_parallelism().map_or(4, usize::from);
-        let parts: Vec<u128> = (0..fs.nparts).collect();
-        let (survivors, checked, mut hits) = std::thread::scope(|sc| {
-            let fs = &fs;
-            let workers: Vec<_> = parts
-                .chunks(parts.len().div_ceil(threads))
-                .map(|chunk| {
-                    sc.spawn(move || {
-                        // One partition at a time: a whole field's survivors
-                        // (4.5e8 at base 42) would not fit in memory.
-                        let (mut survivors, mut kept, mut hits) = (0u64, 0u64, Vec::new());
-                        let mut rec = Vec::new();
-                        for &v in chunk {
-                            rec.clear();
-                            let st =
-                                join_range(&fs.base, fs.s, fs.e, fs.jp, Some(&[v]), Some(&mut rec));
-                            survivors += st.survivors;
-                            hits.extend(st.hits);
-                            kept += rec.iter().filter(|&&n| mid_mirror(fs, n)).count() as u64;
-                        }
-                        (survivors, kept, hits)
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .map(|w| w.join().expect("reference worker"))
-                .fold((0u64, 0u64, Vec::new()), |(a, b, mut h), (x, y, z)| {
-                    h.extend(z);
-                    (a + x, b + y, h)
-                })
-        });
-        hits.sort_unstable();
+        let (survivors, checked, hits) = reference_field(&fs);
         let cpu_secs = t.elapsed().as_secs_f64();
         let (got, _, js) = run_routed(ctx, base, &range);
         assert_eq!(got, hits, "b{base} {range:?}: hits differ");
@@ -2400,8 +2267,8 @@ mod tests {
         );
         eprintln!(
             "FULL FIELD device={} b{base} {range:?} {jp:?}: {} partitions, {survivors} join \
-             survivors, {checked} checked, hits {hits:?}; reference {cpu_secs:.0}s on {threads} \
-             threads, join {:.2}s, stride {:.2}s",
+             survivors, {checked} checked, hits {hits:?}; reference {cpu_secs:.0}s, join \
+             {:.2}s, stride {:.2}s",
             ctx.device_name(),
             fs.nparts,
             js.device_secs,

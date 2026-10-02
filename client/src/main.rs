@@ -9,10 +9,11 @@ use nice_common::client_api_async::{
     submit_field_to_server_async,
 };
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
+use nice_common::cpu_join::{CpuJoin, Scratch};
 use nice_common::stride_filter;
 use nice_common::{
     CLIENT_REQUEST_TIMEOUT_SECS, CLIENT_VERSION, DataToClient, DataToServer, FieldResults,
-    FieldSize, SearchMode, UniquesDistributionSimple, ValidationData,
+    FieldSize, NiceNumberSimple, SearchMode, UniquesDistributionSimple, ValidationData,
 };
 
 // k=3 removes 15-22% of stride candidates versus k=2 at production bases
@@ -771,6 +772,14 @@ fn process_field_sync(
         // CPU processing path
         let range: FieldSize = claim_data.into();
 
+        // Production-size nice-only fields at bases 40-64 go to the overlap
+        // join, the same gate as the GPU's.
+        if mode == SearchMode::Niceonly
+            && let Some(join) = CpuJoin::for_field(claim_data.base, &range)
+        {
+            return vec![process_field_join(&join, claim_data.base, cli)];
+        }
+
         // Scale the processing chunk size with the field size
         let chunk_default_size: u128 = 1_000_000;
         let target_max_chunks: u128 = 100_000;
@@ -823,6 +832,33 @@ fn process_field_sync(
                 }
             })
             .collect()
+    }
+}
+
+/// A nice-only field through the CPU overlap join: its partitions on the
+/// thread pool, with the progress bar counting partitions.
+fn process_field_join(join: &CpuJoin, base: u32, cli: &Cli) -> FieldResults {
+    let tqdm_config = simple_tqdm::Config::new()
+        .with_unit("partitions")
+        .with_disable(cli.no_progress);
+    let mut hits: Vec<u128> = (0..join.partitions())
+        .into_par_iter()
+        .tqdm_config(tqdm_config)
+        .map_init(Scratch::default, |scratch, v| {
+            join.run_partition(v, scratch).hits
+        })
+        .flatten_iter()
+        .collect();
+    hits.sort_unstable();
+    FieldResults {
+        distribution: Vec::new(),
+        nice_numbers: hits
+            .into_iter()
+            .map(|number| NiceNumberSimple {
+                number,
+                num_uniques: base,
+            })
+            .collect(),
     }
 }
 

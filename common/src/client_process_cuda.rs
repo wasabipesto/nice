@@ -1706,8 +1706,8 @@ mod tests {
         use crate::cubecl_backend::CubeclContext;
         use crate::gpu_route::{NiceonlyStarted, Route, begin_niceonly};
         use crate::join_plan::JoinField;
-        use crate::join_plan::test_fields::FRONTIER_57;
         use crate::overlap_join::JoinParams;
+        use crate::overlap_join::test_fields::FRONTIER_57;
         let pair = CudaWithJoin {
             cuda: CudaContext::new(0).expect("CUDA context"),
             join: CubeclContext::new_cuda(0).expect("CubeCL CUDA context"),

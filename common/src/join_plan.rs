@@ -1,15 +1,14 @@
-//! A field prepared for the overlap join's GPU stage, and fitted to a device.
+//! A field fitted to a device for the overlap join's GPU stage.
 //!
-//! - [`FieldSetup`]: the host side of a field, which every partition value
-//!   starts from on the device: the top layer at depth `t − p` and the bottom
-//!   prefixes up to depth `f0`, sorted by digit-sum class.
-//! - [`JoinPlan`]: how the field's buffers fit one device. Partitions per
-//!   launch and survivor-list lengths are chosen so that each buffer fits the
-//!   device's largest binding and all of them a budget ([`JoinLimits`]).
+//! - [`JoinPlan`]: how a field's buffers fit one device. Partitions per
+//!   launch and the survivor list's length are chosen so that each buffer
+//!   fits the device's largest binding and all of them a budget
+//!   ([`JoinLimits`]).
 //! - [`plan_join`]: the join's verdict on a field for a device, which
 //!   decides the field's route ([`crate::gpu_route::begin_niceonly`]).
 //!
-//! Nothing here depends on a GPU runtime: the `CubeCL` stage
+//! The field's host side, which every partition value starts from, is
+//! [`FieldSetup`]. Nothing here depends on a GPU runtime: the `CubeCL` stage
 //! (`crate::cubecl_join`) allocates exactly the buffers [`Footprint`]
 //! counts.
 #![cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
@@ -19,10 +18,9 @@
 
 use crate::FieldSize;
 use crate::gpu_config::n_limbs;
-use crate::overlap_join::{Base, JoinParams, join_params_for};
-use anyhow::{Result, anyhow, ensure};
+use crate::overlap_join::{FieldSetup, JoinParams, join_params_for};
+use anyhow::Result;
 use log::warn;
-use std::time::Instant;
 
 /// Partitions per launch (device slots), bounded below by memory. A field
 /// is b^p partitions (3,249 at base 57), so this sets the launch count: 16
@@ -54,136 +52,6 @@ pub(crate) const NICE_RECORD_BYTES: usize = 16;
 /// at bases 40-64 needs 0.3-0.9 GiB at 16 partitions per launch. See
 /// [`JoinLimits`].
 const JOIN_MEMORY: usize = 1 << 30;
-
-/// The host side of a field: everything that does not depend on the
-/// partition value.
-#[derive(Clone)]
-pub(crate) struct FieldSetup {
-    pub base: Base,
-    pub b: u32,
-    pub s: u128,
-    pub e: u128,
-    pub jp: JoinParams,
-    pub f0: u32,
-    pub key_level: bool,
-    /// `b^f0`: the width of one top prefix block.
-    pub w: u128,
-    /// `b^p`: the number of partition values.
-    pub nparts: u128,
-    pub m1: u32,
-    /// Buckets per partition: key values × digit-sum classes.
-    pub nb: usize,
-    pub plo: u128,
-    pub phi: u128,
-    /// Top layer at depth `t − p`.
-    pub tlay: Vec<(u128, u64)>,
-    /// `bpre`: residues mod `b^f0` whose `2·f0` low output digits are
-    /// distinct, sorted by digit-sum class mod `b − 1`; `seg[c]..seg[c + 1]`
-    /// is class `c`.
-    pub bp_r: Vec<u32>,
-    pub bp_m: Vec<u64>,
-    pub seg: Vec<u32>,
-    /// The prefilter tests the output digits below `k2` (1 or 2 more than
-    /// the bottom list's `k`).
-    pub k2: u32,
-    /// Certificate floor of every full-width block in the field (monotone in
-    /// `P`, so the first full block bounds them all).
-    pub full_floor: u32,
-    pub secs: f64,
-}
-
-impl FieldSetup {
-    /// The same field with only the top-layer prefixes `tlay` (a subset of
-    /// its own). The tops keep their intervals, so a partition's survivors
-    /// split exactly between complementary subsets.
-    pub(crate) fn with_tops(&self, tlay: Vec<(u128, u64)>) -> Self {
-        let mut sub = self.clone();
-        sub.tlay = tlay;
-        sub
-    }
-
-    /// # Errors
-    /// A field or parameters the device stage cannot take.
-    #[allow(clippy::many_single_char_names)] // b, s, e, t, k, o, w as in `overlap_join`
-    pub fn new(b: u32, s: u128, e: u128, jp: JoinParams) -> Result<Self> {
-        let t0 = Instant::now();
-        ensure!(s < e, "empty field");
-        let base = Base::try_new(b, s, e - 1)
-            .ok_or_else(|| anyhow!("[{s}, {e}) crosses a digit-length boundary in base {b}"))?;
-        let l = base.l;
-        ensure!(
-            jp.supported(b, l),
-            "{jp:?} not supported at base {b}, L = {l}"
-        );
-        ensure!(e - 1 < 1 << 96, "device tops need n < 2^96");
-        let (t, k, pp) = (jp.t, jp.k, jp.p);
-        let f0 = l - t;
-        let o = t + k - l;
-        let w = base.powu(f0);
-        let tlay = base.top_layer(s, e - 1, t - pp, k);
-        let mut bpre: Vec<(u64, u64)> = Vec::new();
-        base.bot_dfs(0, 0, 0, f0, f0, 0, 0, &mut bpre);
-        ensure!(!bpre.is_empty(), "empty bottom list");
-        let m1 = b - 1;
-        bpre.sort_unstable_by_key(|&(r, _)| (r % u64::from(m1), r));
-        let mut seg = vec![0u32; m1 as usize + 1];
-        for &(r, _) in &bpre {
-            seg[usize::try_from(r % u64::from(m1))? + 1] += 1;
-        }
-        for c in 0..m1 as usize {
-            seg[c + 1] += seg[c];
-        }
-        // Residues below b^f0 < 2^32 (`JoinParams::supported`).
-        let bp_r = bpre
-            .iter()
-            .map(|&(r, _)| u32::try_from(r))
-            .collect::<Result<_, _>>()?;
-        let bp_m = bpre.iter().map(|&(_, m)| m).collect();
-        let keyspace = base.powu(o - pp);
-        // The prefilter tests digits k..k2 too; it needs both powers to have
-        // at least k2 digits and P mod b^(k2 - f0) to fit u32.
-        let mut mid = 2;
-        while mid > 0
-            && (k + mid > base.s2 || u64::from(b).pow(k + mid - f0) >= 1 << 32 || k + mid > 12)
-        {
-            mid -= 1;
-        }
-        // The device stage always prefilters (every field the gate takes, and
-        // every test window, has a depth of 2).
-        ensure!(
-            mid > 0,
-            "{jp:?} at base {b} leaves no room for the prefilter"
-        );
-        let first_full = s.div_ceil(w);
-        let full_floor = if first_full * w + w - 1 < e {
-            base.cert_floor(first_full * w, first_full * w + w - 1, k)
-        } else {
-            0
-        };
-        Ok(Self {
-            k2: k + mid,
-            full_floor,
-            b,
-            s,
-            e,
-            jp,
-            f0,
-            key_level: o - pp == 1,
-            w,
-            nparts: base.powu(pp),
-            m1,
-            nb: keyspace as usize * m1 as usize,
-            plo: s / w,
-            phi: (e - 1) / w,
-            tlay,
-            bp_r,
-            bp_m,
-            seg,
-            secs: t0.elapsed().as_secs_f64(),
-            base,
-        })
-    }
-}
 
 /// What a device allows the join: its largest buffer, and a budget for all
 /// of one field's buffers together.
@@ -429,28 +297,10 @@ pub fn plan_join(base: u32, range: &FieldSize, lim: JoinLimits) -> Option<JoinFi
     }
 }
 
-/// Fields the tests share: production-size fields that the join takes.
-#[cfg(test)]
-pub(crate) mod test_fields {
-    /// A frontier field of base 57.
-    pub(crate) const FRONTIER_57: u128 = 28_151_599_893_042_801_193;
-
-    /// Production-size fields at bases 42-64 (gate-sized at 42, 1e14
-    /// elsewhere), from the middle of their bands and the frontier.
-    pub(crate) const PLAN_FIELDS: &[(u32, u128, u128)] = &[
-        (42, 9_682_651_996_416, 10_000_000_000_000),
-        (50, 62_082_117_268_529_817, 100_000_000_000_000),
-        (57, FRONTIER_57, 100_000_000_000_000),
-        (60, 1_366_405_974_057_412_100_454, 100_000_000_000_000),
-        (62, 7_997_740_455_941_656_911_841, 100_000_000_000_000),
-        (64, 41_242_006_262_957_161_709_568, 100_000_000_000_000),
-    ];
-}
-
 #[cfg(test)]
 mod tests {
-    use super::test_fields::{FRONTIER_57, PLAN_FIELDS};
     use super::*;
+    use crate::overlap_join::test_fields::{FRONTIER_57, PLAN_FIELDS};
 
     fn plan_field(base: u32, start: u128, size: u128) -> FieldSetup {
         let range = FieldSize::new(start, start + size);
