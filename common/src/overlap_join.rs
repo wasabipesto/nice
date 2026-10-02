@@ -39,18 +39,6 @@
 //! the AND of the two masks is zero. Nothing else is assumed: this is the
 //! client's own MSD, LSD, residue and cross-end reasoning, enumerated as a
 //! join.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_lossless,
-    clippy::many_single_char_names,
-    clippy::similar_names,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::missing_panics_doc,
-    clippy::must_use_candidate,
-    clippy::needless_range_loop,
-    clippy::inline_always
-)]
 
 use crate::FieldSize;
 use crate::client_process::get_is_nice;
