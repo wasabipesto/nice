@@ -25,8 +25,7 @@
 //!    digits must be distinct, and disjoint from the top certificate when it
 //!    provably sits above them. It keeps about 6% at bases 57-64, and only
 //!    those are written out. (Dan's design ran the prefilter as a separate
-//!    pass, [`mid_kernel`], over a full survivor list; the tests still run
-//!    that placement to compare the join's own survivor set.)
+//!    pass over a full survivor list, which was never small.)
 //! 4. [`check_kernel`]: the client's own `candidate_check`.
 //!
 //! Buffers are sized per field to the device (`join_plan::JoinPlan`): each
@@ -80,8 +79,7 @@ const MAX_SPLITS: u32 = 32;
 // ---------------------------------------------------------------------------
 
 pub use kernels::{
-    bucket_kernel, check_kernel, join_kernel, mid_kernel, top_fill_kernel, top_kernel,
-    top_scan_kernel,
+    bucket_kernel, check_kernel, join_kernel, top_fill_kernel, top_kernel, top_scan_kernel,
 };
 
 /// The kernels. The cube macro evaluates `comptime!` expressions host-side,
@@ -112,44 +110,6 @@ mod kernels {
     use super::{DEAD_MASK, JOIN_WG, SURV_FLUSH, SURV_SH_CAP, TOP_CAP};
     use crate::cubecl_backend::candidate_check;
     use cubecl::prelude::*;
-
-    /// Flush the shared survivor stage to the global list. Must be called by the
-    /// whole cube at a point where no thread is still appending (after a
-    /// barrier); `sc` is the stage count read after that barrier.
-    #[cube]
-    fn flush_survivors(
-        s_t: &SharedMemory<u32>,
-        s_r: &SharedMemory<u32>,
-        s_cnt: &mut SharedMemory<Atomic<u32>>,
-        s_base: &mut SharedMemory<u32>,
-        surv: &mut Array<u32>,
-        surv_count: &mut Array<Atomic<u32>>,
-        surv_cap: u32,
-        sc: u32,
-    ) {
-        let mut n = sc;
-        if n > SURV_SH_CAP {
-            n = SURV_SH_CAP; // the rest went straight to the global list
-        }
-        if UNIT_POS_X == 0u32 {
-            s_base[0] = surv_count[0].fetch_add(n);
-        }
-        sync_cube();
-        let gb = s_base[0];
-        let mut i = UNIT_POS_X;
-        while i < n {
-            let g = gb + i;
-            if g < surv_cap {
-                surv[(2u32 * g) as usize] = s_t[i as usize];
-                surv[(2u32 * g + 1u32) as usize] = s_r[i as usize];
-            }
-            i += CUBE_DIM_X;
-        }
-        sync_cube();
-        if UNIT_POS_X == 0u32 {
-            s_cnt[0].store(0u32);
-        }
-    }
 
     /// Step 1+ (v3): extension fused with bucketization. One cube per
     /// (class c, slot): its bpre segment is extended by the slot's partition
@@ -330,7 +290,6 @@ mod kernels {
         #[comptime] key_level: bool,
         #[comptime] key_at_zero: bool,
         #[comptime] ept: u32,
-        #[comptime] fused: bool,
         #[comptime] f0: u32,
         #[comptime] k2: u32,
     ) {
@@ -477,36 +436,23 @@ mod kernels {
                     sync_cube();
                     let sc = s_cnt[0].load();
                     if sc >= SURV_FLUSH {
-                        if fused {
-                            flush_survivors_mid(
-                                &s_t,
-                                &s_r,
-                                &mut s_cnt,
-                                &mut s_base,
-                                &mut plane_tot,
-                                top_m,
-                                top_x,
-                                surv,
-                                surv_count,
-                                staged,
-                                surv_cap,
-                                sc,
-                                base,
-                                f0,
-                                k2,
-                            );
-                        } else {
-                            flush_survivors(
-                                &s_t,
-                                &s_r,
-                                &mut s_cnt,
-                                &mut s_base,
-                                surv,
-                                surv_count,
-                                surv_cap,
-                                sc,
-                            );
-                        }
+                        flush_survivors(
+                            &s_t,
+                            &s_r,
+                            &mut s_cnt,
+                            &mut s_base,
+                            &mut plane_tot,
+                            top_m,
+                            top_x,
+                            surv,
+                            surv_count,
+                            staged,
+                            surv_cap,
+                            sc,
+                            base,
+                            f0,
+                            k2,
+                        );
                         sync_cube();
                     }
                     ws += wave;
@@ -519,36 +465,23 @@ mod kernels {
         sync_cube();
         let sc = s_cnt[0].load();
         if sc > 0u32 {
-            if fused {
-                flush_survivors_mid(
-                    &s_t,
-                    &s_r,
-                    &mut s_cnt,
-                    &mut s_base,
-                    &mut plane_tot,
-                    top_m,
-                    top_x,
-                    surv,
-                    surv_count,
-                    staged,
-                    surv_cap,
-                    sc,
-                    base,
-                    f0,
-                    k2,
-                );
-            } else {
-                flush_survivors(
-                    &s_t,
-                    &s_r,
-                    &mut s_cnt,
-                    &mut s_base,
-                    surv,
-                    surv_count,
-                    surv_cap,
-                    sc,
-                );
-            }
+            flush_survivors(
+                &s_t,
+                &s_r,
+                &mut s_cnt,
+                &mut s_base,
+                &mut plane_tot,
+                top_m,
+                top_x,
+                surv,
+                surv_count,
+                staged,
+                surv_cap,
+                sc,
+                base,
+                f0,
+                k2,
+            );
         }
     }
 
@@ -1079,12 +1012,14 @@ mod kernels {
         ok
     }
 
-    /// [`flush_survivors`] with the middle-digit test applied on the way out
-    /// (the fused prefilter): the staged survivors are tested by the whole cube
-    /// and only those that pass go to `out`, compacted per plane with one atomic
-    /// per round. `staged` counts every survivor staged (statistics).
+    /// Flush the shared survivor stage through the middle-digit prefilter:
+    /// the whole cube tests the staged survivors and only those that pass go
+    /// to `out`, compacted per plane with one atomic per round. `staged`
+    /// counts every survivor staged (statistics). Must be called by the whole
+    /// cube at a point where no thread is still appending (after a barrier);
+    /// `sc` is the stage count read after that barrier.
     #[cube]
-    fn flush_survivors_mid(
+    fn flush_survivors(
         s_t: &SharedMemory<u32>,
         s_r: &SharedMemory<u32>,
         s_cnt: &mut SharedMemory<Atomic<u32>>,
@@ -1156,78 +1091,6 @@ mod kernels {
         sync_cube();
         if UNIT_POS_X == 0u32 {
             s_cnt[0].store(0u32);
-        }
-    }
-
-    /// Step 3 (optional): middle-digit prefilter with compaction. See the module
-    /// docs. Soundness: every digit tested is a real digit of n^2 or n^3 at a
-    /// distinct position (the host guarantees both powers have >= k2 digits), and
-    /// seed digits sit at positions >= k2, so any repeat proves n is not nice.
-    #[cube(launch_unchecked)]
-    pub fn mid_kernel(
-        surv: &Array<u32>,
-        surv_count: &mut Array<Atomic<u32>>,
-        top_m: &Array<u32>, // lo, hi certificate words per top
-        top_x: &Array<u32>, // P mod b^(k2-f0), seed flag per top
-        out: &mut Array<u32>,
-        out_count: &mut Array<Atomic<u32>>,
-        surv_cap: u32,
-        out_cap: u32,
-        #[comptime] base: u32,
-        #[comptime] f0: u32,
-        #[comptime] k2: u32,
-    ) {
-        let mut plane_tot = SharedMemory::<u32>::new(comptime!(JOIN_WG as usize));
-        let mut s_base = SharedMemory::<u32>::new(1usize);
-        let my_plane = UNIT_POS_X / PLANE_DIM;
-        let num_planes = CUBE_DIM_X / PLANE_DIM;
-        let mut count = surv_count[0].load();
-        if count > surv_cap {
-            count = surv_cap;
-        }
-        let mut rb = CUBE_POS_X * CUBE_DIM_X;
-        let rstride = CUBE_COUNT_X * CUBE_DIM_X;
-        while rb < count {
-            let i = rb + UNIT_POS_X;
-            let mut pass = 0u32;
-            let mut t = 0u32;
-            let mut r0 = 0u32;
-            if i < count {
-                t = surv[(2u32 * i) as usize];
-                r0 = surv[(2u32 * i + 1u32) as usize];
-                if mid_pass(t, r0, top_m, top_x, base, f0, k2) {
-                    pass = 1u32;
-                }
-            }
-            let idx = plane_exclusive_sum(pass);
-            let tot = plane_sum(pass);
-            if UNIT_POS_PLANE == 0u32 {
-                plane_tot[my_plane as usize] = tot;
-            }
-            sync_cube();
-            let mut off = 0u32;
-            let mut all = 0u32;
-            let mut p = 0u32;
-            while p < num_planes {
-                let tp = plane_tot[p as usize];
-                if p < my_plane {
-                    off += tp;
-                }
-                all += tp;
-                p += 1u32;
-            }
-            if UNIT_POS_X == 0u32 && all > 0u32 {
-                s_base[0] = out_count[0].fetch_add(all);
-            }
-            sync_cube();
-            if pass != 0u32 {
-                let g = s_base[0] + off + idx;
-                if g < out_cap {
-                    out[(2u32 * g) as usize] = t;
-                    out[(2u32 * g + 1u32) as usize] = r0;
-                }
-            }
-            rb += rstride;
         }
     }
 
@@ -1331,9 +1194,6 @@ pub(crate) struct JoinDevice<R: Runtime> {
     pp: u32,
     k: u32,
     k2: u32,
-    mid: u32,
-    /// Prefilter in the join kernel's flush instead of a separate pass.
-    fused: bool,
     key_level: bool,
     limbs: u32,
     chunk_digits: u32,
@@ -1350,10 +1210,9 @@ pub(crate) struct JoinDevice<R: Runtime> {
     lists: Handle,
     counts: Handle,
     nkeys: u32,
-    surv: Handle,
-    surv_cap: u32,
-    list2: Handle,
-    list2_cap: u32,
+    /// The prefilter's survivors, which the full check reads.
+    list: Handle,
+    list_cap: u32,
     nice_out: Handle,
     nice_count: Handle,
     nice_cap: u32,
@@ -1381,13 +1240,11 @@ pub(crate) struct JoinDevice<R: Runtime> {
     cursor: Handle,
 }
 
-/// What a launched batch leaves behind to be read later.
+/// What a launched batch leaves behind to be read later: its two counts,
+/// the pairs that passed the join's AND and the prefilter's survivors.
 pub(crate) struct BatchRec {
-    pub surv_count: Handle,
-    pub list2_count: Handle,
-    /// Survivors were prefiltered in the join kernel: `surv_count` counts
-    /// what was staged, and no unfiltered list exists to overflow.
-    pub fused: bool,
+    pub survivors: Handle,
+    pub checked: Handle,
 }
 
 impl<R: Runtime> JoinDevice<R> {
@@ -1419,8 +1276,7 @@ impl<R: Runtime> JoinDevice<R> {
         let max_slots = plan.slots;
         ensure!(max_slots > 0, "a join plan with no slots");
         let nkeys = if fs.key_level { fs.b } else { 1 };
-        let (fused, surv_cap, list2_cap, nice_cap) =
-            (plan.fused, plan.surv_cap, plan.list2_cap, plan.nice_cap);
+        let (list_cap, nice_cap) = (plan.list_cap, plan.nice_cap);
 
         // Device-side tops: the top layer with its residues, the field
         // bounds, the power table and the per-slot top and bucket lists.
@@ -1481,8 +1337,6 @@ impl<R: Runtime> JoinDevice<R> {
             pp,
             k: fs.jp.k,
             k2: fs.k2,
-            mid: fs.mid,
-            fused,
             key_level: fs.key_level,
             limbs,
             chunk_digits,
@@ -1499,12 +1353,8 @@ impl<R: Runtime> JoinDevice<R> {
             lists: client.empty(max_slots * fp.lists),
             counts: client.empty(max_slots * fp.counts),
             nkeys,
-            // An unused list (fused: the join's own; no prefilter: its
-            // output) is a placeholder.
-            surv: client.empty((surv_cap as usize * 8).max(8)),
-            surv_cap,
-            list2: client.empty((list2_cap as usize * 8).max(8)),
-            list2_cap,
+            list: client.empty(list_cap as usize * 8),
+            list_cap,
             nice_out: client.create(cubecl::bytes::Bytes::from_elems(vec![
                 0u32;
                 nice_cap as usize
@@ -1565,12 +1415,10 @@ impl<R: Runtime> JoinDevice<R> {
         let vs_h = c.create(cubecl::bytes::Bytes::from_elems(vs.to_vec()));
         let top_count = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; nslots]));
         let bucket_cnt = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; nslots * nb]));
-        let surv_count = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
-        let list2_count = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
-        // Fused prefilter: the join kernel tests survivors as it flushes them
-        // and writes only the passing ones, straight to list2.
-        let fused = self.fused;
-        let staged = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
+        // The join kernel counts its survivors and writes only those that
+        // pass the prefilter to the list, which it counts too.
+        let survivors = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
+        let checked = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
         let (cd16, cdiv16) = chunk_constants_u16(self.b);
         unsafe {
             top_kernel::launch_unchecked::<R>(
@@ -1670,75 +1518,35 @@ impl<R: Runtime> JoinDevice<R> {
                 ArrayArg::from_raw_parts(self.tl.clone(), tl_len),
                 ArrayArg::from_raw_parts(self.top_m.clone(), 2 * max_slots * ntl),
                 ArrayArg::from_raw_parts(self.top_r.clone(), 2 * max_slots * ntl),
-                ArrayArg::from_raw_parts(
-                    if fused {
-                        self.list2.clone()
-                    } else {
-                        self.surv.clone()
-                    },
-                    2 * (if fused { self.list2_cap } else { self.surv_cap }) as usize,
-                ),
-                ArrayArg::from_raw_parts(
-                    if fused {
-                        list2_count.clone()
-                    } else {
-                        surv_count.clone()
-                    },
-                    1,
-                ),
+                ArrayArg::from_raw_parts(self.list.clone(), 2 * self.list_cap as usize),
+                ArrayArg::from_raw_parts(checked.clone(), 1),
                 ArrayArg::from_raw_parts(self.top_x.clone(), 2 * max_slots * ntl),
-                ArrayArg::from_raw_parts(staged.clone(), 1),
+                ArrayArg::from_raw_parts(survivors.clone(), 1),
                 nwork_u32,
                 self.nbp,
-                if fused { self.list2_cap } else { self.surv_cap },
+                self.list_cap,
                 self.b,
                 self.key_level,
                 self.key_level && self.k == 1,
                 ENTRIES_PER_THREAD,
-                fused,
                 self.f0,
                 self.k2,
             );
         }
-        let (chk_list, chk_count, chk_cap) = if fused {
-            (self.list2.clone(), list2_count.clone(), self.list2_cap)
-        } else if self.mid > 0 {
-            unsafe {
-                mid_kernel::launch_unchecked::<R>(
-                    c,
-                    CubeCount::Static(CHECK_CUBES, 1, 1),
-                    CubeDim::new_1d(JOIN_WG),
-                    ArrayArg::from_raw_parts(self.surv.clone(), 2 * self.surv_cap as usize),
-                    ArrayArg::from_raw_parts(surv_count.clone(), 1),
-                    ArrayArg::from_raw_parts(self.top_m.clone(), 2 * max_slots * ntl),
-                    ArrayArg::from_raw_parts(self.top_x.clone(), 2 * max_slots * ntl),
-                    ArrayArg::from_raw_parts(self.list2.clone(), 2 * self.list2_cap as usize),
-                    ArrayArg::from_raw_parts(list2_count.clone(), 1),
-                    self.surv_cap,
-                    self.list2_cap,
-                    self.b,
-                    self.f0,
-                    self.k2,
-                );
-            }
-            (self.list2.clone(), list2_count.clone(), self.list2_cap)
-        } else {
-            (self.surv.clone(), surv_count.clone(), self.surv_cap)
-        };
         unsafe {
             check_kernel::launch_unchecked::<R>(
                 c,
                 CubeCount::Static(CHECK_CUBES, 1, 1),
                 CubeDim::new_1d(JOIN_WG),
-                ArrayArg::from_raw_parts(chk_list, 2 * chk_cap as usize),
-                ArrayArg::from_raw_parts(chk_count, 1),
+                ArrayArg::from_raw_parts(self.list.clone(), 2 * self.list_cap as usize),
+                ArrayArg::from_raw_parts(checked.clone(), 1),
                 ArrayArg::from_raw_parts(self.top_p.clone(), 2 * max_slots * ntl),
                 ArrayArg::from_raw_parts(
                     self.nice_out.clone(),
                     self.nice_cap as usize * NICEONLY_STRIDE as usize,
                 ),
                 ArrayArg::from_raw_parts(self.nice_count.clone(), 1),
-                chk_cap,
+                self.list_cap,
                 self.nice_cap,
                 self.w_f0,
                 self.b,
@@ -1753,22 +1561,13 @@ impl<R: Runtime> JoinDevice<R> {
             );
         }
         c.flush().map_err(|e| anyhow!("flush failed: {e:?}"))?;
-        Ok(BatchRec {
-            surv_count: if fused { staged } else { surv_count },
-            list2_count,
-            fused,
-        })
+        Ok(BatchRec { survivors, checked })
     }
 
-    /// Whether a batch dropped survivors past the end of a list, from its
-    /// two counts (`BatchRec::surv_count`, `BatchRec::list2_count`).
-    fn overflowed(&self, rec: &BatchRec, surv: u32, checked: u32) -> bool {
-        (!rec.fused && surv > self.surv_cap) || checked > self.list2_cap
-    }
-
-    /// How many survivors the full check read, from a batch's two counts.
-    fn checked_of(&self, surv: u32, checked: u32) -> u32 {
-        if self.mid > 0 { checked } else { surv }
+    /// Whether a batch dropped prefilter survivors past the end of the list
+    /// (unchecked), from its `checked` count.
+    fn overflowed(&self, checked: u32) -> bool {
+        checked > self.list_cap
     }
 
     fn read_u32(&self, h: &Handle) -> Result<Vec<u32>> {
@@ -1803,18 +1602,26 @@ impl<R: Runtime> JoinDevice<R> {
         Ok(v)
     }
 
-    /// The (prefilter, with `second`) survivors of the most recent batch as
-    /// n, sorted (tests).
+    /// A batch's two counts: the join's survivors and the prefilter's.
     #[cfg(test)]
-    fn read_survivors(&self, rec: &BatchRec, second: bool) -> Result<Vec<u128>> {
-        let (cnt_h, list, cap) = if second {
-            (&rec.list2_count, &self.list2, self.list2_cap)
-        } else {
-            (&rec.surv_count, &self.surv, self.surv_cap)
-        };
-        let cnt = self.read_u32(cnt_h)?[0];
-        ensure!(cnt <= cap, "survivor list overflow: {cnt} > {cap}");
-        let words = self.read_u32(list)?;
+    fn read_counts(&self, rec: &BatchRec) -> Result<(u32, u32)> {
+        Ok((
+            self.read_u32(&rec.survivors)?[0],
+            self.read_u32(&rec.checked)?[0],
+        ))
+    }
+
+    /// The prefilter's survivors of the most recent batch as n, sorted
+    /// (tests).
+    #[cfg(test)]
+    fn read_checked(&self, rec: &BatchRec) -> Result<Vec<u128>> {
+        let cnt = self.read_u32(&rec.checked)?[0];
+        ensure!(
+            cnt <= self.list_cap,
+            "survivor list overflow: {cnt} > {}",
+            self.list_cap
+        );
+        let words = self.read_u32(&self.list)?;
         let tp = self.read_u32(&self.top_p)?;
         let mut v: Vec<u128> = (0..cnt as usize)
             .map(|i| {
@@ -1844,8 +1651,8 @@ pub(crate) struct JoinFieldStats {
     /// parameters, not on the device or the layout, unless a wave overflows
     /// the join kernel's shared stage: then the overflow goes to the list
     /// unprefiltered and uncounted. No production field has done so (the
-    /// counts agree across layouts and prefilter placements), and the full
-    /// check is exact either way.
+    /// counts matched a separate prefilter pass on ten production fields),
+    /// and the full check is exact either way.
     pub survivors: u64,
     pub checked: u64,
     pub retried_partitions: usize,
@@ -1901,19 +1708,19 @@ pub(crate) fn run_field<R: Runtime>(
     }
     let handles: Vec<Handle> = recs
         .iter()
-        .flat_map(|(_, r)| [r.surv_count.clone(), r.list2_count.clone()])
+        .flat_map(|(_, r)| [r.survivors.clone(), r.checked.clone()])
         .collect();
     let counts = cubecl::future::block_on(client.read_async(handles))
         .map_err(|e| anyhow!("read failed: {e:?}"))?;
     let mut retry: Vec<u32> = Vec::new();
-    for (i, (batch, rec)) in recs.iter().enumerate() {
+    for (i, (batch, _)) in recs.iter().enumerate() {
         let surv = u32::from_bytes(&counts[2 * i])[0];
         let checked = u32::from_bytes(&counts[2 * i + 1])[0];
-        if dev.overflowed(rec, surv, checked) {
+        if dev.overflowed(checked) {
             retry.extend_from_slice(batch);
         } else {
             st.survivors += u64::from(surv);
-            st.checked += u64::from(dev.checked_of(surv, checked));
+            st.checked += u64::from(checked);
         }
     }
     let mut hits = dev.read_hits()?;
@@ -1962,11 +1769,11 @@ fn run_partition<R: Runtime>(
     let mut dev = JoinDevice::new(client, fs, plan)?;
     let rec = dev.launch_batch(&[v], false)?;
     st.batches += 1;
-    let surv = dev.read_u32(&rec.surv_count)?[0];
-    let checked = dev.read_u32(&rec.list2_count)?[0];
-    if !dev.overflowed(&rec, surv, checked) {
+    let surv = dev.read_u32(&rec.survivors)?[0];
+    let checked = dev.read_u32(&rec.checked)?[0];
+    if !dev.overflowed(checked) {
         st.survivors += u64::from(surv);
-        st.checked += u64::from(dev.checked_of(surv, checked));
+        st.checked += u64::from(checked);
         hits.extend(dev.read_hits()?);
         return Ok(());
     }
@@ -1979,7 +1786,7 @@ fn run_partition<R: Runtime>(
         fs.s,
         fs.e,
         fs.tlay.len(),
-        plan.list2_cap.max(plan.surv_cap)
+        plan.list_cap
     );
     st.splits += 1;
     let (lo, hi) = fs.tlay.split_at(fs.tlay.len() / 2);
@@ -2223,16 +2030,16 @@ mod tests {
     /// survivor of a production batch (a base-57 partition has 1.5-2.7e6
     /// join survivors), since the tests compare whole lists: the device's
     /// binding limit, but a larger budget than production's.
-    fn test_plan(fs: &FieldSetup, lim: JoinLimits, slots: usize, fused: bool) -> JoinPlan {
+    fn test_plan(fs: &FieldSetup, lim: JoinLimits, slots: usize) -> JoinPlan {
         let lim = JoinLimits {
             max_binding: lim.max_binding,
             budget: 4 << 30,
         };
-        JoinPlan::new(fs, lim, slots, fused, 1 << 24, 1, 2 << 30).expect("the test layout fits")
+        JoinPlan::new(fs, lim, slots, 1 << 24, 1, 2 << 30).expect("the test layout fits")
     }
 
-    /// GPU survivors (after the AND, and after the prefilter) and hits must
-    /// equal the CPU reference, batch by batch. `parts` defaults to the
+    /// The join's survivor count, the prefilter's survivors and the hits
+    /// must equal the CPU reference, batch by batch. `parts` defaults to the
     /// partitions that hold a top of the window, thinned evenly to at most
     /// 96 so a software rasterizer gets through it.
     fn check_window<R: Runtime>(
@@ -2249,46 +2056,35 @@ mod tests {
             let step = live.len().div_ceil(96).max(1);
             live.into_iter().step_by(step).collect()
         });
-        // Both prefilter placements: unfused, the join's own survivor set is
-        // compared too; fused (production), what reaches the full check.
-        for fused in [false, true] {
-            let plan = test_plan(&fs, limits_of(client), 4, fused);
-            let mut dev = JoinDevice::new(client, &fs, &plan).expect("device");
-            let mut cpu_hits = Vec::new();
-            for batch in parts.chunks(dev.max_slots) {
-                let vs: Vec<u128> = batch.iter().map(|&v| u128::from(v)).collect();
-                let mut cpu = Vec::new();
-                let st = join_range(&fs.base, s, e, jp, Some(&vs), Some(&mut cpu));
-                cpu.sort_unstable();
-                cpu_hits.extend(st.hits);
-                let rec = dev.launch_batch(batch, false).expect("launch");
-                if !rec.fused {
-                    let gpu = dev.read_survivors(&rec, false).expect("survivors");
-                    assert_eq!(
-                        gpu, cpu,
-                        "b{b} [{s}, {e}) {jp:?} partitions {batch:?}: survivors differ"
-                    );
-                }
-                if fs.mid > 0 {
-                    let want: Vec<u128> = cpu
-                        .iter()
-                        .copied()
-                        .filter(|&n| mid_mirror(&fs, n))
-                        .collect();
-                    let got = dev.read_survivors(&rec, true).expect("prefilter survivors");
-                    assert_eq!(
-                        got, want,
-                        "b{b} [{s}, {e}) {jp:?} fused={fused} partitions {batch:?}: prefilter differs"
-                    );
-                }
-            }
-            cpu_hits.sort_unstable();
+        let plan = test_plan(&fs, limits_of(client), 4);
+        let mut dev = JoinDevice::new(client, &fs, &plan).expect("device");
+        let mut cpu_hits = Vec::new();
+        for batch in parts.chunks(dev.max_slots) {
+            let vs: Vec<u128> = batch.iter().map(|&v| u128::from(v)).collect();
+            let mut cpu = Vec::new();
+            let st = join_range(&fs.base, s, e, jp, Some(&vs), Some(&mut cpu));
+            cpu.retain(|&n| mid_mirror(&fs, n));
+            cpu.sort_unstable();
+            cpu_hits.extend(st.hits);
+            let rec = dev.launch_batch(batch, false).expect("launch");
+            let (survivors, _) = dev.read_counts(&rec).expect("counts");
             assert_eq!(
-                dev.read_hits().unwrap(),
-                cpu_hits,
-                "b{b} [{s}, {e}) {jp:?} fused={fused}: hits differ"
+                u64::from(survivors),
+                st.survivors,
+                "b{b} [{s}, {e}) {jp:?} partitions {batch:?}: join survivors differ"
+            );
+            let got = dev.read_checked(&rec).expect("prefilter survivors");
+            assert_eq!(
+                got, cpu,
+                "b{b} [{s}, {e}) {jp:?} partitions {batch:?}: prefilter survivors differ"
             );
         }
+        cpu_hits.sort_unstable();
+        assert_eq!(
+            dev.read_hits().unwrap(),
+            cpu_hits,
+            "b{b} [{s}, {e}) {jp:?}: hits differ"
+        );
     }
 
     /// Layouts far tighter than production's, against the CPU reference over
@@ -2313,9 +2109,7 @@ mod tests {
             for v in 0..fs.nparts {
                 let mut rec = Vec::new();
                 let st = join_range(&fs.base, s, e, jp, Some(&[v]), Some(&mut rec));
-                if fs.mid > 0 {
-                    rec.retain(|&n| mid_mirror(&fs, n));
-                }
+                rec.retain(|&n| mid_mirror(&fs, n));
                 survivors += st.survivors;
                 checked += rec.len() as u64;
                 hits.extend(st.hits);
@@ -2331,9 +2125,9 @@ mod tests {
                 continue; // nothing to split
             }
             let cap = |c: usize| u32::try_from(c.max(1)).expect("a small window");
-            let plan = JoinPlan::new(&fs, lim, 2, true, cap(densest / 2), 1, lim.budget)
+            let plan = JoinPlan::new(&fs, lim, 2, cap(densest / 2), 1, lim.budget)
                 .expect("a two-slot layout fits");
-            let retry = JoinPlan::new(&fs, lim, 1, true, cap(single), 1, lim.budget).expect("fits");
+            let retry = JoinPlan::new(&fs, lim, 1, cap(single), 1, lim.budget).expect("fits");
             let field = JoinField::with_plans(fs, plan, retry);
             let (nice, st) = run_field(client, &field).expect("tight run");
             hits.sort_unstable();
@@ -2575,11 +2369,7 @@ mod tests {
                                 join_range(&fs.base, fs.s, fs.e, fs.jp, Some(&[v]), Some(&mut rec));
                             survivors += st.survivors;
                             hits.extend(st.hits);
-                            kept += if fs.mid > 0 {
-                                rec.iter().filter(|&&n| mid_mirror(fs, n)).count() as u64
-                            } else {
-                                rec.len() as u64
-                            };
+                            kept += rec.iter().filter(|&&n| mid_mirror(fs, n)).count() as u64;
                         }
                         (survivors, kept, hits)
                     })

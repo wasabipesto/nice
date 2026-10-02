@@ -83,8 +83,8 @@ pub(crate) struct FieldSetup {
     pub bp_r: Vec<u32>,
     pub bp_m: Vec<u64>,
     pub seg: Vec<u32>,
-    /// Middle-digit prefilter depth above `k` (0 = off) and `k2 = k + mid`.
-    pub mid: u32,
+    /// The prefilter tests the output digits below `k2` (1 or 2 more than
+    /// the bottom list's `k`).
     pub k2: u32,
     /// Certificate floor of every full-width block in the field (monotone in
     /// `P`, so the first full block bounds them all).
@@ -148,6 +148,12 @@ impl FieldSetup {
         {
             mid -= 1;
         }
+        // The device stage always prefilters (every field the gate takes, and
+        // every test window, has a depth of 2).
+        ensure!(
+            mid > 0,
+            "{jp:?} at base {b} leaves no room for the prefilter"
+        );
         let first_full = s.div_ceil(w);
         let full_floor = if first_full * w + w - 1 < e {
             base.cert_floor(first_full * w, first_full * w + w - 1, k)
@@ -155,7 +161,6 @@ impl FieldSetup {
             0
         };
         Ok(Self {
-            mid,
             k2: k + mid,
             full_floor,
             b,
@@ -303,71 +308,44 @@ impl Footprint {
 pub(crate) struct JoinPlan {
     /// Partitions per launch.
     pub slots: usize,
-    /// The prefilter runs in the join kernel's flush (production) instead
-    /// of as a separate pass (the tests' cross-check).
-    pub fused: bool,
-    /// The join's own survivor list; fused, none is written (0).
-    pub surv_cap: u32,
-    /// The list the full check reads: the prefilter's survivors, or the
-    /// join's own when there is no prefilter.
-    pub list2_cap: u32,
+    /// Entries in the survivor list: the prefilter's survivors, which the
+    /// full check reads.
+    pub list_cap: u32,
     pub nice_cap: u32,
     /// Every buffer of the field together, the batches in flight included.
     pub bytes: usize,
 }
 
 impl JoinPlan {
-    /// The layout for `fs` with at most `slots` partitions per launch and
-    /// survivor lists of at most `cap` entries, fitted to `lim`: the lists
-    /// get at most `list_budget` bytes, then as many slots as fit the rest
-    /// of the budget. `None` if one slot with lists of `min_cap` does not.
+    /// The layout for `fs` with at most `slots` partitions per launch and a
+    /// survivor list of at most `cap` entries (8 bytes each), fitted to
+    /// `lim`: the list gets at most `list_budget` bytes, then as many slots
+    /// as fit the rest of the budget. `None` if one slot with a list of
+    /// `min_cap` does not.
     pub(crate) fn new(
         fs: &FieldSetup,
         lim: JoinLimits,
         slots: usize,
-        fused: bool,
         cap: u32,
         min_cap: u32,
         list_budget: usize,
     ) -> Option<Self> {
-        let fused = fused && fs.mid > 0;
         let fp = Footprint::of(fs, NICE_CAP);
-        // Fused: the prefilter's list only. Unfused: the join's own list and,
-        // with a prefilter, its output, a quarter as long for long lists (the
-        // prefilter keeps ~6% at bases 57-64; short lists keep their full
-        // length for the weak seeds of small bases).
-        let per_entry = if fused || fs.mid == 0 { 8 } else { 16 };
-        let cap = u32::try_from(
-            (cap as usize)
-                .min(lim.max_binding / 8)
-                .min(list_budget.saturating_sub(16) / per_entry),
-        )
-        .unwrap_or(u32::MAX);
-        if cap < min_cap.max(1) || fp.largest_fixed > lim.max_binding {
+        let list_cap = u32::try_from((cap as usize).min(lim.max_binding / 8).min(list_budget / 8))
+            .unwrap_or(u32::MAX);
+        if list_cap < min_cap.max(1) || fp.largest_fixed > lim.max_binding {
             return None;
         }
-        let (surv_cap, list2_cap) = if fused {
-            (0, cap)
-        } else if fs.mid == 0 {
-            (cap, 0)
-        } else if cap <= 1 << 22 {
-            (cap, cap)
-        } else {
-            (cap, cap / 4)
-        };
-        // An unused list is still an 8-byte buffer.
-        let lists = (surv_cap as usize * 8).max(8) + (list2_cap as usize * 8).max(8);
-        let room = lim.budget.checked_sub(fp.fixed + lists)?;
+        let list = list_cap as usize * 8;
+        let room = lim.budget.checked_sub(fp.fixed + list)?;
         let slots = slots
             .min(lim.max_binding / fp.largest_per_slot().max(1))
             .min(room / fp.per_slot().max(1));
         (slots > 0).then(|| JoinPlan {
             slots,
-            fused,
-            surv_cap,
-            list2_cap,
+            list_cap,
             nice_cap: NICE_CAP,
-            bytes: fp.fixed + lists + slots * fp.per_slot(),
+            bytes: fp.fixed + list + slots * fp.per_slot(),
         })
     }
 
@@ -377,10 +355,10 @@ impl JoinPlan {
     /// `None` if the device cannot hold one partition with a re-run list of
     /// [`MIN_RETRY_CAP`].
     pub(crate) fn for_field(fs: &FieldSetup, lim: JoinLimits) -> Option<(Self, Self)> {
-        let main = Self::new(fs, lim, SLOTS, true, SURV_CAP, 1, lim.budget / 4)?;
+        let main = Self::new(fs, lim, SLOTS, SURV_CAP, 1, lim.budget / 4)?;
         let fp = Footprint::of(fs, NICE_CAP);
         let spare = lim.budget.saturating_sub(fp.fixed + fp.per_slot());
-        let retry = Self::new(fs, lim, 1, true, SURV_CAP_RETRY, MIN_RETRY_CAP, spare)?;
+        let retry = Self::new(fs, lim, 1, SURV_CAP_RETRY, MIN_RETRY_CAP, spare)?;
         Some((main, retry))
     }
 }
@@ -492,13 +470,9 @@ mod tests {
         for &(base, start, size) in PLAN_FIELDS {
             let fs = plan_field(base, start, size);
             let (plan, retry) = JoinPlan::for_field(&fs, lim).expect("fits a desktop GPU");
+            assert_eq!((plan.slots, plan.list_cap), (SLOTS, SURV_CAP), "b{base}");
             assert_eq!(
-                (plan.slots, plan.fused, plan.list2_cap),
-                (SLOTS, true, SURV_CAP),
-                "b{base}"
-            );
-            assert_eq!(
-                (retry.slots, retry.list2_cap),
+                (retry.slots, retry.list_cap),
                 (1, SURV_CAP_RETRY),
                 "b{base}"
             );
@@ -524,8 +498,8 @@ mod tests {
         let (plan, retry) = JoinPlan::for_field(&fs, lim).expect("lavapipe holds base 57");
         assert!((1..SLOTS).contains(&plan.slots), "{plan:?}");
         assert!(plan.slots * fp.largest_per_slot() <= lim.max_binding);
-        assert!(plan.list2_cap as usize * 8 <= lim.max_binding);
-        assert!(retry.list2_cap >= MIN_RETRY_CAP);
+        assert!(plan.list_cap as usize * 8 <= lim.max_binding);
+        assert!(retry.list_cap >= MIN_RETRY_CAP);
         assert!(plan.bytes <= lim.budget && retry.bytes <= lim.budget);
         // Buffers smaller than one partition's bucket lists (29 MiB here).
         let lim = JoinLimits {
