@@ -26,6 +26,7 @@
 #![cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
+use crate::gpu_route::{FieldTicket, Route};
 use crate::{FieldResults, FieldSize, NiceNumberSimple, msd_prefix_filter, residue_filter};
 use anyhow::{Result, anyhow};
 use log::{debug, warn};
@@ -531,6 +532,11 @@ pub struct NiceonlyStats {
     /// Device time actually spent on this field's batches, where the backend
     /// can measure it (CUDA, from per-batch events); `None` elsewhere.
     pub device_busy_secs: Option<f64>,
+    /// The field went through the overlap join (`crate::cubecl_join`)
+    /// instead of the MSD/stride pipeline: then `msd_secs` is the join's host
+    /// setup, `num_ranges` its partitions, `valid_numbers` the candidates it
+    /// fully checked and `floor` is 0.
+    pub overlap_join: bool,
 }
 
 impl NiceonlyStats {
@@ -552,6 +558,7 @@ impl NiceonlyStats {
             "num_ranges": self.num_ranges,
             "valid_numbers": self.valid_numbers,
             "launches": self.launches,
+            "overlap_join": self.overlap_join,
         })
     }
 }
@@ -561,14 +568,6 @@ pub struct DeviceResult {
     pub nice_numbers: Vec<NiceNumberSimple>,
     /// Device time spent on the field, if the backend measured it.
     pub device_busy_secs: Option<f64>,
-}
-
-/// What a backend's `begin` returns: either the field was handled on the
-/// spot (a base the device cannot take, or a residue-empty one) or it went
-/// into the pipeline and its results come out of the backend's `finish`.
-pub enum NiceonlyStarted {
-    Immediate(FieldResults),
-    Queued,
 }
 
 /// The device-side result of a field, not yet waited for: launched, results
@@ -1056,6 +1055,7 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                         cpu_wait_secs: open.cpu_wait.as_secs_f64(),
                         device_wait_secs: open.device_wait.as_secs_f64(),
                         device_busy_secs: None,
+                        overlap_join: false,
                     },
                     pushed_at: open.pushed_at,
                 })
@@ -1295,15 +1295,15 @@ impl<P: PendingField + Send + 'static> NiceonlyPipeline<P> {
         }
     }
 
-    /// Enter a field. Returns immediately; the workers pick it up as soon as
-    /// they finish the fields before it.
+    /// Enter a field. Returns immediately with the field's ticket; the
+    /// workers pick it up as soon as they finish the fields before it.
     ///
     /// # Errors
     /// Returns an error if the dispatch thread has exited.
     ///
     /// # Panics
     /// Panics if the shared field-queue mutex was poisoned by an earlier panic.
-    pub fn push(&mut self, base: u32, range: &FieldSize) -> Result<()> {
+    pub fn push(&mut self, base: u32, range: &FieldSize) -> Result<FieldTicket> {
         let seq = self.next_seq;
         let tx = self
             .tx
@@ -1312,7 +1312,7 @@ impl<P: PendingField + Send + 'static> NiceonlyPipeline<P> {
         push_field(&self.shared, tx, seq, base, range)?;
         self.outstanding.push_back((seq, base));
         self.next_seq += 1;
-        Ok(())
+        Ok(FieldTicket::new(Route::Stride, seq))
     }
 
     /// Fields pushed and not yet returned.
@@ -1321,20 +1321,26 @@ impl<P: PendingField + Send + 'static> NiceonlyPipeline<P> {
         self.outstanding.len()
     }
 
-    /// Wait for the oldest outstanding field: blocks until its device work is
-    /// done and its results are read back.
+    /// Wait for the field `ticket` stands for, which must be the oldest
+    /// outstanding one: blocks until its device work is done and its results
+    /// are read back.
     ///
     /// # Errors
-    /// The field's error (device failure, descriptor overflow), or the
-    /// pipeline having stopped.
+    /// The field's error (device failure, descriptor overflow), the
+    /// pipeline having stopped, or a ticket that is not the oldest.
     ///
     /// # Panics
     /// Panics if an MSD worker's error slot mutex was poisoned by an earlier panic.
-    pub fn next_result(&mut self) -> Result<(NiceonlyStats, Vec<NiceNumberSimple>)> {
-        let (seq, base) = self
+    pub fn next_result(
+        &mut self,
+        ticket: FieldTicket,
+    ) -> Result<(NiceonlyStats, Vec<NiceNumberSimple>)> {
+        let &(seq, base) = self
             .outstanding
-            .pop_front()
+            .front()
             .ok_or_else(|| anyhow!("no field outstanding in the niceonly pipeline"))?;
+        ticket.redeem(Route::Stride, seq)?;
+        self.outstanding.pop_front();
         let ready = self
             .results
             .as_ref()
@@ -1390,8 +1396,8 @@ pub fn report_field(backend: &str, base: u32, stats: NiceonlyStats) {
 /// (`stride_filter::first_valid_at_or_after` indexes `valid_residues[idx]`).
 /// So this has to be checked before any stride table is built.
 ///
-/// The CUDA path has the same guard inside `process_range_niceonly_cuda`; the
-/// Vulkan and `CubeCL` paths call this ahead of their CPU fallbacks, so it
+/// [`crate::gpu_route::begin_niceonly`] calls it first for the CUDA and
+/// `CubeCL` pipelines, and the Vulkan path ahead of its CPU fallback, so it
 /// also covers bases the GPU itself cannot take.
 #[must_use]
 pub fn residue_empty_result(base: u32) -> Option<FieldResults> {
@@ -1730,13 +1736,13 @@ mod tests {
         let mut pipeline = NiceonlyPipeline::start("test", MockSink(device.clone()));
 
         // Two open at once, like the client runs it.
-        pipeline.push(base, &fields[0]).unwrap();
-        pipeline.push(base, &fields[1]).unwrap();
+        let t0 = pipeline.push(base, &fields[0]).unwrap();
+        let t1 = pipeline.push(base, &fields[1]).unwrap();
         assert_eq!(pipeline.outstanding(), 2);
-        let (stats0, hits0) = pipeline.next_result().unwrap();
-        pipeline.push(base, &fields[2]).unwrap();
-        let (stats1, hits1) = pipeline.next_result().unwrap();
-        let (stats2, hits2) = pipeline.next_result().unwrap();
+        let (stats0, hits0) = pipeline.next_result(t0).unwrap();
+        let t2 = pipeline.push(base, &fields[2]).unwrap();
+        let (stats1, hits1) = pipeline.next_result(t1).unwrap();
+        let (stats2, hits2) = pipeline.next_result(t2).unwrap();
         assert_eq!(pipeline.outstanding(), 0);
         assert_eq!(
             (
@@ -1790,9 +1796,9 @@ mod tests {
             let base = 40;
             let fields = mixed_windows(2);
             let mut pipeline = NiceonlyPipeline::start("test", Failing);
-            pipeline.push(base, &fields[0]).unwrap();
-            pipeline.push(base, &fields[1]).unwrap();
-            let first = pipeline.next_result();
+            let t0 = pipeline.push(base, &fields[0]).unwrap();
+            let _t1 = pipeline.push(base, &fields[1]).unwrap();
+            let first = pipeline.next_result(t0);
             // Drop with a field still outstanding.
             drop(pipeline);
             let _ = tx.send(first.is_err());
@@ -1801,6 +1807,24 @@ mod tests {
             .recv_timeout(Duration::from_mins(2))
             .expect("the pipeline hung on error or on drop");
         assert!(errored, "the launch failure must reach next_result");
+    }
+
+    /// Tickets come back in the order they were issued: the second field's
+    /// ticket is refused while the first is outstanding, and the first then
+    /// still finishes.
+    #[test]
+    fn threaded_pipeline_refuses_tickets_out_of_order() {
+        let base = 40;
+        let fields = mixed_windows(2);
+        let device = Arc::new(Mutex::new(MockDevice::default()));
+        let mut pipeline = NiceonlyPipeline::start("test", MockSink(device));
+        let t0 = pipeline.push(base, &fields[0]).unwrap();
+        let t1 = pipeline.push(base, &fields[1]).unwrap();
+        let t1_again = FieldTicket::new(t1.route(), t1.seq());
+        assert!(pipeline.next_result(t1).is_err());
+        assert_eq!(pipeline.outstanding(), 2);
+        pipeline.next_result(t0).unwrap();
+        pipeline.next_result(t1_again).unwrap();
     }
 
     /// A field the filter rejects entirely still comes back, promptly and
@@ -1816,8 +1840,8 @@ mod tests {
         let field = FieldSize::new(start, start + 100 * PROCESSING_CHUNK_SIZE);
         let device = Arc::new(Mutex::new(MockDevice::default()));
         let mut pipeline = NiceonlyPipeline::start("test", MockSink(device.clone()));
-        pipeline.push(base, &field).unwrap();
-        let (stats, _) = pipeline.next_result().unwrap();
+        let ticket = pipeline.push(base, &field).unwrap();
+        let (stats, _) = pipeline.next_result(ticket).unwrap();
         assert_eq!(stats.num_ranges, 0);
         assert_eq!(stats.launches, 0);
         let d = device.lock().unwrap();
