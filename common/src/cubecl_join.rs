@@ -410,23 +410,31 @@ mod kernels {
                             bit <<= 1u32;
                             jt += 1u32;
                         }
+                        // Each lane walks its set bits, one per round while any
+                        // lane of the plane has one left. With an exit that
+                        // diverged per lane, CUDA's independent thread
+                        // scheduling (sm_70+) let the lanes drift apart, and
+                        // the AND loop after the walk ran with the plane partly
+                        // idle: 1.6-1.7x on this kernel at base 57.
                         #[unroll]
                         for j in 0..ept {
                             let mut x = pm[j as usize] & vv[j as usize];
                             let r0 = rr[j as usize];
-                            while x != 0u32 {
-                                let jt2 = jc + x.trailing_zeros();
-                                x &= x - 1u32;
-                                if r0 >= t_rlo[jt2 as usize] && r0 < t_rhi[jt2 as usize] {
-                                    let at = s_cnt[0].fetch_add(1u32);
-                                    if at < SURV_SH_CAP {
-                                        s_t[at as usize] = t_id[jt2 as usize];
-                                        s_r[at as usize] = r0;
-                                    } else {
-                                        let g = surv_count[0].fetch_add(1u32);
-                                        if g < surv_cap {
-                                            surv[(2u32 * g) as usize] = t_id[jt2 as usize];
-                                            surv[(2u32 * g + 1u32) as usize] = r0;
+                            while plane_any(x != 0u32) {
+                                if x != 0u32 {
+                                    let jt2 = jc + x.trailing_zeros();
+                                    x &= x - 1u32;
+                                    if r0 >= t_rlo[jt2 as usize] && r0 < t_rhi[jt2 as usize] {
+                                        let at = s_cnt[0].fetch_add(1u32);
+                                        if at < SURV_SH_CAP {
+                                            s_t[at as usize] = t_id[jt2 as usize];
+                                            s_r[at as usize] = r0;
+                                        } else {
+                                            let g = surv_count[0].fetch_add(1u32);
+                                            if g < surv_cap {
+                                                surv[(2u32 * g) as usize] = t_id[jt2 as usize];
+                                                surv[(2u32 * g + 1u32) as usize] = r0;
+                                            }
                                         }
                                     }
                                 }
