@@ -293,6 +293,7 @@ mod kernels {
         #[comptime] ept: u32,
         #[comptime] f0: u32,
         #[comptime] k2: u32,
+        #[comptime] walk_sync: bool,
     ) {
         let m1 = comptime!(base - 1);
         let nkeys = comptime!(if key_level { base } else { 1 });
@@ -415,7 +416,11 @@ mod kernels {
                         // diverged per lane, CUDA's independent thread
                         // scheduling (sm_70+) let the lanes drift apart, and
                         // the AND loop after the walk ran with the plane partly
-                        // idle: 1.6-1.7x on this kernel at base 57.
+                        // idle: 1.6-1.7x on this kernel at base 57. On CUDA
+                        // (`walk_sync`) each round also ends with a plane
+                        // barrier, which drops the YIELD ptxas otherwise puts in
+                        // the loop and lets it keep fewer registers: another
+                        // 2-11%.
                         #[unroll]
                         for j in 0..ept {
                             let mut x = pm[j as usize] & vv[j as usize];
@@ -437,6 +442,9 @@ mod kernels {
                                             }
                                         }
                                     }
+                                }
+                                if walk_sync {
+                                    sync_plane();
                                 }
                             }
                         }
@@ -1204,6 +1212,9 @@ pub(crate) struct JoinDevice<R: Runtime> {
     k: u32,
     k2: u32,
     key_level: bool,
+    /// End each round of the join kernel's set-bit walk with a plane
+    /// barrier (CUDA only, see the walk).
+    walk_sync: bool,
     limbs: u32,
     chunk_digits: u32,
     chunk_div: u32,
@@ -1347,6 +1358,14 @@ impl<R: Runtime> JoinDevice<R> {
             k: fs.jp.k,
             k2: fs.k2,
             key_level: fs.key_level,
+            // Only CUDA has independent thread scheduling to correct for, and
+            // WGSL has no plane barrier.
+            walk_sync: R::name(client).contains("cuda")
+                && client
+                    .properties()
+                    .features
+                    .plane
+                    .contains(cubecl::ir::features::Plane::Sync),
             limbs,
             chunk_digits,
             chunk_div,
@@ -1540,6 +1559,7 @@ impl<R: Runtime> JoinDevice<R> {
                 ENTRIES_PER_THREAD,
                 self.f0,
                 self.k2,
+                self.walk_sync,
             );
         }
         unsafe {
