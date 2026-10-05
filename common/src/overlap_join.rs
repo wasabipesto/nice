@@ -43,6 +43,7 @@
 use crate::FieldSize;
 use crate::client_process::get_is_nice;
 use anyhow::{Result, anyhow, ensure};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 /// Smallest base the join is used for. Below this the stride pipeline is as
@@ -56,6 +57,57 @@ pub const JOIN_MAX_BASE: u32 = 64;
 /// example — the stride pipeline stays faster. Production fields at the
 /// frontier are 1e14.
 pub const JOIN_MIN_FIELD_SIZE: u128 = 10_000_000_000_000;
+
+/// A nice-only field's route as `NICE_JOIN_ROUTE` sets it, for testing and
+/// A/B runs while the join settles (to be removed once it has): `join` sends
+/// every field the join can take to it, whatever its size (the other limits
+/// of [`join_verdict`] and the device's still hold); `stride` keeps every
+/// field on the stride path. Unset, `auto`, or anything else decides field
+/// by field. It applies to the CPU and the GPU, and to the benchmark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteOverride {
+    Auto,
+    Join,
+    Stride,
+}
+
+impl RouteOverride {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Some(Self::Auto),
+            "join" => Some(Self::Join),
+            "stride" => Some(Self::Stride),
+            _ => None,
+        }
+    }
+}
+
+/// The process's [`RouteOverride`], read from `NICE_JOIN_ROUTE` once (and
+/// logged once if it overrides anything).
+#[must_use]
+pub fn route_override() -> RouteOverride {
+    static ROUTE: OnceLock<RouteOverride> = OnceLock::new();
+    *ROUTE.get_or_init(|| {
+        let Ok(value) = std::env::var("NICE_JOIN_ROUTE") else {
+            return RouteOverride::Auto;
+        };
+        let route = RouteOverride::parse(&value).unwrap_or_else(|| {
+            log::warn!("NICE_JOIN_ROUTE={value} is not auto, join or stride; ignoring it");
+            RouteOverride::Auto
+        });
+        if route != RouteOverride::Auto {
+            log::warn!(
+                "NICE_JOIN_ROUTE={value}: nice-only fields take the {} path where they can",
+                if route == RouteOverride::Join {
+                    "overlap join"
+                } else {
+                    "stride"
+                }
+            );
+        }
+        route
+    })
+}
 
 /// The join's shape for one field: `t` top digits, `k` bottom digits,
 /// `p` partition digits.
@@ -136,6 +188,8 @@ pub enum StrideReason {
     DeviceTooSmall,
     /// The backend has no overlap join (hand-CUDA).
     NoJoin,
+    /// `NICE_JOIN_ROUTE=stride` ([`RouteOverride`]).
+    Forced,
 }
 
 impl StrideReason {
@@ -149,6 +203,7 @@ impl StrideReason {
             Self::TooWide => "n too wide for the device stage",
             Self::DeviceTooSmall => "device cannot hold one partition",
             Self::NoJoin => "backend has no overlap join",
+            Self::Forced => "forced by NICE_JOIN_ROUTE=stride",
         }
     }
 }
@@ -156,15 +211,28 @@ impl StrideReason {
 /// The join parameters for a field, or why the field takes the stride
 /// path: outside [`JOIN_MIN_BASE`]..=[`JOIN_MAX_BASE`], smaller than
 /// [`JOIN_MIN_FIELD_SIZE`], past the device stage's 96-bit `n`, or crossing a
-/// digit-length boundary of `n`, `n²` or `n³`.
+/// digit-length boundary of `n`, `n²` or `n³`; `NICE_JOIN_ROUTE` can force
+/// either path ([`RouteOverride`]).
 ///
 /// # Errors
 /// The reason the field takes the stride path.
 pub fn join_verdict(base: u32, range: &FieldSize) -> Result<JoinParams, StrideReason> {
+    join_verdict_routed(base, range, route_override())
+}
+
+/// [`join_verdict`] under the route override `route`.
+fn join_verdict_routed(
+    base: u32,
+    range: &FieldSize,
+    route: RouteOverride,
+) -> Result<JoinParams, StrideReason> {
+    if route == RouteOverride::Stride {
+        return Err(StrideReason::Forced);
+    }
     if !(JOIN_MIN_BASE..=JOIN_MAX_BASE).contains(&base) {
         return Err(StrideReason::Base);
     }
-    if range.size() < JOIN_MIN_FIELD_SIZE {
+    if route != RouteOverride::Join && range.size() < JOIN_MIN_FIELD_SIZE {
         return Err(StrideReason::BelowMinSize);
     }
     if range.last() >= 1u128 << 96 {
@@ -1650,28 +1718,66 @@ mod tests {
 
     #[test]
     fn the_verdict_names_why_a_field_takes_the_stride_path() {
+        // As routed without `NICE_JOIN_ROUTE`, whatever the environment.
+        let verdict = |b, f: &FieldSize| join_verdict_routed(b, f, RouteOverride::Auto);
         let r = get_base_range_u128(57).unwrap().unwrap();
         let s = r.range_start;
         assert_eq!(
-            join_verdict(57, &FieldSize::new(s, s + 4_000_000_000)),
+            verdict(57, &FieldSize::new(s, s + 4_000_000_000)),
             Err(StrideReason::BelowMinSize)
         );
-        assert!(join_verdict(57, &FieldSize::new(s, s + JOIN_MIN_FIELD_SIZE)).is_ok());
+        assert!(verdict(57, &FieldSize::new(s, s + JOIN_MIN_FIELD_SIZE)).is_ok());
         let r = get_base_range_u128(35).unwrap().unwrap();
         let end = (r.range_start + JOIN_MIN_FIELD_SIZE).min(r.range_end);
         assert_eq!(
-            join_verdict(35, &FieldSize::new(r.range_start, end)),
+            verdict(35, &FieldSize::new(r.range_start, end)),
             Err(StrideReason::Base)
         );
         // Across 50^10, where n gains a digit.
         let edge = 50u128.pow(10);
         assert_eq!(
-            join_verdict(
+            verdict(
                 50,
                 &FieldSize::new(edge - 5_000_000_000_000, edge + 5_000_000_000_000)
             ),
             Err(StrideReason::LengthChange)
         );
+    }
+
+    /// `NICE_JOIN_ROUTE`: `stride` keeps every field off the join, `join`
+    /// lifts only the size cutoff (base, length and width still decide), and
+    /// anything unrecognised is ignored.
+    #[test]
+    fn the_route_override_forces_either_path() {
+        let r = get_base_range_u128(57).unwrap().unwrap();
+        let s = r.range_start;
+        let small = FieldSize::new(s, s + 4_000_000_000);
+        let field = FieldSize::new(s, s + JOIN_MIN_FIELD_SIZE);
+        assert_eq!(
+            join_verdict_routed(57, &field, RouteOverride::Stride),
+            Err(StrideReason::Forced)
+        );
+        assert!(join_verdict_routed(57, &small, RouteOverride::Join).is_ok());
+        let r = get_base_range_u128(35).unwrap().unwrap();
+        let tiny = FieldSize::new(r.range_start, r.range_start + 1_000);
+        assert_eq!(
+            join_verdict_routed(35, &tiny, RouteOverride::Join),
+            Err(StrideReason::Base)
+        );
+        let edge = 50u128.pow(10);
+        assert_eq!(
+            join_verdict_routed(50, &FieldSize::new(edge - 5, edge + 5), RouteOverride::Join),
+            Err(StrideReason::LengthChange)
+        );
+        for (value, route) in [
+            ("", Some(RouteOverride::Auto)),
+            ("auto", Some(RouteOverride::Auto)),
+            ("JOIN", Some(RouteOverride::Join)),
+            (" stride\n", Some(RouteOverride::Stride)),
+            ("both", None),
+        ] {
+            assert_eq!(RouteOverride::parse(value), route, "{value:?}");
+        }
     }
 
     #[test]
