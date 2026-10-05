@@ -15,10 +15,11 @@ use crate::client_process::process_range_niceonly;
 use crate::gpu_config::gpu_supports_base;
 use crate::gpu_niceonly::{GPU_LSD_K, NiceonlyStats, residue_empty_result};
 use crate::join_plan::{JoinField, JoinLimits, plan_join};
+use crate::overlap_join::{StrideReason, join_verdict};
 use crate::stride_filter::StrideTable;
 use crate::{FieldResults, FieldSize};
 use anyhow::{Result, anyhow, ensure};
-use log::warn;
+use log::{debug, warn};
 
 /// Which of a GPU's pipelines a field went to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,17 +39,34 @@ pub struct FieldTicket {
     route: Route,
     /// The field's place in its pipeline.
     seq: u64,
+    /// Why a stride field did not take the join.
+    stride_reason: Option<StrideReason>,
 }
 
 impl FieldTicket {
     pub(crate) fn new(route: Route, seq: u64) -> Self {
-        Self { route, seq }
+        Self {
+            route,
+            seq,
+            stride_reason: None,
+        }
     }
 
     /// The pipeline holding the field.
     #[must_use]
     pub fn route(&self) -> Route {
         self.route
+    }
+
+    /// Why the field took the stride pipeline, if it did.
+    #[must_use]
+    pub fn stride_reason(&self) -> Option<StrideReason> {
+        self.stride_reason
+    }
+
+    fn because(mut self, reason: StrideReason) -> Self {
+        self.stride_reason = Some(reason);
+        self
     }
 
     /// Hand the ticket back to the `route` pipeline, whose oldest field is
@@ -136,14 +154,51 @@ pub fn begin_niceonly(
             range, base, &table,
         )));
     }
-    let ticket = match gpu
-        .join_limits()
-        .and_then(|lim| plan_join(base, range, lim))
-    {
-        Some(field) => gpu.begin_join(field)?,
-        None => gpu.begin_stride(range, base)?,
+    let verdict = match gpu.join_limits() {
+        Some(lim) => plan_join(base, range, lim),
+        // The field's own reason if it has one, else the backend's.
+        None => Err(join_verdict(base, range)
+            .err()
+            .unwrap_or(StrideReason::NoJoin)),
+    };
+    let ticket = match verdict {
+        Ok(field) => {
+            debug!(
+                "b{base} [{}, {}): overlap join, {} slice(s) of {} partitions, {} per launch",
+                range.start(),
+                range.end(),
+                field.slice_count(),
+                field.partitions(),
+                field.plan.slots
+            );
+            gpu.begin_join(field)?
+        }
+        Err(reason) => {
+            debug!(
+                "b{base} [{}, {}): stride pipeline, {}",
+                range.start(),
+                range.end(),
+                reason.label()
+            );
+            gpu.begin_stride(range, base)?.because(reason)
+        }
     };
     Ok(NiceonlyStarted::Queued(ticket))
+}
+
+/// [`NiceonlyGpu::finish`], with the route's reason from the ticket put
+/// into the field's stats (for telemetry).
+///
+/// # Errors
+/// See [`NiceonlyGpu::finish`].
+pub fn finish_niceonly(
+    gpu: &dyn NiceonlyGpu,
+    ticket: FieldTicket,
+) -> Result<(FieldResults, NiceonlyStats)> {
+    let reason = ticket.stride_reason();
+    let (results, mut stats) = gpu.finish(ticket)?;
+    stats.route_reason = reason;
+    Ok((results, stats))
 }
 
 /// [`begin_niceonly`] and [`NiceonlyGpu::finish`] in one, for callers that
@@ -158,6 +213,6 @@ pub fn process_niceonly(
 ) -> Result<FieldResults> {
     match begin_niceonly(gpu, range, base)? {
         NiceonlyStarted::Immediate(results) => Ok(results),
-        NiceonlyStarted::Queued(ticket) => gpu.finish(ticket).map(|(results, _)| results),
+        NiceonlyStarted::Queued(ticket) => finish_niceonly(gpu, ticket).map(|(results, _)| results),
     }
 }

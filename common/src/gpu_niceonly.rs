@@ -27,6 +27,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use crate::gpu_route::{FieldTicket, Route};
+use crate::overlap_join::{JoinTelemetry, StrideReason};
 use crate::{FieldResults, FieldSize, NiceNumberSimple, msd_prefix_filter, residue_filter};
 use anyhow::{Result, anyhow};
 use log::{debug, warn};
@@ -535,8 +536,12 @@ pub struct NiceonlyStats {
     /// The field went through the overlap join (`crate::cubecl_join`)
     /// instead of the MSD/stride pipeline: then `msd_secs` is the join's host
     /// setup, `num_ranges` its partitions, `valid_numbers` the candidates it
-    /// fully checked and `floor` is 0.
+    /// fully checked and `floor` is 0, and `join` has the join's own account.
     pub overlap_join: bool,
+    pub join: Option<JoinTelemetry>,
+    /// Why a stride field did not take the join (set from its ticket, see
+    /// `crate::gpu_route::finish_niceonly`).
+    pub route_reason: Option<StrideReason>,
 }
 
 impl NiceonlyStats {
@@ -559,6 +564,9 @@ impl NiceonlyStats {
             "valid_numbers": self.valid_numbers,
             "launches": self.launches,
             "overlap_join": self.overlap_join,
+            "route": if self.overlap_join { "join" } else { "stride" },
+            "route_reason": self.route_reason.map(StrideReason::label),
+            "join": self.join.map(|j| j.json()),
         })
     }
 }
@@ -1056,6 +1064,8 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                         device_wait_secs: open.device_wait.as_secs_f64(),
                         device_busy_secs: None,
                         overlap_join: false,
+                        join: None,
+                        route_reason: None,
                     },
                     pushed_at: open.pushed_at,
                 })

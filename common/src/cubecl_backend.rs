@@ -27,7 +27,7 @@
 )]
 
 use crate::client_process::process_range_detailed;
-use crate::cubecl_join::{JoinPipeline, limits_of};
+use crate::cubecl_join::{JoinPipeline, limits_of, run_slices};
 use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
@@ -36,8 +36,9 @@ use crate::gpu_niceonly::{
     RangeSink, batches_in_flight, lane_shift_for, stride_chunk_bits,
 };
 use crate::gpu_route::{FieldTicket, NiceonlyGpu, Route};
-use crate::join_plan::{JoinField, JoinLimits};
+use crate::join_plan::{JoinField, JoinLimits, plan_join};
 use crate::number_stats::get_near_miss_cutoff;
+use crate::overlap_join::StrideReason;
 use crate::stride_filter::StrideTable;
 use crate::{FieldResults, FieldSize, NiceNumberSimple, UniquesDistributionSimple};
 use anyhow::{Context as _, Result, ensure};
@@ -1402,6 +1403,29 @@ static WGPU_DEFAULT: OnceLock<(
     String,
 )> = OnceLock::new();
 
+/// What a timed sample of the overlap join on one field did
+/// ([`CubeclContext::join_sample`]).
+#[derive(Clone, Debug)]
+pub struct JoinSample {
+    /// The field's slices, and partitions per slice (`b^p`).
+    pub slices: usize,
+    pub partitions: u128,
+    /// Partitions per launch planned for the first slice.
+    pub slots: usize,
+    /// Partitions sampled, all from the first slice.
+    pub sampled: usize,
+    /// Host setup of the first slice on the calling thread (bottom list and
+    /// top layer), and the device's wall time for the sampled partitions.
+    pub setup_secs: f64,
+    pub run_secs: f64,
+    /// Pairs that passed the AND, the prefilter's survivors, partitions
+    /// re-run after a list overflowed, and the hits, over the sample.
+    pub survivors: u64,
+    pub checked: u64,
+    pub retried_partitions: usize,
+    pub hits: Vec<u128>,
+}
+
 /// One initialized `CubeCL` device: wgpu everywhere, or the native CUDA
 /// runtime when built with `cubecl-cuda` (the meaningful NVIDIA comparison,
 /// since it exercises `CubeCL`'s CUDA codegen against the hand kernels).
@@ -1688,6 +1712,51 @@ impl CubeclContext {
             niceonly_pipeline: Mutex::new(None),
             join_pipeline: Mutex::new(None),
         })
+    }
+
+    /// Time the overlap join on the partitions `parts` of the first slice of
+    /// `range`, planned, batched and launched exactly as a production field
+    /// is, without running the whole field. This is how the benchmark
+    /// measures the join at production field sizes: the field's time is
+    /// about `setup + (partitions / sampled) · run` per slice, times the
+    /// slices. Kernels compile on first use, so time a throwaway sample
+    /// first. `Ok(Err(reason))` if the field takes the stride pipeline on
+    /// this device.
+    ///
+    /// # Errors
+    /// Device failures.
+    pub fn join_sample(
+        &self,
+        base: u32,
+        range: &FieldSize,
+        parts: &[u32],
+    ) -> Result<std::result::Result<JoinSample, StrideReason>> {
+        let Some(lim) = NiceonlyGpu::join_limits(self) else {
+            return Ok(Err(StrideReason::NoJoin));
+        };
+        let field = match plan_join(base, range, lim) {
+            Ok(field) => field,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let (hits, st) = match self {
+            Self::Wgpu { client, .. } => run_slices(client, &field, 1, parts)?,
+            #[cfg(feature = "cubecl-cuda")]
+            Self::Cuda { client, .. } => run_slices(client, &field, 1, parts)?,
+            #[cfg(feature = "cubecl-hip")]
+            Self::Hip { client, .. } => run_slices(client, &field, 1, parts)?,
+        };
+        Ok(Ok(JoinSample {
+            slices: field.slice_count(),
+            partitions: field.partitions(),
+            slots: field.plan.slots,
+            sampled: parts.len(),
+            setup_secs: st.setup_secs,
+            run_secs: st.device_secs,
+            survivors: st.survivors,
+            checked: st.checked,
+            retried_partitions: st.retried_partitions,
+            hits: hits.iter().map(|h| h.number).collect(),
+        }))
     }
 
     /// The adapter/device name, for reports.

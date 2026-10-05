@@ -5,8 +5,9 @@
 //! A field is `b^p` partitions, independent of each other, which the client
 //! runs in parallel ([`CpuJoin::run_partition`]). One partition:
 //!
-//! 1. **Tops**: every top-layer prefix extended by the partition's digits
-//!    and certified, as in the reference join.
+//! 1. **Tops**, one key digit at a time: the key's top-layer prefixes
+//!    extended by the partition's digits and certified, as in the reference
+//!    join. A thread holds one key's tops (about `1/b` of the partition's).
 //! 2. **Bottoms**: every residue of the field's bottom list extended by the
 //!    partition's fixed digits, with exact arithmetic once per residue.
 //!    What the last bottom digit `d` (the key digit) adds is affine in `d`:
@@ -19,14 +20,36 @@
 //! 4. **Survivors** go through the middle-digit prefilter, as on the GPU,
 //!    and then the client's own full check.
 //!
-//! The client sends it the nice-only fields the GPU's join would take
-//! ([`CpuJoin::for_field`]). Its survivors, and the prefilter's, are exactly
-//! the reference join's: the tests compare them partition by partition.
+//! The client sends it the nice-only fields the GPU's join would take, a
+//! slice at a time ([`slices_for`]): the host's top layer grows with the
+//! field, so a field with more than [`CPU_SLICE_PREFIXES`] top-layer
+//! prefixes is cut into slices of that many. Its survivors, and the
+//! prefilter's, are exactly the reference join's: the tests compare them
+//! partition by partition.
 
 use crate::FieldSize;
 use crate::client_process::{get_is_nice, get_is_nice_with_known_lsd};
-use crate::overlap_join::{Div64, FieldSetup, JoinParams, join_params_for};
+use crate::overlap_join::{
+    Div64, FieldSetup, JoinParams, join_params_for, join_slices, join_verdict, ndigits,
+    prefix_block,
+};
 use anyhow::Result;
+
+/// The most top-layer prefixes one slice of a field may have on the CPU
+/// (see [`slices_for`]). This bounds the host's top layer (about 32 bytes a
+/// prefix, so 0.5 GiB at most) and its key index; a thread's tops are one
+/// key's share of it. Production fields are one slice up to about 1e16.
+pub const CPU_SLICE_PREFIXES: u128 = 1 << 24;
+
+/// A nice-only field the CPU join takes (the GPU's gate,
+/// `overlap_join::join_verdict`), as the slices it runs in: its parameters
+/// and the slices, in order. `None` if it takes the stride walk.
+#[must_use]
+pub fn slices_for(base: u32, range: &FieldSize) -> Option<(JoinParams, Vec<FieldSize>)> {
+    let jp = join_verdict(base, range).ok()?;
+    let block = prefix_block(base, ndigits(range.last(), base), jp);
+    Some((jp, join_slices(range, block, CPU_SLICE_PREFIXES)))
+}
 
 /// The mask of a bottom whose fixed digits repeat: it joins no top.
 const DEAD: u64 = u64::MAX;
@@ -43,7 +66,8 @@ pub struct PartitionResult {
 }
 
 impl PartitionResult {
-    fn add(&mut self, other: PartitionResult) {
+    /// Add another partition's result to this one.
+    pub fn add(&mut self, other: PartitionResult) {
         self.hits.extend(other.hits);
         self.survivors += other.survivors;
         self.checked += other.checked;
@@ -74,9 +98,8 @@ struct Top {
     /// Every certified position is `>= k2`, so the prefilter's digits must
     /// avoid the certificate too.
     seed: bool,
-    /// `P mod (b − 1)`, and the key digit.
+    /// `P mod (b − 1)`.
     pc: u32,
-    key: u32,
 }
 
 /// The bottom-list residues that survive the partition's fixed digits,
@@ -216,11 +239,15 @@ pub struct CpuJoin {
     /// The AND scan may use AVX2 (detected at run time).
     #[cfg(target_arch = "x86_64")]
     avx2: bool,
+    /// `fs.tlay` is ordered by key digit (stably): `key_off[d]..key_off[d +
+    /// 1]` are the prefixes whose key is `d`.
+    key_off: Vec<u32>,
 }
 
 impl CpuJoin {
-    /// The CPU join for a nice-only field, if it takes the field: the same
-    /// gate as the GPU's (`overlap_join::join_params_for`).
+    /// The CPU join for a nice-only field as one piece, if it takes the
+    /// field: the same gate as the GPU's (`overlap_join::join_params_for`).
+    /// The client runs fields a slice at a time ([`slices_for`]).
     #[must_use]
     pub fn for_field(base: u32, range: &FieldSize) -> Option<Self> {
         let jp = join_params_for(base, range)?;
@@ -232,17 +259,32 @@ impl CpuJoin {
     /// # Errors
     /// A field or parameters the join cannot take (see `FieldSetup::new`).
     pub fn new(base: u32, range: &FieldSize, jp: JoinParams) -> Result<Self> {
-        let fs = FieldSetup::new(base, range.start(), range.end(), jp)?;
+        let mut fs = FieldSetup::new(base, range.start(), range.end(), jp)?;
         let b = u64::from(base);
         let k = jp.k;
         let mid = fs.k2 - k;
         let big_m = b.pow(1 + mid);
         let bmid = b.pow(mid);
         let bk1 = b.pow(k - 1);
+        let keyspace = if fs.key_level { base } else { 1 };
+        // The top layer by key digit (stably), so a key's prefixes are
+        // contiguous; the join only reads them a key at a time.
+        // A key digit is below b <= 64.
+        #[allow(clippy::cast_possible_truncation)]
+        let key_of = |p0: u128| (p0 % u128::from(keyspace)) as usize;
+        fs.tlay.sort_by_key(|&(p0, _)| key_of(p0));
+        let mut key_off = vec![0u32; keyspace as usize + 1];
+        for &(p0, _) in &fs.tlay {
+            key_off[key_of(p0) + 1] += 1;
+        }
+        for d in 0..keyspace as usize {
+            key_off[d + 1] += key_off[d];
+        }
         Ok(Self {
             k,
             mid,
-            keyspace: if fs.key_level { base } else { 1 },
+            keyspace,
+            key_off,
             big_m,
             bmid,
             e1: bk1 % big_m,
@@ -324,18 +366,28 @@ impl CpuJoin {
 
     fn run(&self, v: u32, sc: &mut Scratch, mut record: Option<&mut Vec<u128>>) -> PartitionResult {
         let mut out = PartitionResult::default();
-        self.tops(v, &mut sc.tops);
-        if sc.tops.is_empty() {
-            return out;
-        }
-        self.extend(v, &mut sc.ext);
-        sc.tops.sort_unstable_by_key(|t| (t.key, t.pc));
         let m1 = self.fs.m1;
         let roots = &self.fs.base.roots;
-        let mut first = 0;
-        while first < sc.tops.len() {
-            let key = sc.tops[first].key;
-            let end = first + sc.tops[first..].partition_point(|t| t.key == key);
+        // The bottoms are extended at the first key with a top, so a
+        // partition without tops does no bottom work at all.
+        let mut extended = false;
+        for key in 0..self.keyspace {
+            let (lo, hi) = (
+                self.key_off[key as usize] as usize,
+                self.key_off[key as usize + 1] as usize,
+            );
+            if lo == hi {
+                continue;
+            }
+            self.tops(v, &self.fs.tlay[lo..hi], &mut sc.tops);
+            if sc.tops.is_empty() {
+                continue;
+            }
+            if !extended {
+                self.extend(v, &mut sc.ext);
+                extended = true;
+            }
+            sc.tops.sort_unstable_by_key(|t| t.pc);
             // The last bottom digit: the key itself, or the partition's last.
             let d = if self.fs.key_level {
                 key
@@ -343,7 +395,7 @@ impl CpuJoin {
                 self.partition_digit(v, self.fs.jp.p - 1)
             };
             self.list(d, &mut sc.ext, &mut sc.masks, &mut sc.info, &mut sc.offs);
-            for top in &sc.tops[first..end] {
+            for top in &sc.tops {
                 for &root in roots {
                     let c = ((root + m1 - top.pc) % m1) as usize;
                     let (lo, hi) = (sc.offs[c] as usize, sc.offs[c + 1] as usize);
@@ -356,20 +408,20 @@ impl CpuJoin {
                     self.scan(&pass, &sc.masks[lo..hi], &mut out, &mut record);
                 }
             }
-            first = end;
         }
         out
     }
 
-    /// The partition's tops, as the reference join makes them.
+    /// The partition's tops from the top-layer prefixes `layer` (all of one
+    /// key), as the reference join makes them.
     // Below 2^32: w = b^f0 is (`JoinParams::supported`), and so are b^mid,
     // b - 1 and the key space. w, p, a, e as in `overlap_join`.
     #[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
-    fn tops(&self, v: u32, tops: &mut Vec<Top>) {
+    fn tops(&self, v: u32, layer: &[(u128, u64)], tops: &mut Vec<Top>) {
         tops.clear();
         let fs = &self.fs;
         let (w, v) = (fs.w, u128::from(v));
-        for &(p0, _) in &fs.tlay {
+        for &(p0, _) in layer {
             let p = p0 * fs.nparts + v;
             if p < fs.plo || p > fs.phi {
                 continue;
@@ -393,7 +445,6 @@ impl CpuJoin {
                 dm: ((p / self.pk) % u128::from(self.bmid)) as u32,
                 seed: floor >= fs.k2,
                 pc: (p % u128::from(fs.m1)) as u32,
-                key: (p0 % u128::from(self.keyspace)) as u32,
             });
         }
     }
@@ -849,6 +900,65 @@ mod tests {
                 "b{b} [{s}, {e}) {jp:?}"
             );
         }
+    }
+
+    /// A field run slice by slice finds what it finds whole: the same hits,
+    /// join survivors and prefilter survivors, on every window that has
+    /// prefixes enough to cut into three slices.
+    #[test]
+    fn a_field_in_slices_finds_what_it_finds_whole() {
+        let mut sliced_any = 0;
+        for (b, s, e, jp) in windows() {
+            let range = FieldSize::new(s, e);
+            let whole = CpuJoin::new(b, &range, jp).expect("setup");
+            let block = prefix_block(b, whole.fs.base.l, jp);
+            let prefixes = range.last() / block - range.start() / block + 1;
+            if prefixes < 3 {
+                continue;
+            }
+            let slices = join_slices(&range, block, prefixes.div_ceil(3));
+            let mut sc = Scratch::default();
+            let run = |j: &CpuJoin, sc: &mut Scratch| {
+                let mut out = PartitionResult::default();
+                for v in 0..j.partitions() {
+                    out.add(j.run_partition(v, sc));
+                }
+                out.hits.sort_unstable();
+                out
+            };
+            let all = run(&whole, &mut sc);
+            let mut parts = PartitionResult::default();
+            for sl in &slices {
+                parts.add(run(&CpuJoin::new(b, sl, jp).expect("slice setup"), &mut sc));
+            }
+            parts.hits.sort_unstable();
+            assert_eq!(
+                parts,
+                all,
+                "b{b} [{s}, {e}) {jp:?} in {} slices",
+                slices.len()
+            );
+            sliced_any += 1;
+        }
+        assert!(sliced_any >= 5, "only {sliced_any} windows were cut");
+    }
+
+    /// The client's slices: one up to the cap, and the field's range in
+    /// order beyond it.
+    #[test]
+    fn production_fields_are_one_slice_on_the_cpu() {
+        for &(base, start, size) in PLAN_FIELDS {
+            let (_, slices) =
+                slices_for(base, &FieldSize::new(start, start + size)).expect("a join field");
+            assert_eq!(slices.len(), 1, "b{base}");
+        }
+        assert!(
+            slices_for(
+                57,
+                &FieldSize::new(FRONTIER_57, FRONTIER_57 + 4_000_000_000)
+            )
+            .is_none()
+        );
     }
 
     #[test]

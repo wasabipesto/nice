@@ -18,7 +18,9 @@
 
 use crate::FieldSize;
 use crate::gpu_config::n_limbs;
-use crate::overlap_join::{FieldSetup, JoinParams, join_params_for};
+use crate::overlap_join::{
+    FieldSetup, StrideReason, join_slices, join_verdict, ndigits, prefix_block,
+};
 use anyhow::Result;
 use log::warn;
 
@@ -52,6 +54,18 @@ pub(crate) const NICE_RECORD_BYTES: usize = 16;
 /// at bases 40-64 needs 0.3-0.9 GiB at 16 partitions per launch. See
 /// [`JoinLimits`].
 const JOIN_MEMORY: usize = 1 << 30;
+/// An upper bound on the prefilter survivors one partition yields per
+/// top-layer prefix of the field: measured 0.8-1.6 at bases 57-64 on fields
+/// of 1e14-1e15 (b57 frontier 1.08, b58 1.09-1.11, b60 0.79, Dan's dense
+/// b57 fields up to about 1.6). A batch is planned to fill at most half its
+/// survivor list on this bound; one that still overflows is re-run in
+/// smaller batches (`cubecl_join::run_field`).
+const SURV_PER_PREFIX: usize = 2;
+/// Partitions per launch a slice of a large field is cut for
+/// ([`max_slice_prefixes`]). A slice of that size usually gets two or three
+/// times as many, since only a third to a half of its top-layer prefixes
+/// are certified.
+const SLICE_SLOTS: usize = 2;
 
 /// What a device allows the join: its largest buffer, and a budget for all
 /// of one field's buffers together.
@@ -104,9 +118,15 @@ pub(crate) struct Footprint {
 
 impl Footprint {
     pub(crate) fn of(fs: &FieldSetup, nice_cap: u32) -> Self {
+        Self::with_prefixes(fs, fs.tlay.len(), nice_cap)
+    }
+
+    /// The footprint `fs`'s field would have with `ntl` top-layer prefixes:
+    /// every buffer is affine in it.
+    pub(crate) fn with_prefixes(fs: &FieldSetup, ntl: usize, nice_cap: u32) -> Self {
         let b = fs.b as usize;
         let nbp = fs.bp_r.len();
-        let ntl = fs.tlay.len().max(1);
+        let ntl = ntl.max(1);
         let nroots = fs.base.roots.len();
         let nkeys = if fs.key_level { b } else { 1 };
         let nl3 = 3 * n_limbs(fs.b).unwrap_or(3) as usize;
@@ -114,7 +134,7 @@ impl Footprint {
             nbp * 4,                               // bp_r
             nbp * 8,                               // bp_m
             fs.seg.len() * 4,                      // seg
-            fs.tlay.len() * 5 * 4,                 // tlay
+            ntl * 5 * 4,                           // tlay
             10 * 4,                                // fb
             (fs.base.s3 as usize + 1) * nl3 * 4,   // pw
             nroots * 4,                            // roots
@@ -206,9 +226,13 @@ impl JoinPlan {
         }
         let list = list_cap as usize * 8;
         let room = lim.budget.checked_sub(fp.fixed + list)?;
+        // The batch's expected prefilter survivors fill at most half its list.
+        let by_survivors =
+            (list_cap as usize / 2 / (SURV_PER_PREFIX * fs.tlay.len().max(1))).max(1);
         let slots = slots
             .min(lim.max_binding / fp.largest_per_slot().max(1))
-            .min(room / fp.per_slot().max(1));
+            .min(room / fp.per_slot().max(1))
+            .min(by_survivors);
         (slots > 0).then(|| JoinPlan {
             slots,
             list_cap,
@@ -231,11 +255,45 @@ impl JoinPlan {
     }
 }
 
-/// A nice-only field ready for the join on one device: its host side and its
-/// two device layouts, the batches' and the overflow re-run's. Preparing it
+/// The most top-layer prefixes one slice of `fs`'s field may have on a
+/// device with `lim`: [`SLICE_SLOTS`] partitions per launch must fit the
+/// budget and the largest binding, with their expected survivors in half the
+/// list. 0 if not even one prefix fits.
+///
+/// Every buffer that grows with the field grows with its top layer, so this
+/// bounds them all, whatever the field's size ([`plan_join`]).
+pub(crate) fn max_slice_prefixes(fs: &FieldSetup, lim: JoinLimits) -> usize {
+    let (one, two) = (
+        Footprint::with_prefixes(fs, 1, NICE_CAP),
+        Footprint::with_prefixes(fs, 2, NICE_CAP),
+    );
+    // Bytes per prefix: in the field's tables, and per slot.
+    let per_fixed = two.fixed - one.fixed;
+    let per_slot = two.per_slot() - one.per_slot();
+    let per_largest = two.top.max(two.tl) - one.top.max(one.tl);
+    let list_cap = (SURV_CAP as usize)
+        .min(lim.max_binding / 8)
+        .min(lim.budget / 4 / 8);
+    let s = SLICE_SLOTS;
+    let base_bytes = one.fixed - per_fixed + list_cap * 8 + s * (one.per_slot() - per_slot);
+    let by_budget = lim.budget.saturating_sub(base_bytes) / (per_fixed + s * per_slot).max(1);
+    let by_binding =
+        (lim.max_binding / s / per_largest.max(1)).min(lim.max_binding / per_fixed.max(1));
+    let by_survivors = list_cap / 2 / (s * SURV_PER_PREFIX);
+    by_budget.min(by_binding).min(by_survivors)
+}
+
+/// A nice-only field ready for the join on one device: its slices (one, for
+/// any field below about 1e15), the first slice's host side and its two
+/// device layouts, the batches' and the overflow re-run's. Preparing it
 /// decides the field's route ([`plan_join`]), and the device stage then has
-/// no host work left before its first launch.
+/// no host work left before its first launch; it prepares later slices
+/// itself, each while the previous one runs.
 pub struct JoinField {
+    /// The field's slices in order, and the device they were cut for.
+    pub(crate) slices: Vec<FieldSize>,
+    pub(crate) lim: JoinLimits,
+    /// The first slice's setup and layouts.
     pub(crate) fs: FieldSetup,
     pub(crate) plan: JoinPlan,
     pub(crate) retry: JoinPlan,
@@ -243,62 +301,131 @@ pub struct JoinField {
 
 impl JoinField {
     /// Prepare `[range)` at `base` with parameters `jp` for a device with
-    /// `lim`; `Ok(None)` if the device cannot hold one partition of it.
+    /// `lim`, as one slice; `Ok(None)` if the device cannot hold one
+    /// partition of it.
     ///
     /// # Errors
     /// A field or parameters the join cannot take.
+    #[cfg(test)]
     pub(crate) fn prepare(
         base: u32,
         range: &FieldSize,
-        jp: JoinParams,
+        jp: crate::overlap_join::JoinParams,
         lim: JoinLimits,
     ) -> Result<Option<Self>> {
         let fs = FieldSetup::new(base, range.start(), range.end(), jp)?;
-        Ok(JoinPlan::for_field(&fs, lim).map(|(plan, retry)| Self { fs, plan, retry }))
+        Ok(JoinPlan::for_field(&fs, lim).map(|(plan, retry)| Self {
+            slices: vec![*range],
+            lim,
+            fs,
+            plan,
+            retry,
+        }))
     }
 
-    /// A field with layouts of the test's choosing.
+    /// A field with layouts of the test's choosing, as one slice.
     #[cfg(test)]
     pub(crate) fn with_plans(fs: FieldSetup, plan: JoinPlan, retry: JoinPlan) -> Self {
-        Self { fs, plan, retry }
+        Self {
+            slices: vec![FieldSize::new(fs.s, fs.e)],
+            lim: JoinLimits {
+                max_binding: usize::MAX,
+                budget: usize::MAX,
+            },
+            fs,
+            plan,
+            retry,
+        }
+    }
+
+    /// The field cut into slices of at most `max_prefixes` top-layer
+    /// prefixes (tests force small ones).
+    #[cfg(test)]
+    pub(crate) fn resliced(mut self, max_prefixes: u128) -> Result<Self> {
+        let (s, e) = (
+            self.slices[0].start(),
+            self.slices[self.slices.len() - 1].end(),
+        );
+        let block = prefix_block(self.fs.b, self.fs.base.l, self.fs.jp);
+        self.slices = join_slices(&FieldSize::new(s, e), block, max_prefixes);
+        self.fs = self
+            .fs
+            .sub_range(self.slices[0].start(), self.slices[0].end())?;
+        Ok(self)
+    }
+
+    /// The number of slices.
+    #[must_use]
+    pub fn slice_count(&self) -> usize {
+        self.slices.len()
+    }
+
+    /// Partitions in each slice (`b^p`).
+    #[must_use]
+    pub fn partitions(&self) -> u128 {
+        self.fs.nparts
     }
 }
 
 /// The overlap join's verdict on a nice-only field for a device with `lim`:
-/// the field prepared for the join, or `None` for the stride pipeline. The
-/// join takes production-size fields at bases 40-64 ([`join_params_for`])
-/// of which the device can hold at least one partition
-/// ([`JoinPlan::for_field`]); a device that cannot is said so once in the
-/// log. Preparing the field (20-110 ms) happens on the caller's thread, so
+/// the field prepared for the join, or why it takes the stride pipeline.
+///
+/// - **The field:** production-size fields at bases 40-64 ([`join_verdict`]).
+/// - **The device:** the field is cut into slices of at most
+///   [`max_slice_prefixes`] top-layer prefixes, so that whatever its size each
+///   slice fits the device with a few partitions per launch. A device that
+///   cannot hold one partition of a slice gets none, and says so once in the
+///   log.
+///
+/// Preparing the first slice (20-300 ms) happens on the caller's thread, so
 /// in the client it overlaps the device's work on the previous field.
-#[must_use]
-pub fn plan_join(base: u32, range: &FieldSize, lim: JoinLimits) -> Option<JoinField> {
+///
+/// # Errors
+/// The reason the field takes the stride pipeline.
+pub fn plan_join(base: u32, range: &FieldSize, lim: JoinLimits) -> Result<JoinField, StrideReason> {
     static TOO_SMALL: std::sync::Once = std::sync::Once::new();
-    let jp = join_params_for(base, range)?;
-    match JoinField::prepare(base, range, jp, lim) {
-        Ok(Some(field)) => Some(field),
-        Ok(None) => {
-            TOO_SMALL.call_once(|| {
-                warn!(
-                    "overlap join: this device ({} MiB buffer limit, {} MiB budget) cannot hold \
-                     one partition of a base-{base} field; those fields use the stride pipeline",
-                    lim.max_binding >> 20,
-                    lim.budget >> 20
-                );
-            });
-            None
-        }
-        Err(e) => {
+    let too_small = || {
+        TOO_SMALL.call_once(|| {
             warn!(
-                "overlap join cannot take base {base} {range:?} ({e:#}); using the stride pipeline"
+                "overlap join: this device ({} MiB buffer limit, {} MiB budget) cannot hold \
+                 one partition of a base-{base} field; those fields use the stride pipeline",
+                lim.max_binding >> 20,
+                lim.budget >> 20
             );
-            None
-        }
+        });
+        StrideReason::DeviceTooSmall
+    };
+    let cannot = |e: anyhow::Error| {
+        warn!("overlap join cannot take base {base} {range:?} ({e:#}); using the stride pipeline");
+        StrideReason::Base
+    };
+    let jp = join_verdict(base, range)?;
+    let block = prefix_block(base, ndigits(range.last(), base), jp);
+    // The bottom side, and from it the slice size, from the first block.
+    let first_end = (range.start() / block * block + block).min(range.end());
+    let probe = FieldSetup::new(base, range.start(), first_end, jp).map_err(cannot)?;
+    let cap = max_slice_prefixes(&probe, lim);
+    if cap == 0 {
+        return Err(too_small());
     }
+    let slices = join_slices(range, block, cap as u128);
+    let mut fs = probe
+        .sub_range(slices[0].start(), slices[0].end())
+        .map_err(cannot)?;
+    // The first slice's setup includes the bottom list, built for the probe.
+    fs.secs += probe.secs;
+    let (plan, retry) = JoinPlan::for_field(&fs, lim).ok_or_else(too_small)?;
+    Ok(JoinField {
+        slices,
+        lim,
+        fs,
+        plan,
+        retry,
+    })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::overlap_join::test_fields::{FRONTIER_57, PLAN_FIELDS};
 
@@ -331,6 +458,96 @@ mod tests {
                 "b{base}"
             );
         }
+    }
+
+    /// The densest base-58 region the probes found (2026-10-05), where a 1e15
+    /// field overran the join kernel's survivor stage before it flushed per
+    /// chunk.
+    pub(crate) const DENSE_58: u128 = 102_121_216_587_923_470_200;
+
+    /// A field of 1e14 at base `base`, from the middle of its band.
+    fn mid_band(base: u32, size: u128) -> FieldSize {
+        let r = crate::base_range::get_base_range_u128(base)
+            .unwrap()
+            .unwrap();
+        let s = r.range_start + (r.range_end - r.range_start - size) / 2;
+        FieldSize::new(s, s + size)
+    }
+
+    /// Fields of the sizes production uses and will use (1e14 at base 57,
+    /// 1e15 at 58, 1e16 at 60, about 1e17 at 62) get the join on an 8-10 GB
+    /// card, cut into as few slices as fit: one up to 1e15. Every slice's
+    /// buffers fit the budget, and its expected survivors half its list.
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // the field size, printed
+    fn fields_of_every_production_size_are_cut_into_slices_that_fit() {
+        let lim = JoinLimits {
+            max_binding: 10 << 28,
+            budget: JOIN_MEMORY,
+        };
+        for (base, range, most) in [
+            (
+                57,
+                FieldSize::new(FRONTIER_57, FRONTIER_57 + 100_000_000_000_000),
+                1,
+            ),
+            (
+                58,
+                FieldSize::new(DENSE_58, DENSE_58 + 1_000_000_000_000_000),
+                1,
+            ),
+            (60, mid_band(60, 10_000_000_000_000_000), 8),
+            (62, mid_band(62, 100_000_000_000_000_000), 64),
+        ] {
+            let field = plan_join(base, &range, lim).expect("the join takes it");
+            let n = field.slices.len();
+            assert!((1..=most).contains(&n), "b{base}: {n} slices");
+            assert_eq!(field.slices[0].start(), range.start());
+            assert_eq!(field.slices[n - 1].end(), range.end());
+            for w in field.slices.windows(2) {
+                assert_eq!(w[0].end(), w[1].start());
+            }
+            let cap = max_slice_prefixes(&field.fs, lim);
+            let block = prefix_block(base, field.fs.base.l, field.fs.jp);
+            for sl in &field.slices {
+                assert!((sl.last() / block - sl.start() / block) < cap as u128);
+            }
+            let (plan, ntl) = (field.plan, field.fs.tlay.len());
+            assert!(plan.bytes <= lim.budget, "b{base}: {plan:?}");
+            assert!(plan.slots >= SLICE_SLOTS, "b{base}: {plan:?}");
+            assert!(
+                plan.slots * ntl * SURV_PER_PREFIX
+                    <= plan.list_cap as usize / 2 + ntl * SURV_PER_PREFIX
+            );
+            println!(
+                "b{base} {:.0e}: {n} slice(s), first {ntl} prefixes, {} per launch, {} MiB",
+                range.size() as f64,
+                plan.slots,
+                plan.bytes >> 20
+            );
+        }
+    }
+
+    /// A small device cuts the same field finer, and still holds each slice.
+    #[test]
+    fn small_devices_cut_large_fields_finer() {
+        let range = FieldSize::new(DENSE_58, DENSE_58 + 1_000_000_000_000_000);
+        let desktop = plan_join(58, &range, JoinLimits::for_buffer(2 << 30)).expect("fits");
+        let soft = JoinLimits {
+            max_binding: 128 << 20,
+            budget: 256 << 20,
+        };
+        let field = plan_join(58, &range, soft).expect("lavapipe holds a slice");
+        assert!(field.slices.len() > desktop.slices.len());
+        assert!(field.plan.bytes <= soft.budget && field.retry.bytes <= soft.budget);
+        let tiny = JoinLimits {
+            max_binding: 16 << 20,
+            budget: 32 << 20,
+        };
+        assert_eq!(
+            plan_join(58, &range, tiny).err(),
+            Some(StrideReason::DeviceTooSmall)
+        );
     }
 
     /// A device with small buffers gets a smaller layout that respects them,

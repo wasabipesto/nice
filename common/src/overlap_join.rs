@@ -118,20 +118,145 @@ impl JoinParams {
     }
 }
 
-/// The join parameters for a field, or `None` if the field goes to the
-/// stride pipeline: outside [`JOIN_MIN_BASE`]..=[`JOIN_MAX_BASE`], smaller
-/// than [`JOIN_MIN_FIELD_SIZE`], crossing a digit-length boundary of `n`,
-/// `n²` or `n³`, or past the device stage's 96-bit `n`.
-#[must_use]
-pub fn join_params_for(base: u32, range: &FieldSize) -> Option<JoinParams> {
-    if range.size() < JOIN_MIN_FIELD_SIZE || range.last() >= 1u128 << 96 {
-        return None;
+/// Why a nice-only field takes the stride path instead of the overlap join.
+/// The join's own reasons come from [`join_verdict`]; the GPU route adds
+/// the device's and the backend's (`crate::gpu_route::begin_niceonly`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrideReason {
+    /// The base is outside [`JOIN_MIN_BASE`]..=[`JOIN_MAX_BASE`], or the
+    /// join has no parameters for its digit length.
+    Base,
+    /// The field is smaller than [`JOIN_MIN_FIELD_SIZE`].
+    BelowMinSize,
+    /// `n`, `n²` or `n³` changes digit length inside the field.
+    LengthChange,
+    /// `n` reaches 2^96, past the device stage's width.
+    TooWide,
+    /// The GPU cannot hold one partition of a slice of the field.
+    DeviceTooSmall,
+    /// The backend has no overlap join (hand-CUDA).
+    NoJoin,
+}
+
+impl StrideReason {
+    /// A short label, as logged and as sent in telemetry.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Base => "base outside the join's range",
+            Self::BelowMinSize => "field below the join's minimum size",
+            Self::LengthChange => "digit length changes inside the field",
+            Self::TooWide => "n too wide for the device stage",
+            Self::DeviceTooSmall => "device cannot hold one partition",
+            Self::NoJoin => "backend has no overlap join",
+        }
+    }
+}
+
+/// The join parameters for a field, or why the field takes the stride
+/// path: outside [`JOIN_MIN_BASE`]..=[`JOIN_MAX_BASE`], smaller than
+/// [`JOIN_MIN_FIELD_SIZE`], past the device stage's 96-bit `n`, or crossing a
+/// digit-length boundary of `n`, `n²` or `n³`.
+///
+/// # Errors
+/// The reason the field takes the stride path.
+pub fn join_verdict(base: u32, range: &FieldSize) -> Result<JoinParams, StrideReason> {
+    if !(JOIN_MIN_BASE..=JOIN_MAX_BASE).contains(&base) {
+        return Err(StrideReason::Base);
+    }
+    if range.size() < JOIN_MIN_FIELD_SIZE {
+        return Err(StrideReason::BelowMinSize);
+    }
+    if range.last() >= 1u128 << 96 {
+        return Err(StrideReason::TooWide);
     }
     let l = ndigits(range.last(), base);
-    let jp = JoinParams::for_length(base, l)?;
+    let jp = JoinParams::for_length(base, l).ok_or(StrideReason::Base)?;
     // Lengths of n, n² and n³ must be constant over the field.
-    Base::try_new(base, range.first(), range.last())?;
-    Some(jp)
+    Base::try_new(base, range.first(), range.last()).ok_or(StrideReason::LengthChange)?;
+    Ok(jp)
+}
+
+/// What the overlap join did with one field, as sent in telemetry (the
+/// GPU's in `gpu_niceonly::NiceonlyStats`, the CPU's by the client).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct JoinTelemetry {
+    /// Host setup of every slice (top layer and bottom list), and the
+    /// partitions' run time: on the GPU the device's wall time, on the CPU
+    /// the partitions' wall time on the client's threads.
+    pub setup_secs: f64,
+    pub run_secs: f64,
+    /// Slices, and partitions per slice.
+    pub slices: usize,
+    pub partitions: usize,
+    /// GPU: partitions per launch planned, and the fewest any launch used
+    /// (both 0 on the CPU).
+    pub slots: usize,
+    pub min_slots: usize,
+    /// GPU: partitions re-run after their batch overflowed its list, and
+    /// halvings of a partition's top layer.
+    pub retried_partitions: usize,
+    pub splits: u32,
+    /// Pairs that passed the join's AND, and of those the prefilter's
+    /// survivors, which the full check read.
+    pub survivors: u64,
+    pub checked: u64,
+}
+
+impl JoinTelemetry {
+    /// As the `join` object of the telemetry JSON.
+    #[must_use]
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "setup_secs": self.setup_secs,
+            "run_secs": self.run_secs,
+            "slices": self.slices,
+            "partitions": self.partitions,
+            "slots": self.slots,
+            "min_slots": self.min_slots,
+            "retried_partitions": self.retried_partitions,
+            "splits": self.splits,
+            "survivors": self.survivors,
+            "checked": self.checked,
+        })
+    }
+}
+
+/// [`join_verdict`] without the reason: the join parameters for a field, or
+/// `None` if it takes the stride path.
+#[must_use]
+pub fn join_params_for(base: u32, range: &FieldSize) -> Option<JoinParams> {
+    join_verdict(base, range).ok()
+}
+
+/// How many numbers one top-layer prefix covers: `b^(L − t + p)`, the
+/// granularity a field is sliced at ([`join_slices`]).
+#[must_use]
+pub fn prefix_block(base: u32, l: u32, jp: JoinParams) -> u128 {
+    u128::from(base).pow(l - (jp.t - jp.p))
+}
+
+/// `range` cut into consecutive slices of at most `max_prefixes` top-layer
+/// prefixes each, at multiples of `block` ([`prefix_block`]); one slice if
+/// the field has no more prefixes than that.
+///
+/// Every structure the join builds per field grows with its top layer: the
+/// host's (`FieldSetup::tlay`), the device's top buffers, and the
+/// survivors a partition yields. A field is processed slice by slice, so
+/// all of them are bounded by `max_prefixes` whatever the field's size, at
+/// the cost of the per-field fixed work (the bottom side, every partition)
+/// once per slice.
+#[must_use]
+pub fn join_slices(range: &FieldSize, block: u128, max_prefixes: u128) -> Vec<FieldSize> {
+    let step = block.saturating_mul(max_prefixes.max(1));
+    let mut out = Vec::new();
+    let mut s = range.start();
+    while s < range.end() {
+        let e = (s / block * block).saturating_add(step).min(range.end());
+        out.push(FieldSize::new(s, e));
+        s = e;
+    }
+    out
 }
 
 /// Four little-endian `u64` words: enough for `n³` with `n < 2^85`.
@@ -673,7 +798,7 @@ impl FieldSetup {
         let f0 = l - t;
         let o = t + k - l;
         let w = base.powu(f0);
-        let tlay = base.top_layer(s, e - 1, t - pp, k);
+        let (tlay, full_floor) = Self::top_side(&base, jp, w, s, e);
         let mut bpre: Vec<(u64, u64)> = Vec::new();
         base.bot_dfs(0, 0, 0, f0, f0, 0, 0, &mut bpre);
         ensure!(!bpre.is_empty(), "empty bottom list");
@@ -707,12 +832,6 @@ impl FieldSetup {
             mid > 0,
             "{jp:?} at base {b} leaves no room for the prefilter"
         );
-        let first_full = s.div_ceil(w);
-        let full_floor = if first_full * w + w - 1 < e {
-            base.cert_floor(first_full * w, first_full * w + w - 1, k)
-        } else {
-            0
-        };
         Ok(Self {
             k2: k + mid,
             full_floor,
@@ -734,6 +853,60 @@ impl FieldSetup {
             seg,
             secs: t0.elapsed().as_secs_f64(),
             base,
+        })
+    }
+
+    /// The field's top side over `[s, e)`: its top layer at depth `t − p`,
+    /// and the certificate floor of its full-width blocks.
+    fn top_side(base: &Base, jp: JoinParams, w: u128, s: u128, e: u128) -> (Vec<(u128, u64)>, u32) {
+        let tlay = base.top_layer(s, e - 1, jp.t - jp.p, jp.k);
+        let first_full = s.div_ceil(w);
+        let full_floor = if first_full * w + w - 1 < e {
+            base.cert_floor(first_full * w, first_full * w + w - 1, jp.k)
+        } else {
+            0
+        };
+        (tlay, full_floor)
+    }
+
+    /// The same setup for `[s, e)`, another range with the same digit
+    /// lengths (a slice of the field, see [`join_slices`]): the bottom side
+    /// is reused, only the top side is built again.
+    ///
+    /// # Errors
+    /// An empty range, or one whose digit lengths differ from this field's.
+    pub fn sub_range(&self, s: u128, e: u128) -> Result<Self> {
+        let t0 = Instant::now();
+        ensure!(s < e, "empty field");
+        let lengths = Base::try_new(self.b, s, e - 1).map(|b| (b.l, b.s2, b.s3));
+        ensure!(
+            lengths == Some((self.base.l, self.base.s2, self.base.s3)),
+            "[{s}, {e}) does not share the digit lengths of [{}, {})",
+            self.s,
+            self.e
+        );
+        let (tlay, full_floor) = Self::top_side(&self.base, self.jp, self.w, s, e);
+        Ok(Self {
+            base: self.base.clone(),
+            b: self.b,
+            s,
+            e,
+            jp: self.jp,
+            f0: self.f0,
+            key_level: self.key_level,
+            w: self.w,
+            nparts: self.nparts,
+            m1: self.m1,
+            nb: self.nb,
+            plo: s / self.w,
+            phi: (e - 1) / self.w,
+            tlay,
+            bp_r: self.bp_r.clone(),
+            bp_m: self.bp_m.clone(),
+            seg: self.seg.clone(),
+            k2: self.k2,
+            full_floor,
+            secs: t0.elapsed().as_secs_f64(),
         })
     }
 }
@@ -1406,6 +1579,95 @@ mod tests {
         let r = get_base_range_u128(35).unwrap().unwrap();
         let end = (r.range_start + JOIN_MIN_FIELD_SIZE).min(r.range_end);
         assert!(join_params_for(35, &FieldSize::new(r.range_start, end)).is_none());
+    }
+
+    /// Slices cover the field in order, meet at prefix-block boundaries, hold
+    /// at most the cap's prefixes, and are as few as the cap allows.
+    #[test]
+    fn slices_cover_the_field_at_prefix_boundaries() {
+        let block = 1_000u128;
+        for (s, e, cap) in [
+            (0u128, 10_000u128, 3u128),
+            (1_234, 9_876, 2),
+            (5_000, 5_001, 7),
+            (999, 1_001, 1),
+            (0, 10_000, 100),
+        ] {
+            let slices = join_slices(&FieldSize::new(s, e), block, cap);
+            assert_eq!(slices.first().map(FieldSize::start), Some(s));
+            assert_eq!(slices.last().map(FieldSize::end), Some(e));
+            for w in slices.windows(2) {
+                assert_eq!(w[0].end(), w[1].start());
+                assert_eq!(w[1].start() % block, 0);
+            }
+            for sl in &slices {
+                assert!((sl.end() - 1) / block - sl.start() / block < cap, "{sl:?}");
+            }
+            let prefixes = (e - 1) / block - s / block + 1;
+            assert_eq!(
+                slices.len() as u128,
+                prefixes.div_ceil(cap),
+                "[{s}, {e}) cap {cap}"
+            );
+        }
+    }
+
+    /// A slice set up from the field's setup is the setup of that range as a
+    /// field of its own, and the slices' top layers make up the field's.
+    #[test]
+    fn a_slice_sets_up_as_a_field_of_its_own() {
+        let (b, s) = (42, 9_682_651_996_416u128);
+        let range = FieldSize::new(s, s + JOIN_MIN_FIELD_SIZE);
+        let jp = join_params_for(b, &range).expect("a join field");
+        let whole = FieldSetup::new(b, range.start(), range.end(), jp).expect("setup");
+        let block = prefix_block(b, whole.base.l, jp);
+        let prefixes = (range.last() / block - range.start() / block + 1) / 3 + 1;
+        let slices = join_slices(&range, block, prefixes);
+        assert_eq!(slices.len(), 3);
+        let mut layer = Vec::new();
+        for sl in &slices {
+            let sub = whole.sub_range(sl.start(), sl.end()).expect("slice setup");
+            let own = FieldSetup::new(b, sl.start(), sl.end(), jp).expect("setup");
+            assert_eq!(
+                (sub.s, sub.e, sub.plo, sub.phi, sub.full_floor, sub.k2),
+                (own.s, own.e, own.plo, own.phi, own.full_floor, own.k2)
+            );
+            assert_eq!(sub.tlay, own.tlay);
+            assert_eq!(
+                (&sub.bp_r, &sub.bp_m, &sub.seg),
+                (&own.bp_r, &own.bp_m, &own.seg)
+            );
+            layer.extend(sub.tlay);
+        }
+        assert_eq!(layer, whole.tlay);
+        // Another digit length is refused.
+        assert!(whole.sub_range(1, 2).is_err());
+    }
+
+    #[test]
+    fn the_verdict_names_why_a_field_takes_the_stride_path() {
+        let r = get_base_range_u128(57).unwrap().unwrap();
+        let s = r.range_start;
+        assert_eq!(
+            join_verdict(57, &FieldSize::new(s, s + 4_000_000_000)),
+            Err(StrideReason::BelowMinSize)
+        );
+        assert!(join_verdict(57, &FieldSize::new(s, s + JOIN_MIN_FIELD_SIZE)).is_ok());
+        let r = get_base_range_u128(35).unwrap().unwrap();
+        let end = (r.range_start + JOIN_MIN_FIELD_SIZE).min(r.range_end);
+        assert_eq!(
+            join_verdict(35, &FieldSize::new(r.range_start, end)),
+            Err(StrideReason::Base)
+        );
+        // Across 50^10, where n gains a digit.
+        let edge = 50u128.pow(10);
+        assert_eq!(
+            join_verdict(
+                50,
+                &FieldSize::new(edge - 5_000_000_000_000, edge + 5_000_000_000_000)
+            ),
+            Err(StrideReason::LengthChange)
+        );
     }
 
     #[test]

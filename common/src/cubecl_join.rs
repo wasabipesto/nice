@@ -30,11 +30,13 @@
 //!
 //! Buffers are sized per field to the device (`join_plan::JoinPlan`): each
 //! within the device's largest binding and all of them within a budget. A
+//! field too large for that is cut into slices of a bounded top layer and
+//! run slice by slice, so any field size fits (`join_plan::plan_join`). A
 //! device that cannot hold one partition does not get the join, and its
-//! fields stay on the stride pipeline (`join_plan::plan_join`). Every list is bounded
-//! and checked: a batch whose survivors overflow is re-run one partition at
-//! a time with a longer list, and a partition that overflows that is re-run
-//! on halves of its top layer.
+//! fields stay on the stride pipeline. Every list is bounded and checked:
+//! the batches whose survivors overflow are re-run in batches half the
+//! size, down to one partition with a longer list, and a partition that
+//! overflows that is re-run on halves of its top layer.
 #![cfg(feature = "cubecl")]
 
 use crate::NiceNumberSimple;
@@ -45,7 +47,7 @@ use crate::gpu_route::{FieldTicket, Route};
 use crate::join_plan::{
     BATCHES_IN_FLIGHT, Footprint, JoinField, JoinLimits, JoinPlan, NICE_RECORD_BYTES,
 };
-use crate::overlap_join::FieldSetup;
+use crate::overlap_join::{FieldSetup, JoinTelemetry};
 use anyhow::{Result, anyhow, ensure};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -1681,13 +1683,21 @@ impl<R: Runtime> JoinDevice<R> {
 /// What one field through the join did, for telemetry.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct JoinFieldStats {
+    /// Host setup of every slice, the first on the thread that began the
+    /// field and the rest beside the device's work on the slice before.
     pub setup_secs: f64,
+    /// Wall time of the device work, every slice from first launch to last
+    /// read.
     pub device_secs: f64,
     pub device_wait_secs: f64,
+    /// Slices, and partitions per slice.
+    pub slices: usize,
     pub partitions: usize,
     pub batches: u32,
-    /// Partitions per launch, and the bytes of the field's buffers.
+    /// Partitions per launch planned for the first slice, the fewest any
+    /// launch used, and the bytes of the first slice's buffers.
     pub slots: usize,
+    pub min_slots: usize,
     pub bytes: usize,
     /// Pairs that passed the join's AND, and the prefilter's survivors
     /// (what the full check read). Both depend only on the field and the
@@ -1698,18 +1708,18 @@ pub(crate) struct JoinFieldStats {
     /// and the full check is exact either way.
     pub survivors: u64,
     pub checked: u64,
+    /// Partitions of batches that overflowed their list and ran again, in a
+    /// batch half the size (each time they did).
     pub retried_partitions: usize,
     /// Halvings of a re-run partition's top layer (normally none).
     pub splits: u32,
 }
 
-/// Run one prepared field through the join on `client`: every partition
-/// value in batches, then every batch's survivor counts are checked and any
-/// batch that overflowed its list is re-run a partition at a time, on
-/// halves of its top layer if one partition alone overflows (see
-/// [`run_partition`]). A field whose top layer is empty has no candidates
-/// and needs no device work at all; about a third of random 1e14 fields at
-/// bases 57-64 are such.
+/// Run one prepared field through the join on `client`: slice by slice
+/// (each later slice's setup beside the device's work on the one before),
+/// every partition of each in batches ([`run_slice`]). A field whose top
+/// layer is empty has no candidates and needs no device work at all; about
+/// a third of random 1e14 fields at bases 57-64 are such.
 ///
 /// # Errors
 /// Device failures, or a single top prefix of one partition that overflows
@@ -1718,23 +1728,140 @@ pub(crate) fn run_field<R: Runtime>(
     client: &ComputeClient<R>,
     field: &JoinField,
 ) -> Result<(Vec<NiceNumberSimple>, JoinFieldStats)> {
-    let fs = &field.fs;
+    let parts: Vec<u32> = (0..u32::try_from(field.fs.nparts)?).collect();
+    run_slices(client, field, field.slices.len(), &parts)
+}
+
+/// The first `count` slices of `field`, each on the partitions `parts`:
+/// [`run_field`], or a sample of it (`count = 1` and a few partitions) for
+/// timing the join on a production-size field without running all of it.
+///
+/// # Errors
+/// As [`run_field`].
+pub(crate) fn run_slices<R: Runtime>(
+    client: &ComputeClient<R>,
+    field: &JoinField,
+    count: usize,
+    parts: &[u32],
+) -> Result<(Vec<NiceNumberSimple>, JoinFieldStats)> {
     let mut st = JoinFieldStats {
-        setup_secs: fs.secs,
+        partitions: usize::try_from(field.fs.nparts)?,
+        slots: field.plan.slots,
+        min_slots: field.plan.slots,
+        bytes: field.plan.bytes,
         ..JoinFieldStats::default()
     };
-    if fs.tlay.is_empty() {
-        return Ok((Vec::new(), st));
+    let mut hits = Vec::new();
+    let mut slots_hint = field.plan.slots;
+    let mut next: Option<Result<FieldSetup>> = None;
+    for i in 0..count.min(field.slices.len()) {
+        let owned;
+        let fs = if i == 0 {
+            &field.fs
+        } else {
+            owned = next.take().expect("prepared beside the previous slice")?;
+            &owned
+        };
+        st.slices += 1;
+        st.setup_secs += fs.secs;
+        let (plan, retry) = if i == 0 {
+            (field.plan, field.retry)
+        } else {
+            JoinPlan::for_field(fs, field.lim)
+                .ok_or_else(|| anyhow!("slice {i} of the field does not fit the device"))?
+        };
+        let later = field.slices.get(i + 1).filter(|_| i + 1 < count);
+        std::thread::scope(|scope| -> Result<()> {
+            let prep = later.map(|sl| scope.spawn(|| field.fs.sub_range(sl.start(), sl.end())));
+            let used = run_slice(
+                client, fs, &plan, &retry, slots_hint, parts, &mut st, &mut hits,
+            )?;
+            slots_hint = used;
+            next = prep.map(|h| h.join().expect("slice setup panicked"));
+            Ok(())
+        })?;
+    }
+    hits.sort_unstable();
+    hits.dedup();
+    let nice = hits
+        .into_iter()
+        .map(|number| NiceNumberSimple {
+            number,
+            num_uniques: field.fs.b,
+        })
+        .collect();
+    Ok((nice, st))
+}
+
+/// One slice, on the partitions `parts`: batches of at most `slots_hint`
+/// partitions (and of the plan's), all launched before any is read. The
+/// batches whose survivors overflowed their list go again in batches half
+/// the size, until one partition is left; one partition that still
+/// overflows takes the re-run layout ([`run_partition`]). Returns the batch
+/// size the last pass used, for the next slice to start from.
+#[allow(clippy::too_many_arguments)]
+fn run_slice<R: Runtime>(
+    client: &ComputeClient<R>,
+    fs: &FieldSetup,
+    plan: &JoinPlan,
+    retry: &JoinPlan,
+    slots_hint: usize,
+    parts: &[u32],
+    st: &mut JoinFieldStats,
+    hits: &mut Vec<u128>,
+) -> Result<usize> {
+    if fs.tlay.is_empty() || parts.is_empty() {
+        return Ok(slots_hint);
     }
     let t0 = Instant::now();
-    let parts: Vec<u32> = (0..u32::try_from(fs.nparts)?).collect();
-    st.partitions = parts.len();
-    st.slots = field.plan.slots;
-    st.bytes = field.plan.bytes;
-    let mut dev = JoinDevice::new(client, fs, &field.plan)?;
+    let mut dev = JoinDevice::new(client, fs, plan)?;
+    let mut slots = slots_hint.clamp(1, dev.max_slots);
+    let mut todo = parts.to_vec();
+    loop {
+        st.min_slots = st.min_slots.min(slots);
+        let overflowed = run_pass(client, &mut dev, &todo, slots, st)?;
+        if overflowed.is_empty() {
+            break;
+        }
+        debug!(
+            "overlap join b{}: {} partitions overflowed a survivor list in batches of {slots}",
+            fs.b,
+            overflowed.len()
+        );
+        st.retried_partitions += overflowed.len();
+        if slots == 1 {
+            // Survivors past a list's end were dropped unchecked, so these
+            // run again; hits they already found come back again and are
+            // deduplicated by the caller.
+            hits.extend(dev.read_hits()?);
+            drop(dev);
+            for &v in &overflowed {
+                run_partition(client, fs, retry, v, 0, st, hits)?;
+            }
+            st.device_secs += t0.elapsed().as_secs_f64();
+            return Ok(1);
+        }
+        slots = (slots / 2).max(1);
+        todo = overflowed;
+    }
+    hits.extend(dev.read_hits()?);
+    st.device_secs += t0.elapsed().as_secs_f64();
+    Ok(slots)
+}
+
+/// One pass over `parts` in batches of `slots`, pipelined: every batch is
+/// launched before any count is read. Adds the batches that fit their list
+/// to `st` and returns the partitions of those that did not.
+fn run_pass<R: Runtime>(
+    client: &ComputeClient<R>,
+    dev: &mut JoinDevice<R>,
+    parts: &[u32],
+    slots: usize,
+    st: &mut JoinFieldStats,
+) -> Result<Vec<u32>> {
     let mut inflight: VecDeque<LaunchFence> = VecDeque::new();
     let mut recs = Vec::new();
-    for batch in parts.chunks(dev.max_slots) {
+    for batch in parts.chunks(slots) {
         while inflight.len() >= BATCHES_IN_FLIGHT {
             let tw = Instant::now();
             if let Some(f) = inflight.pop_front() {
@@ -1755,44 +1882,36 @@ pub(crate) fn run_field<R: Runtime>(
         .collect();
     let counts = cubecl::future::block_on(client.read_async(handles))
         .map_err(|e| anyhow!("read failed: {e:?}"))?;
-    let mut retry: Vec<u32> = Vec::new();
+    let mut overflowed = Vec::new();
     for (i, (batch, _)) in recs.iter().enumerate() {
         let surv = u32::from_bytes(&counts[2 * i])[0];
         let checked = u32::from_bytes(&counts[2 * i + 1])[0];
         if dev.overflowed(checked) {
-            retry.extend_from_slice(batch);
+            overflowed.extend_from_slice(batch);
         } else {
             st.survivors += u64::from(surv);
             st.checked += u64::from(checked);
         }
     }
-    let mut hits = dev.read_hits()?;
-    drop(dev);
-    if !retry.is_empty() {
-        // Survivors past a list's end were dropped unchecked, so the whole
-        // batch runs again; hits it already found come back again and are
-        // deduplicated below.
-        debug!(
-            "overlap join b{}: {} partitions overflowed a survivor list, re-running one at a time",
-            fs.b,
-            retry.len()
-        );
-        st.retried_partitions = retry.len();
-        for &v in &retry {
-            run_partition(client, fs, &field.retry, v, 0, &mut st, &mut hits)?;
+    Ok(overflowed)
+}
+
+impl JoinFieldStats {
+    /// The field's account as telemetry.
+    pub(crate) fn telemetry(&self) -> JoinTelemetry {
+        JoinTelemetry {
+            setup_secs: self.setup_secs,
+            run_secs: self.device_secs,
+            slices: self.slices,
+            partitions: self.partitions,
+            slots: self.slots,
+            min_slots: self.min_slots,
+            retried_partitions: self.retried_partitions,
+            splits: self.splits,
+            survivors: self.survivors,
+            checked: self.checked,
         }
-        hits.sort_unstable();
-        hits.dedup();
     }
-    st.device_secs = t0.elapsed().as_secs_f64();
-    let nice = hits
-        .into_iter()
-        .map(|number| NiceNumberSimple {
-            number,
-            num_uniques: fs.b,
-        })
-        .collect();
-    Ok((nice, st))
 }
 
 /// The same field with only the top-layer prefixes `tlay` (a subset of its
@@ -1898,23 +2017,27 @@ impl JoinPipeline {
                         device_secs: js.device_secs,
                         total_secs: job.pushed_at.elapsed().as_secs_f64(),
                         floor: 0,
-                        num_ranges: js.partitions,
+                        num_ranges: js.partitions * js.slices.max(1),
                         valid_numbers: js.checked,
                         launches: js.batches,
                         cpu_wait_secs: 0.0,
                         device_wait_secs: js.device_wait_secs,
                         device_busy_secs: None,
                         overlap_join: true,
+                        join: Some(js.telemetry()),
+                        route_reason: None,
                     };
                     debug!(
-                        "overlap join b{base} {jp:?}: setup {:.3}s, device {:.3}s ({} partitions, \
-                         {} batches of {}, {} MiB), {} survivors, {} checked, {} re-run, \
-                         {} splits, total {:.3}s",
+                        "overlap join b{base} {jp:?}: setup {:.3}s, device {:.3}s ({} slices of \
+                         {} partitions, {} batches of {} (at least {}), {} MiB), {} survivors, \
+                         {} checked, {} re-run, {} splits, total {:.3}s",
                         js.setup_secs,
                         js.device_secs,
+                        js.slices,
                         js.partitions,
                         js.batches,
                         js.slots,
+                        js.min_slots,
                         js.bytes >> 20,
                         js.survivors,
                         js.checked,
@@ -2178,6 +2301,144 @@ mod tests {
         );
         println!("{name}: b57 frontier field {jp:?}, partitions 0, 1000, 3248 agree");
         check_tight_layouts(client, name);
+        check_slices(client, name);
+    }
+
+    /// A field run slice by slice (here cut into about three) finds what it
+    /// finds whole: the same hits, join survivors and prefilter survivors.
+    fn check_slices<R: Runtime>(client: &ComputeClient<R>, name: &str) {
+        let lim = limits_of(client);
+        let mut sliced_any = 0;
+        for &(b, s, e, t, k, p) in WINDOWS {
+            let (jp, range) = (JoinParams { t, k, p }, FieldSize::new(s, e));
+            let Some(whole) = JoinField::prepare(b, &range, jp, lim).expect("setup") else {
+                continue;
+            };
+            let block = crate::overlap_join::prefix_block(b, whole.fs.base.l, jp);
+            let prefixes = range.last() / block - range.start() / block + 1;
+            if prefixes < 3 || whole.fs.nparts > 64 {
+                continue; // nothing to cut, or long on a software rasterizer
+            }
+            let (all, st_all) = run_field(client, &whole).expect("whole run");
+            let field = whole.resliced(prefixes.div_ceil(3)).expect("slices");
+            let (got, st) = run_field(client, &field).expect("sliced run");
+            assert!(st.slices >= 2, "b{b} [{s}, {e}) {jp:?}: {st:?}");
+            assert_eq!(got, all, "b{b} [{s}, {e}) {jp:?}: hits differ");
+            assert_eq!(
+                (st.survivors, st.checked),
+                (st_all.survivors, st_all.checked),
+                "b{b} [{s}, {e}) {jp:?}: survivor counts differ in {} slices",
+                st.slices
+            );
+            sliced_any += 1;
+        }
+        assert!(sliced_any > 0, "{name}: no window was cut into slices");
+        println!("{name}: {sliced_any} windows agree whole and in slices");
+    }
+
+    /// The benchmark's sample of a production field: partitions of the b57
+    /// frontier field's first (only) slice, timed through the production
+    /// plan, with the CPU join's counts; and a field below the size gate
+    /// gets the reason instead.
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn join_sample_runs_partitions_of_a_production_field() {
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        let range = FieldSize::new(FRONTIER_57, FRONTIER_57 + 100_000_000_000_000);
+        let parts = [1_000u32];
+        let sample = ctx
+            .join_sample(57, &range, &parts)
+            .expect("device run")
+            .expect("a join field");
+        assert_eq!(
+            (sample.slices, sample.partitions, sample.sampled),
+            (1, 3_249, 1)
+        );
+        let cpu = crate::cpu_join::CpuJoin::for_field(57, &range).expect("a join field");
+        let want = cpu.run_partition(1_000, &mut crate::cpu_join::Scratch::default());
+        assert_eq!(
+            (sample.survivors, sample.checked),
+            (want.survivors, want.checked)
+        );
+        assert_eq!(sample.hits, want.hits);
+        assert!(sample.setup_secs > 0.0 && sample.run_secs > 0.0);
+        let small = FieldSize::new(FRONTIER_57, FRONTIER_57 + 4_000_000_000);
+        assert_eq!(
+            ctx.join_sample(57, &small, &parts)
+                .expect("no device work")
+                .err(),
+            Some(crate::overlap_join::StrideReason::BelowMinSize)
+        );
+    }
+
+    /// A field with dense buckets (base 58, 1e15), on `NICE_TEST_JOIN_DENSE`
+    /// partitions spread over it: the hits must equal the CPU join's, and
+    /// the survivor counts nearly so. A chunk that overruns the stage's
+    /// headroom still sends its overflow to the list unfiltered (and
+    /// uncounted as a join survivor); with the stage flushed per chunk that
+    /// is about 2e-5 of the survivors here (7.6k of 323M on 32 partitions),
+    /// where flushing per wave sent two thirds (11x the full checks).
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device; opt-in, NICE_TEST_JOIN_DENSE=partitions"]
+    fn cubecl_cuda_join_matches_the_cpu_join_on_a_dense_field() {
+        let Ok(n) = std::env::var("NICE_TEST_JOIN_DENSE") else {
+            eprintln!("skipping: set NICE_TEST_JOIN_DENSE to a partition count");
+            return;
+        };
+        let n: u32 = n.parse().expect("NICE_TEST_JOIN_DENSE: a count");
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        let CubeclContext::Cuda { client, .. } = ctx else {
+            unreachable!("new_cuda is CUDA")
+        };
+        let dense = crate::join_plan::tests::DENSE_58;
+        let range = FieldSize::new(dense, dense + 1_000_000_000_000_000);
+        let field =
+            crate::join_plan::plan_join(58, &range, limits_of(&client)).expect("a join field");
+        let total = u32::try_from(field.fs.nparts).unwrap();
+        let parts: Vec<u32> = (0..n).map(|i| i * total / n.max(1)).collect();
+        let t0 = Instant::now();
+        let (hits, st) = run_slices(&client, &field, 1, &parts).expect("device run");
+        let gpu_secs = t0.elapsed().as_secs_f64();
+        let cpu =
+            crate::cpu_join::CpuJoin::new(58, &field.slices[0], field.fs.jp).expect("cpu setup");
+        let mut sc = crate::cpu_join::Scratch::default();
+        let mut want = crate::cpu_join::PartitionResult::default();
+        for &v in &parts {
+            want.add(cpu.run_partition(v, &mut sc));
+        }
+        want.hits.sort_unstable();
+        let got: Vec<u128> = hits.iter().map(|h| h.number).collect();
+        println!(
+            "b58 dense 1e15, {n} partitions: {} slice(s), {} per launch (fewest {}), {} re-run; \
+             survivors {} checked {} on the device in {gpu_secs:.2}s",
+            field.slices.len(),
+            st.slots,
+            st.min_slots,
+            st.retried_partitions,
+            st.survivors,
+            st.checked
+        );
+        assert_eq!(got, want.hits, "hits differ");
+        // Each survivor that overran the stage is missing from the join's
+        // count and went to the list unfiltered: at most one more checked.
+        assert!(
+            st.survivors <= want.survivors,
+            "more join survivors than the CPU join"
+        );
+        let spilled = want.survivors - st.survivors;
+        #[allow(clippy::cast_precision_loss)]
+        let share = spilled as f64 / want.survivors.max(1) as f64;
+        println!("  {spilled} survivors overran the stage ({share:.1e} of them)");
+        assert!(
+            share <= 1e-4,
+            "{spilled} of {} survivors overran the stage",
+            want.survivors
+        );
+        assert!(
+            st.checked >= want.checked && st.checked - want.checked <= spilled,
+            "prefilter survivors differ beyond the overrun"
+        );
     }
 
     #[test]

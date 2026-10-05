@@ -9,7 +9,8 @@ use nice_common::client_api_async::{
     submit_field_to_server_async,
 };
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
-use nice_common::cpu_join::{CpuJoin, Scratch};
+use nice_common::cpu_join::{CpuJoin, PartitionResult, Scratch, slices_for};
+use nice_common::overlap_join::{JoinParams, JoinTelemetry, StrideReason, join_verdict};
 use nice_common::stride_filter;
 use nice_common::{
     CLIENT_REQUEST_TIMEOUT_SECS, CLIENT_VERSION, DataToClient, DataToServer, FieldResults,
@@ -51,7 +52,7 @@ use nice_common::cubecl_backend::{
 };
 #[cfg(any(feature = "cuda", feature = "cubecl"))]
 use nice_common::gpu_route::{
-    FieldTicket, NiceonlyGpu, NiceonlyStarted, begin_niceonly, process_niceonly,
+    FieldTicket, NiceonlyGpu, NiceonlyStarted, begin_niceonly, finish_niceonly, process_niceonly,
 };
 #[cfg(feature = "vulkan")]
 use nice_common::vulkan::VulkanContext;
@@ -712,7 +713,7 @@ fn process_field_sync(
     cli: &Cli,
     gpu: &GpuCtx,
     stride_table: Option<&Arc<stride_filter::StrideTable>>,
-) -> Vec<FieldResults> {
+) -> (Vec<FieldResults>, PipelineTelemetry) {
     let mode = cli.mode;
     if cli.gpu {
         // GPU processing path
@@ -755,7 +756,7 @@ fn process_field_sync(
             };
 
             match gpu_results {
-                Ok(result) => vec![result],
+                Ok(result) => (vec![result], None),
                 Err(e) => {
                     error!("GPU processing error: {e:?}");
                     std::process::exit(1);
@@ -774,10 +775,30 @@ fn process_field_sync(
 
         // Production-size nice-only fields at bases 40-64 go to the overlap
         // join, the same gate as the GPU's.
-        if mode == SearchMode::Niceonly
-            && let Some(join) = CpuJoin::for_field(claim_data.base, &range)
-        {
-            return vec![process_field_join(&join, claim_data.base, cli)];
+        let base = claim_data.base;
+        let mut telemetry = None;
+        if mode == SearchMode::Niceonly {
+            if let Some((jp, slices)) = slices_for(base, &range) {
+                debug!(
+                    "b{base} [{}, {}): overlap join on the CPU, {} slice(s)",
+                    range.start(),
+                    range.end(),
+                    slices.len()
+                );
+                if let Some((results, join)) = process_field_join(base, jp, &slices, cli) {
+                    let telemetry = serde_json::json!({ "route": "join", "join": join.json() });
+                    return (vec![results], Some(telemetry));
+                }
+            } else {
+                let reason = join_verdict(base, &range).err().map(StrideReason::label);
+                debug!(
+                    "b{base} [{}, {}): stride walk on the CPU, {}",
+                    range.start(),
+                    range.end(),
+                    reason.unwrap_or("")
+                );
+                telemetry = Some(serde_json::json!({ "route": "stride", "route_reason": reason }));
+            }
         }
 
         // Scale the processing chunk size with the field size
@@ -819,7 +840,7 @@ fn process_field_sync(
             .with_disable(cli.no_progress);
 
         // Process each chunk and gather the results
-        chunks
+        let results = chunks
             .par_iter()
             .tqdm_config(tqdm_config)
             .map(|chunk| match mode {
@@ -831,26 +852,69 @@ fn process_field_sync(
                     process_range_niceonly(chunk, claim_data.base, stride_table)
                 }
             })
-            .collect()
+            .collect();
+        (results, telemetry)
     }
 }
 
-/// A nice-only field through the CPU overlap join: its partitions on the
-/// thread pool, with the progress bar counting partitions.
-fn process_field_join(join: &CpuJoin, base: u32, cli: &Cli) -> FieldResults {
-    let tqdm_config = simple_tqdm::Config::new()
-        .with_unit("partitions")
-        .with_disable(cli.no_progress);
-    let mut hits: Vec<u128> = (0..join.partitions())
-        .into_par_iter()
-        .tqdm_config(tqdm_config)
-        .map_init(Scratch::default, |scratch, v| {
-            join.run_partition(v, scratch).hits
-        })
-        .flatten_iter()
-        .collect();
+/// A nice-only field through the CPU overlap join, a slice at a time (one,
+/// below about 1e16), each slice's partitions on the thread pool with the
+/// progress bar counting them. Returns its results and the join's account,
+/// or `None` if the join cannot set the field up (then it takes the stride
+/// walk).
+fn process_field_join(
+    base: u32,
+    jp: JoinParams,
+    slices: &[FieldSize],
+    cli: &Cli,
+) -> Option<(FieldResults, JoinTelemetry)> {
+    let mut tel = JoinTelemetry {
+        slices: slices.len(),
+        ..JoinTelemetry::default()
+    };
+    let mut hits: Vec<u128> = Vec::new();
+    for (i, slice) in slices.iter().enumerate() {
+        let t0 = Instant::now();
+        let join = match CpuJoin::new(base, slice, jp) {
+            Ok(join) => join,
+            // The bottom side is the same for every slice, so only the first
+            // can fail, and then the whole field takes the stride walk.
+            Err(e) if i == 0 => {
+                warn!(
+                    "overlap join cannot take base {base} {slice:?} ({e:#}); using the stride walk"
+                );
+                return None;
+            }
+            Err(e) => panic!("slice {i} of a field whose first slice set up: {e:#}"),
+        };
+        tel.setup_secs += t0.elapsed().as_secs_f64();
+        tel.partitions = usize::try_from(join.partitions()).unwrap_or(usize::MAX);
+        let t1 = Instant::now();
+        let tqdm_config = simple_tqdm::Config::new()
+            .with_unit("partitions")
+            .with_desc(if slices.len() > 1 {
+                format!("slice {}/{}", i + 1, slices.len())
+            } else {
+                String::new()
+            })
+            .with_disable(cli.no_progress);
+        let out = (0..join.partitions())
+            .into_par_iter()
+            .tqdm_config(tqdm_config)
+            .map_init(Scratch::default, |scratch, v| {
+                join.run_partition(v, scratch)
+            })
+            .reduce(PartitionResult::default, |mut a, b| {
+                a.add(b);
+                a
+            });
+        tel.run_secs += t1.elapsed().as_secs_f64();
+        tel.survivors += out.survivors;
+        tel.checked += out.checked;
+        hits.extend(out.hits);
+    }
     hits.sort_unstable();
-    FieldResults {
+    let results = FieldResults {
         distribution: Vec::new(),
         nice_numbers: hits
             .into_iter()
@@ -859,13 +923,14 @@ fn process_field_join(join: &CpuJoin, base: u32, cli: &Cli) -> FieldResults {
                 num_uniques: base,
             })
             .collect(),
-    }
+    };
+    Some((results, tel))
 }
 
 /// A field that has been started: either finished on the spot, or queued in
 /// one of the GPU's pipelines, which hands its results back for its ticket.
 enum FieldStage {
-    Done(Vec<FieldResults>),
+    Done(Vec<FieldResults>, PipelineTelemetry),
     // Only the CUDA and `CubeCL` backends have pipelines (Vulkan processes a
     // field on the calling thread).
     #[cfg(any(feature = "cuda", feature = "cubecl"))]
@@ -888,7 +953,7 @@ fn begin_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Field
     {
         let range: FieldSize = claim_data.into();
         return match begin_niceonly(niceonly, &range, claim_data.base) {
-            Ok(NiceonlyStarted::Immediate(results)) => FieldStage::Done(vec![results]),
+            Ok(NiceonlyStarted::Immediate(results)) => FieldStage::Done(vec![results], None),
             Ok(NiceonlyStarted::Queued(ticket)) => FieldStage::Queued(ticket),
             Err(e) => {
                 error!("GPU processing error: {e:?}");
@@ -896,7 +961,8 @@ fn begin_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Field
             }
         };
     }
-    FieldStage::Done(process_field_sync(claim_data, cli, gpu, None))
+    let (results, telemetry) = process_field_sync(claim_data, cli, gpu, None);
+    FieldStage::Done(results, telemetry)
 }
 
 /// Per-field pipeline telemetry from the GPU niceonly path, already as the
@@ -909,14 +975,14 @@ fn finish_field_sync(stage: FieldStage, gpu: &GpuCtx) -> (Vec<FieldResults>, Pip
     #[cfg(not(any(feature = "cuda", feature = "cubecl")))]
     let _ = gpu; // nothing is ever queued in this build
     match stage {
-        FieldStage::Done(results) => (results, None),
+        FieldStage::Done(results, telemetry) => (results, telemetry),
         #[cfg(any(feature = "cuda", feature = "cubecl"))]
         FieldStage::Queued(ticket) => {
             let niceonly = gpu
                 .as_deref()
                 .and_then(GpuHandle::niceonly)
                 .expect("only a GPU with pipelines queues a field");
-            match niceonly.finish(ticket) {
+            match finish_niceonly(niceonly, ticket) {
                 Ok((results, stats)) => (vec![results], Some(stats.telemetry_json())),
                 Err(e) => {
                     error!("GPU processing error: {e:?}");
