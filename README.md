@@ -176,8 +176,8 @@ Options:
           Which GPU backend to use with --gpu
 
           Possible values:
-          - auto:        Fastest measured order for the mode: detailed tries `cubecl-cuda`, `cubecl`, CUDA, then Vulkan; niceonly tries CUDA, `cubecl`, then Vulkan. See `init_gpu` for the numbers behind the ordering
-          - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC
+          - auto:        Fastest measured order for the mode: detailed tries `cubecl-cuda`, `cubecl`, CUDA, then Vulkan; niceonly tries CUDA (with `CubeCL`'s CUDA runtime beside it for the overlap join's production-size fields), `cubecl`, then Vulkan. See `init_gpu` for the numbers behind the ordering
+          - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In niceonly mode every field stays on hand-CUDA's stride pipeline: the overlap join needs `auto` or `cubecl-cuda`
           - vulkan:      Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe). Experimental: only present in builds with the `vulkan` feature, which the `gpu` umbrella no longer includes
           - cubecl:      `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base
           - cubecl-cuda: `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature and, like `cuda`, the CUDA toolkit at runtime for NVRTC)

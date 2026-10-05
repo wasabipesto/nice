@@ -60,15 +60,20 @@ use nice_common::vulkan::VulkanContext;
 /// Which GPU backend to drive.
 ///
 /// Every backend `dlopen`s its driver at runtime, so a single binary can carry
-/// all of them and require none at build time. `Auto` tries CUDA first,
-/// leaving behaviour on an NVIDIA machine exactly as it was.
+/// all of them and require none at build time. `Auto` tries CUDA first on
+/// NVIDIA, and in nice-only mode pairs it with `CubeCL`'s CUDA runtime for the
+/// overlap join (see `init_gpu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
     /// Fastest measured order for the mode: detailed tries `cubecl-cuda`,
-    /// `cubecl`, CUDA, then Vulkan; niceonly tries CUDA, `cubecl`, then
-    /// Vulkan. See `init_gpu` for the numbers behind the ordering.
+    /// `cubecl`, CUDA, then Vulkan; niceonly tries CUDA (with `CubeCL`'s CUDA
+    /// runtime beside it for the overlap join's production-size fields),
+    /// `cubecl`, then Vulkan. See `init_gpu` for the numbers behind the
+    /// ordering.
     Auto,
-    /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC.
+    /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In
+    /// niceonly mode every field stays on hand-CUDA's stride pipeline: the
+    /// overlap join needs `auto` or `cubecl-cuda`.
     Cuda,
     /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA,
     /// llvmpipe). Experimental: only present in builds with the `vulkan`
