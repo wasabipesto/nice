@@ -197,6 +197,9 @@ pub struct JoinTelemetry {
     /// halvings of a partition's top layer.
     pub retried_partitions: usize,
     pub splits: u32,
+    /// GPU: layouts the device did not run, each followed by one of at most
+    /// half the size (normally none).
+    pub refused: u32,
     /// Pairs that passed the join's AND, and of those the prefilter's
     /// survivors, which the full check read.
     pub survivors: u64,
@@ -216,6 +219,7 @@ impl JoinTelemetry {
             "min_slots": self.min_slots,
             "retried_partitions": self.retried_partitions,
             "splits": self.splits,
+            "refused_layouts": self.refused,
             "survivors": self.survivors,
             "checked": self.checked,
         })

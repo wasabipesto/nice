@@ -23,6 +23,7 @@ use crate::overlap_join::{
 };
 use anyhow::Result;
 use log::warn;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Partitions per launch (device slots), bounded below by memory. A field
 /// is b^p partitions (3,249 at base 57), so this sets the launch count: 16
@@ -90,6 +91,45 @@ impl JoinLimits {
             max_binding,
             budget: JOIN_MEMORY.min(max_binding.saturating_mul(2)),
         }
+    }
+}
+
+/// The largest layout one device may get, learned from the device: one
+/// that does not run a layout its limits allow gets at most half of that
+/// layout from then on. The macOS runner's paravirtual Metal device reports
+/// a 3.5 GiB buffer limit and runs a 626 MiB layout, but drops every
+/// dispatch of a 697 MiB one without an error. A device's planning (through
+/// its limits) and its join's worker share one ceiling, so every later
+/// field is planned within it.
+#[derive(Debug)]
+pub struct JoinCeiling(AtomicUsize);
+
+impl Default for JoinCeiling {
+    fn default() -> Self {
+        Self(AtomicUsize::new(usize::MAX))
+    }
+}
+
+impl JoinCeiling {
+    /// `lim` with neither its budget nor its largest buffer above the
+    /// ceiling.
+    pub(crate) fn cap(&self, lim: JoinLimits) -> JoinLimits {
+        let c = self.get();
+        JoinLimits {
+            max_binding: lim.max_binding.min(c),
+            budget: lim.budget.min(c),
+        }
+    }
+
+    /// The device did not run a layout of `bytes`: at most half of it from
+    /// now on. Returns the ceiling.
+    pub(crate) fn lower(&self, bytes: usize) -> usize {
+        let half = bytes / 2;
+        self.0.fetch_min(half, Ordering::Relaxed).min(half)
+    }
+
+    pub(crate) fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
     }
 }
 

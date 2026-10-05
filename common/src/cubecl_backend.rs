@@ -36,7 +36,7 @@ use crate::gpu_niceonly::{
     RangeSink, batches_in_flight, lane_shift_for, stride_chunk_bits,
 };
 use crate::gpu_route::{FieldTicket, NiceonlyGpu, Route};
-use crate::join_plan::{JoinField, JoinLimits, plan_join};
+use crate::join_plan::{JoinCeiling, JoinField, JoinLimits, plan_join};
 use crate::number_stats::get_near_miss_cutoff;
 use crate::overlap_join::StrideReason;
 use crate::stride_filter::StrideTable;
@@ -1442,6 +1442,8 @@ pub enum CubeclContext {
         /// The overlap join's pipeline, started on the first field it takes
         /// (see [`crate::join_plan::plan_join`]).
         join_pipeline: Mutex<Option<JoinPipeline>>,
+        /// The largest join layout this device runs, as far as it has shown.
+        join_ceiling: Arc<JoinCeiling>,
     },
     #[cfg(feature = "cubecl-cuda")]
     Cuda {
@@ -1456,6 +1458,8 @@ pub enum CubeclContext {
         /// The overlap join's pipeline, started on the first field it takes
         /// (see [`crate::join_plan::plan_join`]).
         join_pipeline: Mutex<Option<JoinPipeline>>,
+        /// The largest join layout this device runs, as far as it has shown.
+        join_ceiling: Arc<JoinCeiling>,
     },
     #[cfg(feature = "cubecl-hip")]
     Hip {
@@ -1470,6 +1474,8 @@ pub enum CubeclContext {
         /// The overlap join's pipeline, started on the first field it takes
         /// (see [`crate::join_plan::plan_join`]).
         join_pipeline: Mutex<Option<JoinPipeline>>,
+        /// The largest join layout this device runs, as far as it has shown.
+        join_ceiling: Arc<JoinCeiling>,
     },
 }
 
@@ -1585,6 +1591,7 @@ impl CubeclContext {
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
             join_pipeline: Mutex::new(None),
+            join_ceiling: Arc::default(),
         })
     }
 
@@ -1627,6 +1634,7 @@ impl CubeclContext {
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
             join_pipeline: Mutex::new(None),
+            join_ceiling: Arc::default(),
         })
     }
 
@@ -1673,6 +1681,7 @@ impl CubeclContext {
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
             join_pipeline: Mutex::new(None),
+            join_ceiling: Arc::default(),
         })
     }
 
@@ -1711,6 +1720,7 @@ impl CubeclContext {
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
             join_pipeline: Mutex::new(None),
+            join_ceiling: Arc::default(),
         })
     }
 
@@ -1739,11 +1749,23 @@ impl CubeclContext {
             Err(reason) => return Ok(Err(reason)),
         };
         let (hits, st) = match self {
-            Self::Wgpu { client, .. } => run_slices(client, &field, 1, parts)?,
+            Self::Wgpu {
+                client,
+                join_ceiling,
+                ..
+            } => run_slices(client, &field, 1, parts, join_ceiling)?,
             #[cfg(feature = "cubecl-cuda")]
-            Self::Cuda { client, .. } => run_slices(client, &field, 1, parts)?,
+            Self::Cuda {
+                client,
+                join_ceiling,
+                ..
+            } => run_slices(client, &field, 1, parts, join_ceiling)?,
             #[cfg(feature = "cubecl-hip")]
-            Self::Hip { client, .. } => run_slices(client, &field, 1, parts)?,
+            Self::Hip {
+                client,
+                join_ceiling,
+                ..
+            } => run_slices(client, &field, 1, parts, join_ceiling)?,
         };
         Ok(Ok(JoinSample {
             slices: field.slice_count(),
@@ -2089,11 +2111,23 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
 impl NiceonlyGpu for CubeclContext {
     fn join_limits(&self) -> Option<JoinLimits> {
         Some(match self {
-            Self::Wgpu { client, .. } => limits_of(client),
+            Self::Wgpu {
+                client,
+                join_ceiling,
+                ..
+            } => join_ceiling.cap(limits_of(client)),
             #[cfg(feature = "cubecl-cuda")]
-            Self::Cuda { client, .. } => limits_of(client),
+            Self::Cuda {
+                client,
+                join_ceiling,
+                ..
+            } => join_ceiling.cap(limits_of(client)),
             #[cfg(feature = "cubecl-hip")]
-            Self::Hip { client, .. } => limits_of(client),
+            Self::Hip {
+                client,
+                join_ceiling,
+                ..
+            } => join_ceiling.cap(limits_of(client)),
         })
     }
 
@@ -2149,20 +2183,23 @@ impl NiceonlyGpu for CubeclContext {
             Self::Wgpu {
                 client,
                 join_pipeline,
+                join_ceiling,
                 ..
-            } => begin_join_on(client, join_pipeline, field),
+            } => begin_join_on(client, join_pipeline, join_ceiling, field),
             #[cfg(feature = "cubecl-cuda")]
             Self::Cuda {
                 client,
                 join_pipeline,
+                join_ceiling,
                 ..
-            } => begin_join_on(client, join_pipeline, field),
+            } => begin_join_on(client, join_pipeline, join_ceiling, field),
             #[cfg(feature = "cubecl-hip")]
             Self::Hip {
                 client,
                 join_pipeline,
+                join_ceiling,
                 ..
-            } => begin_join_on(client, join_pipeline, field),
+            } => begin_join_on(client, join_pipeline, join_ceiling, field),
         }
     }
 
@@ -2221,12 +2258,13 @@ fn begin_stride_on<R: cubecl::prelude::Runtime>(
 fn begin_join_on<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     join_pipeline: &Mutex<Option<JoinPipeline>>,
+    join_ceiling: &Arc<JoinCeiling>,
     field: JoinField,
 ) -> Result<FieldTicket> {
     join_pipeline
         .lock()
         .unwrap()
-        .get_or_insert_with(|| JoinPipeline::start(client.clone()))
+        .get_or_insert_with(|| JoinPipeline::start(client.clone(), join_ceiling.clone()))
         .push(field)
 }
 
