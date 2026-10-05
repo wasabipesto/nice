@@ -2339,23 +2339,47 @@ mod tests {
     /// The benchmark's sample of a production field: partitions of the b57
     /// frontier field's first (only) slice, timed through the production
     /// plan, with the CPU join's counts; and a field below the size gate
-    /// gets the reason instead.
-    #[test]
+    /// gets the reason instead. It prints the device's limits and the plan,
+    /// and runs the same partition with a 4-slot test layout too, so a
+    /// device that mishandles the production layout shows which part.
+    #[test_log::test]
     #[ignore = "requires a wgpu device"]
     fn join_sample_runs_partitions_of_a_production_field() {
         let ctx = CubeclContext::new_default().expect("CubeCL init");
         let range = FieldSize::new(FRONTIER_57, FRONTIER_57 + 100_000_000_000_000);
-        let parts = [1_000u32];
+        let cpu = crate::cpu_join::CpuJoin::for_field(57, &range).expect("a join field");
+        let want = cpu.run_partition(1_000, &mut crate::cpu_join::Scratch::default());
+        let (client, name) = client();
+        let lim = limits_of(&client);
+        let field = crate::join_plan::plan_join(57, &range, lim).expect("a join field");
+        println!(
+            "{name}: limits {lim:?}; {} slice(s); plan {:?}; re-run {:?}",
+            field.slices.len(),
+            field.plan,
+            field.retry
+        );
+        let (_, prod) = run_slices(&client, &field, 1, &[1_000]).expect("production layout");
+        let four =
+            JoinField::with_plans(field.fs.clone(), test_plan(&field.fs, lim, 4), field.retry);
+        let (_, test) = run_slices(&client, &four, 1, &[1_000]).expect("test layout");
+        println!(
+            "partition 1000: CPU ({}, {}); production layout ({}, {}, {} re-run); 4-slot layout ({}, {})",
+            want.survivors,
+            want.checked,
+            prod.survivors,
+            prod.checked,
+            prod.retried_partitions,
+            test.survivors,
+            test.checked
+        );
         let sample = ctx
-            .join_sample(57, &range, &parts)
+            .join_sample(57, &range, &[1_000])
             .expect("device run")
             .expect("a join field");
         assert_eq!(
             (sample.slices, sample.partitions, sample.sampled),
             (1, 3_249, 1)
         );
-        let cpu = crate::cpu_join::CpuJoin::for_field(57, &range).expect("a join field");
-        let want = cpu.run_partition(1_000, &mut crate::cpu_join::Scratch::default());
         assert_eq!(
             (sample.survivors, sample.checked),
             (want.survivors, want.checked)
@@ -2364,7 +2388,7 @@ mod tests {
         assert!(sample.setup_secs > 0.0 && sample.run_secs > 0.0);
         let small = FieldSize::new(FRONTIER_57, FRONTIER_57 + 4_000_000_000);
         assert_eq!(
-            ctx.join_sample(57, &small, &parts)
+            ctx.join_sample(57, &small, &[1_000])
                 .expect("no device work")
                 .err(),
             Some(crate::overlap_join::StrideReason::BelowMinSize)
