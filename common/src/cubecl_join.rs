@@ -288,6 +288,7 @@ mod kernels {
         surv_count: &mut Array<Atomic<u32>>,
         top_x: &Array<u32>,
         staged: &mut Array<Atomic<u32>>,
+        ran: &mut Array<u32>,
         nwork: u32,
         nbp: u32,
         surv_cap: u32,
@@ -515,6 +516,10 @@ mod kernels {
                 f0,
                 k2,
             );
+        }
+        // The batch ran: see `JoinDevice::launch_batch`.
+        if CUBE_POS_X == 0u32 && UNIT_POS_X == 0u32 {
+            ran[0] = 1u32;
         }
     }
 
@@ -1136,6 +1141,7 @@ mod kernels {
         top_p: &Array<u32>, // lo, hi words of P per top
         nice_out: &mut Array<u32>,
         nice_count: &mut Array<Atomic<u32>>,
+        ran: &mut Array<u32>,
         surv_cap: u32,
         nice_cap: u32,
         w_f0: u32, // b^f0
@@ -1197,6 +1203,9 @@ mod kernels {
             );
             i += stride;
         }
+        if CUBE_POS_X == 0u32 && UNIT_POS_X == 0u32 {
+            ran[1] = 1u32;
+        }
     }
 }
 
@@ -1238,6 +1247,9 @@ pub(crate) struct JoinDevice<R: Runtime> {
     w_f0: u32,
     nbp: u32,
     max_slots: usize,
+    /// The layout's bytes, and its largest buffer (for errors).
+    bytes: usize,
+    largest: usize,
     bp_r: Handle,
     bp_m: Handle,
     seg: Handle,
@@ -1281,6 +1293,8 @@ pub(crate) struct JoinDevice<R: Runtime> {
 pub(crate) struct BatchRec {
     pub survivors: Handle,
     pub checked: Handle,
+    /// The join and the check kernels' flags (both 1 once they ran).
+    pub ran: Handle,
 }
 
 impl<R: Runtime> JoinDevice<R> {
@@ -1389,6 +1403,10 @@ impl<R: Runtime> JoinDevice<R> {
             w_f0: u32::try_from(fs.w)?,
             nbp: u32::try_from(nbp)?,
             max_slots,
+            bytes: plan.bytes,
+            largest: (max_slots * fp.largest_per_slot())
+                .max(fp.largest_fixed)
+                .max(list_cap as usize * 8),
             bp_r: client.create(cubecl::bytes::Bytes::from_elems(fs.bp_r.clone())),
             bp_m: client.create(cubecl::bytes::Bytes::from_elems(bp_m_words)),
             seg: client.create(cubecl::bytes::Bytes::from_elems(fs.seg.clone())),
@@ -1463,6 +1481,11 @@ impl<R: Runtime> JoinDevice<R> {
         // pass the prefilter to the list, which it counts too.
         let survivors = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
         let checked = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
+        // Set by the join and the check kernels as they finish. A device
+        // that drops a dispatch without an error (as the macOS runner's
+        // paravirtual GPU did with layouts above about 0.5 GiB) leaves it
+        // clear, and the batch would otherwise read as having no survivors.
+        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 2]));
         let (cd16, cdiv16) = chunk_constants_u16(self.b);
         unsafe {
             top_kernel::launch_unchecked::<R>(
@@ -1566,6 +1589,7 @@ impl<R: Runtime> JoinDevice<R> {
                 ArrayArg::from_raw_parts(checked.clone(), 1),
                 ArrayArg::from_raw_parts(self.top_x.clone(), 2 * max_slots * ntl),
                 ArrayArg::from_raw_parts(survivors.clone(), 1),
+                ArrayArg::from_raw_parts(ran.clone(), 2),
                 nwork_u32,
                 self.nbp,
                 self.list_cap,
@@ -1591,6 +1615,7 @@ impl<R: Runtime> JoinDevice<R> {
                     self.nice_cap as usize * NICEONLY_STRIDE as usize,
                 ),
                 ArrayArg::from_raw_parts(self.nice_count.clone(), 1),
+                ArrayArg::from_raw_parts(ran.clone(), 2),
                 self.list_cap,
                 self.nice_cap,
                 self.w_f0,
@@ -1606,7 +1631,25 @@ impl<R: Runtime> JoinDevice<R> {
             );
         }
         c.flush().map_err(|e| anyhow!("flush failed: {e:?}"))?;
-        Ok(BatchRec { survivors, checked })
+        Ok(BatchRec {
+            survivors,
+            checked,
+            ran,
+        })
+    }
+
+    /// Fail unless a batch's join and check kernels both ran (their flags,
+    /// see [`Self::launch_batch`]): a device that silently drops a dispatch
+    /// must stop the field, not report it as having no survivors.
+    fn ensure_ran(&self, flags: &[u32], slots: usize) -> Result<()> {
+        ensure!(
+            flags.len() >= 2 && flags[0] == 1 && flags[1] == 1,
+            "overlap join: the device did not run a batch of {slots} partitions (layout of {} \
+             MiB, buffers up to {} MiB); its reported limits may exceed what it can do",
+            self.bytes >> 20,
+            self.largest >> 20
+        );
+        Ok(())
     }
 
     /// Whether a batch dropped prefilter survivors past the end of the list
@@ -1878,14 +1921,15 @@ fn run_pass<R: Runtime>(
     }
     let handles: Vec<Handle> = recs
         .iter()
-        .flat_map(|(_, r)| [r.survivors.clone(), r.checked.clone()])
+        .flat_map(|(_, r)| [r.survivors.clone(), r.checked.clone(), r.ran.clone()])
         .collect();
     let counts = cubecl::future::block_on(client.read_async(handles))
         .map_err(|e| anyhow!("read failed: {e:?}"))?;
     let mut overflowed = Vec::new();
     for (i, (batch, _)) in recs.iter().enumerate() {
-        let surv = u32::from_bytes(&counts[2 * i])[0];
-        let checked = u32::from_bytes(&counts[2 * i + 1])[0];
+        dev.ensure_ran(u32::from_bytes(&counts[3 * i + 2]), batch.len())?;
+        let surv = u32::from_bytes(&counts[3 * i])[0];
+        let checked = u32::from_bytes(&counts[3 * i + 1])[0];
         if dev.overflowed(checked) {
             overflowed.extend_from_slice(batch);
         } else {
@@ -1940,6 +1984,7 @@ fn run_partition<R: Runtime>(
     let mut dev = JoinDevice::new(client, fs, plan)?;
     let rec = dev.launch_batch(&[v], false)?;
     st.batches += 1;
+    dev.ensure_ran(&dev.read_u32(&rec.ran)?, 1)?;
     let surv = dev.read_u32(&rec.survivors)?[0];
     let checked = dev.read_u32(&rec.checked)?[0];
     if !dev.overflowed(checked) {
@@ -2362,24 +2407,6 @@ mod tests {
         let four =
             JoinField::with_plans(field.fs.clone(), test_plan(&field.fs, lim, 4), field.retry);
         let (_, test) = run_slices(&client, &four, 1, &[1_000]).expect("test layout");
-        // Where the device stops computing: the production layout at fewer
-        // partitions per launch (smaller lists and buffers), same list.
-        for slots in [6, 8, 10, 12, 14] {
-            let Some(plan) = JoinPlan::new(&field.fs, lim, slots, 1 << 24, 1, lim.budget / 4)
-            else {
-                continue;
-            };
-            let probe = JoinField::with_plans(field.fs.clone(), plan, field.retry);
-            let (_, st) = run_slices(&client, &probe, 1, &[1_000]).expect("probe layout");
-            println!(
-                "  {} slots, {} MiB ({} MiB lists): ({}, {})",
-                plan.slots,
-                plan.bytes >> 20,
-                (plan.slots * Footprint::of(&field.fs, 1024).lists) >> 20,
-                st.survivors,
-                st.checked
-            );
-        }
         println!(
             "partition 1000: CPU ({}, {}); production layout ({}, {}, {} re-run); 4-slot layout ({}, {})",
             want.survivors,
