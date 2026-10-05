@@ -2362,6 +2362,24 @@ mod tests {
         let four =
             JoinField::with_plans(field.fs.clone(), test_plan(&field.fs, lim, 4), field.retry);
         let (_, test) = run_slices(&client, &four, 1, &[1_000]).expect("test layout");
+        // Where the device stops computing: the production layout at fewer
+        // partitions per launch (smaller lists and buffers), same list.
+        for slots in [6, 8, 10, 12, 14] {
+            let Some(plan) = JoinPlan::new(&field.fs, lim, slots, 1 << 24, 1, lim.budget / 4)
+            else {
+                continue;
+            };
+            let probe = JoinField::with_plans(field.fs.clone(), plan, field.retry);
+            let (_, st) = run_slices(&client, &probe, 1, &[1_000]).expect("probe layout");
+            println!(
+                "  {} slots, {} MiB ({} MiB lists): ({}, {})",
+                plan.slots,
+                plan.bytes >> 20,
+                (plan.slots * Footprint::of(&field.fs, 1024).lists) >> 20,
+                st.survivors,
+                st.checked
+            );
+        }
         println!(
             "partition 1000: CPU ({}, {}); production layout ({}, {}, {} re-run); 4-slot layout ({}, {})",
             want.survivors,
