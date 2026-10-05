@@ -1741,8 +1741,9 @@ impl CubeclContext {
         range: &FieldSize,
         parts: &[u32],
     ) -> Result<std::result::Result<JoinSample, StrideReason>> {
-        let Some(lim) = NiceonlyGpu::join_limits(self) else {
-            return Ok(Err(StrideReason::NoJoin));
+        let lim = match NiceonlyGpu::join_limits(self) {
+            Ok(lim) => lim,
+            Err(reason) => return Ok(Err(reason)),
         };
         let field = match plan_join(base, range, lim) {
             Ok(field) => field,
@@ -2109,26 +2110,29 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
 /// candidate set a superset, and the final check is the same. Fields start
 /// through [`crate::gpu_route::begin_niceonly`].
 impl NiceonlyGpu for CubeclContext {
-    fn join_limits(&self) -> Option<JoinLimits> {
-        Some(match self {
+    fn join_limits(&self) -> std::result::Result<JoinLimits, StrideReason> {
+        match self {
             Self::Wgpu {
                 client,
+                device_name,
                 join_ceiling,
                 ..
-            } => join_ceiling.cap(limits_of(client)),
+            } => join_limits_on(client, device_name, join_ceiling),
             #[cfg(feature = "cubecl-cuda")]
             Self::Cuda {
                 client,
+                device_name,
                 join_ceiling,
                 ..
-            } => join_ceiling.cap(limits_of(client)),
+            } => join_limits_on(client, device_name, join_ceiling),
             #[cfg(feature = "cubecl-hip")]
             Self::Hip {
                 client,
+                device_name,
                 join_ceiling,
                 ..
-            } => join_ceiling.cap(limits_of(client)),
-        })
+            } => join_limits_on(client, device_name, join_ceiling),
+        }
     }
 
     fn begin_stride(&self, range: &FieldSize, base: u32) -> Result<FieldTicket> {
@@ -2433,6 +2437,42 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlySink<R> {
 /// control barrier inside plane-divergent control flow (the plane-scoped
 /// compaction queue returned 2 of 283 survivors there, and was exact with
 /// the barriers removed), so that path stays off on such adapters.
+/// Whether a device can run the overlap join's kernels, which use plane
+/// (subgroup) operations with no fallback. `CubeCL` reports them on every
+/// CUDA, HIP and Metal device and on wgpu adapters with subgroups, but never
+/// on CPU-type adapters, where the software rasterizers (lavapipe,
+/// `SwiftShader`) run them anyway. The stride pipeline has a path without
+/// them, so a device that fails this keeps every field there.
+fn joins_on(plane_ops: bool, device: &str) -> bool {
+    plane_ops || is_software_rasterizer(device)
+}
+
+/// [`NiceonlyGpu::join_limits`] for one `CubeCL` device: its limits within
+/// the layouts it has shown it runs (`ceiling`), unless it cannot run the
+/// join's kernels at all ([`joins_on`]).
+fn join_limits_on<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    device: &str,
+    ceiling: &JoinCeiling,
+) -> std::result::Result<JoinLimits, StrideReason> {
+    let plane_ops = client
+        .properties()
+        .features
+        .plane
+        .contains(cubecl::ir::features::Plane::Ops);
+    if !joins_on(plane_ops, device) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            warn!(
+                "overlap join: {device} has no subgroup operations, which the join's \
+                 kernels need; nice-only fields use the stride pipeline"
+            );
+        });
+        return Err(StrideReason::NoPlaneOps);
+    }
+    Ok(ceiling.cap(limits_of(client)))
+}
+
 pub(crate) fn is_software_rasterizer(device: &str) -> bool {
     let squashed = device.to_lowercase().replace(' ', "");
     ["llvmpipe", "lavapipe", "swiftshader", "softwarerasterizer"]
@@ -2925,6 +2965,29 @@ mod tests {
     #[test]
     fn batch_size_cannot_overflow_a_u32_bin() {
         assert!(CUBECL_BATCH_SIZE < u128::from(u32::MAX));
+    }
+
+    /// The join runs where `CubeCL` reports plane operations, and on the
+    /// software rasterizers that run them without saying so; anywhere else
+    /// its fields keep the stride pipeline.
+    #[test]
+    fn the_join_needs_plane_operations() {
+        assert!(joins_on(
+            true,
+            "NVIDIA GeForce RTX 3080 (Vulkan, wgpu<wgsl>)"
+        ));
+        assert!(joins_on(
+            false,
+            "llvmpipe (LLVM 19.1.7, 256 bits) (Vulkan, wgpu<spirv>)"
+        ));
+        assert!(!joins_on(
+            false,
+            "Microsoft Basic Render Driver (Dx12, wgpu<wgsl>)"
+        ));
+        assert!(!joins_on(
+            false,
+            "Intel(R) UHD Graphics 620 (Dx12, wgpu<wgsl>)"
+        ));
     }
 
     /// CPU/CubeCL parity on the detailed path — the same bases and ranges as

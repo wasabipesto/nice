@@ -402,7 +402,9 @@ pub struct CudaWithJoin {
 
 #[cfg(feature = "cubecl-cuda")]
 impl NiceonlyGpu for CudaWithJoin {
-    fn join_limits(&self) -> Option<crate::join_plan::JoinLimits> {
+    fn join_limits(
+        &self,
+    ) -> std::result::Result<crate::join_plan::JoinLimits, crate::overlap_join::StrideReason> {
         self.join.join_limits()
     }
 

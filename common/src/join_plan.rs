@@ -437,7 +437,7 @@ pub fn plan_join(base: u32, range: &FieldSize, lim: JoinLimits) -> Result<JoinFi
     };
     let cannot = |e: anyhow::Error| {
         warn!("overlap join cannot take base {base} {range:?} ({e:#}); using the stride pipeline");
-        StrideReason::Base
+        StrideReason::Setup
     };
     let jp = join_verdict(base, range)?;
     let block = prefix_block(base, ndigits(range.last(), base), jp);

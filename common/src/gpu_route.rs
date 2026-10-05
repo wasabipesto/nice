@@ -100,10 +100,14 @@ pub enum NiceonlyStarted {
 /// A GPU backend's nice-only pipelines. Fields go in through
 /// [`begin_niceonly`], which picks the pipeline.
 pub trait NiceonlyGpu {
-    /// The device's limits for the overlap join, or `None` if this backend
-    /// has no join; then every field takes the stride pipeline.
-    fn join_limits(&self) -> Option<JoinLimits> {
-        None
+    /// The device's limits for the overlap join, or why it takes no join
+    /// fields (this backend has no join, or the device cannot run it); then
+    /// every field takes the stride pipeline.
+    ///
+    /// # Errors
+    /// The reason the device takes no join fields.
+    fn join_limits(&self) -> std::result::Result<JoinLimits, StrideReason> {
+        Err(StrideReason::NoJoin)
     }
 
     /// Queue a field in the MSD/stride pipeline.
@@ -155,11 +159,9 @@ pub fn begin_niceonly(
         )));
     }
     let verdict = match gpu.join_limits() {
-        Some(lim) => plan_join(base, range, lim),
-        // The field's own reason if it has one, else the backend's.
-        None => Err(join_verdict(base, range)
-            .err()
-            .unwrap_or(StrideReason::NoJoin)),
+        Ok(lim) => plan_join(base, range, lim),
+        // The field's own reason if it has one, else the device's.
+        Err(device) => Err(join_verdict(base, range).err().unwrap_or(device)),
     };
     let ticket = match verdict {
         Ok(field) => {

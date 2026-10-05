@@ -130,8 +130,8 @@ mod kernels {
 
     /// Step 1+ (v3): extension fused with bucketization. One cube per
     /// (class c, slot): its bpre segment is extended by the slot's partition
-    /// digits exactly as in [`bottom_extend_kernel`] (the extended entries are
-    /// written to `ext_m`/`ext_pk` as there), and each surviving entry's two
+    /// digits (the extended entries are written to `ext_m`/`ext_pk`, where the
+    /// join kernel reads them), and each surviving entry's two
     /// key-position digits are stepped through every key value d incrementally
     /// (+s2, +s3 mod b); the entry's index goes onto the (slot, d, c) list for
     /// every d where they are distinct and new. List layout per slot:
@@ -1904,12 +1904,20 @@ pub(crate) fn run_slices<R: Runtime>(
                 .ok_or_else(|| anyhow!("slice {i} of the field does not fit the device"))?
         };
         let later = field.slices.get(i + 1).filter(|_| i + 1 < count);
+        let start = slots_hint.clamp(1, layouts.0.slots);
         std::thread::scope(|scope| -> Result<()> {
             let prep = later.map(|sl| scope.spawn(|| field.fs.sub_range(sl.start(), sl.end())));
             let used = run_slice(
                 client, fs, layouts, field.lim, ceiling, slots_hint, parts, &mut st, &mut hits,
             )?;
-            slots_hint = used;
+            // A slice that kept its batch size lets the next one try twice
+            // that (up to its own plan's), so one dense slice does not hold
+            // the rest of the field at a smaller size.
+            slots_hint = if used < start {
+                used
+            } else {
+                used.saturating_mul(2)
+            };
             next = prep.map(|h| h.join().expect("slice setup panicked"));
             Ok(())
         })?;
@@ -2036,13 +2044,13 @@ fn rerun_partition<R: Runtime>(
     hits: &mut Vec<u128>,
 ) -> Result<()> {
     loop {
-        let (survivors, checked) = (st.survivors, st.checked);
+        let (survivors, checked, splits) = (st.survivors, st.checked, st.splits);
         let Err(e) = run_partition(client, fs, retry, v, 0, st, hits) else {
             return Ok(());
         };
         let why = e.downcast::<NotRun>()?;
         // Halves of its top layer that ran are counted again when it does.
-        (st.survivors, st.checked) = (survivors, checked);
+        (st.survivors, st.checked, st.splits) = (survivors, checked, splits);
         *retry = refit(client, fs, lim, ceiling, &why, st)?.1;
     }
 }
@@ -2528,6 +2536,75 @@ mod tests {
         check_tight_layouts(client, name);
         check_slices(client, name);
         check_refused_layouts(client, name);
+        check_production_shape(client, name);
+    }
+
+    /// The re-run and refusal paths at the production shape (the b57
+    /// frontier field: t = L-3, k = 6, p = 2, key-level buckets), which the
+    /// windows above are too small for, on three of its partitions: a
+    /// survivor list half the densest partition's, so partitions overflow,
+    /// run again alone and split their top layer; then the production
+    /// layout refused. Hits and both survivor counts must equal the CPU
+    /// reference's.
+    fn check_production_shape<R: Runtime>(client: &ComputeClient<R>, name: &str) {
+        let range = FieldSize::new(FRONTIER_57, FRONTIER_57 + 100_000_000_000_000);
+        let lim = limits_of(client);
+        let field = crate::join_plan::plan_join(57, &range, lim).expect("a join field");
+        let fs = &field.fs;
+        let parts = [0u32, 1_000, 3_248];
+        let (mut survivors, mut checked, mut hits, mut densest) = (0u64, 0u64, Vec::new(), 0);
+        for &v in &parts {
+            let mut rec = Vec::new();
+            let st = join_range(
+                &fs.base,
+                range.start(),
+                range.end(),
+                fs.jp,
+                Some(&[u128::from(v)]),
+                Some(&mut rec),
+            );
+            rec.retain(|&n| mid_mirror(fs, n));
+            survivors += st.survivors;
+            checked += rec.len() as u64;
+            densest = densest.max(rec.len());
+            hits.extend(st.hits);
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        let cap = u32::try_from(densest / 2).expect("a partition's survivors fit u32");
+        let plan = JoinPlan::new(fs, lim, 4, cap, 1, lim.budget).expect("a tight layout fits");
+        let retry = JoinPlan::new(fs, lim, 1, cap, 1, lim.budget).expect("a tight re-run fits");
+        let tight = JoinField::with_plans(fs.clone(), plan, retry);
+        let (got, st) =
+            run_slices(client, &tight, 1, &parts, &JoinCeiling::default()).expect("tight run");
+        let got: Vec<u128> = got.iter().map(|n| n.number).collect();
+        assert_eq!(got, hits, "tight layout: hits differ");
+        assert_eq!(
+            (st.survivors, st.checked),
+            (survivors, checked),
+            "tight layout: {st:?}"
+        );
+        assert!(
+            st.retried_partitions > 0 && st.splits > 0,
+            "tight layout: {st:?}"
+        );
+        REFUSE_ABOVE.with(|r| r.set(field.plan.bytes - 1));
+        let refused = run_slices(client, &field, 1, &parts, &JoinCeiling::default());
+        REFUSE_ABOVE.with(|r| r.set(usize::MAX));
+        let (got, st_refused) = refused.expect("a smaller layout runs");
+        let got: Vec<u128> = got.iter().map(|n| n.number).collect();
+        assert_eq!(got, hits, "refused layout: hits differ");
+        assert_eq!(
+            (st_refused.survivors, st_refused.checked),
+            (survivors, checked),
+            "refused layout: {st_refused:?}"
+        );
+        assert!(st_refused.refused >= 1, "refused layout: {st_refused:?}");
+        println!(
+            "{name}: b57 frontier partitions {parts:?} agree in a tight layout ({} re-run, {} \
+             splits) and after a refused one",
+            st.retried_partitions, st.splits
+        );
     }
 
     /// A device that does not run its planned layout (it runs nothing above
@@ -3015,7 +3092,7 @@ mod tests {
                 mean(&|x| f64::from(x.0.launches)),
                 per_field.iter().map(|x| x.1.slots).max().unwrap_or(0),
                 per_field.iter().map(|x| x.1.bytes >> 20).max().unwrap_or(0),
-                per_field.iter().filter(|x| x.1.partitions == 0).count(),
+                per_field.iter().filter(|x| x.1.batches == 0).count(),
                 sum(&|x| x.retried_partitions as u64),
                 sum(&|x| u64::from(x.splits)),
                 sum(&|x| x.survivors),

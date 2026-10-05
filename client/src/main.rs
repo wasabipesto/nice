@@ -794,6 +794,10 @@ fn process_field_sync(
                     let telemetry = serde_json::json!({ "route": "join", "join": join.json() });
                     return (vec![results], Some(telemetry));
                 }
+                telemetry = Some(serde_json::json!({
+                    "route": "stride",
+                    "route_reason": StrideReason::Setup.label(),
+                }));
             } else {
                 let reason = join_verdict(base, &range).err().map(StrideReason::label);
                 debug!(
@@ -882,15 +886,15 @@ fn process_field_join(
         let t0 = Instant::now();
         let join = match CpuJoin::new(base, slice, jp) {
             Ok(join) => join,
-            // The bottom side is the same for every slice, so only the first
-            // can fail, and then the whole field takes the stride walk.
-            Err(e) if i == 0 => {
+            // The bottom side and the digit lengths are the field's, so only
+            // the first slice can fail in practice; any failure sends the
+            // whole field to the stride walk.
+            Err(e) => {
                 warn!(
                     "overlap join cannot take base {base} {slice:?} ({e:#}); using the stride walk"
                 );
                 return None;
             }
-            Err(e) => panic!("slice {i} of a field whose first slice set up: {e:#}"),
         };
         tel.setup_secs += t0.elapsed().as_secs_f64();
         tel.partitions = usize::try_from(join.partitions()).unwrap_or(usize::MAX);

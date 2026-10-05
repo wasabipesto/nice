@@ -188,6 +188,11 @@ pub enum StrideReason {
     DeviceTooSmall,
     /// The backend has no overlap join (hand-CUDA).
     NoJoin,
+    /// The device has no plane (subgroup) operations, which the join's
+    /// kernels need (some wgpu adapters, such as DX12 without DXC).
+    NoPlaneOps,
+    /// The join could not set the field up (not expected at bases 40-64).
+    Setup,
     /// `NICE_JOIN_ROUTE=stride` ([`RouteOverride`]).
     Forced,
 }
@@ -203,6 +208,8 @@ impl StrideReason {
             Self::TooWide => "n too wide for the device stage",
             Self::DeviceTooSmall => "device cannot hold one partition",
             Self::NoJoin => "backend has no overlap join",
+            Self::NoPlaneOps => "device has no subgroup operations",
+            Self::Setup => "the join could not set the field up",
             Self::Forced => "forced by NICE_JOIN_ROUTE=stride",
         }
     }
@@ -504,9 +511,14 @@ pub struct Base {
     dpow: Vec<Div64>,
 }
 
+/// Digits the certificate's buffers hold (`Base::cert`): the cube of any
+/// field the join takes has at most 39, at bases 40-64.
+const DIGIT_BUF: usize = 48;
+
 impl Base {
     /// `lo..=hi` must share the digit length of n, n² and n³ (true inside
-    /// any field of a nice band); `None` otherwise.
+    /// any field of a nice band), and n³ must have at most [`DIGIT_BUF`]
+    /// digits; `None` otherwise.
     #[must_use]
     pub fn try_new(b: u32, lo: u128, hi: u128) -> Option<Self> {
         if !(3..=JOIN_MAX_BASE).contains(&b) || lo == 0 || lo > hi {
@@ -568,7 +580,7 @@ impl Base {
         let s3 = digits_w(&W4::mul_u128_u128(lo, lo).mul_u128(lo));
         let hs2 = digits_w(&W4::mul_u128_u128(hi, hi));
         let hs3 = digits_w(&W4::mul_u128_u128(hi, hi).mul_u128(hi));
-        if s2 != hs2 || s3 != hs3 {
+        if s2 != hs2 || s3 != hs3 || s3 as usize > DIGIT_BUF {
             return None;
         }
         let dpow = pow64.iter().map(|&x| Div64::new(x)).collect();
@@ -633,7 +645,7 @@ impl Base {
     // Digits are below b <= 64, so `as u8` is exact; x fits u64 by then.
     #[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
     #[inline]
-    fn digits_w(&self, mut x: W4, len: u32, out: &mut [u8; 48]) {
+    fn digits_w(&self, mut x: W4, len: u32, out: &mut [u8; DIGIT_BUF]) {
         let b = u64::from(self.b);
         let mut n = 0usize;
         while x.0[2] != 0 || x.0[3] != 0 {
@@ -678,8 +690,8 @@ impl Base {
         let a3 = a2.mul_u128(a);
         let e3 = e2.mul_u128(e);
         let mut mask = 0u64;
-        let mut dx = [0u8; 48];
-        let mut dy = [0u8; 48];
+        let mut dx = [0u8; DIGIT_BUF];
+        let mut dy = [0u8; DIGIT_BUF];
         for (x, y, sp) in [(a2, e2, self.s2), (a3, e3, self.s3)] {
             let c0 = cap.max(self.ndig_w(&y.sub(&x)));
             if c0 >= sp {
