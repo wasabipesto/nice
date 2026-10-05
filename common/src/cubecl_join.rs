@@ -267,7 +267,9 @@ mod kernels {
 
     /// Step 2 (v3): one cube per work item over the dense (slot, d, c) list
     /// built by [`bucket_kernel`]; `ept` entries per thread per wave, every
-    /// thread runs every wave (uniform), survivors staged and flushed per wave.
+    /// thread runs every wave (uniform), survivors staged and flushed through
+    /// the prefilter whenever the stage is half full, checked after every 32
+    /// tops.
     #[cube(launch_unchecked)]
     pub fn join_kernel(
         ext_m: &Array<u32>,
@@ -448,29 +450,41 @@ mod kernels {
                                 }
                             }
                         }
-                        jc += 32u32;
-                    }
-                    sync_cube();
-                    let sc = s_cnt[0].load();
-                    if sc >= SURV_FLUSH {
-                        flush_survivors(
-                            &s_t,
-                            &s_r,
-                            &mut s_cnt,
-                            &mut s_base,
-                            &mut plane_tot,
-                            top_m,
-                            top_x,
-                            surv,
-                            surv_count,
-                            staged,
-                            surv_cap,
-                            sc,
-                            base,
-                            f0,
-                            k2,
-                        );
+                        // Flush the stage once it is half full, after every
+                        // chunk of 32 tops. Once a wave pairs its 1,024
+                        // entries with a full 256 tops (buckets that dense
+                        // come with fields of about 1e15 and up), checking
+                        // only at the wave's end let the stage overrun, and
+                        // its overflow went to the list unfiltered: 11x the
+                        // full checks on a base-58 field of 1e15, and lists
+                        // that overflowed. A chunk can still overrun the
+                        // half left (about 2e-5 of the survivors there, and
+                        // no more on larger fields, since a chunk is the same
+                        // size); that overflow takes the same unfiltered
+                        // path, which costs only its full checks.
                         sync_cube();
+                        let sc = s_cnt[0].load();
+                        if sc >= SURV_FLUSH {
+                            flush_survivors(
+                                &s_t,
+                                &s_r,
+                                &mut s_cnt,
+                                &mut s_base,
+                                &mut plane_tot,
+                                top_m,
+                                top_x,
+                                surv,
+                                surv_count,
+                                staged,
+                                surv_cap,
+                                sc,
+                                base,
+                                f0,
+                                k2,
+                            );
+                            sync_cube();
+                        }
+                        jc += 32u32;
                     }
                     ws += wave;
                 }
