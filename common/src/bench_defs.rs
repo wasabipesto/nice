@@ -178,27 +178,33 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
 ];
 
 /// Reference rates (numbers/sec) for the synthetic score, pinned per client
-/// version: (scenario key, gpu, reference rate). CPU references were measured
-/// on a 4-core `x86_64` dev box, GPU references on an RTX 3060; a score of 1000
-/// means "matches the reference machine on the geometric mean".
+/// version: (scenario key, gpu, reference rate). A score of 1000 means
+/// "matches every reference rate on the geometric mean".
 ///
-/// The nice-only field scenarios have no references yet: they are pinned
-/// with the next re-pin, and until then a nice-only sweep has no score.
+/// The references are arbitrary anchors, not a description of any machine:
+/// they are re-pinned whenever the maintainers decide the scale has drifted,
+/// which changes every score at once. Compare scores within a client version
+/// only; the per-scenario rates in the report are what to use across
+/// versions.
 ///
 /// The browser suite scores against these same references deliberately: a
 /// browser scoring 550 where the native client scores 1000 on the same box
 /// is information, not a bug.
-///
 pub const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
-    ("b40_detailed", false, 1.4e7),
-    ("b50_detailed", false, 8.9e6),
-    ("b50_detailed_1t", false, 2.2e6),
-    ("b40_detailed", true, 4.5e9),
-    ("b50_detailed", true, 3.2e9),
+    ("b57_1e14", false, 1.4e12),
+    ("b57_1e14_1t", false, 2.8e11),
+    ("b58_1e15", false, 3.1e12),
+    ("b40_detailed", false, 4.2e7),
+    ("b50_detailed", false, 1.7e7),
+    ("b50_detailed_1t", false, 2.8e6),
+    ("b57_1e14", true, 2.5e13),
+    ("b58_1e15", true, 5.6e13),
+    ("b40_detailed", true, 2.4e9),
+    ("b50_detailed", true, 1.5e9),
 ];
 
-/// Geometric mean of measured rate over reference rate, scaled so the
-/// reference machine scores 1000. Scenarios without a pinned reference or
+/// Geometric mean of measured rate over reference rate, scaled so matching
+/// every reference exactly scores 1000. Scenarios without a pinned reference or
 /// that were dropped (rate <= 0) are excluded; `None` if nothing scored.
 pub fn compute_score<'a>(
     rates: impl IntoIterator<Item = (&'a str, f64)>,
@@ -250,16 +256,31 @@ mod tests {
     }
 
     #[test]
-    fn detailed_scenarios_have_cpu_references() {
-        // Every detailed CPU scenario must be scoreable, or the score
-        // silently thins. (The nice-only fields wait for the re-pin.)
-        for def in DETAILED_SCENARIOS {
+    fn every_scenario_has_its_references() {
+        // Every scenario scores on the CPU, and every one a GPU runs (all but
+        // the single-thread ones) on the GPU too, or the score silently thins.
+        let has = |key: &str, gpu: bool| {
+            SCORE_REFERENCES
+                .iter()
+                .any(|(k, g, _)| *k == key && *g == gpu)
+        };
+        let scenarios: Vec<(&str, bool)> = DETAILED_SCENARIOS
+            .iter()
+            .map(|d| (d.key, d.single_thread))
+            .chain(NICEONLY_FIELDS.iter().map(|d| (d.key, d.single_thread)))
+            .collect();
+        for &(key, single_thread) in &scenarios {
+            assert!(has(key, false), "missing CPU score reference for {key}");
             assert!(
-                SCORE_REFERENCES
-                    .iter()
-                    .any(|(k, gpu, _)| k == &def.key && !gpu),
-                "missing CPU score reference for {}",
-                def.key
+                single_thread || has(key, true),
+                "missing GPU score reference for {key}"
+            );
+        }
+        // No reference is left over from a scenario that is gone.
+        for (key, _, _) in SCORE_REFERENCES {
+            assert!(
+                scenarios.iter().any(|(k, _)| k == key),
+                "reference for unknown scenario {key}"
             );
         }
     }
