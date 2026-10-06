@@ -3,9 +3,12 @@
 Run: python3 -m unittest discover fleet
 """
 
+import os
 import sqlite3
+import tempfile
 import time
 import unittest
+import urllib.error
 
 import controller
 import estimator
@@ -291,7 +294,7 @@ class RenewExploitTests(unittest.TestCase):
 
     def _patch_estimate(self, est):
         orig = controller.estimate_offer
-        controller.estimate_offer = lambda cfg, db, offer, mode=None: est
+        controller.estimate_offer = lambda cfg, db, offer, mode=None, version=None: est
         return orig
 
     def test_healthy_winner_is_renewed_not_reaped(self):
@@ -327,13 +330,30 @@ class RenewExploitTests(unittest.TestCase):
         row = db.execute("SELECT ttl_at FROM instances WHERE vast_id = 1").fetchone()
         self.assertLess(row["ttl_at"], time.time(), "faded instance TTL must not be renewed")
 
+    def test_an_instance_is_priced_at_the_version_it_runs(self):
+        db = memory_db()
+        self._seed_expired_exploit(db, vast_id=1)
+        self._seed_expired_exploit(db, vast_id=2)  # launched before versions were kept
+        db.execute("UPDATE instances SET client_version = '3.4.4' WHERE vast_id = 1")
+        asked = []
+        orig = controller.estimate_offer
+        controller.estimate_offer = lambda cfg_, db_, offer, mode=None, version=None: (
+            asked.append(version)
+            or {"prediction_stage": "exact", "confidence": 85, "blended_rate_p25": 5.0e10})
+        try:
+            renew_exploits(cfg(bid_multiplier=1.2), db, dry=False, version="3.4.5")
+        finally:
+            controller.estimate_offer = orig
+        self.assertEqual(sorted(asked), ["3.4.4", "3.4.5"])
+
     def test_renew_disabled_leaves_it_for_reconcile(self):
         db = memory_db()
         self._seed_expired_exploit(db)
         called = {"n": 0}
         orig = controller.estimate_offer
         controller.estimate_offer = (
-            lambda cfg, db, offer, mode=None: called.__setitem__("n", called["n"] + 1))
+            lambda cfg, db, offer, mode=None, version=None:
+            called.__setitem__("n", called["n"] + 1))
         try:
             renew_exploits(cfg(exploit_renew_window_hours=0), db, dry=False)
         finally:
@@ -398,10 +418,10 @@ class MultiModeTests(unittest.TestCase):
         created = []
         orig = controller.create_instance
         controller.create_instance = (
-            lambda cfg, db, offer, purpose, bid, ttl, ev, pounce, dry, mode=None:
+            lambda cfg, db, offer, purpose, bid, ttl, ev, pounce, dry, mode=None, version=None:
             created.append((offer["id"], mode)))
         try:
-            controller.plan_exploit(c, db, by_mode, dry=False)
+            controller.plan_exploit(c, db, by_mode, dry=False, version="3.4.5")
         finally:
             controller.create_instance = orig
         # Each physical offer id bought at most once across both modes (dedup).
@@ -443,6 +463,7 @@ class InsufficientCreditTests(unittest.TestCase):
                     cfg(dry_run=False), db,
                     {"id": 1, "gpu_name": "RTX A4000", "cpu_name": "EPYC"},
                     "exploit", 0.05, 1.0, 1.0e12, False, False, mode="niceonly",
+                    version="3.4.5",
                 )
         finally:
             controller.vast_client = orig
@@ -458,6 +479,7 @@ class InsufficientCreditTests(unittest.TestCase):
                 cfg(dry_run=False), db,
                 {"id": 1, "gpu_name": "RTX A4000", "cpu_name": "EPYC"},
                 "exploit", 0.05, 1.0, 1.0e12, False, False, mode="niceonly",
+                version="3.4.5",
             )
         finally:
             controller.vast_client = orig
@@ -484,7 +506,7 @@ class InsufficientCreditTests(unittest.TestCase):
         controller.create_instance = broke
         try:
             with self.assertRaises(controller.InsufficientCredit):
-                controller.plan_exploit(c, db, by_mode, dry=False)
+                controller.plan_exploit(c, db, by_mode, dry=False, version="3.4.5")
         finally:
             controller.create_instance = orig
         # One attempt total — not one per offer, not one per mode.
@@ -719,14 +741,14 @@ class ExploreTargetingTests(unittest.TestCase):
         return {"niceonly": [({"id": i, "gpu_name": g, "cpu_name": c, "min_bid": b}, {}, 1.0)
                              for i, (g, c, b) in enumerate(specs)]}
 
-    def _run(self, db, c, by_mode):
+    def _run(self, db, c, by_mode, version="3.3.0"):
         created = []
         orig = controller.create_instance
         controller.create_instance = (
-            lambda cfg, db_, offer, purpose, bid, ttl, ev, pounce, dry, mode=None:
+            lambda cfg, db_, offer, purpose, bid, ttl, ev, pounce, dry, mode=None, version=None:
             created.append(offer["gpu_name"]))
         try:
-            controller.plan_explore(c, db, by_mode, dry=False)
+            controller.plan_explore(c, db, by_mode, dry=False, version=version)
         finally:
             controller.create_instance = orig
         return created
@@ -771,6 +793,19 @@ class ExploreTargetingTests(unittest.TestCase):
         ]))
         self.assertEqual(sorted(created), ["RTX 4080", "RTX 4090"])
 
+    def test_only_the_launched_version_counts_as_coverage(self):
+        # After a release every cell is thin again: twenty reports from an
+        # older client say nothing about how the release runs there.
+        db = memory_db()
+        now = time.time()
+        db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                   (now,))
+        self._seed_corpus(db, [("rtx 3060", "amd epyc 7763", 20)])   # all 3.3.0
+        c = cfg(explore_per_tick=2, explore_target_samples=8)
+        offers = self._offers([("RTX 3060", "AMD EPYC 7763 64-Core", 0.01)])
+        self.assertEqual(self._run(db, c, offers, version="3.3.0"), [])
+        self.assertEqual(self._run(db, c, offers, version="3.4.5"), ["RTX 3060"])
+
     def test_cooldown_is_by_cell_not_exact_pair(self):
         # The old cooldown keyed on the raw (gpu, cpu) strings, so one popular
         # GPU across many CPU models never cooled down.
@@ -793,8 +828,8 @@ class CorpusSyncTests(unittest.TestCase):
     a failed pull leaves what we already had."""
 
     def _report(self, i, gpu=True, mode="Nice-only", threads=8, cpu="AMD EPYC 7763",
-                gpu_model="RTX 3080", rate=2.0e9):
-        return {"id": i, "client_version": "3.3.0", "data": {
+                gpu_model="RTX 3080", rate=2.0e9, version="3.3.0"):
+        return {"id": i, "client_version": version, "data": {
             "schema_version": 1,
             "config": {"gpu": gpu, "mode": mode, "threads": threads},
             "hardware": {"cpu_model": cpu, "gpu_model": gpu_model},
@@ -884,6 +919,221 @@ class CorpusSyncTests(unittest.TestCase):
         self.assertEqual(out["prediction_stage"], "exact")
         self.assertEqual(out["samples_used"], 3)
         self.assertLess(abs(out["blended_rate_p50"] - 2.0e9), 1.0)
+
+    def test_estimate_offer_keeps_to_the_version_it_is_given(self):
+        db = memory_db()
+        rows = ([self._report(i) for i in (1, 2, 3)]
+                + [self._report(i, rate=8.0e9, version="3.4.5") for i in (4, 5, 6)])
+        orig, _ = self._patch_fetch([rows])
+        try:
+            controller.sync_corpus(cfg(), db)
+        finally:
+            controller._fetch_json = orig
+        c = cfg(gpu=True, mode="niceonly")
+        offer = {"gpu_name": "NVIDIA GeForce RTX 3080", "cpu_name": "AMD EPYC 7763",
+                 "cpu_cores_effective": 8}
+        controller._corpus = None
+        try:
+            same = controller.estimate_offer(c, db, offer, version="3.4.5")
+            pooled = controller.estimate_offer(c, db, offer)
+        finally:
+            controller._corpus = None
+        self.assertEqual(same["versions_used"], ["3.4.5"])
+        self.assertLess(abs(same["blended_rate_p50"] - 8.0e9), 1.0)
+        self.assertEqual(pooled["versions_used"], ["3.3.0", "3.4.5"])
+
+
+class ClientVersionTests(unittest.TestCase):
+    """The version the fleet prices with is the version it launches: the
+    newest release image in the registry, or the config's pin."""
+
+    TAGS = ["latest", "latest-gpu", "3", "3-gpu", "3.4-gpu", "3.4.5", "3.4.5-gpu",
+            "3.9.0-gpu", "3.10.0-gpu", "3.11.0", "3.12.0-rc.1-gpu", "4.0.0-gpu",
+            "pr-184-gpu", "0f3c2e1-amd64-gpu"]
+
+    def test_newest_release_orders_by_number_and_flavour(self):
+        self.assertEqual(controller.newest_release(self.TAGS, gpu=True), "3.10.0",
+                         "3.10 is newer than 3.9; 4.x, pre-releases and moving tags never count")
+        self.assertEqual(controller.newest_release(self.TAGS, gpu=False), "3.11.0",
+                         "a CPU fleet reads the plain tags")
+        self.assertIsNone(controller.newest_release(["latest-gpu", "3-gpu"], gpu=True))
+
+    def test_the_image_is_the_repository_tagged_with_the_version(self):
+        for image in ("ghcr.io/o/nice_client", "ghcr.io/o/nice_client:latest-gpu",
+                      "ghcr.io/o/nice_client@sha256:abc"):
+            self.assertEqual(controller.image_repository(cfg(image=image)),
+                             "ghcr.io/o/nice_client")
+        self.assertEqual(controller.image_repository(cfg(image="localhost:5000/o/c:3-gpu")),
+                         "localhost:5000/o/c", "a registry port is not a tag")
+        self.assertEqual(controller.launch_image(cfg(image="ghcr.io/o/c:3-gpu", gpu=True), "3.4.5"),
+                         "ghcr.io/o/c:3.4.5-gpu")
+        self.assertEqual(controller.launch_image(cfg(image="ghcr.io/o/c", gpu=False), "3.4.5"),
+                         "ghcr.io/o/c:3.4.5")
+
+    def test_registry_tags_takes_a_token_and_follows_pages(self):
+        challenge = ('Bearer realm="https://ghcr.io/token",service="ghcr.io",'
+                     'scope="repository:o/c:pull"')
+        responses = [
+            urllib.error.HTTPError("u", 401, "Unauthorized", {"WWW-Authenticate": challenge}, None),
+            ({"token": "t0k"}, None),
+            ({"tags": ["3.4.4-gpu", "3.4.5-gpu"]},
+             '</v2/o/c/tags/list?last=3.4.5-gpu&n=1000>; rel="next"'),
+            ({"tags": ["latest-gpu"]}, None),
+        ]
+        calls = []
+
+        def fake(cfg_, url, token):
+            calls.append((url, token))
+            r = responses.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        orig = controller._registry_get
+        controller._registry_get = fake
+        try:
+            tags = controller.registry_tags(cfg(image="ghcr.io/o/c:latest-gpu"))
+        finally:
+            controller._registry_get = orig
+        self.assertEqual(tags, ["3.4.4-gpu", "3.4.5-gpu", "latest-gpu"])
+        self.assertEqual(calls, [
+            ("https://ghcr.io/v2/o/c/tags/list?n=1000", None),
+            ("https://ghcr.io/token?service=ghcr.io&scope=repository%3Ao%2Fc%3Apull", None),
+            ("https://ghcr.io/v2/o/c/tags/list?n=1000", "t0k"),
+            ("https://ghcr.io/v2/o/c/tags/list?last=3.4.5-gpu&n=1000", "t0k"),
+        ])
+
+    def _resolve(self, db, c, now, tags):
+        """current_client_version against a registry holding `tags` (or
+        raising them, if an exception). Returns (version, lookups made)."""
+        calls = []
+
+        def fake(cfg_):
+            calls.append(cfg_)
+            if isinstance(tags, Exception):
+                raise tags
+            return tags
+
+        orig = controller.registry_tags
+        controller.registry_tags = fake
+        try:
+            return controller.current_client_version(c, db, now), len(calls)
+        finally:
+            controller.registry_tags = orig
+
+    def test_a_pin_is_used_as_written(self):
+        self.assertEqual(self._resolve(memory_db(), cfg(client_version="3.4.4"), 1000.0,
+                                       OSError("not consulted")), ("3.4.4", 0))
+
+    def test_a_malformed_pin_launches_nothing(self):
+        db = memory_db()
+        self.assertEqual(self._resolve(db, cfg(client_version="v3.4.5"), 1000.0, ["3.4.5-gpu"]),
+                         (None, 0))
+        self.assertIsNotNone(db.execute("SELECT 1 FROM events WHERE kind = 'ERROR'").fetchone())
+
+    def test_auto_follows_the_registry_hourly(self):
+        db = memory_db()
+        c = cfg(client_version="auto", gpu=True)
+        self.assertEqual(self._resolve(db, c, 1000.0, ["3.4.4-gpu", "3.4.5-gpu"]), ("3.4.5", 1))
+        # Within the hour the stored answer stands, even if a release has landed.
+        self.assertEqual(self._resolve(db, c, 1000.0 + 3599, ["3.4.6-gpu"]), ("3.4.5", 0))
+        # After it, the new release is found and announced.
+        self.assertEqual(self._resolve(db, c, 1000.0 + 3600, ["3.4.5-gpu", "3.4.6-gpu"]),
+                         ("3.4.6", 1))
+        changes = [r["detail"] for r in
+                   db.execute("SELECT detail FROM events WHERE kind = 'VERSION' ORDER BY rowid")]
+        self.assertEqual(len(changes), 2)
+        self.assertIn("3.4.5 -> 3.4.6", changes[1])
+        self.assertIn("nice_client:3.4.6-gpu", changes[1])
+
+    def test_a_failed_lookup_keeps_the_last_version(self):
+        db = memory_db()
+        c = cfg(client_version="auto")
+        self._resolve(db, c, 1000.0, ["3.4.5-gpu"])
+        self.assertEqual(self._resolve(db, c, 1000.0 + 7200, OSError("registry down")),
+                         ("3.4.5", 1))
+        # With no version ever found there is nothing to launch.
+        self.assertEqual(self._resolve(memory_db(), c, 1000.0, OSError("registry down")),
+                         (None, 1))
+        # A registry with no release on the line counts as a failed lookup.
+        self.assertEqual(self._resolve(memory_db(), c, 1000.0, ["latest-gpu", "4.0.0-gpu"]),
+                         (None, 1))
+
+    def test_a_tag_on_the_configured_image_is_flagged(self):
+        db = memory_db()
+        self._resolve(db, cfg(client_version="3.4.5", image="ghcr.io/o/c:latest-gpu"),
+                      1000.0, [])
+        warn = db.execute("SELECT detail FROM events WHERE kind = 'WARN'").fetchone()
+        self.assertIn("latest-gpu", warn["detail"])
+
+    def test_create_launches_the_release_tag_and_records_it(self):
+        db = memory_db()
+        seen = {}
+
+        class Stub:
+            def create_instance(self, **kw):
+                seen.update(kw)
+                return {"success": True, "new_contract": 42}
+
+        orig = controller.vast_client
+        controller.vast_client = lambda cfg_: Stub()
+        try:
+            controller.create_instance(
+                cfg(dry_run=False, gpu=True, image="ghcr.io/o/c:latest-gpu"), db,
+                {"id": 1, "gpu_name": "RTX 3080", "cpu_name": "EPYC"},
+                "exploit", 0.05, 1.0, 1.0e12, False, False, mode="niceonly", version="3.4.5",
+            )
+        finally:
+            controller.vast_client = orig
+        self.assertEqual(seen["image"], "ghcr.io/o/c:3.4.5-gpu")
+        row = db.execute("SELECT client_version FROM instances WHERE vast_id = 42").fetchone()
+        self.assertEqual(row["client_version"], "3.4.5")
+
+
+class TickVersionTests(unittest.TestCase):
+    """The tick prices and buys at one version, and buys nothing without one."""
+
+    def _tick(self, version):
+        stubs = {
+            "reconcile": lambda cfg_, db_, dry: {},
+            "reconcile_invoices": lambda cfg_, db_, dry: None,
+            "sync_corpus": lambda cfg_, db_: 1,
+            "current_client_version": lambda cfg_, db_, now: version,
+            "search_offers": lambda cfg_: [{"id": 7, "gpu_name": "RTX 3080",
+                                            "cpu_name": "EPYC", "min_bid": 0.05}],
+            "estimate_offer": lambda cfg_, db_, offer, mode=None, version=None: (
+                asked.append(version) or {"blended_rate_p25": 1.0e9}),
+            "plan_explore": lambda cfg_, db_, by_mode, dry, v: bought.append(("explore", v)),
+            "plan_exploit": lambda cfg_, db_, by_mode, dry, v: bought.append(("exploit", v)),
+        }
+        asked, bought = [], []
+        saved = {name: getattr(controller, name) for name in stubs}
+        with tempfile.TemporaryDirectory() as tmp:
+            c = cfg(db_path=os.path.join(tmp, "fleet.sqlite3"),
+                    kill_switch_path=os.path.join(tmp, "KILL"))
+            for name, stub in stubs.items():
+                setattr(controller, name, stub)
+            try:
+                controller.tick(c)
+            finally:
+                for name, fn in saved.items():
+                    setattr(controller, name, fn)
+            db = sqlite3.connect(c["db_path"])
+            summary = db.execute(
+                "SELECT detail FROM events WHERE kind = 'SUMMARY'").fetchone()[0]
+            db.close()
+        return asked, bought, summary
+
+    def test_one_version_prices_and_buys(self):
+        asked, bought, summary = self._tick("3.4.5")
+        self.assertEqual(asked, ["3.4.5"])
+        self.assertEqual(bought, [("explore", "3.4.5"), ("exploit", "3.4.5")])
+        self.assertIn("image=ghcr.io/wasabipesto/nice_client:3.4.5-gpu", summary)
+
+    def test_no_version_buys_nothing(self):
+        _asked, bought, summary = self._tick(None)
+        self.assertEqual(bought, [])
+        self.assertIn("image=none", summary)
 
 
 class OnstartTemplateTests(unittest.TestCase):

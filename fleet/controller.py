@@ -12,7 +12,8 @@ One tick per cron invocation:
      destroy anything expired or unknown, charge runtime spend to the bucket
   2. accrue budget into the token bucket (sustained rate, capped)
   3. search bid offers and estimate each locally, against a corpus of
-     benchmark reports mirrored from the API's database
+     benchmark reports mirrored from the API's database, at the client version
+     the fleet launches (the newest release image, or a pinned version)
   4. explore slice: benchmark the hardware the estimator can't price yet,
      ranked by how thin that GPU/CPU-family cell is, rate-limited and cooled
   5. exploit slice: rank offers by hold-amortized P25 EV, buy under the
@@ -31,11 +32,14 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import sqlite3
 import statistics
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.parse
 import urllib.request
 
 import estimator
@@ -60,6 +64,15 @@ _BENCH_SWEEP = (
     "nice_client niceonly --benchmark --benchmark-upload --no-progress "
     "--api-base {api_base} --username {username} --threads {threads}"
 )
+
+# The client major version the onstart commands are written for. With
+# client_version "auto" the controller follows the newest release on this line
+# and never leaves it on its own: a new major may change the command line, so
+# moving to it is a code change made alongside the templates.
+CLIENT_MAJOR = 3
+
+# How long a version read from the registry stands before it is looked up again.
+VERSION_REFRESH_SECS = 3600
 
 DEFAULT_CONFIG = {
     "dry_run": True,
@@ -153,7 +166,14 @@ DEFAULT_CONFIG = {
     # re-evaluation via a fresh buy. Set the window to 0 to disable renewal.
     "exploit_renew_window_hours": 1.0,
     "exploit_max_lifetime_hours": 168.0,
-    "image": "ghcr.io/wasabipesto/nice_client:latest-gpu",
+    # The client version the fleet prices with and launches: estimates ask for
+    # this version's benchmarks, and instances run the image tagged with it, so
+    # the two cannot differ. "auto" is the newest X.Y.Z release image on the
+    # CLIENT_MAJOR line in the registry; a version string ("3.4.5") pins it.
+    "client_version": "auto",
+    # The image repository only: the tag comes from client_version (X.Y.Z-gpu
+    # for a GPU fleet). A tag written here is ignored, with a warning.
+    "image": "ghcr.io/wasabipesto/nice_client",
     "disk_gb": 30,
     # Instances launch in ssh runtype: Vast runs its own init and executes
     # onstart_cmd in a shell, so the image ENTRYPOINT is bypassed and the
@@ -226,12 +246,19 @@ CREATE TABLE IF NOT EXISTS instances (
                                      -- $0 invoice is a fact, not an unsettled bill
     invoiced REAL,                   -- actual Vast charge (GPU+storage+net),
                                      -- NULL until the instance is invoiced
-    mode TEXT                        -- exploit mode (which bucket it charges);
+    mode TEXT,                       -- exploit mode (which bucket it charges);
                                      -- NULL for explore (funded by primary mode)
+    client_version TEXT              -- version it was launched with and is priced
+                                     -- at; NULL if launched before this was kept
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value REAL
+);
+CREATE TABLE IF NOT EXISTS release (  -- the client version last read from the registry
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version TEXT NOT NULL,
+    resolved_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS corpus (   -- local mirror of the API's benchmarks table
     id INTEGER PRIMARY KEY,           -- benchmarks.id upstream; the sync watermark
@@ -329,6 +356,8 @@ def open_db(path):
         db.execute("ALTER TABLE instances ADD COLUMN mode TEXT")
     if "ever_ran" not in icols:
         db.execute("ALTER TABLE instances ADD COLUMN ever_ran INTEGER NOT NULL DEFAULT 0")
+    if "client_version" not in icols:
+        db.execute("ALTER TABLE instances ADD COLUMN client_version TEXT")
     ecols = {r["name"] for r in db.execute("PRAGMA table_info(ev_seen)").fetchall()}
     if "mode" not in ecols:
         db.execute("ALTER TABLE ev_seen ADD COLUMN mode TEXT")
@@ -786,7 +815,10 @@ def reconcile_invoices(cfg, db, dry):
     )
 
 
-def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry, mode=None):
+def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry, mode=None,
+                    version=None):
+    if not version:
+        raise ValueError("create_instance needs the client version it launches")
     onstart_tpl = cfg["onstart_exploit"] if purpose == "exploit" else cfg["onstart_explore"]
     onstart = onstart_tpl.format(
         mode=mode or cfg.get("mode", "niceonly"),  # exploit runs this mode; explore ignores it
@@ -797,7 +829,7 @@ def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry, mo
     label = f"{cfg['label_prefix']}-{purpose}"
     desc = (
         f"{purpose} offer {offer['id']} {offer.get('gpu_name')} / "
-        f"{(offer.get('cpu_name') or '?')[:40]} bid ${bid}/hr ev {ev:.3e}"
+        f"{(offer.get('cpu_name') or '?')[:40]} bid ${bid}/hr ev {ev:.3e} client {version}"
     )
     if dry:
         log_event(db, "DRY-CREATE", desc)
@@ -805,7 +837,7 @@ def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry, mo
     try:
         result = vast_client(cfg).create_instance(
             id=offer["id"],
-            image=cfg["image"],
+            image=launch_image(cfg, version),
             disk=cfg["disk_gb"],
             label=label,
             onstart_cmd=onstart,
@@ -829,11 +861,11 @@ def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry, mo
     now = time.time()
     db.execute(
         "INSERT INTO instances (vast_id, label, purpose, gpu_name, cpu_name, bid, "
-        "ev_predicted, pounce, created_at, ttl_at, last_charged_at, mode) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "ev_predicted, pounce, created_at, ttl_at, last_charged_at, mode, client_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             vast_id, label, purpose, offer.get("gpu_name"), offer.get("cpu_name"),
-            bid, ev, int(pounce), now, now + ttl_hours * 3600, now, mode,
+            bid, ev, int(pounce), now, now + ttl_hours * 3600, now, mode, version,
         ),
     )
     if purpose == "explore":
@@ -947,10 +979,139 @@ def load_corpus(db):
     return _corpus
 
 
-def estimate_offer(cfg, db, offer, mode=None):
+# ---------------------------------------------------------------------------
+# Client version: the version the fleet prices with is the version it launches
+
+_RELEASE_TAG = re.compile(r"(\d+)\.(\d+)\.(\d+)(-gpu)?")
+_VERSION_PIN = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?")
+
+
+def image_repository(cfg):
+    """The configured image without any tag or digest."""
+    ref = cfg["image"].split("@", 1)[0]
+    head, slash, last = ref.rpartition("/")
+    return head + slash + last.split(":", 1)[0]
+
+
+def launch_image(cfg, version):
+    """The image an instance of `version` runs: that release's own tag, never a
+    moving one (3-gpu, latest-gpu), so an instance cannot pull different code
+    from the version it was priced as."""
+    return f"{image_repository(cfg)}:{version}{'-gpu' if cfg['gpu'] else ''}"
+
+
+def newest_release(tags, gpu):
+    """The newest X.Y.Z among registry tags on the CLIENT_MAJOR line, or None.
+    A GPU fleet counts only X.Y.Z-gpu tags and a CPU fleet only plain X.Y.Z;
+    moving tags and pre-releases never match."""
+    best = None
+    for tag in tags:
+        m = _RELEASE_TAG.fullmatch(tag)
+        if not m or bool(m.group(4)) != bool(gpu) or int(m.group(1)) != CLIENT_MAJOR:
+            continue
+        key = (int(m.group(2)), int(m.group(3)))
+        if best is None or key > best[0]:
+            best = (key, f"{m.group(1)}.{m.group(2)}.{m.group(3)}")
+    return best[1] if best else None
+
+
+def _registry_get(cfg, url, token):
+    """GET one registry API URL: (decoded body, Link header)."""
+    headers = {"User-Agent": cfg["user_agent"]}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read()), resp.headers.get("Link")
+
+
+def _registry_token(cfg, challenge):
+    """An anonymous pull token, fetched where the registry's Bearer challenge
+    says (`Bearer realm="...",service="...",scope="..."`)."""
+    scheme, _, params = challenge.partition(" ")
+    fields = dict(re.findall(r'(\w+)="([^"]*)"', params))
+    if scheme.lower() != "bearer" or "realm" not in fields:
+        raise RuntimeError(f"unexpected registry challenge {challenge!r}")
+    realm = fields.pop("realm")
+    body, _ = _registry_get(cfg, f"{realm}?{urllib.parse.urlencode(fields)}", None)
+    return body.get("token") or body["access_token"]
+
+
+def registry_tags(cfg):
+    """Every tag in the image's repository, from the registry's v2 API. The
+    first request is refused with a Bearer challenge naming where to get an
+    anonymous pull token; later pages follow the Link header. Raises on any
+    failure."""
+    host, _, path = image_repository(cfg).partition("/")
+    url = f"https://{host}/v2/{path}/tags/list?n=1000"
+    token = None
+    tags = []
+    for _ in range(100):  # pages, with a stop for a Link chain that never ends
+        try:
+            body, link = _registry_get(cfg, url, token)
+        except urllib.error.HTTPError as e:
+            if e.code != 401 or token is not None:
+                raise
+            token = _registry_token(cfg, e.headers.get("WWW-Authenticate") or "")
+            continue
+        tags.extend(body.get("tags") or [])
+        nxt = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', link or "")
+        if nxt is None:
+            return tags
+        url = urllib.parse.urljoin(url, nxt.group(1))
+    raise RuntimeError("registry tag list did not end after 100 pages")
+
+
+def current_client_version(cfg, db, now):
+    """The client version this tick prices with and launches.
+
+    A pin in the config is used as written. Otherwise it is the newest release
+    image in the registry: a version's tag appears there only once its image
+    has been pushed, minutes after the git tag, so this never names a version
+    that cannot be launched yet. A lookup stands for VERSION_REFRESH_SECS, and
+    a failed one keeps the last version found. None means there is no version
+    to launch (a malformed pin, or no lookup has ever succeeded), and the tick
+    then buys nothing."""
+    if cfg["image"] != image_repository(cfg):
+        log_event(db, "WARN", f"image {cfg['image']!r} has a tag; it is ignored, "
+                              "the tag comes from client_version")
+    pin = cfg.get("client_version") or "auto"
+    if pin != "auto":
+        if not _VERSION_PIN.fullmatch(pin):
+            log_event(db, "ERROR", f"client_version {pin!r} is neither 'auto' nor X.Y.Z")
+            return None
+        return pin
+    row = db.execute("SELECT version, resolved_at FROM release WHERE id = 1").fetchone()
+    if row is not None and 0 <= now - row["resolved_at"] < VERSION_REFRESH_SECS:
+        return row["version"]
+    try:
+        version = newest_release(registry_tags(cfg), cfg["gpu"])
+        if version is None:
+            raise RuntimeError(f"no {CLIENT_MAJOR}.x release tag in {image_repository(cfg)}")
+    except Exception as e:  # network, HTTP, a malformed response: all survivable
+        kept = row["version"] if row is not None else None
+        log_event(db, "WARN", f"release lookup failed: {e!r}; "
+                              f"{'keeping ' + kept if kept else 'no client version known'}")
+        return kept
+    if row is None or row["version"] != version:
+        log_event(db, "VERSION", f"client {row['version'] if row else 'none'} -> {version}: "
+                                 f"launching {launch_image(cfg, version)}")
+    db.execute(
+        "INSERT INTO release (id, version, resolved_at) VALUES (1, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET version = excluded.version, "
+        "resolved_at = excluded.resolved_at",
+        (version, now),
+    )
+    db.commit()
+    return version
+
+
+def estimate_offer(cfg, db, offer, mode=None, version=None):
     """Predict what an offer will achieve. Same response shape the API's
     /estimate returned, so callers are unchanged; the numbers now come from
-    the local corpus rather than a round trip."""
+    the local corpus rather than a round trip. With a `version`, the estimate
+    keeps to that client version's benchmarks once enough of them match (see
+    estimator.estimate); None pools every version."""
     mode_display = estimator.mode_string(mode or cfg["mode"])
     if mode_display is None:
         raise ValueError(f"unknown mode {mode or cfg['mode']!r}")
@@ -961,6 +1122,7 @@ def estimate_offer(cfg, db, offer, mode=None):
         "threads": int(offer.get("cpu_cores_effective") or 0) or None,
         "cpu_model": offer.get("cpu_name"),
         "gpu_model": offer.get("gpu_name"),
+        "client_version": version,
     }
     out = estimator.estimate(corpus, query)
     warn_if_divergent(db, cfg, corpus, query, out)
@@ -1098,10 +1260,12 @@ def reconcile(cfg, db, dry):
     return ours_live
 
 
-def extend_or_probe_pounces(cfg, db, dry):
+def extend_or_probe_pounces(cfg, db, dry, version=None):
     """Pounce instances start on a short probe TTL. Extend only once the
     estimator — now fed by the instance's own uploaded benchmark — still
-    supports the buy at a trustworthy stage."""
+    supports the buy at a trustworthy stage. Each instance is priced at the
+    client version it runs; one launched before versions were recorded, at
+    `version`."""
     now = time.time()
     rows = db.execute(
         "SELECT * FROM instances WHERE destroyed_at IS NULL AND pounce = 1 AND confirmed = 0"
@@ -1114,7 +1278,8 @@ def extend_or_probe_pounces(cfg, db, dry):
             "min_bid": row["bid"] / mcfg(cfg, m, "bid_multiplier"),
         }
         try:
-            est = estimate_offer(cfg, db, offer_like, mode=m)
+            est = estimate_offer(cfg, db, offer_like, mode=m,
+                                 version=row["client_version"] or version)
         except Exception as e:
             log_event(db, "WARN", f"estimate for pounce {row['vast_id']} failed: {e!r}")
             continue
@@ -1135,12 +1300,14 @@ def extend_or_probe_pounces(cfg, db, dry):
     db.commit()
 
 
-def renew_exploits(cfg, db, dry):
+def renew_exploits(cfg, db, dry, version=None):
     """Keep proven winners. An ordinary exploit within its renew window of TTL
     is re-estimated; if it still clears the trust bar and holds above-median EV
     it is renewed in place, otherwise it is reaped now (reconcile deferred the
     ordinary-exploit TTL decision to here). A hard lifetime cap forces a fresh
-    buy periodically. Pounces are handled by extend_or_probe_pounces."""
+    buy periodically. Pounces are handled by extend_or_probe_pounces. Each
+    instance is priced at the client version it runs; one launched before
+    versions were recorded, at `version`."""
     window_h = cfg.get("exploit_renew_window_hours", 0)
     if not window_h or window_h <= 0:
         return
@@ -1165,7 +1332,8 @@ def renew_exploits(cfg, db, dry):
             "min_bid": row["bid"] / mcfg(cfg, m, "bid_multiplier"),
         }
         try:
-            est = estimate_offer(cfg, db, offer_like, mode=m)
+            est = estimate_offer(cfg, db, offer_like, mode=m,
+                                 version=row["client_version"] or version)
         except Exception as e:
             log_event(db, "WARN", f"renew estimate for {row['vast_id']} failed: {e!r}")
             continue  # can't judge; leave TTL as-is, re-check next tick
@@ -1234,18 +1402,23 @@ def corpus_cell_key(gpu_model, cpu_model):
     return (estimator.normalize_gpu_model(gpu_model or "?"), estimator.cpu_match_key(cpu_model))
 
 
-def corpus_cell_counts(db):
+def corpus_cell_counts(db, version=None):
     """Reports per coverage cell, from the local mirror. GPU reports only:
     an explore's value is the hardware pairing it prices, and the CPU-only
-    runs in its sweep are priced by the CPU chain regardless of GPU."""
+    runs in its sweep are priced by the CPU chain regardless of GPU. With a
+    `version`, only that client version's reports count, so after a release
+    every cell is thin again until reports from the release arrive."""
+    sql, args = "SELECT gpu_model, cpu_model FROM corpus WHERE gpu = 1", ()
+    if version is not None:
+        sql, args = sql + " AND client_version = ?", (version,)
     counts = {}
-    for r in db.execute("SELECT gpu_model, cpu_model FROM corpus WHERE gpu = 1").fetchall():
+    for r in db.execute(sql, args).fetchall():
         key = (r["gpu_model"] or "?", estimator.cpu_match_key(r["cpu_model"]))
         counts[key] = counts.get(key, 0) + 1
     return counts
 
 
-def plan_explore(cfg, db, by_mode, dry):
+def plan_explore(cfg, db, by_mode, dry, version):
     """Buy benchmarks for the hardware the estimator cannot price yet.
 
     Explore used to take the cheapest uncertain offer and cool down on the
@@ -1279,7 +1452,7 @@ def plan_explore(cfg, db, by_mode, dry):
     if slots == 0:
         return
     offers = {o["id"]: o for mode_offers in by_mode.values() for o, _e, _v in mode_offers}
-    counts = corpus_cell_counts(db)
+    counts = corpus_cell_counts(db, version)
     target = cfg["explore_target_samples"]
 
     # Cells explored recently, whether or not their reports have landed yet:
@@ -1319,13 +1492,14 @@ def plan_explore(cfg, db, by_mode, dry):
         create_instance(
             cfg, db, offer, "explore", bid,
             cfg["explore_ttl_minutes"] / 60.0, 0.0, pounce=False, dry=dry, mode=None,
+            version=version,
         )
         recent.add(key)   # one buy per cell per tick, not one per matching offer
         slots -= 1
     db.commit()
 
 
-def plan_exploit(cfg, db, by_mode, dry):
+def plan_exploit(cfg, db, by_mode, dry, version):
     """One independent exploit pass per mode, each against its own bucket, EV
     ranking, instance cap, reserve and pounce baseline. A physical offer can be
     bought for only one mode per tick, so passes share a `claimed` set; modes
@@ -1378,7 +1552,8 @@ def plan_exploit(cfg, db, by_mode, dry):
             if not ordinary and not pounce:
                 break  # bucket at/below reserve and nothing exceptional: hold
             ttl = mcfg(cfg, m, "pounce_probe_hours") if pounce else mcfg(cfg, m, "exploit_ttl_hours")
-            create_instance(cfg, db, offer, "exploit", bid, ttl, ev, pounce, dry, mode=m)
+            create_instance(cfg, db, offer, "exploit", bid, ttl, ev, pounce, dry, mode=m,
+                            version=version)
             claimed.add(offer["id"])
             active += 1
             balance -= bid * ttl  # planning estimate only; real charge accrues per tick
@@ -1436,8 +1611,11 @@ def tick(cfg):
         log_event(db, "ERROR", "benchmark corpus empty; skipping tick")
         return
 
-    # 1d. Renew proven winners before their TTL churns them.
-    renew_exploits(cfg, db, dry)
+    # 1d. The client version this tick prices with and launches.
+    version = current_client_version(cfg, db, now)
+
+    # 1e. Renew proven winners before their TTL churns them.
+    renew_exploits(cfg, db, dry, version)
 
     # 2. Accrue each mode's bucket.
     balances = {}
@@ -1452,7 +1630,7 @@ def tick(cfg):
     db.commit()
 
     # 3. Pounce probes come before new purchases.
-    extend_or_probe_pounces(cfg, db, dry)
+    extend_or_probe_pounces(cfg, db, dry, version)
 
     # 4. Market snapshot + estimates, priced for each exploit mode.
     try:
@@ -1467,7 +1645,7 @@ def tick(cfg):
         hold = e_hold_hours(db, cfg, gpu)
         for m in modes:
             try:
-                est = estimate_offer(cfg, db, offer, mode=m)
+                est = estimate_offer(cfg, db, offer, mode=m, version=version)
             except Exception as e:
                 log_event(db, "WARN", f"estimate [{m}] failed for offer {offer.get('id')}: {e!r}")
                 continue
@@ -1477,16 +1655,20 @@ def tick(cfg):
         record_ev_seen(db, m, by_mode[m])
         log_event(db, "MARKET", f"[{m}] {len(by_mode[m])} offers; {confidence_spread(by_mode[m], cfg)}")
 
-    # 5. Explore (all modes at once), then exploit (per mode).
-    try:
-        plan_explore(cfg, db, by_mode, dry)
-        plan_exploit(cfg, db, by_mode, dry)
-    except InsufficientCredit:
-        # Commit first: creates that succeeded earlier this tick are already
-        # on Vast, and an uncommitted ledger row would get them reaped as
-        # orphans next tick.
-        db.commit()
-        log_event(db, "CREDIT", "account out of credit; buys aborted for this tick")
+    # 5. Explore (all modes at once), then exploit (per mode). Nothing is
+    # bought without a client version to launch.
+    if version is None:
+        log_event(db, "ERROR", "no client version to launch; buying nothing this tick")
+    else:
+        try:
+            plan_explore(cfg, db, by_mode, dry, version)
+            plan_exploit(cfg, db, by_mode, dry, version)
+        except InsufficientCredit:
+            # Commit first: creates that succeeded earlier this tick are already
+            # on Vast, and an uncommitted ledger row would get them reaped as
+            # orphans next tick.
+            db.commit()
+            log_event(db, "CREDIT", "account out of credit; buys aborted for this tick")
 
     # Tick summary.
     active = db.execute(
@@ -1500,7 +1682,8 @@ def tick(cfg):
     log_event(
         db, "SUMMARY",
         f"active={active[0]} active_spend=${active[1]:.3f} 30d_spend=${month_spend:.3f} "
-        f"buckets[{buckets_str}]{' [DRY RUN]' if dry else ''}",
+        f"buckets[{buckets_str}] "
+        f"image={launch_image(cfg, version) if version else 'none'}{' [DRY RUN]' if dry else ''}",
     )
     db.commit()
 
