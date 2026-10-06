@@ -2,10 +2,11 @@
 //!
 //! Replaces the old single-field benchmark modes with an adaptive sweep that
 //! measures the configuration the user would actually run (mode, threads,
-//! GPU) across scenarios chosen to span the live search space: bases with
-//! different stride densities and window regions where the MSD filter is
-//! strong or weak. Each scenario is calibrated with a short run, then sized
-//! so the whole sweep fits the `--benchmark-secs` budget.
+//! GPU). Nice-only measures production fields on the route a client takes
+//! for them on this device (the overlap join where it can run), timing a
+//! sample of each field's partitions and scaling it to the whole field.
+//! Detailed mode repeats fixed windows. Each scenario gets an equal share of
+//! the `--benchmark-secs` budget.
 //!
 //! Also measures API latency against the lightweight `/ping` endpoint
 //! (spread before and after the sweep), collects hardware and scheduler
@@ -15,14 +16,24 @@
 //! geometric mean against reference rates pinned per client version and is
 //! never used for real analysis.
 
+#[cfg(feature = "cubecl")]
+use crate::GpuHandle;
 use crate::{Cli, DEFAULT_LSD_K_VALUE, GpuCtx, process_field_sync};
-use log::debug;
+use log::{debug, warn};
 use nice_common::bench_defs::{
-    BENCH_SCHEMA_VERSION, DETAILED_SCENARIOS, NICEONLY_SCENARIOS, ScenarioDef, compute_score,
+    BENCH_SCHEMA_VERSION, DETAILED_SCENARIOS, FieldScenario, NICEONLY_FIELDS, ScenarioDef,
+    compute_score, sample_order,
 };
 use nice_common::client_api_async::Client;
+use nice_common::cpu_join::{CpuJoin, PartitionResult, Scratch, slices_for};
+#[cfg(feature = "cubecl")]
+use nice_common::cubecl_backend::CubeclContext;
+use nice_common::overlap_join::{StrideReason, join_verdict};
 use nice_common::stride_filter::StrideTable;
-use nice_common::{BUILD_SHA, BenchmarkToServer, CLIENT_VERSION, DataToClient, SearchMode};
+use nice_common::{
+    BUILD_SHA, BenchmarkToServer, CLIENT_VERSION, DataToClient, FieldSize, SearchMode,
+};
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -73,22 +84,100 @@ struct ScenarioResult {
     base: u32,
     character: &'static str,
     threads: usize,
+    /// The region the rate is for: the window, or a nice-only field.
     window_start: u128,
     window_size: u128,
     repetitions: u32,
     seconds: f64,
     rate: f64,
     warmup_seconds: f64,
-    /// The MSD floor the GPU niceonly pipeline was held at for the measured
-    /// windows, after steering to it in the warm-up; `None` elsewhere.
+    /// The MSD floor in force after the measured windows, on a GPU
+    /// nice-only field that took the stride path; `None` elsewhere.
     msd_floor: Option<u128>,
+    /// How a nice-only field scenario measured its field.
+    field: Option<FieldMeasure>,
 }
 
-/// Seconds a GPU niceonly scenario steers its MSD floor before the floor is
-/// frozen and the windows are timed. The controller steps every half
-/// second, so this is six steps: enough to go from the seed to either clamp.
-#[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
-const STEER_WARMUP_SECS: f64 = 3.0;
+/// How a nice-only field scenario measured its field: on the route a client
+/// takes for that field on this device, scaled to the whole field.
+struct FieldMeasure {
+    /// `join` or `stride`.
+    route: &'static str,
+    /// Why the field takes the stride path, where it does.
+    route_reason: Option<&'static str>,
+    /// Seconds the whole field would take.
+    field_secs: f64,
+    /// The overlap join's sample, on the join route.
+    join: Option<JoinMeasure>,
+    /// The window timed at the field's start, on the stride route.
+    stride_window: Option<u128>,
+    /// Why the measurement failed (the rate is then 0).
+    error: Option<String>,
+}
+
+/// A timed sample of a field's partitions on the overlap join.
+struct JoinMeasure {
+    slices: usize,
+    /// Partitions per slice, and per launch (GPU).
+    partitions: u32,
+    slots: Option<usize>,
+    /// Partitions timed, all from the first slice.
+    sampled: usize,
+    /// The first slice's host setup, and the time the sampled partitions
+    /// took (the device's wall time on a GPU, the pool's on a CPU).
+    setup_secs: f64,
+    run_secs: f64,
+    survivors: u64,
+    checked: u64,
+    retried_partitions: usize,
+    refused_layouts: u32,
+    hits: usize,
+    /// Whether the host's setup overlaps the device's work (GPU).
+    setup_overlaps: bool,
+}
+
+impl JoinMeasure {
+    /// The whole field: each slice's partitions at the sample's rate, and
+    /// its setup. A GPU client sets up its next field (and a field its next
+    /// slice) on the host while the device runs the current one, so there
+    /// setup costs time only where it is the longer of the two; the CPU sets
+    /// up a slice before running its partitions. A field's slices have the
+    /// same shape, so the first stands for all of them.
+    #[allow(clippy::cast_precision_loss)]
+    fn field_secs(&self) -> f64 {
+        let run = self.run_secs * f64::from(self.partitions) / self.sampled.max(1) as f64;
+        let slice = if self.setup_overlaps {
+            self.setup_secs.max(run)
+        } else {
+            self.setup_secs + run
+        };
+        self.slices as f64 * slice
+    }
+}
+
+/// What sampling a field on the overlap join came to.
+enum JoinOutcome {
+    Sampled {
+        measure: JoinMeasure,
+        /// Untimed: kernel compilation (GPU).
+        warmup_secs: f64,
+        /// Wall time of the timed part.
+        timed_secs: f64,
+    },
+    /// The field takes the stride path on this device, for this reason.
+    Stride(&'static str),
+    /// The device failed (GPU only).
+    #[cfg_attr(not(feature = "cubecl"), allow(dead_code))]
+    Failed(String),
+}
+
+/// Whole batches the GPU sample times at least: a pipeline's worth
+/// (`join_plan::BATCHES_IN_FLIGHT`).
+#[cfg(feature = "cubecl")]
+const MIN_GPU_BATCHES: usize = 4;
+
+/// Partitions per thread the CPU sample times at least.
+const MIN_CPU_PER_THREAD: usize = 2;
 
 /// Print a human-facing line: to stdout normally, to stderr under
 /// `--benchmark-json`, where stdout is reserved for the JSON document.
@@ -175,32 +264,41 @@ fn run_sweep(cli: &Arc<Cli>, gpu: &GpuCtx) -> (Vec<ScenarioResult>, HashMap<u32,
     quiet.no_progress = true;
     let quiet = Arc::new(quiet);
 
-    let defs: Vec<&ScenarioDef> = match cli.mode {
-        SearchMode::Niceonly => NICEONLY_SCENARIOS,
-        SearchMode::Detailed => DETAILED_SCENARIOS,
-    }
-    .iter()
-    // Single-thread scenarios decompose CPU scaling; they mean nothing for
-    // the GPU pipeline.
-    .filter(|d| !(cli.gpu && d.single_thread))
-    .collect();
-
-    #[allow(clippy::cast_precision_loss)]
-    let share = cli.benchmark_secs / defs.len() as f64;
-
     let mut cache = TableCache {
         tables: HashMap::new(),
         build_secs: HashMap::new(),
     };
-    let results = defs
-        .iter()
-        .map(|def| run_scenario(&quiet, gpu, def, share, &mut cache))
-        .collect();
+    // Single-thread scenarios decompose CPU scaling; they mean nothing for
+    // the GPU pipeline.
+    let results = match cli.mode {
+        SearchMode::Niceonly => {
+            let defs: Vec<&FieldScenario> = NICEONLY_FIELDS
+                .iter()
+                .filter(|d| !(cli.gpu && d.single_thread))
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            let share = cli.benchmark_secs / defs.len() as f64;
+            defs.iter()
+                .map(|def| run_field_scenario(&quiet, gpu, def, share, &mut cache))
+                .collect()
+        }
+        SearchMode::Detailed => {
+            let defs: Vec<&ScenarioDef> = DETAILED_SCENARIOS
+                .iter()
+                .filter(|d| !(cli.gpu && d.single_thread))
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            let share = cli.benchmark_secs / defs.len() as f64;
+            defs.iter()
+                .map(|def| run_scenario(&quiet, gpu, def, share, &mut cache))
+                .collect()
+        }
+    };
     (results, cache.build_secs)
 }
 
-/// Run one scenario: warm up, then repeat the fixed window until the
-/// scenario's share of the time budget is spent (always at least once).
+/// Run one detailed scenario: warm up, then repeat the fixed window until
+/// the scenario's share of the time budget is spent (always at least once).
 fn run_scenario(
     cli: &Arc<Cli>,
     gpu: &GpuCtx,
@@ -223,9 +321,341 @@ fn run_scenario(
         def.window_cpu.max(2_000_000 * threads as u128)
     };
     let start = def.resolved_start();
+    let w = run_windows(
+        cli,
+        gpu,
+        def.base,
+        def.single_thread,
+        start,
+        window,
+        share_secs,
+        cache,
+    );
+    ScenarioResult {
+        key: def.key,
+        base: def.base,
+        character: def.character,
+        threads,
+        window_start: start,
+        window_size: window,
+        repetitions: w.repetitions,
+        seconds: w.seconds,
+        rate: w.rate,
+        warmup_seconds: w.warmup_seconds,
+        msd_floor: w.msd_floor,
+        field: None,
+    }
+}
 
+/// Run one nice-only field scenario on the route a client takes for the
+/// field on this device: a sample of its partitions on the overlap join, or
+/// windows at its start on the stride path (whose cost is linear in size),
+/// scaled to the whole field either way.
+fn run_field_scenario(
+    cli: &Arc<Cli>,
+    gpu: &GpuCtx,
+    def: &FieldScenario,
+    share_secs: f64,
+    cache: &mut TableCache,
+) -> ScenarioResult {
+    let threads = if def.single_thread { 1 } else { cli.threads };
+    let range = FieldSize::new(def.start, def.end());
+    let outcome = if cli.gpu {
+        gpu_join_sample(gpu, def, &range, share_secs)
+    } else {
+        cpu_join_sample(def, &range, threads, share_secs)
+    };
+    let mut result = ScenarioResult {
+        key: def.key,
+        base: def.base,
+        character: def.character,
+        threads,
+        window_start: def.start,
+        window_size: def.size,
+        repetitions: 0,
+        seconds: 0.0,
+        rate: 0.0,
+        warmup_seconds: 0.0,
+        msd_floor: None,
+        field: None,
+    };
+    let size = approx_f64(def.size);
+    let measure = match outcome {
+        JoinOutcome::Sampled {
+            measure,
+            warmup_secs,
+            timed_secs,
+        } => {
+            let field_secs = measure.field_secs();
+            result.repetitions = 1;
+            result.seconds = timed_secs;
+            result.warmup_seconds = warmup_secs;
+            result.rate = size / field_secs.max(1e-9);
+            FieldMeasure {
+                route: "join",
+                route_reason: None,
+                field_secs,
+                join: Some(measure),
+                stride_window: None,
+                error: None,
+            }
+        }
+        JoinOutcome::Stride(reason) => {
+            let window = if cli.gpu {
+                def.stride_window_gpu
+            } else {
+                def.stride_window_cpu * threads as u128
+            };
+            let w = run_windows(
+                cli,
+                gpu,
+                def.base,
+                def.single_thread,
+                def.start,
+                window,
+                share_secs,
+                cache,
+            );
+            result.repetitions = w.repetitions;
+            result.seconds = w.seconds;
+            result.warmup_seconds = w.warmup_seconds;
+            result.msd_floor = w.msd_floor;
+            result.rate = w.rate;
+            FieldMeasure {
+                route: "stride",
+                route_reason: Some(reason),
+                field_secs: size / w.rate.max(1e-9),
+                join: None,
+                stride_window: Some(window),
+                error: None,
+            }
+        }
+        JoinOutcome::Failed(error) => {
+            warn!("benchmark scenario {} failed: {error}", def.key);
+            FieldMeasure {
+                route: "join",
+                route_reason: None,
+                field_secs: 0.0,
+                join: None,
+                stride_window: None,
+                error: Some(error),
+            }
+        }
+    };
+    result.field = Some(measure);
+    result
+}
+
+/// The GPU's overlap join, if its backend has one: `CubeCL` alone, or paired
+/// with hand-CUDA (`--gpu-backend auto` on NVIDIA).
+#[cfg(feature = "cubecl")]
+fn join_context(gpu: &GpuCtx) -> Option<&CubeclContext> {
+    match &**gpu.as_ref()? {
+        GpuHandle::Cubecl(ctx) => Some(ctx),
+        #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+        GpuHandle::CudaJoin(pair) => Some(&pair.join),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Sample `def`'s field on the GPU's overlap join (see
+/// [`gpu_join_sample_on`]), or say why it takes the stride path there.
+fn gpu_join_sample(
+    gpu: &GpuCtx,
+    def: &FieldScenario,
+    range: &FieldSize,
+    share_secs: f64,
+) -> JoinOutcome {
+    #[cfg(feature = "cubecl")]
+    if let Some(ctx) = join_context(gpu) {
+        return gpu_join_sample_on(ctx, def, range, share_secs);
+    }
+    let _ = (gpu, share_secs);
+    // As `gpu_route::begin_niceonly` decides: the field's own reason if it
+    // has one, else the backend's.
+    JoinOutcome::Stride(
+        join_verdict(def.base, range)
+            .err()
+            .unwrap_or(StrideReason::NoJoin)
+            .label(),
+    )
+}
+
+/// Time partitions of the field's first slice through the GPU join's driver,
+/// in the production layout ([`CubeclContext::join_sample`]). An untimed
+/// one-partition sample compiles the kernels (and takes any layout the
+/// device refuses); one timed batch then sizes the sample to the share, in
+/// whole batches, at least [`MIN_GPU_BATCHES`]. Each sample also pays its own
+/// setup, so the batch overstates the time per batch and the sample comes
+/// out short of the share rather than past it.
+#[cfg(feature = "cubecl")]
+fn gpu_join_sample_on(
+    ctx: &CubeclContext,
+    def: &FieldScenario,
+    range: &FieldSize,
+    share_secs: f64,
+) -> JoinOutcome {
+    let sample = |parts: &[u32]| match ctx.join_sample(def.base, range, parts) {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(reason)) => Err(JoinOutcome::Stride(reason.label())),
+        Err(e) => Err(JoinOutcome::Failed(format!("{e:#}"))),
+    };
+    let t0 = Instant::now();
+    let warm = match sample(&[0]) {
+        Ok(s) => s,
+        Err(outcome) => return outcome,
+    };
+    let warmup_secs = t0.elapsed().as_secs_f64();
+    let Ok(partitions) = u32::try_from(warm.partitions) else {
+        return JoinOutcome::Failed(format!("{} partitions", warm.partitions));
+    };
+    let order = sample_order(partitions);
+    let timed = Instant::now();
+    let batch = match sample(&order[..warm.slots.clamp(1, order.len())]) {
+        Ok(s) => s,
+        Err(outcome) => return outcome,
+    };
+    let left = share_secs - timed.elapsed().as_secs_f64();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let batches = (left / batch.run_secs.max(1e-4)).max(0.0) as usize;
+    let count = (batches.max(MIN_GPU_BATCHES) * batch.slots.max(1)).min(order.len());
+    let s = match sample(&order[..count]) {
+        Ok(s) => s,
+        Err(outcome) => return outcome,
+    };
+    JoinOutcome::Sampled {
+        measure: JoinMeasure {
+            slices: s.slices,
+            partitions,
+            slots: Some(s.slots),
+            sampled: s.sampled,
+            setup_secs: s.setup_secs,
+            run_secs: s.run_secs,
+            survivors: s.survivors,
+            checked: s.checked,
+            retried_partitions: s.retried_partitions,
+            refused_layouts: warm.refused + batch.refused + s.refused,
+            hits: s.hits.len(),
+            setup_overlaps: true,
+        },
+        warmup_secs,
+        timed_secs: timed.elapsed().as_secs_f64(),
+    }
+}
+
+/// Time partitions of the field's first slice on the CPU join, on the
+/// client's thread pool as a field runs (one thread for a single-thread
+/// scenario): at least [`MIN_CPU_PER_THREAD`] per thread, then one more
+/// round sized to fill the share at the rate measured so far. The share
+/// includes the slice's setup, which every field pays.
+fn cpu_join_sample(
+    def: &FieldScenario,
+    range: &FieldSize,
+    threads: usize,
+    share_secs: f64,
+) -> JoinOutcome {
+    let Some((jp, slices)) = slices_for(def.base, range) else {
+        return JoinOutcome::Stride(
+            join_verdict(def.base, range)
+                .err()
+                .unwrap_or(StrideReason::Setup)
+                .label(),
+        );
+    };
+    let timed = Instant::now();
+    let join = match CpuJoin::new(def.base, &slices[0], jp) {
+        Ok(join) => join,
+        Err(e) => {
+            warn!(
+                "overlap join cannot take {} ({e:#}); timing the stride walk",
+                def.key
+            );
+            return JoinOutcome::Stride(StrideReason::Setup.label());
+        }
+    };
+    let setup_secs = timed.elapsed().as_secs_f64();
+    let partitions = join.partitions();
+    let order = sample_order(partitions);
+    let pool = (threads == 1).then(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-thread pool")
+    });
+    let run = |parts: &[u32]| {
+        let go = || {
+            parts
+                .par_iter()
+                .map_init(Scratch::default, |scratch, &v| {
+                    join.run_partition(v, scratch)
+                })
+                .reduce(PartitionResult::default, |mut a, b| {
+                    a.add(b);
+                    a
+                })
+        };
+        pool.as_ref().map_or_else(go, |p| p.install(go))
+    };
+    let mut found = PartitionResult::default();
+    let (mut done, mut run_secs) = (0usize, 0.0f64);
+    let mut next = (MIN_CPU_PER_THREAD * threads).clamp(1, order.len());
+    while next > 0 {
+        let t = Instant::now();
+        found.add(run(&order[done..done + next]));
+        run_secs += t.elapsed().as_secs_f64();
+        done += next;
+        let left = share_secs - timed.elapsed().as_secs_f64();
+        #[allow(clippy::cast_precision_loss)]
+        let per_partition = run_secs / done as f64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let fit = (left / per_partition).max(0.0) as usize;
+        next = (fit / threads * threads).min(order.len() - done);
+    }
+    JoinOutcome::Sampled {
+        measure: JoinMeasure {
+            slices: slices.len(),
+            partitions,
+            slots: None,
+            sampled: done,
+            setup_secs,
+            run_secs,
+            survivors: found.survivors,
+            checked: found.checked,
+            retried_partitions: 0,
+            refused_layouts: 0,
+            hits: found.hits.len(),
+            setup_overlaps: false,
+        },
+        warmup_secs: 0.0,
+        timed_secs: timed.elapsed().as_secs_f64(),
+    }
+}
+
+/// What timing one region's windows came to.
+struct Windows {
+    repetitions: u32,
+    seconds: f64,
+    rate: f64,
+    warmup_seconds: f64,
+    msd_floor: Option<u128>,
+}
+
+/// Time windows of one region: an untimed warm-up, then the window repeated
+/// until the share is spent (always at least once).
+#[allow(clippy::too_many_arguments)]
+fn run_windows(
+    cli: &Arc<Cli>,
+    gpu: &GpuCtx,
+    base: u32,
+    single_thread: bool,
+    start: u128,
+    window: u128,
+    share_secs: f64,
+    cache: &mut TableCache,
+) -> Windows {
     // Build the stride table outside the timed windows.
-    let table = cache.get(cli.mode, def.base);
+    let table = cache.get(cli.mode, base);
 
     // One untimed warmup so one-time costs (GPU kernel JIT for this base,
     // thread pool spin-up, cold caches) land outside the measurement. The
@@ -233,20 +663,22 @@ fn run_scenario(
     // on a fraction so slow devices don't pay the window twice.
     let warmup_window = if cli.gpu { window } else { (window / 8).max(1) };
     let warmup_t0 = Instant::now();
-    run_window(cli, gpu, def, start, warmup_window, table.as_ref());
-
-    // GPU niceonly: steer the MSD floor to where this machine balances on
-    // this base, then hold it there for the timed windows. Every scenario
-    // starts from the same seed, so the result does not depend on the
-    // scenario before it. See `gpu_niceonly::benchmark_floor_thaw`.
-    let msd_floor = steer_floor(cli, gpu, def, start, window, table.as_ref());
+    run_window(
+        cli,
+        gpu,
+        base,
+        single_thread,
+        start,
+        warmup_window,
+        table.as_ref(),
+    );
     let warmup_seconds = warmup_t0.elapsed().as_secs_f64();
 
     let scenario_start = Instant::now();
     let mut repetitions = 0u32;
     let mut total_secs = 0.0f64;
     loop {
-        total_secs += run_window(cli, gpu, def, start, window, table.as_ref());
+        total_secs += run_window(cli, gpu, base, single_thread, start, window, table.as_ref());
         repetitions += 1;
         if scenario_start.elapsed().as_secs_f64() >= share_secs * 0.9 {
             break;
@@ -255,53 +687,26 @@ fn run_scenario(
 
     #[allow(clippy::cast_precision_loss)]
     let rate = approx_f64(window) * f64::from(repetitions) / total_secs.max(1e-4);
-    ScenarioResult {
-        key: def.key,
-        base: def.base,
-        character: def.character,
-        threads,
-        window_start: start,
-        window_size: window,
+    Windows {
         repetitions,
         seconds: total_secs,
         rate,
         warmup_seconds,
-        msd_floor,
+        msd_floor: msd_floor(cli),
     }
 }
 
-/// Run windows with the floor steering for `STEER_WARMUP_SECS`, then freeze
-/// it and return it. `None` unless this is a GPU niceonly scenario.
-#[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
-fn steer_floor(
-    cli: &Arc<Cli>,
-    gpu: &GpuCtx,
-    def: &ScenarioDef,
-    start: u128,
-    window: u128,
-    table: Option<&Arc<StrideTable>>,
-) -> Option<u128> {
-    use nice_common::gpu_niceonly::{benchmark_floor_freeze, benchmark_floor_thaw};
-    if !(cli.gpu && cli.mode == SearchMode::Niceonly) {
-        return None;
-    }
-    benchmark_floor_thaw();
-    let t0 = Instant::now();
-    while t0.elapsed().as_secs_f64() < STEER_WARMUP_SECS {
-        run_window(cli, gpu, def, start, window, table);
-    }
-    Some(benchmark_floor_freeze())
+/// The MSD floor the GPU nice-only stride pipeline steered to, for the
+/// report; `None` elsewhere. The floor is steered as in production, across
+/// the warm-up and the windows: holding it for the measurement changed the
+/// rate by 3–15% either way on the GPUs measured.
+#[cfg(any(feature = "cuda", feature = "cubecl"))]
+fn msd_floor(cli: &Cli) -> Option<u128> {
+    (cli.gpu && cli.mode == SearchMode::Niceonly).then(nice_common::gpu_niceonly::msd_floor_in_use)
 }
 
-#[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
-fn steer_floor(
-    _cli: &Arc<Cli>,
-    _gpu: &GpuCtx,
-    _def: &ScenarioDef,
-    _start: u128,
-    _window: u128,
-    _table: Option<&Arc<StrideTable>>,
-) -> Option<u128> {
+#[cfg(not(any(feature = "cuda", feature = "cubecl")))]
+fn msd_floor(_cli: &Cli) -> Option<u128> {
     None
 }
 
@@ -309,20 +714,21 @@ fn steer_floor(
 fn run_window(
     cli: &Arc<Cli>,
     gpu: &GpuCtx,
-    def: &ScenarioDef,
+    base: u32,
+    single_thread: bool,
     start: u128,
     window: u128,
     table: Option<&Arc<StrideTable>>,
 ) -> f64 {
     let claim = DataToClient {
         claim_id: 0,
-        base: def.base,
+        base,
         range_start: start,
         range_end: start + window,
         range_size: window,
     };
     let t0 = Instant::now();
-    if def.single_thread {
+    if single_thread {
         // A local one-thread pool overrides the global pool inside `install`.
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -335,6 +741,84 @@ fn run_window(
         process_field_sync(&claim, cli, gpu, table);
     }
     t0.elapsed().as_secs_f64()
+}
+
+/// The detailed scenarios: fixed windows, repeated.
+fn print_window_table(results: &[ScenarioResult]) {
+    println!(
+        "{:<20} {:>4} {:<14} {:>7} {:>10} {:>6} {:>8} {:>12} {:>8}",
+        "scenario",
+        "base",
+        "character",
+        "threads",
+        "window",
+        "reps",
+        "secs",
+        "numbers/sec",
+        "floor"
+    );
+    for r in results {
+        println!(
+            "{:<20} {:>4} {:<14} {:>7} {:>10.1e} {:>6} {:>8.3} {:>12.3e} {:>8}",
+            r.key,
+            r.base,
+            r.character,
+            r.threads,
+            approx_f64(r.window_size),
+            r.repetitions,
+            r.seconds,
+            r.rate,
+            r.msd_floor
+                .map_or_else(|| "-".to_string(), |f| f.to_string())
+        );
+    }
+}
+
+/// The nice-only fields: the route each took, what was timed (partitions
+/// sampled, or the stride window), and the whole field's time and rate.
+fn print_field_table(results: &[ScenarioResult]) {
+    println!(
+        "{:<12} {:>4} {:>7} {:<6} {:>12} {:>8} {:>10} {:>12} {:>8}",
+        "scenario",
+        "base",
+        "threads",
+        "route",
+        "timed",
+        "secs",
+        "field secs",
+        "numbers/sec",
+        "floor"
+    );
+    for r in results {
+        let Some(f) = &r.field else { continue };
+        let timed = match (&f.join, f.stride_window) {
+            (Some(j), _) => format!("{}/{}", j.sampled, j.partitions),
+            (None, Some(w)) => format!("{:.0e} window", approx_f64(w)),
+            (None, None) => "-".to_string(),
+        };
+        println!(
+            "{:<12} {:>4} {:>7} {:<6} {:>12} {:>8.3} {:>10.2} {:>12.3e} {:>8}",
+            r.key,
+            r.base,
+            r.threads,
+            f.route,
+            timed,
+            r.seconds,
+            f.field_secs,
+            r.rate,
+            r.msd_floor
+                .map_or_else(|| "-".to_string(), |f| f.to_string())
+        );
+    }
+    for r in results {
+        let Some(f) = &r.field else { continue };
+        if let Some(reason) = f.route_reason {
+            println!("{}: the stride path ({reason})", r.key);
+        }
+        if let Some(error) = &f.error {
+            println!("{}: failed: {error}", r.key);
+        }
+    }
 }
 
 /// Sample `GET /ping` latency. Errors (offline, endpoint not deployed yet)
@@ -377,32 +861,10 @@ fn print_report(
     score: Option<f64>,
 ) {
     println!();
-    println!(
-        "{:<20} {:>4} {:<14} {:>7} {:>10} {:>6} {:>8} {:>12} {:>8}",
-        "scenario",
-        "base",
-        "character",
-        "threads",
-        "window",
-        "reps",
-        "secs",
-        "numbers/sec",
-        "floor"
-    );
-    for r in results {
-        println!(
-            "{:<20} {:>4} {:<14} {:>7} {:>10.1e} {:>6} {:>8.3} {:>12.3e} {:>8}",
-            r.key,
-            r.base,
-            r.character,
-            r.threads,
-            approx_f64(r.window_size),
-            r.repetitions,
-            r.seconds,
-            r.rate,
-            r.msd_floor
-                .map_or_else(|| "-".to_string(), |f| f.to_string())
-        );
+    if results.iter().any(|r| r.field.is_some()) {
+        print_field_table(results);
+    } else {
+        print_window_table(results);
     }
 
     let all_pings: Vec<f64> = ping_before
@@ -444,7 +906,7 @@ fn build_report_json(
     let scenarios: Vec<Value> = results
         .iter()
         .map(|r| {
-            json!({
+            let mut scenario = json!({
                 "key": r.key,
                 "base": r.base,
                 "character": r.character,
@@ -456,7 +918,36 @@ fn build_report_json(
                 "rate": r.rate,
                 "warmup_seconds": r.warmup_seconds,
                 "msd_floor": r.msd_floor.map(|f| f.to_string()),
-            })
+            });
+            if let (Some(f), Value::Object(map)) = (&r.field, &mut scenario) {
+                map.insert("route".into(), json!(f.route));
+                map.insert("route_reason".into(), json!(f.route_reason));
+                map.insert("field_secs".into(), json!(f.field_secs));
+                map.insert(
+                    "stride_window".into(),
+                    json!(f.stride_window.map(|w| w.to_string())),
+                );
+                map.insert(
+                    "join".into(),
+                    f.join.as_ref().map_or(Value::Null, |j| {
+                        json!({
+                            "slices": j.slices,
+                            "partitions": j.partitions,
+                            "slots": j.slots,
+                            "sampled": j.sampled,
+                            "setup_secs": j.setup_secs,
+                            "run_secs": j.run_secs,
+                            "survivors": j.survivors,
+                            "checked": j.checked,
+                            "retried_partitions": j.retried_partitions,
+                            "refused_layouts": j.refused_layouts,
+                            "hits": j.hits,
+                        })
+                    }),
+                );
+                map.insert("error".into(), json!(f.error));
+            }
+            scenario
         })
         .collect();
 
@@ -712,6 +1203,43 @@ fn parse_environ(data: &[u8]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn measure(setup_overlaps: bool) -> JoinMeasure {
+        JoinMeasure {
+            slices: 2,
+            partitions: 1000,
+            slots: None,
+            sampled: 100,
+            setup_secs: 0.5,
+            run_secs: 0.2,
+            survivors: 0,
+            checked: 0,
+            retried_partitions: 0,
+            refused_layouts: 0,
+            hits: 0,
+            setup_overlaps,
+        }
+    }
+
+    #[test]
+    fn a_sample_scales_to_the_whole_field() {
+        // 100 of 1000 partitions in 0.2 s: 2 s a slice, two slices. The CPU
+        // adds each slice's setup; on a GPU the setup hides under the device
+        // time, unless it is the longer of the two.
+        assert!((measure(false).field_secs() - 2.0 * (0.5 + 2.0)).abs() < 1e-9);
+        assert!((measure(true).field_secs() - 2.0 * 2.0).abs() < 1e-9);
+        let slow_host = JoinMeasure {
+            setup_secs: 3.0,
+            ..measure(true)
+        };
+        assert!((slow_host.field_secs() - 2.0 * 3.0).abs() < 1e-9);
+        // A sample of the whole slice is not scaled.
+        let whole = JoinMeasure {
+            sampled: 1000,
+            ..measure(true)
+        };
+        assert!((whole.field_secs() - 2.0 * 0.5).abs() < 1e-9);
+    }
 
     #[test]
     fn cpu_model_x86_and_arm() {

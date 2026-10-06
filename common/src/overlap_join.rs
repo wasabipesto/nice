@@ -228,7 +228,7 @@ pub fn join_verdict(base: u32, range: &FieldSize) -> Result<JoinParams, StrideRe
 }
 
 /// [`join_verdict`] under the route override `route`.
-fn join_verdict_routed(
+pub(crate) fn join_verdict_routed(
     base: u32,
     range: &FieldSize,
     route: RouteOverride,

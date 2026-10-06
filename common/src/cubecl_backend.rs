@@ -1424,6 +1424,9 @@ pub struct JoinSample {
     pub checked: u64,
     pub retried_partitions: usize,
     pub hits: Vec<u128>,
+    /// Layouts the device did not run during the sample, each re-run in a
+    /// smaller one (see [`crate::join_plan::JoinCeiling`]).
+    pub refused: u32,
 }
 
 /// One initialized `CubeCL` device: wgpu everywhere, or the native CUDA
@@ -1779,6 +1782,7 @@ impl CubeclContext {
             checked: st.checked,
             retried_partitions: st.retried_partitions,
             hits: hits.iter().map(|h| h.number).collect(),
+            refused: st.refused,
         }))
     }
 

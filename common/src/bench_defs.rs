@@ -7,18 +7,26 @@
 //! — `client/src/bench.rs` for the native sweep, the search page for the
 //! browser — but the *work measured* is defined here.
 //!
-//! A fixed measurement region: both the start and the window length are
-//! hardcoded so every machine measures *identical work*; machine speed only
-//! changes how many repetitions fit in the scenario's time share.
-//! Repetition also solves timer granularity — a machine that clears the
-//! window in microseconds simply runs it thousands of times.
+//! A detailed scenario is a fixed measurement region: both the start and the
+//! window length are hardcoded so every machine measures *identical work*;
+//! machine speed only changes how many repetitions fit in the scenario's time
+//! share. Repetition also solves timer granularity — a machine that clears
+//! the window in microseconds simply runs it thousands of times.
+//!
+//! A nice-only scenario is a fixed production field ([`FieldScenario`]),
+//! measured on the route a client would take for it on the device. The
+//! overlap join's cost per number keeps falling up to production sizes, so
+//! a small window would not say what a field costs; instead the client times
+//! a sample of the field's partitions, in [`sample_order`], and scales it to
+//! the whole field. Every machine measures the same partitions first, and a
+//! faster one covers more of the field in its share.
 
 use crate::base_range::get_base_range_u128;
 
 /// Version of the benchmark JSON report layout. Bump on breaking changes.
 pub const BENCH_SCHEMA_VERSION: u32 = 1;
 
-/// A fixed measurement region (see the module docs).
+/// A fixed measurement region for detailed mode (see the module docs).
 pub struct ScenarioDef {
     pub key: &'static str,
     pub base: u32,
@@ -56,66 +64,88 @@ impl ScenarioDef {
     }
 }
 
-pub const NICEONLY_SCENARIOS: &[ScenarioDef] = &[
-    ScenarioDef {
-        key: "b40_msd_strong",
-        base: 40,
-        start: None,
-        window_cpu: 100_000_000,
-        window_gpu: 8_000_000_000,
-        character: "msd-strong",
+/// A nice-only scenario: one production field (see the module docs).
+pub struct FieldScenario {
+    pub key: &'static str,
+    pub base: u32,
+    /// The field, a real one from the server's table.
+    pub start: u128,
+    pub size: u128,
+    /// For human readers of the report.
+    pub character: &'static str,
+    /// Run with a single thread instead of the configured thread count (see
+    /// [`ScenarioDef::single_thread`]). CPU only.
+    pub single_thread: bool,
+    /// The window at the field's start that is timed when the field takes
+    /// the stride path, whose cost is linear in size: per CPU thread, and on
+    /// a GPU. Both are below the overlap join's minimum field size.
+    pub stride_window_cpu: u128,
+    pub stride_window_gpu: u128,
+}
+
+impl FieldScenario {
+    /// The field's end (exclusive).
+    #[must_use]
+    pub fn end(&self) -> u128 {
+        self.start + self.size
+    }
+}
+
+pub const NICEONLY_FIELDS: &[FieldScenario] = &[
+    // Base 57's frontier when the overlap join landed (field 206295804).
+    FieldScenario {
+        key: "b57_1e14",
+        base: 57,
+        start: 28_151_599_893_042_801_193,
+        size: 100_000_000_000_000,
+        character: "b57 field",
         single_thread: false,
+        stride_window_cpu: 2_000_000_000,
+        stride_window_gpu: 1_000_000_000_000,
     },
-    ScenarioDef {
-        key: "b40_msd_weak",
-        base: 40,
-        start: Some(5_007_828_088_304),
-        window_cpu: 20_000_000,
-        window_gpu: 4_000_000_000,
-        character: "msd-weak",
-        single_thread: false,
-    },
-    ScenarioDef {
-        key: "b50_residue_dense",
-        base: 50,
-        start: Some(27_219_467_191_689_038),
-        window_cpu: 20_000_000,
-        window_gpu: 4_000_000_000,
-        character: "residue-dense",
-        single_thread: false,
-    },
-    ScenarioDef {
-        key: "b50_msd_weak",
-        base: 50,
-        start: Some(73_940_161_512_353_211),
-        window_cpu: 20_000_000,
-        window_gpu: 4_000_000_000,
-        character: "msd-weak",
-        single_thread: false,
-    },
-    ScenarioDef {
-        key: "b52_msd_weak",
-        base: 52,
-        start: Some(407_887_399_136_188_818),
-        window_cpu: 20_000_000,
-        window_gpu: 4_000_000_000,
-        character: "msd-weak",
-        single_thread: false,
-    },
-    // Same region and window as b50_msd_weak so the pair decomposes into
-    // per-core rate × parallel efficiency. On very slow devices a single
-    // repetition of this window may exceed the scenario share; one full
-    // repetition is always completed, so the budget is a soft target.
-    ScenarioDef {
-        key: "b50_msd_weak_1t",
-        base: 50,
-        start: Some(73_940_161_512_353_211),
-        window_cpu: 20_000_000,
-        window_gpu: 0,
-        character: "msd-weak",
+    // The same field on one thread, so the pair decomposes into per-core
+    // rate × parallel efficiency.
+    FieldScenario {
+        key: "b57_1e14_1t",
+        base: 57,
+        start: 28_151_599_893_042_801_193,
+        size: 100_000_000_000_000,
+        character: "b57 field",
         single_thread: true,
+        stride_window_cpu: 2_000_000_000,
+        stride_window_gpu: 0,
+    },
+    // A base-58 field (206813862) of the size the server hands out there,
+    // in a region with candidates: half of base 58's fields have none and
+    // would measure only the join's setup.
+    FieldScenario {
+        key: "b58_1e15",
+        base: 58,
+        start: 102_121_216_587_923_470_200,
+        size: 1_000_000_000_000_000,
+        character: "b58 field",
+        single_thread: false,
+        stride_window_cpu: 2_000_000_000,
+        stride_window_gpu: 1_000_000_000_000,
     },
 ];
+
+/// The order a field scenario samples its partitions in: counting with the
+/// bits reversed, skipping values past the end. Every prefix is spread
+/// evenly over `0..partitions`, so a sample of any length covers the whole
+/// partition space, and machines that sample different lengths still share
+/// the partitions they measure first.
+#[must_use]
+pub fn sample_order(partitions: u32) -> Vec<u32> {
+    if partitions <= 1 {
+        return (0..partitions).collect();
+    }
+    let bits = u32::BITS - (partitions - 1).leading_zeros();
+    (0..1u32 << bits)
+        .map(|i| i.reverse_bits() >> (u32::BITS - bits))
+        .filter(|&v| v < partitions)
+        .collect()
+}
 
 pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
     ScenarioDef {
@@ -152,29 +182,17 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
 /// on a 4-core `x86_64` dev box, GPU references on an RTX 3060; a score of 1000
 /// means "matches the reference machine on the geometric mean".
 ///
+/// The nice-only field scenarios have no references yet: they are pinned
+/// with the next re-pin, and until then a nice-only sweep has no score.
+///
 /// The browser suite scores against these same references deliberately: a
 /// browser scoring 550 where the native client scores 1000 on the same box
 /// is information, not a bug.
 ///
-/// The GPU niceonly references predate the benchmark steering the MSD floor
-/// to convergence before each scenario (`gpu_niceonly::benchmark_floor_thaw`);
-/// they were measured under the earlier per-field controller and are due for
-/// re-pinning at the next reference bump.
 pub const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
-    ("b40_msd_strong", false, 1.0e12),
-    ("b40_msd_weak", false, 1.6e9),
-    ("b50_residue_dense", false, 1.1e9),
-    ("b50_msd_weak", false, 9.4e8),
-    ("b52_msd_weak", false, 3.2e9),
-    ("b50_msd_weak_1t", false, 2.0e8),
     ("b40_detailed", false, 1.4e7),
     ("b50_detailed", false, 8.9e6),
     ("b50_detailed_1t", false, 2.2e6),
-    ("b40_msd_strong", true, 2.3e11),
-    ("b40_msd_weak", true, 1.5e11),
-    ("b50_residue_dense", true, 1.3e11),
-    ("b50_msd_weak", true, 1.3e11),
-    ("b52_msd_weak", true, 1.6e11),
     ("b40_detailed", true, 4.5e9),
     ("b50_detailed", true, 3.2e9),
 ];
@@ -213,14 +231,14 @@ mod tests {
     fn score_uses_only_referenced_scenarios() {
         let reference_rate = SCORE_REFERENCES
             .iter()
-            .find(|(k, g, _)| *k == "b50_msd_weak" && !g)
+            .find(|(k, g, _)| *k == "b50_detailed" && !g)
             .unwrap()
             .2;
         // Exactly matching the reference on the only scored scenario = 1000;
         // an unknown key contributes nothing.
         let score = compute_score(
             [
-                ("b50_msd_weak", reference_rate),
+                ("b50_detailed", reference_rate),
                 ("not_a_real_scenario", 1.0),
             ],
             false,
@@ -228,13 +246,14 @@ mod tests {
         .unwrap();
         assert!((score - 1000.0).abs() < 1e-6);
         // An unmeasured scenario contributes nothing either.
-        assert_eq!(compute_score([("b50_msd_weak", 0.0)], false), None);
+        assert_eq!(compute_score([("b50_detailed", 0.0)], false), None);
     }
 
     #[test]
-    fn all_scenarios_have_cpu_references() {
-        // Every CPU scenario must be scoreable, or the score silently thins.
-        for def in NICEONLY_SCENARIOS.iter().chain(DETAILED_SCENARIOS) {
+    fn detailed_scenarios_have_cpu_references() {
+        // Every detailed CPU scenario must be scoreable, or the score
+        // silently thins. (The nice-only fields wait for the re-pin.)
+        for def in DETAILED_SCENARIOS {
             assert!(
                 SCORE_REFERENCES
                     .iter()
@@ -249,9 +268,79 @@ mod tests {
     fn scenario_starts_resolve() {
         // `resolved_start` panics on a base with no range; catch a bad table
         // entry here instead of at a user's benchmark run.
-        for def in NICEONLY_SCENARIOS.iter().chain(DETAILED_SCENARIOS) {
+        for def in DETAILED_SCENARIOS {
             let start = def.resolved_start();
             assert!(start > 0, "{} resolved to zero", def.key);
+        }
+    }
+
+    #[test]
+    fn field_scenarios_are_production_join_fields() {
+        // Each field lies in its base's range and is one the overlap join
+        // takes, so the scenario measures the production route.
+        for def in NICEONLY_FIELDS {
+            let range = get_base_range_u128(def.base).unwrap().unwrap();
+            assert!(
+                range.start() <= def.start && def.end() <= range.end(),
+                "{} is outside base {}",
+                def.key,
+                def.base
+            );
+            let field = crate::FieldSize::new(def.start, def.end());
+            assert!(
+                crate::overlap_join::join_verdict_routed(
+                    def.base,
+                    &field,
+                    crate::overlap_join::RouteOverride::Auto
+                )
+                .is_ok(),
+                "{} does not take the overlap join",
+                def.key
+            );
+            // The stride windows stay below the join's minimum, so they time
+            // the stride path wherever the field takes it.
+            for w in [def.stride_window_cpu, def.stride_window_gpu] {
+                assert!(w < crate::overlap_join::JOIN_MIN_FIELD_SIZE, "{}", def.key);
+            }
+            // Each `_1t` scenario repeats a multi-thread one's field.
+            if let Some(multi) = def.key.strip_suffix("_1t") {
+                assert!(def.single_thread);
+                let pair = NICEONLY_FIELDS.iter().find(|d| d.key == multi).unwrap();
+                assert_eq!(
+                    (pair.base, pair.start, pair.size),
+                    (def.base, def.start, def.size)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_sample_order_spreads_every_prefix() {
+        for partitions in [1u32, 2, 3, 57 * 57, 58 * 58, 64 * 64, 5000] {
+            let order = sample_order(partitions);
+            // A permutation of the partitions.
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..partitions).collect::<Vec<_>>());
+            // Every prefix of 8 or more puts a share of its partitions in
+            // each eighth of the space that stays near an eighth.
+            for len in [8usize, 16, 64, 256]
+                .into_iter()
+                .filter(|&l| l <= order.len())
+            {
+                let mut eighths = [0usize; 8];
+                for &v in &order[..len] {
+                    eighths[usize::try_from(u64::from(v) * 8 / u64::from(partitions)).unwrap()] +=
+                        1;
+                }
+                let want = len / 8;
+                for (i, &n) in eighths.iter().enumerate() {
+                    assert!(
+                        n + 2 >= want && n <= want + 2,
+                        "{partitions} partitions, prefix {len}: eighth {i} holds {n}"
+                    );
+                }
+            }
         }
     }
 }
