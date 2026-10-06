@@ -273,11 +273,11 @@ fn quantile(sorted: &[f64], frac: f64) -> f64 {
 /// scenario pair: linear in threads, capped by perfect scaling from the
 /// single-thread rate.
 fn thread_scale(sample: &BenchmarkSample, target: u32) -> Option<f64> {
-    let anchor_multi = sample
-        .scenarios
-        .iter()
-        .find(|s| !s.key.ends_with("_1t") && s.key.starts_with("b50"))?;
+    // The anchor pair: a single-thread scenario `X_1t` and the multi-thread
+    // scenario `X` it repeats on one thread.
     let anchor_single = sample.scenarios.iter().find(|s| s.key.ends_with("_1t"))?;
+    let multi_key = anchor_single.key.strip_suffix("_1t")?;
+    let anchor_multi = sample.scenarios.iter().find(|s| s.key == multi_key)?;
     let source = f64::from(sample.threads.max(1));
     let target_f = f64::from(target.max(1));
     let linear = target_f / source;
@@ -771,6 +771,32 @@ mod tests {
             .find(|s| s.key == "b50_msd_weak")
             .unwrap();
         assert!((multi.rate_p50 - 2.0e9).abs() < 1.0);
+    }
+
+    #[test]
+    fn the_thread_anchor_pairs_a_1t_scenario_with_its_own_multi_scenario() {
+        // The single-thread scenario's own multi-thread counterpart anchors
+        // the scaling, at any base: here b57's, not the b50 one listed first.
+        let mut s = sample(false, "AMD EPYC 7763", None, 8, 2.0e9, 1.0e8);
+        for sc in &mut s.scenarios {
+            sc.key = sc.key.replace("b50_msd_weak", "b57_1e14");
+        }
+        s.scenarios.insert(
+            0,
+            ScenarioSample {
+                key: "b50_other".to_string(),
+                base: 50,
+                threads: 8,
+                rate: 1.0e6,
+            },
+        );
+        // Ceiling 1e8 x 64 / 2e9 = 3.2 binds under the linear 64 / 8 = 8;
+        // anchored on the b50 scenario it would have been 6400.
+        let scale = thread_scale(&s, 64).unwrap();
+        assert!((scale - 3.2).abs() < 1e-9, "{scale}");
+        // No pair, no anchor.
+        s.scenarios.retain(|sc| sc.key != "b57_1e14");
+        assert!(thread_scale(&s, 64).is_none());
     }
 
     #[test]

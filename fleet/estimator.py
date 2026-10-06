@@ -214,12 +214,14 @@ def thread_scale(sample, target):
     """Rate multiplier taking a sample's multi-thread scenarios to `target`
     threads. Linear in thread count, capped by perfect scaling from the
     sample's own single-thread anchor. None when the anchor pair is absent."""
-    anchor_multi = next(
-        (s for s in sample.scenarios if not s["key"].endswith("_1t") and s["key"].startswith("b50")),
-        None,
-    )
+    # The anchor pair: a single-thread scenario `X_1t` and the multi-thread
+    # scenario `X` it repeats on one thread.
     anchor_single = next((s for s in sample.scenarios if s["key"].endswith("_1t")), None)
-    if anchor_multi is None or anchor_single is None:
+    if anchor_single is None:
+        return None
+    multi_key = anchor_single["key"][: -len("_1t")]
+    anchor_multi = next((s for s in sample.scenarios if s["key"] == multi_key), None)
+    if anchor_multi is None:
         return None
     source = float(max(sample.threads, 1))
     target_f = float(max(target, 1))
