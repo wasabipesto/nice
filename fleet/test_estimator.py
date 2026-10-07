@@ -18,6 +18,7 @@ from estimator import (
     mode_string,
     normalize_gpu_model,
     normalize_model,
+    thread_scale,
 )
 from estimator import Sample
 
@@ -101,6 +102,19 @@ class CpuChainTests(unittest.TestCase):
         out = estimate(samples, inp(False, cpu="AMD EPYC 7763", threads=64))
         self.assertLess(abs(multi(out)["rate_p50"] - 6.4e9), 1.0)
         self.assertLess(out["confidence"], 60, "extrapolation must discount confidence")
+
+    def test_thread_anchor_pairs_a_1t_scenario_with_its_own_multi_scenario(self):
+        # The single-thread scenario's own multi-thread counterpart anchors
+        # the scaling, at any base: here b57's, not the b50 one listed first.
+        s = sample(False, "AMD EPYC 7763", None, 8, 2.0e9, 1.0e8)
+        s.scenarios = [{"key": "b50_other", "base": 50, "threads": 8, "rate": 1.0e6}] + [
+            {**sc, "key": sc["key"].replace("b50_msd_weak", "b57_1e14")} for sc in s.scenarios]
+        # Ceiling 1e8 x 64 / 2e9 = 3.2 binds under the linear 64 / 8 = 8;
+        # anchored on the b50 scenario it would have been 6400.
+        self.assertAlmostEqual(thread_scale(s, 64), 3.2)
+        # No pair, no anchor.
+        s.scenarios = [sc for sc in s.scenarios if sc["key"] != "b57_1e14"]
+        self.assertIsNone(thread_scale(s, 64))
 
     def test_family_fallback_and_floor(self):
         samples = [sample(False, "AMD EPYC 7763", None, 8, 2.0e9, 3.0e8)]

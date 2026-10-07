@@ -1410,6 +1410,9 @@ pub struct JoinSample {
     /// The field's slices, and partitions per slice (`b^p`).
     pub slices: usize,
     pub partitions: u128,
+    /// The field's size in first slices
+    /// ([`crate::overlap_join::slice_weight`]).
+    pub slice_weight: f64,
     /// Partitions per launch planned for the first slice.
     pub slots: usize,
     /// Partitions sampled, all from the first slice.
@@ -1424,6 +1427,9 @@ pub struct JoinSample {
     pub checked: u64,
     pub retried_partitions: usize,
     pub hits: Vec<u128>,
+    /// Layouts the device did not run during the sample, each re-run in a
+    /// smaller one (see [`crate::join_plan::JoinCeiling`]).
+    pub refused: u32,
 }
 
 /// One initialized `CubeCL` device: wgpu everywhere, or the native CUDA
@@ -1771,6 +1777,7 @@ impl CubeclContext {
         Ok(Ok(JoinSample {
             slices: field.slice_count(),
             partitions: field.partitions(),
+            slice_weight: crate::overlap_join::slice_weight(&field.slices),
             slots: field.plan.slots,
             sampled: parts.len(),
             setup_secs: st.setup_secs,
@@ -1779,6 +1786,7 @@ impl CubeclContext {
             checked: st.checked,
             retried_partitions: st.retried_partitions,
             hits: hits.iter().map(|h| h.number).collect(),
+            refused: st.refused,
         }))
     }
 
