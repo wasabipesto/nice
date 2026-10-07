@@ -248,6 +248,10 @@ pub const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
     ("b40_detailed", false, 4.2e7),
     ("b50_detailed", false, 1.7e7),
     ("b50_detailed_1t", false, 2.8e6),
+    ("b58_msd_weak", true, 4.5e13),
+    ("b58_msd_strong", true, 2.9e14),
+    ("b60_msd_weak", true, 8.2e13),
+    ("b62_msd_weak", true, 1.0e14),
     ("b40_detailed", true, 2.4e9),
     ("b50_detailed", true, 1.5e9),
 ];
@@ -306,10 +310,8 @@ mod tests {
 
     #[test]
     fn every_scenario_has_its_references() {
-        // Every scenario scores on the CPU, and every detailed one a GPU runs
-        // (all but the single-thread ones) on the GPU too, or the score
-        // silently thins. The nice-only fields' GPU references wait for
-        // sweeps with the field time as it now stands.
+        // Every scenario scores on the CPU, and every one a GPU runs (all but
+        // the single-thread ones) on the GPU too, or the score silently thins.
         let has = |key: &str, gpu: bool| {
             SCORE_REFERENCES
                 .iter()
@@ -320,14 +322,11 @@ mod tests {
             .map(|d| (d.key, d.single_thread))
             .chain(NICEONLY_FIELDS.iter().map(|d| (d.key, d.single_thread)))
             .collect();
-        for &(key, _) in &scenarios {
+        for &(key, single_thread) in &scenarios {
             assert!(has(key, false), "missing CPU score reference for {key}");
-        }
-        for def in DETAILED_SCENARIOS {
             assert!(
-                def.single_thread || has(def.key, true),
-                "missing GPU score reference for {}",
-                def.key
+                single_thread || has(key, true),
+                "missing GPU score reference for {key}"
             );
         }
         // No reference is left over from a scenario that is gone.
