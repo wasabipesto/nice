@@ -25,7 +25,8 @@
     "detailed": {"accrual_usd_per_month": 15.0, "bucket_cap_usd": 3.0, "max_exploit_instances": 3}
   },
 
-  "image": "ghcr.io/wasabipesto/nice_client:3-gpu",
+  "client_version": "auto",
+  "image": "ghcr.io/wasabipesto/nice_client",
   "disk_gb": 30,
 
   "explore_per_tick": 2,

@@ -83,6 +83,31 @@ A credit above `$0` re-enables explores; keep it below the reserve line
 wave of ordinary exploit buys. `MANUAL-CREDIT` is a one-time injection outside
 the accrual bound, so note why.
 
+## Client version
+
+The fleet prices offers with one client version's benchmarks and launches that
+same version, so the two cannot drift apart:
+
+- `client_version: "auto"` (the default) follows the newest `X.Y.Z` release
+  image in the registry on the controller's major line (`CLIENT_MAJOR`, 3). A
+  version's tag appears there only once its image is pushed, so the fleet
+  never prices a version it cannot launch yet. The lookup runs at most hourly;
+  a failed one keeps the last version found, and with none ever found the
+  tick buys nothing.
+- A version string (`"3.4.5"`) pins it, e.g. to hold the fleet on a release.
+- `image` names the repository only. Instances run `<image>:<version>-gpu`
+  (`<image>:<version>` for a CPU fleet), never a moving tag like `3-gpu` or
+  `latest-gpu`; a tag written in `image` is ignored with a warning.
+- Each instance records the version it was launched with, and renewal and
+  pounce confirmation price it at that version. Instances launched before
+  versions were recorded are priced at the current one.
+- Explore counts coverage from the current version's reports only, so after a
+  release it re-measures hardware that only older versions have measured.
+- A `VERSION` event logs each change, and `SUMMARY` lines name the image.
+
+This relies on a release's tag matching the workspace version the client
+reports (the `v3.4.5` tag carries `version = "3.4.5"`).
+
 ## Notes / known gaps
 
 - **First live explore run validates the launch incantation.** The GPU
