@@ -140,7 +140,7 @@ pub fn sample_order(partitions: u32) -> Vec<u32> {
     if partitions <= 1 {
         return (0..partitions).collect();
     }
-    let bits = u32::BITS - (partitions - 1).leading_zeros();
+    let bits = (partitions - 1).bit_width();
     (0..1u32 << bits)
         .map(|i| i.reverse_bits() >> (u32::BITS - bits))
         .filter(|&v| v < partitions)
