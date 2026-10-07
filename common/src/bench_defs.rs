@@ -146,13 +146,15 @@ pub const NICEONLY_FIELDS: &[FieldScenario] = &[
         stride_window_cpu: 2_000_000_000,
         stride_window_gpu: 1_000_000_000_000,
     },
-    // A dense b60 field (grid index 60118, density 0.41) whose leading part
-    // has its density, which the GPU's sample of the first slice and the
-    // CPU's first 3e15 rely on.
+    // A dense b60 field (density 0.41) whose leading part has its density,
+    // which the GPU's sample of the first slice and the CPU's first 3e15
+    // rely on. It starts 2e13 into grid field 60118, past a pocket the
+    // stride path's MSD filter rejects outright, so a stride window at its
+    // start times dense work, as `msd_weak` says.
     FieldScenario {
         key: "b60_msd_weak",
         base: 60,
-        start: 1_157_209_612_114_824_200_908,
+        start: 1_157_209_632_114_824_200_908,
         size: 10_000_000_000_000_000,
         cpu_size: 3_000_000_000_000_000,
         character: "msd-weak",
