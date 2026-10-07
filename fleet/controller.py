@@ -29,6 +29,7 @@ token bucket, ~$30/mo accrual, ~$7 cap, half-full reserve line, pounce at
 """
 
 import argparse
+import datetime
 import fcntl
 import json
 import os
@@ -63,6 +64,11 @@ _BENCH_SWEEP = (
     "--api-base {api_base} --username {username} --threads {threads} ; sleep 5 ; "
     "nice_client niceonly --benchmark --benchmark-upload --no-progress "
     "--api-base {api_base} --username {username} --threads {threads}"
+)
+# The (mode, gpu) of each report _BENCH_SWEEP uploads, as the client labels
+# them; a retired explore's missing entries are the configs that failed.
+SWEEP_BENCHMARKS = (
+    ("Nice-only", True), ("Detailed", False), ("Detailed", True), ("Nice-only", False),
 )
 
 # The client major version the onstart commands are written for. With
@@ -1191,6 +1197,64 @@ def charge_final_interval(db, cfg, row, now, fraction=0.5):
     return cost
 
 
+def fetch_explore_uploads(cfg, db, vast_ids):
+    """Benchmark reports uploaded by the given instances, keyed by vast_id.
+
+    The client stamps each report with the CONTAINER_ID Vast injects, which is
+    the instance id. Returns {vast_id: [(submit_epoch, mode, gpu), ...]}, or
+    None if the lookup failed (the caller then can't tell retirement from
+    preemption and must fall back to treating it as the latter).
+    """
+    ids = ",".join(str(int(v)) for v in vast_ids)
+    url = (
+        f"{cfg['data_base']}/benchmarks"
+        "?select=submit_time,cid:data->environment->>CONTAINER_ID,"
+        "mode:data->config->>mode,gpu:data->config->>gpu"
+        f"&username=eq.{urllib.parse.quote(cfg['username'])}"
+        f"&data->environment->>CONTAINER_ID=in.({ids})"
+    )
+    try:
+        rows = _fetch_json(cfg, url)
+    except Exception as e:
+        log_event(db, "WARN", f"explore upload lookup failed: {e!r}")
+        return None
+    out = {}
+    for r in rows:
+        try:
+            vid = int(r["cid"])
+            ts = datetime.datetime.fromisoformat(r["submit_time"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.setdefault(vid, []).append((ts, r.get("mode"), r.get("gpu") == "true"))
+    return out
+
+
+def retire_explore(db, cfg, row, uploads, now):
+    """Close out an explore that finished its sweep and destroyed itself.
+
+    Explores benchmark for a few minutes and then self-retire, usually between
+    two ticks, so reconcile never sees them running and would otherwise book
+    them as preempted, unrun, and billed for half the tick interval. Their
+    uploads say otherwise: the last one is posted just before the instance
+    deletes itself, so bill from the last charge up to it.
+    """
+    last = max(ts for ts, _, _ in uploads)
+    cost = max(0.0, last - row["last_charged_at"]) / 3600.0 * row["bid"]
+    db.execute(
+        "UPDATE instances SET spend = spend + ?, last_charged_at = ?, ever_ran = 1, "
+        "destroyed_at = ?, destroy_reason = 'retired' WHERE vast_id = ?",
+        (cost, now, now, row["vast_id"]),
+    )
+    charge_bucket(db, bucket_mode(row["mode"], cfg), cost)
+    got = {(mode, gpu) for _, mode, gpu in uploads}
+    missing = [f"{m} {'GPU' if g else 'CPU'}" for m, g in SWEEP_BENCHMARKS if (m, g) not in got]
+    detail = (f"instance {row['vast_id']} after {(now - row['created_at']) / 3600.0:.2f}h; "
+              f"{len(SWEEP_BENCHMARKS) - len(missing)} of {len(SWEEP_BENCHMARKS)} benchmarks uploaded")
+    if missing:
+        detail += ", missing " + ", ".join(missing)
+    log_event(db, "RETIRED", detail)
+
+
 def reconcile(cfg, db, dry):
     """Diff ledger vs live instances. Runs first, unconditionally."""
     now = time.time()
@@ -1211,9 +1275,19 @@ def reconcile(cfg, db, dry):
     for vast_id in ours_live.keys() - ledger.keys():
         destroy_instance(cfg, db, vast_id, "orphan", dry)
 
+    # Explores that vanished may have finished and retired themselves; their
+    # uploads tell the two apart.
+    gone_explores = [v for v, r in ledger.items()
+                     if v not in ours_live and r["purpose"] == "explore"]
+    uploads = fetch_explore_uploads(cfg, db, gone_explores) if gone_explores else {}
+
     for vast_id, row in ledger.items():
         if vast_id not in ours_live:
-            # Gone without us destroying it: preempted (or finished).
+            if uploads and uploads.get(vast_id):
+                retire_explore(db, cfg, row, uploads[vast_id], now)
+                continue
+            # Gone without us destroying it and without uploads: preempted, or
+            # an explore that died before it could benchmark anything.
             hold_h = (now - row["created_at"]) / 3600.0
             charge_final_interval(db, cfg, row, now)
             db.execute(

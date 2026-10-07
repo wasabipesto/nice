@@ -118,5 +118,10 @@ reports (the `v3.4.5` tag carries `version = "3.4.5"`).
   act; the first days run permissive-but-reserve-gated.
 - Realized-throughput confirmation currently rides on the benchmark-upload →
   `/estimate` loop; per-field telemetry correlation is a future refinement.
+- Explores delete themselves after their benchmark sweep, usually between
+  ticks, so reconcile never sees them running. It checks a vanished explore's
+  benchmark uploads: one with uploads is recorded `retired` and billed at its
+  bid up to its last upload, and its `RETIRED` event names any benchmark that
+  didn't upload. One with none, or a failed lookup, is recorded `preempted`.
 - Explore instances are cheap but not free: `explore_per_day` × ~2–5 min of
   the cheapest matching offer (well under $0.05/day at defaults).
