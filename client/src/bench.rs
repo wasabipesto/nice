@@ -28,7 +28,7 @@ use nice_common::client_api_async::Client;
 use nice_common::cpu_join::{CpuJoin, PartitionResult, Scratch, slices_for};
 #[cfg(feature = "cubecl")]
 use nice_common::cubecl_backend::CubeclContext;
-use nice_common::overlap_join::{StrideReason, join_verdict};
+use nice_common::overlap_join::{StrideReason, join_verdict, slice_weight};
 use nice_common::stride_filter::StrideTable;
 use nice_common::{
     BUILD_SHA, BenchmarkToServer, CLIENT_VERSION, DataToClient, FieldSize, SearchMode,
@@ -118,6 +118,9 @@ struct FieldMeasure {
 /// A timed sample of a field's partitions on the overlap join.
 struct JoinMeasure {
     slices: usize,
+    /// The field's size in first slices
+    /// ([`nice_common::overlap_join::slice_weight`]).
+    slice_weight: f64,
     /// Partitions per slice, and per launch (GPU).
     partitions: u32,
     slots: Option<usize>,
@@ -127,6 +130,10 @@ struct JoinMeasure {
     /// took (the device's wall time on a GPU, the pool's on a CPU).
     setup_secs: f64,
     run_secs: f64,
+    /// The time each partition past the sample adds, where a sample also
+    /// pays a fixed cost a slice pays only once (GPU; see
+    /// [`gpu_join_sample_on`]). Otherwise the sample scales evenly.
+    marginal_secs: Option<f64>,
     survivors: u64,
     checked: u64,
     retried_partitions: usize,
@@ -137,28 +144,37 @@ struct JoinMeasure {
 }
 
 impl JoinMeasure {
-    /// The whole field: each slice's partitions at the sample's rate, and
-    /// its setup. A GPU client sets up its next field (and a field its next
-    /// slice) on the host while the device runs the current one, so there
-    /// setup costs time only where it is the longer of the two; the CPU sets
-    /// up a slice before running its partitions. A field's slices have the
-    /// same shape, so the first stands for all of them.
+    /// The first slice's partitions: the sample, and the rest at the
+    /// marginal rate where there is one, else at the sample's.
     #[allow(clippy::cast_precision_loss)]
+    fn slice_run_secs(&self) -> f64 {
+        let (all, done) = (f64::from(self.partitions), self.sampled.max(1) as f64);
+        self.marginal_secs.map_or(self.run_secs * all / done, |m| {
+            self.run_secs + (all - done).max(0.0) * m
+        })
+    }
+
+    /// The whole field: the first slice's partitions and its setup, times
+    /// the field's size in first slices. A GPU client sets up its next
+    /// field (and a field its next slice) on the host while the device runs
+    /// the current one, so there setup costs time only where it is the
+    /// longer of the two; the CPU sets up a slice before running its
+    /// partitions.
     fn field_secs(&self) -> f64 {
-        let run = self.run_secs * f64::from(self.partitions) / self.sampled.max(1) as f64;
+        let run = self.slice_run_secs();
         let slice = if self.setup_overlaps {
             self.setup_secs.max(run)
         } else {
             self.setup_secs + run
         };
-        self.slices as f64 * slice
+        self.slice_weight * slice
     }
 }
 
 /// What sampling a field on the overlap join came to.
 enum JoinOutcome {
     Sampled {
-        measure: JoinMeasure,
+        measure: Box<JoinMeasure>,
         /// Untimed: kernel compilation (GPU).
         warmup_secs: f64,
         /// Wall time of the timed part.
@@ -395,7 +411,7 @@ fn run_field_scenario(
                 route: "join",
                 route_reason: None,
                 field_secs,
-                join: Some(measure),
+                join: Some(*measure),
                 stride_window: None,
                 error: None,
             }
@@ -489,6 +505,12 @@ fn gpu_join_sample(
 /// whole batches, at least [`MIN_GPU_BATCHES`]. Each sample also pays its own
 /// setup, so the batch overstates the time per batch and the sample comes
 /// out short of the share rather than past it.
+///
+/// Each sample's device time also holds a fixed cost before its first batch
+/// (25-55 ms on an RTX 3080 or 4090), which a slice pays once. The sizing
+/// batch paid it too, so the two samples' difference is the time the
+/// further partitions take, and the slice's other partitions are scaled
+/// from that rather than from the whole sample's average.
 #[cfg(feature = "cubecl")]
 fn gpu_join_sample_on(
     ctx: &CubeclContext,
@@ -524,21 +546,27 @@ fn gpu_join_sample_on(
         Ok(s) => s,
         Err(outcome) => return outcome,
     };
+    #[allow(clippy::cast_precision_loss)]
+    let marginal_secs = (s.sampled > batch.sampled)
+        .then(|| (s.run_secs - batch.run_secs) / (s.sampled - batch.sampled) as f64)
+        .filter(|&m| m > 0.0);
     JoinOutcome::Sampled {
-        measure: JoinMeasure {
+        measure: Box::new(JoinMeasure {
             slices: s.slices,
+            slice_weight: s.slice_weight,
             partitions,
             slots: Some(s.slots),
             sampled: s.sampled,
             setup_secs: s.setup_secs,
             run_secs: s.run_secs,
+            marginal_secs,
             survivors: s.survivors,
             checked: s.checked,
             retried_partitions: s.retried_partitions,
             refused_layouts: warm.refused + batch.refused + s.refused,
             hits: s.hits.len(),
             setup_overlaps: true,
-        },
+        }),
         warmup_secs,
         timed_secs: timed.elapsed().as_secs_f64(),
     }
@@ -613,20 +641,22 @@ fn cpu_join_sample(
         next = (fit / threads * threads).min(order.len() - done);
     }
     JoinOutcome::Sampled {
-        measure: JoinMeasure {
+        measure: Box::new(JoinMeasure {
             slices: slices.len(),
+            slice_weight: slice_weight(&slices),
             partitions,
             slots: None,
             sampled: done,
             setup_secs,
             run_secs,
+            marginal_secs: None,
             survivors: found.survivors,
             checked: found.checked,
             retried_partitions: 0,
             refused_layouts: 0,
             hits: found.hits.len(),
             setup_overlaps: false,
-        },
+        }),
         warmup_secs: 0.0,
         timed_secs: timed.elapsed().as_secs_f64(),
     }
@@ -777,8 +807,14 @@ fn print_window_table(results: &[ScenarioResult]) {
 /// The nice-only fields: the route each took, what was timed (partitions
 /// sampled, or the stride window), and the whole field's time and rate.
 fn print_field_table(results: &[ScenarioResult]) {
+    let w = results
+        .iter()
+        .map(|r| r.key.len())
+        .chain([8])
+        .max()
+        .unwrap_or(8);
     println!(
-        "{:<12} {:>4} {:>7} {:<6} {:>12} {:>8} {:>10} {:>12} {:>8}",
+        "{:<w$} {:>4} {:>7} {:<6} {:>12} {:>8} {:>10} {:>12} {:>8}",
         "scenario",
         "base",
         "threads",
@@ -797,7 +833,7 @@ fn print_field_table(results: &[ScenarioResult]) {
             (None, None) => "-".to_string(),
         };
         println!(
-            "{:<12} {:>4} {:>7} {:<6} {:>12} {:>8.3} {:>10.2} {:>12.3e} {:>8}",
+            "{:<w$} {:>4} {:>7} {:<6} {:>12} {:>8.3} {:>10.2} {:>12.3e} {:>8}",
             r.key,
             r.base,
             r.threads,
@@ -932,11 +968,13 @@ fn build_report_json(
                     f.join.as_ref().map_or(Value::Null, |j| {
                         json!({
                             "slices": j.slices,
+                            "slice_weight": j.slice_weight,
                             "partitions": j.partitions,
                             "slots": j.slots,
                             "sampled": j.sampled,
                             "setup_secs": j.setup_secs,
                             "run_secs": j.run_secs,
+                            "marginal_secs": j.marginal_secs,
                             "survivors": j.survivors,
                             "checked": j.checked,
                             "retried_partitions": j.retried_partitions,
@@ -1207,11 +1245,13 @@ mod tests {
     fn measure(setup_overlaps: bool) -> JoinMeasure {
         JoinMeasure {
             slices: 2,
+            slice_weight: 2.0,
             partitions: 1000,
             slots: None,
             sampled: 100,
             setup_secs: 0.5,
             run_secs: 0.2,
+            marginal_secs: None,
             survivors: 0,
             checked: 0,
             retried_partitions: 0,
@@ -1239,6 +1279,32 @@ mod tests {
             ..measure(true)
         };
         assert!((whole.field_secs() - 2.0 * 0.5).abs() < 1e-9);
+        // A last slice a quarter as wide adds a quarter of a slice.
+        let short_last = JoinMeasure {
+            slice_weight: 1.25,
+            ..measure(true)
+        };
+        assert!((short_last.field_secs() - 1.25 * 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_fixed_cost_per_sample_is_paid_once_per_slice() {
+        // 0.05 s before the first batch, then 1.5 ms a partition: the
+        // sample of 100 took 0.2 s. The slice pays the 0.05 s once and its
+        // other 900 partitions 1.5 ms each, not 2 ms (the sample's average).
+        let m = JoinMeasure {
+            marginal_secs: Some(0.0015),
+            ..measure(true)
+        };
+        assert!((m.slice_run_secs() - (0.2 + 900.0 * 0.0015)).abs() < 1e-9);
+        assert!((m.field_secs() - 2.0 * 1.55).abs() < 1e-9);
+        // A sample of the whole slice is its time either way.
+        let whole = JoinMeasure {
+            sampled: 1000,
+            run_secs: 1.55,
+            ..m
+        };
+        assert!((whole.slice_run_secs() - 1.55).abs() < 1e-9);
     }
 
     #[test]

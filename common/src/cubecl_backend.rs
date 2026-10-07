@@ -1410,6 +1410,9 @@ pub struct JoinSample {
     /// The field's slices, and partitions per slice (`b^p`).
     pub slices: usize,
     pub partitions: u128,
+    /// The field's size in first slices
+    /// ([`crate::overlap_join::slice_weight`]).
+    pub slice_weight: f64,
     /// Partitions per launch planned for the first slice.
     pub slots: usize,
     /// Partitions sampled, all from the first slice.
@@ -1774,6 +1777,7 @@ impl CubeclContext {
         Ok(Ok(JoinSample {
             slices: field.slice_count(),
             partitions: field.partitions(),
+            slice_weight: crate::overlap_join::slice_weight(&field.slices),
             slots: field.plan.slots,
             sampled: parts.len(),
             setup_secs: st.setup_secs,

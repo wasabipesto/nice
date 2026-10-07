@@ -338,6 +338,20 @@ pub fn join_slices(range: &FieldSize, block: u128, max_prefixes: u128) -> Vec<Fi
     out
 }
 
+/// A field's size in first slices ([`join_slices`]): the slices' total over
+/// the first one's. Every slice but the last is as wide as the first, and
+/// the last is usually narrower, so a field timed by its first slice is
+/// this many of them, not its slice count.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // a ratio of field sizes
+pub fn slice_weight(slices: &[FieldSize]) -> f64 {
+    let Some(first) = slices.first() else {
+        return 0.0;
+    };
+    let total: u128 = slices.iter().map(FieldSize::size).sum();
+    total as f64 / first.size().max(1) as f64
+}
+
 /// Four little-endian `u64` words: enough for `n³` with `n < 2^85`.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct W4(pub [u64; 4]);
@@ -1694,6 +1708,11 @@ mod tests {
                 "[{s}, {e}) cap {cap}"
             );
         }
+        // Three slices of 3,000 and one of 1,000 weigh 3 1/3 first slices.
+        let slices = join_slices(&FieldSize::new(0, 10_000), block, 3);
+        assert_eq!(slices.len(), 4);
+        assert!((slice_weight(&slices) - 10.0 / 3.0).abs() < 1e-12);
+        assert!((slice_weight(&slices[..1]) - 1.0).abs() < 1e-12);
     }
 
     /// A slice set up from the field's setup is the setup of that range as a
