@@ -13,6 +13,13 @@
 //! join count partitions the device has run. Fields are identified by their
 //! range, since the niceonly pipeline keeps more than one open at a time.
 
+// The GPU paths are the only callers of the reporting half; without a GPU
+// feature only the client's half (`install`, the trait) is used.
+#![cfg_attr(
+    not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")),
+    allow(dead_code)
+)]
+
 use crate::FieldSize;
 use std::sync::OnceLock;
 

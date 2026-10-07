@@ -7,8 +7,9 @@
 //! ahead of it is done (the host filters one field's blocks after the
 //! other's, while the device drains the first), so a bar per open field
 //! left one line standing still. Every open field keeps a bar of its own,
-//! with its own clock and position, but only the oldest is drawn; when it
-//! finishes, the next takes the line. A finished field's bar is cleared;
+//! with its own position, and a clock that starts with its first unit of
+//! work, but only the oldest is drawn; when it finishes, the next takes the
+//! line. A finished field's bar is cleared;
 //! the "✓ Processed" log line is the record that stays in the scrollback.
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
@@ -106,7 +107,14 @@ impl ProgressSink for GpuProgress {
     fn advance(&self, range: &FieldSize, done: u64) {
         let fields = self.fields.lock().unwrap();
         if let Some((_, bar)) = fields.iter().find(|(k, _)| *k == key(range)) {
+            let started = bar.position() == 0 && done > 0;
             bar.set_position(done);
+            if started {
+                // The field's work has begun: its clock and rate run from
+                // here, not from when it was opened behind another field.
+                bar.reset_elapsed();
+                bar.reset_eta();
+            }
             if bar.length().is_some_and(|len| done >= len) && bar.message().is_empty() {
                 bar.set_style(waiting_style());
                 bar.set_message(", waiting on device");
