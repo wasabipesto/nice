@@ -577,6 +577,124 @@ class EHoldStatisticTests(unittest.TestCase):
         self.assertAlmostEqual(e_hold_hours(db, cfg(), "RTX 3080"), 4.36, places=2)
 
 
+class ExploreRetireTests(unittest.TestCase):
+    """Explores benchmark and delete themselves between ticks, so reconcile
+    never sees them running; their uploads are the evidence they ran."""
+
+    def setUp(self):
+        self.db = memory_db()
+        self.now = time.time()
+        self.db.execute("INSERT INTO buckets (mode, balance, updated_at) VALUES ('niceonly', 5.0, ?)",
+                        (self.now,))
+        self.orig_show = controller.show_instances
+        self.orig_fetch = controller._fetch_json
+        controller.show_instances = lambda cfg: []
+        self.urls = []
+
+    def tearDown(self):
+        controller.show_instances = self.orig_show
+        controller._fetch_json = self.orig_fetch
+
+    def _seed(self, vast_id, purpose="explore", bid=0.12, charged_ago_min=10.0):
+        t = self.now - charged_ago_min * 60
+        self.db.execute(
+            "INSERT INTO instances (vast_id, label, purpose, gpu_name, bid, created_at, "
+            "ttl_at, last_charged_at, mode) VALUES (?, 'x', ?, 'RTX 3080', ?, ?, ?, ?, ?)",
+            (vast_id, purpose, bid, t, self.now + 3600, t,
+             "niceonly" if purpose == "exploit" else None))
+
+    def _uploads(self, rows):
+        def fake(cfg, url):
+            self.urls.append(url)
+            if isinstance(rows, Exception):
+                raise rows
+            return rows
+        controller._fetch_json = fake
+
+    def _report(self, vast_id, mins_ago, mode="Nice-only", gpu=True):
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(self.now - mins_ago * 60))
+        return {"submit_time": ts, "cid": str(vast_id), "mode": mode,
+                "gpu": "true" if gpu else "false"}
+
+    def _row(self, vast_id):
+        return self.db.execute("SELECT * FROM instances WHERE vast_id = ?", (vast_id,)).fetchone()
+
+    def _balance(self):
+        return self.db.execute("SELECT balance FROM buckets WHERE mode='niceonly'").fetchone()[0]
+
+    def test_explore_with_uploads_is_retired_and_billed_to_last_upload(self):
+        self._seed(1, bid=0.12, charged_ago_min=10.0)
+        self._uploads([self._report(1, 8, "Nice-only", True), self._report(1, 7, "Detailed", False),
+                       self._report(1, 6, "Detailed", True), self._report(1, 4, "Nice-only", False)])
+        controller.reconcile(cfg(), self.db, dry=False)
+        row = self._row(1)
+        self.assertEqual(row["destroy_reason"], "retired")
+        self.assertEqual(row["ever_ran"], 1)
+        # Charged from last_charged_at (10 min ago) to the last upload (4 min
+        # ago): 6 min at $0.12/hr, not half the 10-minute interval.
+        self.assertAlmostEqual(row["spend"], 0.012, places=4)
+        self.assertAlmostEqual(self._balance(), 5.0 - 0.012, places=4)
+        ev = self.db.execute("SELECT detail FROM events WHERE kind='RETIRED'").fetchone()[0]
+        self.assertIn("4 of 4 benchmarks uploaded", ev)
+        self.assertNotIn("missing", ev)
+
+    def test_retired_event_names_missing_benchmarks(self):
+        self._seed(2)
+        self._uploads([self._report(2, 6, "Detailed", False), self._report(2, 5, "Nice-only", False)])
+        controller.reconcile(cfg(), self.db, dry=False)
+        ev = self.db.execute("SELECT detail FROM events WHERE kind='RETIRED'").fetchone()[0]
+        self.assertIn("2 of 4 benchmarks uploaded, missing Nice-only GPU, Detailed GPU", ev)
+
+    def test_upload_before_last_charge_costs_nothing_more(self):
+        # Seen running at the previous tick (already billed to then), last
+        # upload landed before that tick.
+        self._seed(3, charged_ago_min=2.0)
+        self._uploads([self._report(3, 5)])
+        controller.reconcile(cfg(), self.db, dry=False)
+        self.assertEqual(self._row(3)["destroy_reason"], "retired")
+        self.assertEqual(self._row(3)["spend"], 0.0)
+
+    def test_explore_without_uploads_is_still_preempted(self):
+        self._seed(4, bid=0.12, charged_ago_min=10.0)
+        self._uploads([])
+        controller.reconcile(cfg(), self.db, dry=False)
+        row = self._row(4)
+        self.assertEqual(row["destroy_reason"], "preempted")
+        self.assertEqual(row["ever_ran"], 0)
+        self.assertAlmostEqual(row["spend"], 0.01, places=4)  # half of 10 min
+
+    def test_failed_lookup_falls_back_to_preempted(self):
+        self._seed(5)
+        self._uploads(urllib.error.URLError("down"))
+        controller.reconcile(cfg(), self.db, dry=False)
+        self.assertEqual(self._row(5)["destroy_reason"], "preempted")
+        self.assertEqual(
+            self.db.execute("SELECT COUNT(*) FROM events WHERE kind='WARN'").fetchone()[0], 1)
+
+    def test_one_lookup_for_all_gone_explores_and_none_for_exploits(self):
+        self._seed(6)
+        self._seed(7)
+        self._seed(8, purpose="exploit")
+        self._uploads([self._report(6, 5), self._report(7, 5)])
+        controller.reconcile(cfg(), self.db, dry=False)
+        self.assertEqual(len(self.urls), 1)
+        self.assertIn("CONTAINER_ID=in.(6,7)", self.urls[0])
+        self.assertIn("username=eq.", self.urls[0])
+        self.assertEqual(self._row(8)["destroy_reason"], "preempted")
+
+    def test_nothing_gone_means_no_lookup(self):
+        self._uploads([])
+        controller.reconcile(cfg(), self.db, dry=False)
+        self.assertEqual(self.urls, [])
+
+    def test_unparseable_rows_are_skipped(self):
+        self._uploads([{"submit_time": "garbage", "cid": "9"}, {"cid": None},
+                       self._report(9, 3)])
+        out = controller.fetch_explore_uploads(cfg(), self.db, [9])
+        self.assertEqual(list(out), [9])
+        self.assertEqual(len(out[9]), 1)
+
+
 class TickWrapperTests(unittest.TestCase):
     """Locking, log rotation and path resolution, which used to live in a
     shell wrapper beside the controller."""

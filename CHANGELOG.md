@@ -7,6 +7,7 @@
 - Reduce the MSD interval analysis cost per node by utilizing wide division for endpoint digit extraction and masked recursion to reduce the number of total split computations.
 - Split the CPU nice-only stride walk into two phases. Phase 1 streams the gap and low-mask tables and compacts the survivor list into per-thread buffers with no data-dependent branch, Phase 2 runs the affine middle-digit filter and the seeded nice check on the survivors only. 
 - Make the fleet controller price offers with the same client version it launches. By default `client_version: "auto"` follows the newest release image in the registry and uses that version for both pricing estimates and launching.
+- Record fleet explore instances that finish their benchmarks and delete themselves as retired instead of preempted, billed up to their last upload.
 - Update `--threads 0` (and `NICE_THREADS=0`) to explicitly spawn as many threads as the host has CPU cores instead of falling back to edge case behavior. `RAYON_NUM_THREADS` no longer influences the client. Omitting this option still defaults to 4 threads.
 - Lower the CPU MSD recursion floor from 8000 to 4000 since both node checks and survivor checks are cheaper.
 - Record the build commit SHA alongside the version for benchmarks, telemetry, and api `/status`. 
