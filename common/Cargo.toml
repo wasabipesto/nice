@@ -53,7 +53,7 @@ diesel = { version = "2.3", features = ["chrono", "postgres", "r2d2", "serde_jso
 dotenvy = { version = "0.15", optional = true }
 log = { version = "0.4" }
 malachite = { version = "0.11" }
-malachite-nz = { version = "0.11", features = ["enable_serde"] }
+malachite-nz = { version = "0.12", features = ["enable_serde"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true, default-features = false }
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time"], optional = true }
