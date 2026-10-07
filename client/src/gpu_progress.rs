@@ -80,6 +80,14 @@ fn style(numbers_per_unit: u128) -> ProgressStyle {
     .progress_chars("█▉▊▋▌▍▎▏ ")
 }
 
+/// Once the host is done with a field and the device drains it, the rate
+/// would only decay towards zero; the bar shows the time it has waited.
+fn waiting_style() -> ProgressStyle {
+    ProgressStyle::with_template("{percent}|{wide_bar:.white}| {pos}/{len} [{elapsed}{msg}]")
+        .expect("static template")
+        .progress_chars("█▉▊▋▌▍▎▏ ")
+}
+
 fn key(range: &FieldSize) -> (u128, u128) {
     (range.start(), range.end())
 }
@@ -99,7 +107,8 @@ impl ProgressSink for GpuProgress {
         let fields = self.fields.lock().unwrap();
         if let Some((_, bar)) = fields.iter().find(|(k, _)| *k == key(range)) {
             bar.set_position(done);
-            if bar.length().is_some_and(|len| done >= len) {
+            if bar.length().is_some_and(|len| done >= len) && bar.message().is_empty() {
+                bar.set_style(waiting_style());
                 bar.set_message(", waiting on device");
             }
         }
