@@ -418,7 +418,7 @@ mod tests {
         assert_eq!(table.modulus, 90);
 
         // Should have valid residues combining both filters
-        assert!(!table.valid_residues.is_empty());
+        assert!(!table.valid_residues.is_empty(), "no valid residues");
         assert_eq!(table.valid_residues.len(), table.gap_table.len());
 
         // Verify gap table covers full cycle
@@ -521,7 +521,7 @@ mod tests {
         // range and compare both paths.
         for base in [40u32, 50, 52, 60, 64] {
             let table = StrideTable::new(base, 3);
-            assert!(!table.low_digit_masks.is_empty());
+            assert!(!table.low_digit_masks.is_empty(), "b{base}: no masks");
             let range = get_base_range_u128(base).unwrap().unwrap();
             let start = range.start() + (range.end() - range.start()) / 3;
             let (mut n, mut idx) = table.first_valid_at_or_after(start);
@@ -559,7 +559,7 @@ mod tests {
         // M = 59 * 60^3 = 12,744,000 and all residues/gaps must fit u32.
         let table = StrideTable::new(60, 3);
         assert_eq!(table.modulus, 12_744_000);
-        assert!(!table.valid_residues.is_empty());
+        assert!(!table.valid_residues.is_empty(), "no valid residues");
         let total_gap: u128 = table.gap_table.iter().map(|&g| u128::from(g)).sum();
         assert_eq!(total_gap, table.modulus);
     }

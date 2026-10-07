@@ -709,6 +709,12 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
 /// the same base (the benchmark sweep times many small windows, where a
 /// per-call table build would dominate); `None` builds one for this field,
 /// which is negligible at production field sizes.
+// Without a GPU feature the GPU branch below only exits, so clippy reads its
+// `else` as redundant.
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")),
+    allow(clippy::redundant_else)
+)]
 fn process_field_sync(
     claim_data: &DataToClient,
     cli: &Cli,
