@@ -1611,7 +1611,7 @@ mod tests {
             let mut scratch = Vec::new();
             recurse_generic(slice, &params, 0, 0, &mut scratch);
             assert_eq!(reused, scratch, "b{base} floor {floor}");
-            assert!(!reused.is_empty());
+            assert!(!reused.is_empty(), "b{base} floor {floor}: no ranges");
         }
     }
 

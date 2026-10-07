@@ -316,7 +316,7 @@ mod tests {
         let valid = get_valid_lsds(&40);
 
         // Should have some valid LSDs
-        assert!(!valid.is_empty());
+        assert!(!valid.is_empty(), "base 40 should have some valid LSDs");
 
         // Should filter out at least some LSDs (not all can be valid)
         assert!(valid.len() < 40);

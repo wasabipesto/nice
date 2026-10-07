@@ -26,16 +26,19 @@
     clippy::used_underscore_binding
 )]
 
-use crate::client_process::{process_range_detailed, process_range_niceonly};
+use crate::client_process::process_range_detailed;
+use crate::cubecl_join::{JoinPipeline, limits_of, run_slices};
 use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
 use crate::gpu_niceonly::{
-    DeviceResult, GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline, NiceonlyStarted, NiceonlyStats,
-    PendingField, RangeSink, batches_in_flight, lane_shift_for, residue_empty_result,
-    stride_chunk_bits,
+    DeviceResult, GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline, NiceonlyStats, PendingField,
+    RangeSink, batches_in_flight, lane_shift_for, stride_chunk_bits,
 };
+use crate::gpu_route::{FieldTicket, NiceonlyGpu, Route};
+use crate::join_plan::{JoinCeiling, JoinField, JoinLimits, plan_join};
 use crate::number_stats::get_near_miss_cutoff;
+use crate::overlap_join::StrideReason;
 use crate::stride_filter::StrideTable;
 use crate::{FieldResults, FieldSize, NiceNumberSimple, UniquesDistributionSimple};
 use anyhow::{Context as _, Result, ensure};
@@ -371,7 +374,7 @@ const NICEONLY_OUT_CAPACITY: usize = 1 << 16;
     clippy::collapsible_if,
     clippy::fn_params_excessive_bools
 )]
-fn candidate_check(
+pub(crate) fn candidate_check(
     n_lo: u64,
     n_hi: u64,
     sv_s: &mut SharedMemory<u32>,
@@ -1400,6 +1403,29 @@ static WGPU_DEFAULT: OnceLock<(
     String,
 )> = OnceLock::new();
 
+/// What a timed sample of the overlap join on one field did
+/// ([`CubeclContext::join_sample`]).
+#[derive(Clone, Debug)]
+pub struct JoinSample {
+    /// The field's slices, and partitions per slice (`b^p`).
+    pub slices: usize,
+    pub partitions: u128,
+    /// Partitions per launch planned for the first slice.
+    pub slots: usize,
+    /// Partitions sampled, all from the first slice.
+    pub sampled: usize,
+    /// Host setup of the first slice on the calling thread (bottom list and
+    /// top layer), and the device's wall time for the sampled partitions.
+    pub setup_secs: f64,
+    pub run_secs: f64,
+    /// Pairs that passed the AND, the prefilter's survivors, partitions
+    /// re-run after a list overflowed, and the hits, over the sample.
+    pub survivors: u64,
+    pub checked: u64,
+    pub retried_partitions: usize,
+    pub hits: Vec<u128>,
+}
+
 /// One initialized `CubeCL` device: wgpu everywhere, or the native CUDA
 /// runtime when built with `cubecl-cuda` (the meaningful NVIDIA comparison,
 /// since it exercises `CubeCL`'s CUDA codegen against the hand kernels).
@@ -1413,6 +1439,11 @@ pub enum CubeclContext {
         /// The continuous niceonly pipeline, started on the first niceonly field.
         niceonly_pipeline:
             Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::wgpu::WgpuRuntime>>>>,
+        /// The overlap join's pipeline, started on the first field it takes
+        /// (see [`crate::join_plan::plan_join`]).
+        join_pipeline: Mutex<Option<JoinPipeline>>,
+        /// The largest join layout this device runs, as far as it has shown.
+        join_ceiling: Arc<JoinCeiling>,
     },
     #[cfg(feature = "cubecl-cuda")]
     Cuda {
@@ -1424,6 +1455,11 @@ pub enum CubeclContext {
         /// The continuous niceonly pipeline, started on the first niceonly field.
         niceonly_pipeline:
             Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::cuda::CudaRuntime>>>>,
+        /// The overlap join's pipeline, started on the first field it takes
+        /// (see [`crate::join_plan::plan_join`]).
+        join_pipeline: Mutex<Option<JoinPipeline>>,
+        /// The largest join layout this device runs, as far as it has shown.
+        join_ceiling: Arc<JoinCeiling>,
     },
     #[cfg(feature = "cubecl-hip")]
     Hip {
@@ -1435,6 +1471,11 @@ pub enum CubeclContext {
         /// The continuous niceonly pipeline, started on the first niceonly field.
         niceonly_pipeline:
             Mutex<Option<NiceonlyPipeline<CubeclPendingField<cubecl::hip::HipRuntime>>>>,
+        /// The overlap join's pipeline, started on the first field it takes
+        /// (see [`crate::join_plan::plan_join`]).
+        join_pipeline: Mutex<Option<JoinPipeline>>,
+        /// The largest join layout this device runs, as far as it has shown.
+        join_ceiling: Arc<JoinCeiling>,
     },
 }
 
@@ -1549,6 +1590,8 @@ impl CubeclContext {
             device_name: device_name.clone(),
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
+            join_pipeline: Mutex::new(None),
+            join_ceiling: Arc::default(),
         })
     }
 
@@ -1590,6 +1633,8 @@ impl CubeclContext {
             device_name: device_name.clone(),
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
+            join_pipeline: Mutex::new(None),
+            join_ceiling: Arc::default(),
         })
     }
 
@@ -1635,6 +1680,8 @@ impl CubeclContext {
             device_name: cuda_device_name(device_index),
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
+            join_pipeline: Mutex::new(None),
+            join_ceiling: Arc::default(),
         })
     }
 
@@ -1672,7 +1719,67 @@ impl CubeclContext {
             device_name: format!("cubecl-hip device {device_index}"),
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
+            join_pipeline: Mutex::new(None),
+            join_ceiling: Arc::default(),
         })
+    }
+
+    /// Time the overlap join on the partitions `parts` of the first slice of
+    /// `range`, planned, batched and launched exactly as a production field
+    /// is, without running the whole field. This is how the benchmark
+    /// measures the join at production field sizes: the field's time is
+    /// about `setup + (partitions / sampled) · run` per slice, times the
+    /// slices. Kernels compile on first use, so time a throwaway sample
+    /// first. `Ok(Err(reason))` if the field takes the stride pipeline on
+    /// this device.
+    ///
+    /// # Errors
+    /// Device failures.
+    pub fn join_sample(
+        &self,
+        base: u32,
+        range: &FieldSize,
+        parts: &[u32],
+    ) -> Result<std::result::Result<JoinSample, StrideReason>> {
+        let lim = match NiceonlyGpu::join_limits(self) {
+            Ok(lim) => lim,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let field = match plan_join(base, range, lim) {
+            Ok(field) => field,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let (hits, st) = match self {
+            Self::Wgpu {
+                client,
+                join_ceiling,
+                ..
+            } => run_slices(client, &field, 1, parts, join_ceiling)?,
+            #[cfg(feature = "cubecl-cuda")]
+            Self::Cuda {
+                client,
+                join_ceiling,
+                ..
+            } => run_slices(client, &field, 1, parts, join_ceiling)?,
+            #[cfg(feature = "cubecl-hip")]
+            Self::Hip {
+                client,
+                join_ceiling,
+                ..
+            } => run_slices(client, &field, 1, parts, join_ceiling)?,
+        };
+        Ok(Ok(JoinSample {
+            slices: field.slice_count(),
+            partitions: field.partitions(),
+            slots: field.plan.slots,
+            sampled: parts.len(),
+            setup_secs: st.setup_secs,
+            run_secs: st.device_secs,
+            survivors: st.survivors,
+            checked: st.checked,
+            retried_partitions: st.retried_partitions,
+            hits: hits.iter().map(|h| h.number).collect(),
+        }))
     }
 
     /// The adapter/device name, for reports.
@@ -1761,7 +1868,9 @@ pub async fn process_range_detailed_cubecl_async(
 /// `NICE_CUBECL_WIDE=1` opts in for A/B runs on devices where it is legal;
 /// `NICE_CUBECL_WIDE=0` forces split16 anywhere. A forced wide flavor on a
 /// device without u64 fails at shader compile time, loudly.
-fn wide_chunk_for<R: cubecl::prelude::Runtime>(client: &cubecl::prelude::ComputeClient<R>) -> bool {
+pub(crate) fn wide_chunk_for<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+) -> bool {
     let name = R::name(client);
     let cuda = name.contains("cuda");
     let direct = name.contains("spirv") || name.contains("msl") || name == "hip";
@@ -1993,141 +2102,144 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
     })
 }
 
-/// `CubeCL` implementation of `process_range_niceonly`.
-///
-/// Runs the MSD prefix filter on the CPU (all cores) and checks the surviving
-/// ranges' stride-valid candidates on the GPU, which reconstructs them from
-/// the residue table on-device. Produces the exact same nice-number set as the
-/// CPU path: the coarser MSD floor makes the GPU's candidate set a *superset*,
-/// and the per-candidate check is identical.
-///
-/// **Range semantics**: half-open [`range_start`, `range_end`).
-///
-/// # Errors
-/// Returns an error on any device failure or if the output buffer overflows.
-/// Start one niceonly field: hand it to the continuous pipeline, or answer
-/// it on the spot for a base the device cannot take. Pair with
-/// [`finish_niceonly_cubecl`], which returns fields in the order they were
-/// begun.
-///
-/// # Errors
-/// Returns an error if the pipeline's dispatch thread has died.
-///
-/// # Panics
-/// Panics if the pipeline mutex was poisoned by an earlier panic.
-pub fn begin_niceonly_cubecl(
-    ctx: &CubeclContext,
-    range: &FieldSize,
-    base: u32,
-) -> Result<NiceonlyStarted> {
-    if let Some(empty) = residue_empty_result(base) {
-        return Ok(NiceonlyStarted::Immediate(empty));
+/// The `CubeCL` nice-only path. The MSD prefix filter runs on the CPU (all
+/// cores) and the GPU checks the surviving ranges' stride-valid candidates,
+/// which it reconstructs from the residue table on-device; production-size
+/// fields go to the overlap join instead. Either way the nice numbers found
+/// are exactly the CPU path's: the coarser MSD floor makes the GPU's
+/// candidate set a superset, and the final check is the same. Fields start
+/// through [`crate::gpu_route::begin_niceonly`].
+impl NiceonlyGpu for CubeclContext {
+    fn join_limits(&self) -> std::result::Result<JoinLimits, StrideReason> {
+        match self {
+            Self::Wgpu {
+                client,
+                device_name,
+                join_ceiling,
+                ..
+            } => join_limits_on(client, device_name, join_ceiling),
+            #[cfg(feature = "cubecl-cuda")]
+            Self::Cuda {
+                client,
+                device_name,
+                join_ceiling,
+                ..
+            } => join_limits_on(client, device_name, join_ceiling),
+            #[cfg(feature = "cubecl-hip")]
+            Self::Hip {
+                client,
+                device_name,
+                join_ceiling,
+                ..
+            } => join_limits_on(client, device_name, join_ceiling),
+        }
     }
-    if !gpu_supports_base(base) {
-        warn!("base {base} not supported on GPU, falling back to CPU for this field");
-        let table = StrideTable::new(base, GPU_LSD_K);
-        return Ok(NiceonlyStarted::Immediate(process_range_niceonly(
-            range, base, &table,
-        )));
+
+    fn begin_stride(&self, range: &FieldSize, base: u32) -> Result<FieldTicket> {
+        let software = is_software_rasterizer(&self.device_name());
+        match self {
+            Self::Wgpu {
+                client,
+                niceonly_plans,
+                niceonly_pipeline,
+                ..
+            } => begin_stride_on(
+                client,
+                niceonly_plans,
+                niceonly_pipeline,
+                software,
+                range,
+                base,
+            ),
+            #[cfg(feature = "cubecl-cuda")]
+            Self::Cuda {
+                client,
+                niceonly_plans,
+                niceonly_pipeline,
+                ..
+            } => begin_stride_on(
+                client,
+                niceonly_plans,
+                niceonly_pipeline,
+                software,
+                range,
+                base,
+            ),
+            #[cfg(feature = "cubecl-hip")]
+            Self::Hip {
+                client,
+                niceonly_plans,
+                niceonly_pipeline,
+                ..
+            } => begin_stride_on(
+                client,
+                niceonly_plans,
+                niceonly_pipeline,
+                software,
+                range,
+                base,
+            ),
+        }
     }
-    let software = is_software_rasterizer(&ctx.device_name());
-    match ctx {
-        CubeclContext::Wgpu {
-            client,
-            niceonly_plans,
-            niceonly_pipeline,
-            ..
-        } => begin_impl(
-            client,
-            niceonly_plans,
-            niceonly_pipeline,
-            software,
-            range,
-            base,
-        ),
-        #[cfg(feature = "cubecl-cuda")]
-        CubeclContext::Cuda {
-            client,
-            niceonly_plans,
-            niceonly_pipeline,
-            ..
-        } => begin_impl(
-            client,
-            niceonly_plans,
-            niceonly_pipeline,
-            software,
-            range,
-            base,
-        ),
-        #[cfg(feature = "cubecl-hip")]
-        CubeclContext::Hip {
-            client,
-            niceonly_plans,
-            niceonly_pipeline,
-            ..
-        } => begin_impl(
-            client,
-            niceonly_plans,
-            niceonly_pipeline,
-            software,
-            range,
-            base,
-        ),
+
+    fn begin_join(&self, field: JoinField) -> Result<FieldTicket> {
+        match self {
+            Self::Wgpu {
+                client,
+                join_pipeline,
+                join_ceiling,
+                ..
+            } => begin_join_on(client, join_pipeline, join_ceiling, field),
+            #[cfg(feature = "cubecl-cuda")]
+            Self::Cuda {
+                client,
+                join_pipeline,
+                join_ceiling,
+                ..
+            } => begin_join_on(client, join_pipeline, join_ceiling, field),
+            #[cfg(feature = "cubecl-hip")]
+            Self::Hip {
+                client,
+                join_pipeline,
+                join_ceiling,
+                ..
+            } => begin_join_on(client, join_pipeline, join_ceiling, field),
+        }
+    }
+
+    fn finish(&self, ticket: FieldTicket) -> Result<(FieldResults, NiceonlyStats)> {
+        match self {
+            Self::Wgpu {
+                niceonly_pipeline,
+                join_pipeline,
+                ..
+            } => finish_on(niceonly_pipeline, join_pipeline, ticket),
+            #[cfg(feature = "cubecl-cuda")]
+            Self::Cuda {
+                niceonly_pipeline,
+                join_pipeline,
+                ..
+            } => finish_on(niceonly_pipeline, join_pipeline, ticket),
+            #[cfg(feature = "cubecl-hip")]
+            Self::Hip {
+                niceonly_pipeline,
+                join_pipeline,
+                ..
+            } => finish_on(niceonly_pipeline, join_pipeline, ticket),
+        }
     }
 }
 
-/// Wait for the oldest field begun with [`begin_niceonly_cubecl`] that went
-/// into the pipeline, and return its results.
-///
-/// # Errors
-/// The field's device error, or an output buffer overflow.
-///
-/// # Panics
-/// Panics if the pipeline mutex was poisoned by an earlier panic.
-pub fn finish_niceonly_cubecl(ctx: &CubeclContext) -> Result<(FieldResults, NiceonlyStats)> {
-    match ctx {
-        CubeclContext::Wgpu {
-            niceonly_pipeline, ..
-        } => finish_impl(niceonly_pipeline),
-        #[cfg(feature = "cubecl-cuda")]
-        CubeclContext::Cuda {
-            niceonly_pipeline, ..
-        } => finish_impl(niceonly_pipeline),
-        #[cfg(feature = "cubecl-hip")]
-        CubeclContext::Hip {
-            niceonly_pipeline, ..
-        } => finish_impl(niceonly_pipeline),
-    }
-}
-
-/// One field, begun and finished: the synchronous form, for callers that
-/// process a single field at a time (the benchmark sweep, tests).
-///
-/// # Errors
-/// See [`begin_niceonly_cubecl`] and [`finish_niceonly_cubecl`].
-///
-/// # Panics
-/// Panics if the pipeline mutex was poisoned by an earlier panic.
-pub fn process_range_niceonly_cubecl(
-    ctx: &CubeclContext,
-    range: &FieldSize,
-    base: u32,
-) -> Result<FieldResults> {
-    match begin_niceonly_cubecl(ctx, range, base)? {
-        NiceonlyStarted::Immediate(results) => Ok(results),
-        NiceonlyStarted::Queued => finish_niceonly_cubecl(ctx).map(|(results, _)| results),
-    }
-}
-
-/// Runtime-generic body of [`begin_niceonly_cubecl`].
-fn begin_impl<R: cubecl::prelude::Runtime>(
+/// Runtime-generic body of [`CubeclContext::begin_stride`]: the stride
+/// pipeline, started on the first field.
+fn begin_stride_on<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
     plans: &Arc<Mutex<HashMap<u32, Arc<NiceonlyPlan>>>>,
     pipeline: &Mutex<Option<NiceonlyPipeline<CubeclPendingField<R>>>>,
     software: bool,
     range: &FieldSize,
     base: u32,
-) -> Result<NiceonlyStarted> {
+) -> Result<FieldTicket> {
     let mut guard = pipeline.lock().unwrap();
     let pipeline = guard.get_or_insert_with(|| {
         NiceonlyPipeline::start(
@@ -2142,25 +2254,53 @@ fn begin_impl<R: cubecl::prelude::Runtime>(
             },
         )
     });
-    pipeline.push(base, range)?;
-    Ok(NiceonlyStarted::Queued)
+    pipeline.push(base, range)
 }
 
-/// Runtime-generic body of [`finish_niceonly_cubecl`].
-fn finish_impl<R: cubecl::prelude::Runtime>(
+/// Runtime-generic body of [`CubeclContext::begin_join`]: the join's
+/// pipeline, started on the first field it takes.
+fn begin_join_on<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    join_pipeline: &Mutex<Option<JoinPipeline>>,
+    join_ceiling: &Arc<JoinCeiling>,
+    field: JoinField,
+) -> Result<FieldTicket> {
+    join_pipeline
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| JoinPipeline::start(client.clone(), join_ceiling.clone()))
+        .push(field)
+}
+
+/// Runtime-generic body of [`CubeclContext::finish`]: the ticket says which
+/// pipeline holds the field.
+fn finish_on<R: cubecl::prelude::Runtime>(
     pipeline: &Mutex<Option<NiceonlyPipeline<CubeclPendingField<R>>>>,
+    join_pipeline: &Mutex<Option<JoinPipeline>>,
+    ticket: FieldTicket,
 ) -> Result<(FieldResults, NiceonlyStats)> {
-    let mut guard = pipeline.lock().unwrap();
-    let pipeline = guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("no niceonly field has been begun"))?;
-    let (stats, nice_numbers) = pipeline.next_result()?;
-    debug!(
-        "CubeCL niceonly pipeline: {} ranges in {} dispatches, found {}",
-        stats.num_ranges,
-        stats.launches,
-        nice_numbers.len()
-    );
+    let (stats, nice_numbers) = match ticket.route() {
+        Route::Join => join_pipeline
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no overlap join field has been begun"))?
+            .next_result(ticket)?,
+        Route::Stride => {
+            let mut guard = pipeline.lock().unwrap();
+            let pipeline = guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("no niceonly field has been begun"))?;
+            let (stats, nice_numbers) = pipeline.next_result(ticket)?;
+            debug!(
+                "CubeCL niceonly pipeline: {} ranges in {} dispatches, found {}",
+                stats.num_ranges,
+                stats.launches,
+                nice_numbers.len()
+            );
+            (stats, nice_numbers)
+        }
+    };
     Ok((
         FieldResults {
             distribution: Vec::new(),
@@ -2170,6 +2310,38 @@ fn finish_impl<R: cubecl::prelude::Runtime>(
     ))
 }
 
+/// The join's own account (re-runs, layout, survivor counts) of the last
+/// field `finish` returned from the join.
+#[cfg(test)]
+pub(crate) fn last_join_stats(ctx: &CubeclContext) -> Option<crate::cubecl_join::JoinFieldStats> {
+    let pipeline = match ctx {
+        CubeclContext::Wgpu { join_pipeline, .. } => join_pipeline,
+        #[cfg(feature = "cubecl-cuda")]
+        CubeclContext::Cuda { join_pipeline, .. } => join_pipeline,
+        #[cfg(feature = "cubecl-hip")]
+        CubeclContext::Hip { join_pipeline, .. } => join_pipeline,
+    };
+    pipeline
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(JoinPipeline::last_field_stats)
+}
+
+/// Device memory the context's client has in use and has reserved, bytes.
+#[cfg(test)]
+pub(crate) fn memory_usage(ctx: &CubeclContext) -> Option<(u64, u64)> {
+    let usage = match ctx {
+        CubeclContext::Wgpu { client, .. } => client.memory_usage(),
+        #[cfg(feature = "cubecl-cuda")]
+        CubeclContext::Cuda { client, .. } => client.memory_usage(),
+        #[cfg(feature = "cubecl-hip")]
+        CubeclContext::Hip { client, .. } => client.memory_usage(),
+    }
+    .ok()?;
+    Some((usage.bytes_in_use, usage.bytes_reserved))
+}
+
 /// A fence on one launched batch: the client's `sync` future taken right
 /// after the launch and polled once on the spot. The flush is eager, but on
 /// wgpu the submitted-work-done callback is registered inside the future's
@@ -2177,11 +2349,11 @@ fn finish_impl<R: cubecl::prelude::Runtime>(
 /// registration*; polling immediately pins it to the work queued up to this
 /// launch, so awaiting it later does not also wait for whatever was launched
 /// since.
-type LaunchFence = cubecl::future::DynFut<Result<(), cubecl::server::ServerError>>;
+pub(crate) type LaunchFence = cubecl::future::DynFut<Result<(), cubecl::server::ServerError>>;
 
 /// Take a fence on everything the client has queued so far. `None` if it
 /// resolved on the spot (nothing pending).
-fn launch_fence<R: cubecl::prelude::Runtime>(
+pub(crate) fn launch_fence<R: cubecl::prelude::Runtime>(
     client: &cubecl::prelude::ComputeClient<R>,
 ) -> Result<Option<LaunchFence>> {
     use std::task::{Context, Poll, Waker};
@@ -2265,6 +2437,42 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlySink<R> {
 /// control barrier inside plane-divergent control flow (the plane-scoped
 /// compaction queue returned 2 of 283 survivors there, and was exact with
 /// the barriers removed), so that path stays off on such adapters.
+/// Whether a device can run the overlap join's kernels, which use plane
+/// (subgroup) operations with no fallback. `CubeCL` reports them on every
+/// CUDA, HIP and Metal device and on wgpu adapters with subgroups, but never
+/// on CPU-type adapters, where the software rasterizers (lavapipe,
+/// `SwiftShader`) run them anyway. The stride pipeline has a path without
+/// them, so a device that fails this keeps every field there.
+fn joins_on(plane_ops: bool, device: &str) -> bool {
+    plane_ops || is_software_rasterizer(device)
+}
+
+/// [`NiceonlyGpu::join_limits`] for one `CubeCL` device: its limits within
+/// the layouts it has shown it runs (`ceiling`), unless it cannot run the
+/// join's kernels at all ([`joins_on`]).
+fn join_limits_on<R: cubecl::prelude::Runtime>(
+    client: &cubecl::prelude::ComputeClient<R>,
+    device: &str,
+    ceiling: &JoinCeiling,
+) -> std::result::Result<JoinLimits, StrideReason> {
+    let plane_ops = client
+        .properties()
+        .features
+        .plane
+        .contains(cubecl::ir::features::Plane::Ops);
+    if !joins_on(plane_ops, device) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            warn!(
+                "overlap join: {device} has no subgroup operations, which the join's \
+                 kernels need; nice-only fields use the stride pipeline"
+            );
+        });
+        return Err(StrideReason::NoPlaneOps);
+    }
+    Ok(ceiling.cap(limits_of(client)))
+}
+
 pub(crate) fn is_software_rasterizer(device: &str) -> bool {
     let squashed = device.to_lowercase().replace(' ', "");
     ["llvmpipe", "lavapipe", "swiftshader", "softwarerasterizer"]
@@ -2750,11 +2958,36 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_process::process_range_niceonly;
+    use crate::gpu_route::process_niceonly;
 
     /// The GPU histogram bins are u32; a batch must not be able to overflow one.
     #[test]
     fn batch_size_cannot_overflow_a_u32_bin() {
         assert!(CUBECL_BATCH_SIZE < u128::from(u32::MAX));
+    }
+
+    /// The join runs where `CubeCL` reports plane operations, and on the
+    /// software rasterizers that run them without saying so; anywhere else
+    /// its fields keep the stride pipeline.
+    #[test]
+    fn the_join_needs_plane_operations() {
+        assert!(joins_on(
+            true,
+            "NVIDIA GeForce RTX 3080 (Vulkan, wgpu<wgsl>)"
+        ));
+        assert!(joins_on(
+            false,
+            "llvmpipe (LLVM 19.1.7, 256 bits) (Vulkan, wgpu<spirv>)"
+        ));
+        assert!(!joins_on(
+            false,
+            "Microsoft Basic Render Driver (Dx12, wgpu<wgsl>)"
+        ));
+        assert!(!joins_on(
+            false,
+            "Intel(R) UHD Graphics 620 (Dx12, wgpu<wgsl>)"
+        ));
     }
 
     /// CPU/CubeCL parity on the detailed path — the same bases and ranges as
@@ -2842,7 +3075,7 @@ mod tests {
             let table = StrideTable::new(base, GPU_LSD_K);
             let mut cpu = process_range_niceonly(&range, base, &table).nice_numbers;
             cpu.sort_by_key(|n| n.number);
-            let gpu = process_range_niceonly_cubecl(&ctx, &range, base).expect("cubecl-hip run");
+            let gpu = process_niceonly(&ctx, &range, base).expect("cubecl-hip run");
 
             assert_eq!(cpu, gpu.nice_numbers, "base {base}: niceonly mismatch");
             println!(
@@ -2947,7 +3180,8 @@ mod tests {
     #[ignore = "requires a wgpu device; prints throughput"]
     #[allow(clippy::cast_precision_loss)]
     fn pipeline_throughput_fixed_fields() {
-        use crate::gpu_niceonly::{NiceonlyStarted, fields_in_flight, msd_floor_in_use};
+        use crate::gpu_niceonly::{fields_in_flight, msd_floor_in_use};
+        use crate::gpu_route::{NiceonlyStarted, begin_niceonly};
         // The parity workflow runs every ignored test in this module on a
         // software rasterizer; a throughput run there is hours of nothing.
         // Only run when asked for by name.
@@ -2964,25 +3198,24 @@ mod tests {
             .map(|i| FieldSize::new(start + i * size, start + (i + 1) * size))
             .collect();
         let warm = FieldSize::new(start - size, start);
-        if let NiceonlyStarted::Queued = begin_niceonly_cubecl(&ctx, &warm, base).unwrap() {
-            finish_niceonly_cubecl(&ctx).unwrap();
+        if let NiceonlyStarted::Queued(ticket) = begin_niceonly(&ctx, &warm, base).unwrap() {
+            ctx.finish(ticket).unwrap();
         }
         let lookahead = fields_in_flight().saturating_sub(1);
         let t = std::time::Instant::now();
-        let mut queued = 0usize;
+        let mut queued = std::collections::VecDeque::new();
         let mut found = 0usize;
         for f in &fields {
-            if let NiceonlyStarted::Queued = begin_niceonly_cubecl(&ctx, f, base).unwrap() {
-                queued += 1;
+            if let NiceonlyStarted::Queued(ticket) = begin_niceonly(&ctx, f, base).unwrap() {
+                queued.push_back(ticket);
             }
-            while queued > lookahead {
-                found += finish_niceonly_cubecl(&ctx).unwrap().0.nice_numbers.len();
-                queued -= 1;
+            while queued.len() > lookahead {
+                let ticket = queued.pop_front().unwrap();
+                found += ctx.finish(ticket).unwrap().0.nice_numbers.len();
             }
         }
-        while queued > 0 {
-            found += finish_niceonly_cubecl(&ctx).unwrap().0.nice_numbers.len();
-            queued -= 1;
+        for ticket in queued {
+            found += ctx.finish(ticket).unwrap().0.nice_numbers.len();
         }
         let secs = t.elapsed().as_secs_f64();
         eprintln!(
@@ -3008,7 +3241,7 @@ mod tests {
             let table = StrideTable::new(base, GPU_LSD_K);
             let mut cpu = process_range_niceonly(&range, base, &table).nice_numbers;
             cpu.sort_by_key(|n| n.number);
-            let gpu = process_range_niceonly_cubecl(&ctx, &range, base).expect("cubecl run");
+            let gpu = process_niceonly(&ctx, &range, base).expect("cubecl run");
 
             assert_eq!(cpu, gpu.nice_numbers, "base {base}: niceonly mismatch");
             assert!(
@@ -3031,7 +3264,7 @@ mod tests {
         let ctx = CubeclContext::new_default().expect("CubeCL init");
         let base_range = crate::base_range::get_base_range_u128(10).unwrap().unwrap();
         let range = FieldSize::new(base_range.range_start, base_range.range_end);
-        let results = process_range_niceonly_cubecl(&ctx, &range, 10).expect("cubecl run");
+        let results = process_niceonly(&ctx, &range, 10).expect("cubecl run");
         assert_eq!(
             results
                 .nice_numbers
@@ -3320,7 +3553,7 @@ mod tests {
             let table = StrideTable::new(base, GPU_LSD_K);
             let mut cpu = process_range_niceonly(&range, base, &table).nice_numbers;
             cpu.sort_by_key(|n| n.number);
-            let gpu = process_range_niceonly_cubecl(&ctx, &range, base).expect("cubecl-cuda run");
+            let gpu = process_niceonly(&ctx, &range, base).expect("cubecl-cuda run");
 
             assert_eq!(cpu, gpu.nice_numbers, "base {base}: niceonly mismatch");
             println!(

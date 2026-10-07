@@ -9,10 +9,12 @@ use nice_common::client_api_async::{
     submit_field_to_server_async,
 };
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
+use nice_common::cpu_join::{CpuJoin, PartitionResult, Scratch, slices_for};
+use nice_common::overlap_join::{JoinParams, JoinTelemetry, StrideReason, join_verdict};
 use nice_common::stride_filter;
 use nice_common::{
     CLIENT_REQUEST_TIMEOUT_SECS, CLIENT_VERSION, DataToClient, DataToServer, FieldResults,
-    FieldSize, SearchMode, UniquesDistributionSimple, ValidationData,
+    FieldSize, NiceNumberSimple, SearchMode, UniquesDistributionSimple, ValidationData,
 };
 
 // k=3 removes 15-22% of stride candidates versus k=2 at production bases
@@ -36,19 +38,21 @@ const MAX_SUBMITS_IN_FLIGHT: usize = 8;
 
 mod bench;
 
+#[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+use nice_common::client_process_cuda::CudaWithJoin;
 #[cfg(feature = "cuda")]
-use nice_common::client_process_cuda::{
-    CUDA_BATCH_SIZE, CudaContext, begin_niceonly_cuda, finish_niceonly_cuda,
-    process_range_detailed_cuda, process_range_niceonly_cuda,
-};
+use nice_common::client_process_cuda::{CUDA_BATCH_SIZE, CudaContext, process_range_detailed_cuda};
 #[cfg(feature = "vulkan")]
 use nice_common::client_process_vulkan::{
     VULKAN_BATCH_SIZE, process_range_detailed_vulkan, process_range_niceonly_vulkan,
 };
 #[cfg(feature = "cubecl")]
 use nice_common::cubecl_backend::{
-    CUBECL_BATCH_SIZE, CubeclContext, begin_niceonly_cubecl, finish_niceonly_cubecl,
-    process_range_detailed_cubecl, process_range_niceonly_cubecl,
+    CUBECL_BATCH_SIZE, CubeclContext, process_range_detailed_cubecl,
+};
+#[cfg(any(feature = "cuda", feature = "cubecl"))]
+use nice_common::gpu_route::{
+    FieldTicket, NiceonlyGpu, NiceonlyStarted, begin_niceonly, finish_niceonly, process_niceonly,
 };
 #[cfg(feature = "vulkan")]
 use nice_common::vulkan::VulkanContext;
@@ -56,19 +60,20 @@ use nice_common::vulkan::VulkanContext;
 /// Which GPU backend to drive.
 ///
 /// Every backend `dlopen`s its driver at runtime, so a single binary can carry
-/// all of them and require none at build time. `Auto` tries CUDA first,
-/// leaving behaviour on an NVIDIA machine exactly as it was.
+/// all of them and require none at build time. `Auto` tries CUDA first on
+/// NVIDIA, and in nice-only mode pairs it with `CubeCL`'s CUDA runtime for the
+/// overlap join (see `init_gpu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
     /// Fastest measured order for the mode: detailed tries `cubecl-cuda`,
-    /// `cubecl`, CUDA, then Vulkan; niceonly tries CUDA, `cubecl`, then
-    /// Vulkan. See `init_gpu` for the numbers behind the ordering.
+    /// `cubecl`, CUDA, then Vulkan; niceonly tries CUDA (with join),
+    /// `cubecl`, then Vulkan.
     Auto,
-    /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC.
+    /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In
+    /// niceonly this uses the CUDA stride pipeline.
     Cuda,
     /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA,
-    /// llvmpipe). Experimental: only present in builds with the `vulkan`
-    /// feature, which the `gpu` umbrella no longer includes.
+    /// llvmpipe) (needs the experimental `vulkan` feature).
     Vulkan,
     /// `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base.
     Cubecl,
@@ -97,9 +102,30 @@ enum GpuHandle {
     Vulkan(VulkanContext),
     #[cfg(feature = "cubecl")]
     Cubecl(CubeclContext),
+    /// NVIDIA nice-only under `--gpu-backend auto`: hand-CUDA, with
+    /// `CubeCL`'s CUDA runtime for the fields the overlap join takes, where
+    /// it is several times faster (see `CudaWithJoin`).
+    #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+    CudaJoin(CudaWithJoin),
 }
 
 impl GpuHandle {
+    /// The nice-only pipelines behind this handle; `None` for Vulkan, which
+    /// processes each field on the calling thread.
+    #[cfg(any(feature = "cuda", feature = "cubecl"))]
+    fn niceonly(&self) -> Option<&dyn NiceonlyGpu> {
+        match self {
+            #[cfg(feature = "cuda")]
+            GpuHandle::Cuda(ctx) => Some(ctx),
+            #[cfg(feature = "cubecl")]
+            GpuHandle::Cubecl(ctx) => Some(ctx),
+            #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+            GpuHandle::CudaJoin(pair) => Some(pair),
+            #[cfg(feature = "vulkan")]
+            GpuHandle::Vulkan(_) => None,
+        }
+    }
+
     /// The name of the device this backend is actually running on, for the
     /// benchmark report and submission telemetry.
     ///
@@ -125,6 +151,8 @@ impl GpuHandle {
                 GpuHandle::Cuda(_) => cudarc::driver::CudaContext::new(device)
                     .ok()
                     .and_then(|d| d.name().ok()),
+                #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+                GpuHandle::CudaJoin(pair) => Some(pair.join.device_name()),
                 #[cfg(feature = "vulkan")]
                 GpuHandle::Vulkan(ctx) => Some(ctx.device_name.clone()),
                 #[cfg(feature = "cubecl")]
@@ -150,6 +178,11 @@ impl GpuHandle {
             match self {
                 #[cfg(feature = "cuda")]
                 GpuHandle::Cuda(_) => Some("cuda"),
+                // Hand-CUDA does everything but the join's fields, the
+                // benchmark included; those fields' own telemetry says
+                // `overlap_join`.
+                #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+                GpuHandle::CudaJoin(_) => Some("cuda"),
                 #[cfg(feature = "vulkan")]
                 GpuHandle::Vulkan(_) => Some("vulkan"),
                 #[cfg(feature = "cubecl")]
@@ -428,7 +461,12 @@ fn guarded_init<T>(
 /// - **Niceonly**: `cuda` → `cubecl` → `vulkan`. Hand-CUDA keeps a slim edge
 ///   at the b50+ bases where long-run wall time concentrates; everywhere
 ///   without a toolkit, `CubeCL` is the best available (wins RADV b50+ and
-///   NVIDIA-over-wgpu outright, runs out of the box on Apple).
+///   NVIDIA-over-wgpu outright, runs out of the box on Apple). Both `CubeCL`
+///   runtimes also carry the overlap join, which takes production-size
+///   fields at the frontier (`join_plan::plan_join`) and is several
+///   times faster there; so on NVIDIA, a build with `cubecl-cuda` pairs the
+///   hand-CUDA context with a `CubeCL` CUDA one (`GpuHandle::CudaJoin`) and
+///   routes each field to the faster of the two.
 ///
 /// An **explicitly named** backend that fails to initialize is fatal rather
 /// than falling back: for a distributed compute client, silently dropping to
@@ -513,6 +551,30 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                     && let Ok(name) = device.name()
                 {
                     info!("  GPU: {name}");
+                }
+                // Nice-only auto also brings up CubeCL's CUDA runtime for the
+                // overlap join, which takes production-size fields; without
+                // it every field stays on hand-CUDA.
+                #[cfg(feature = "cubecl-cuda")]
+                if want == GpuBackend::Auto {
+                    let attempt =
+                        guarded_init("the CubeCL CUDA runtime could not be started", || {
+                            CubeclContext::new_cuda(cli.gpu_device)
+                        });
+                    match attempt {
+                        Ok(join) => {
+                            info!("  overlap join: CubeCL CUDA runtime ready for large fields");
+                            return Some(Arc::new(GpuHandle::CudaJoin(CudaWithJoin {
+                                cuda: ctx,
+                                join,
+                            })));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "  overlap join unavailable, every field stays on hand-CUDA: {e:#}"
+                            );
+                        }
+                    }
                 }
                 return Some(Arc::new(GpuHandle::Cuda(ctx)));
             }
@@ -647,12 +709,18 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
 /// the same base (the benchmark sweep times many small windows, where a
 /// per-call table build would dominate); `None` builds one for this field,
 /// which is negligible at production field sizes.
+// Without a GPU feature the GPU branch below only exits, so clippy reads its
+// `else` as redundant.
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")),
+    allow(clippy::redundant_else)
+)]
 fn process_field_sync(
     claim_data: &DataToClient,
     cli: &Cli,
     gpu: &GpuCtx,
     stride_table: Option<&Arc<stride_filter::StrideTable>>,
-) -> Vec<FieldResults> {
+) -> (Vec<FieldResults>, PipelineTelemetry) {
     let mode = cli.mode;
     if cli.gpu {
         // GPU processing path
@@ -667,9 +735,14 @@ fn process_field_sync(
                     SearchMode::Detailed => {
                         process_range_detailed_cuda(ctx, &range, claim_data.base)
                     }
-                    SearchMode::Niceonly => {
-                        process_range_niceonly_cuda(ctx, &range, claim_data.base)
+                    SearchMode::Niceonly => process_niceonly(ctx, &range, claim_data.base),
+                },
+                #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
+                GpuHandle::CudaJoin(pair) => match mode {
+                    SearchMode::Detailed => {
+                        process_range_detailed_cuda(&pair.cuda, &range, claim_data.base)
                     }
+                    SearchMode::Niceonly => process_niceonly(pair, &range, claim_data.base),
                 },
                 #[cfg(feature = "vulkan")]
                 GpuHandle::Vulkan(ctx) => match mode {
@@ -685,14 +758,12 @@ fn process_field_sync(
                     SearchMode::Detailed => {
                         process_range_detailed_cubecl(ctx, &range, claim_data.base)
                     }
-                    SearchMode::Niceonly => {
-                        process_range_niceonly_cubecl(ctx, &range, claim_data.base)
-                    }
+                    SearchMode::Niceonly => process_niceonly(ctx, &range, claim_data.base),
                 },
             };
 
             match gpu_results {
-                Ok(result) => vec![result],
+                Ok(result) => (vec![result], None),
                 Err(e) => {
                     error!("GPU processing error: {e:?}");
                     std::process::exit(1);
@@ -708,6 +779,38 @@ fn process_field_sync(
     } else {
         // CPU processing path
         let range: FieldSize = claim_data.into();
+
+        // Production-size nice-only fields at bases 40-64 go to the overlap
+        // join, the same gate as the GPU's.
+        let base = claim_data.base;
+        let mut telemetry = None;
+        if mode == SearchMode::Niceonly {
+            if let Some((jp, slices)) = slices_for(base, &range) {
+                debug!(
+                    "b{base} [{}, {}): overlap join on the CPU, {} slice(s)",
+                    range.start(),
+                    range.end(),
+                    slices.len()
+                );
+                if let Some((results, join)) = process_field_join(base, jp, &slices, cli) {
+                    let telemetry = serde_json::json!({ "route": "join", "join": join.json() });
+                    return (vec![results], Some(telemetry));
+                }
+                telemetry = Some(serde_json::json!({
+                    "route": "stride",
+                    "route_reason": StrideReason::Setup.label(),
+                }));
+            } else {
+                let reason = join_verdict(base, &range).err().map(StrideReason::label);
+                debug!(
+                    "b{base} [{}, {}): stride walk on the CPU, {}",
+                    range.start(),
+                    range.end(),
+                    reason.unwrap_or("")
+                );
+                telemetry = Some(serde_json::json!({ "route": "stride", "route_reason": reason }));
+            }
+        }
 
         // Scale the processing chunk size with the field size
         let chunk_default_size: u128 = 1_000_000;
@@ -748,7 +851,7 @@ fn process_field_sync(
             .with_disable(cli.no_progress);
 
         // Process each chunk and gather the results
-        chunks
+        let results = chunks
             .par_iter()
             .tqdm_config(tqdm_config)
             .map(|chunk| match mode {
@@ -760,55 +863,117 @@ fn process_field_sync(
                     process_range_niceonly(chunk, claim_data.base, stride_table)
                 }
             })
-            .collect()
+            .collect();
+        (results, telemetry)
     }
 }
 
-/// A field that has been started: either finished on the spot, or queued in
-/// a GPU pipeline that returns fields in the order they were begun.
-enum FieldStage {
-    Done(Vec<FieldResults>),
-    // Only the GPU niceonly path queues; a CPU-only build never constructs it.
-    #[cfg_attr(
-        not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")),
-        allow(dead_code)
-    )]
-    Queued,
+/// A nice-only field through the CPU overlap join, a slice at a time (one,
+/// below about 1e16), each slice's partitions on the thread pool with the
+/// progress bar counting them. Returns its results and the join's account,
+/// or `None` if the join cannot set the field up (then it takes the stride
+/// walk).
+fn process_field_join(
+    base: u32,
+    jp: JoinParams,
+    slices: &[FieldSize],
+    cli: &Cli,
+) -> Option<(FieldResults, JoinTelemetry)> {
+    let mut tel = JoinTelemetry {
+        slices: slices.len(),
+        ..JoinTelemetry::default()
+    };
+    let mut hits: Vec<u128> = Vec::new();
+    for (i, slice) in slices.iter().enumerate() {
+        let t0 = Instant::now();
+        let join = match CpuJoin::new(base, slice, jp) {
+            Ok(join) => join,
+            // The bottom side and the digit lengths are the field's, so only
+            // the first slice can fail in practice; any failure sends the
+            // whole field to the stride walk.
+            Err(e) => {
+                warn!(
+                    "overlap join cannot take base {base} {slice:?} ({e:#}); using the stride walk"
+                );
+                return None;
+            }
+        };
+        tel.setup_secs += t0.elapsed().as_secs_f64();
+        tel.partitions = usize::try_from(join.partitions()).unwrap_or(usize::MAX);
+        let t1 = Instant::now();
+        let tqdm_config = simple_tqdm::Config::new()
+            .with_unit("partitions")
+            .with_desc(if slices.len() > 1 {
+                format!("slice {}/{}", i + 1, slices.len())
+            } else {
+                String::new()
+            })
+            .with_disable(cli.no_progress);
+        let out = (0..join.partitions())
+            .into_par_iter()
+            .tqdm_config(tqdm_config)
+            .map_init(Scratch::default, |scratch, v| {
+                join.run_partition(v, scratch)
+            })
+            .reduce(PartitionResult::default, |mut a, b| {
+                a.add(b);
+                a
+            });
+        tel.run_secs += t1.elapsed().as_secs_f64();
+        tel.survivors += out.survivors;
+        tel.checked += out.checked;
+        hits.extend(out.hits);
+    }
+    hits.sort_unstable();
+    let results = FieldResults {
+        distribution: Vec::new(),
+        nice_numbers: hits
+            .into_iter()
+            .map(|number| NiceNumberSimple {
+                number,
+                num_uniques: base,
+            })
+            .collect(),
+    };
+    Some((results, tel))
 }
 
-/// Start a field. GPU niceonly fields go into the backend's continuous
-/// pipeline and return `Queued`; everything else is processed here and now.
+/// A field that has been started: either finished on the spot, or queued in
+/// one of the GPU's pipelines, which hands its results back for its ticket.
+enum FieldStage {
+    Done(Vec<FieldResults>, PipelineTelemetry),
+    // Only the CUDA and `CubeCL` backends have pipelines (Vulkan processes a
+    // field on the calling thread).
+    #[cfg(any(feature = "cuda", feature = "cubecl"))]
+    Queued(FieldTicket),
+}
+
+/// Start a field. GPU nice-only fields go into the backend's pipelines and
+/// come back `Queued`; everything else, Vulkan nice-only included, is
+/// processed here and now.
 ///
 /// Splitting start from finish is what lets the caller keep one field ahead
-/// of the device: the next field's MSD filtering runs while the device drains
-/// the current one. See `nice_common::gpu_niceonly::NiceonlyPipeline`.
+/// of the device: the next field's MSD filtering (or the join's field setup)
+/// runs while the device drains the current one. Where each field runs is
+/// decided in `nice_common::gpu_route::begin_niceonly`.
 fn begin_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> FieldStage {
-    #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
-    if cli.gpu && cli.mode == SearchMode::Niceonly {
-        use nice_common::gpu_niceonly::NiceonlyStarted;
-        let handle = gpu.as_ref().expect("GPU context failed to initialize");
+    #[cfg(any(feature = "cuda", feature = "cubecl"))]
+    if cli.gpu
+        && cli.mode == SearchMode::Niceonly
+        && let Some(niceonly) = gpu.as_deref().and_then(GpuHandle::niceonly)
+    {
         let range: FieldSize = claim_data.into();
-        let started = match &**handle {
-            #[cfg(feature = "cuda")]
-            GpuHandle::Cuda(ctx) => begin_niceonly_cuda(ctx, &range, claim_data.base),
-            #[cfg(feature = "cubecl")]
-            GpuHandle::Cubecl(ctx) => begin_niceonly_cubecl(ctx, &range, claim_data.base),
-            // The Vulkan sink cannot leave the calling thread, so it has no
-            // pipeline: the field is done by the time this returns.
-            #[cfg(feature = "vulkan")]
-            GpuHandle::Vulkan(ctx) => process_range_niceonly_vulkan(ctx, &range, claim_data.base)
-                .map(NiceonlyStarted::Immediate),
-        };
-        return match started {
-            Ok(NiceonlyStarted::Immediate(results)) => FieldStage::Done(vec![results]),
-            Ok(NiceonlyStarted::Queued) => FieldStage::Queued,
+        return match begin_niceonly(niceonly, &range, claim_data.base) {
+            Ok(NiceonlyStarted::Immediate(results)) => FieldStage::Done(vec![results], None),
+            Ok(NiceonlyStarted::Queued(ticket)) => FieldStage::Queued(ticket),
             Err(e) => {
                 error!("GPU processing error: {e:?}");
                 std::process::exit(1);
             }
         };
     }
-    FieldStage::Done(process_field_sync(claim_data, cli, gpu, None))
+    let (results, telemetry) = process_field_sync(claim_data, cli, gpu, None);
+    FieldStage::Done(results, telemetry)
 }
 
 /// Per-field pipeline telemetry from the GPU niceonly path, already as the
@@ -816,44 +981,24 @@ fn begin_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Field
 type PipelineTelemetry = Option<serde_json::Value>;
 
 /// Finish a field begun with `begin_field_sync`: for a queued one, wait for
-/// the GPU pipeline's next result (fields come back in order).
-fn finish_field_sync(
-    stage: FieldStage,
-    cli: &Cli,
-    gpu: &GpuCtx,
-) -> (Vec<FieldResults>, PipelineTelemetry) {
+/// its results from the pipeline its ticket names.
+fn finish_field_sync(stage: FieldStage, gpu: &GpuCtx) -> (Vec<FieldResults>, PipelineTelemetry) {
+    #[cfg(not(any(feature = "cuda", feature = "cubecl")))]
+    let _ = gpu; // nothing is ever queued in this build
     match stage {
-        FieldStage::Done(results) => (results, None),
-        FieldStage::Queued => {
-            // Gated on the backends that queue, not on every GPU feature:
-            // Vulkan processes fields synchronously and never produces
-            // `Queued`. With `vulkan` alone the old gate left a match whose
-            // only arm was `unreachable!`, which has no type (E0282), and
-            // everything after it dead.
-            #[cfg(any(feature = "cuda", feature = "cubecl"))]
-            {
-                let _ = cli;
-                let handle = gpu.as_ref().expect("GPU context failed to initialize");
-                let finished = match &**handle {
-                    #[cfg(feature = "cuda")]
-                    GpuHandle::Cuda(ctx) => finish_niceonly_cuda(ctx),
-                    #[cfg(feature = "cubecl")]
-                    GpuHandle::Cubecl(ctx) => finish_niceonly_cubecl(ctx),
-                    #[cfg(feature = "vulkan")]
-                    GpuHandle::Vulkan(_) => unreachable!("Vulkan fields are never queued"),
-                };
-                match finished {
-                    Ok((results, stats)) => (vec![results], Some(stats.telemetry_json())),
-                    Err(e) => {
-                        error!("GPU processing error: {e:?}");
-                        std::process::exit(1);
-                    }
+        FieldStage::Done(results, telemetry) => (results, telemetry),
+        #[cfg(any(feature = "cuda", feature = "cubecl"))]
+        FieldStage::Queued(ticket) => {
+            let niceonly = gpu
+                .as_deref()
+                .and_then(GpuHandle::niceonly)
+                .expect("only a GPU with pipelines queues a field");
+            match finish_niceonly(niceonly, ticket) {
+                Ok((results, stats)) => (vec![results], Some(stats.telemetry_json())),
+                Err(e) => {
+                    error!("GPU processing error: {e:?}");
+                    std::process::exit(1);
                 }
-            }
-            #[cfg(not(any(feature = "cuda", feature = "cubecl")))]
-            {
-                let _ = (cli, gpu);
-                unreachable!("no queuing GPU backend compiled in, so nothing is ever queued")
             }
         }
     }
@@ -877,14 +1022,9 @@ async fn begin_field(
 }
 
 /// Finish one field on the blocking pool.
-async fn finish_field(
-    stage: FieldStage,
-    cli: &Arc<Cli>,
-    gpu: &GpuCtx,
-) -> (Vec<FieldResults>, PipelineTelemetry) {
-    let cli = Arc::clone(cli);
+async fn finish_field(stage: FieldStage, gpu: &GpuCtx) -> (Vec<FieldResults>, PipelineTelemetry) {
     let gpu = gpu.clone();
-    tokio::task::spawn_blocking(move || finish_field_sync(stage, &cli, &gpu))
+    tokio::task::spawn_blocking(move || finish_field_sync(stage, &gpu))
         .await
         .expect("Processing task panicked")
 }
@@ -900,7 +1040,7 @@ async fn process_field(
 ) -> (DataToClient, Vec<FieldResults>, Duration) {
     let start_time = Instant::now();
     let (claim_data, stage) = begin_field(claim_data, cli, gpu).await;
-    let (results, _) = finish_field(stage, cli, gpu).await;
+    let (results, _) = finish_field(stage, gpu).await;
     (claim_data, results, start_time.elapsed())
 }
 
@@ -1239,7 +1379,7 @@ async fn run_pipelined_fields(
         // the last round.
         while in_flight.len() > lookahead || (!cli.repeat && !in_flight.is_empty()) {
             let field = in_flight.pop_front().expect("checked non-empty");
-            let (results, pipeline) = finish_field(field.stage, cli, gpu).await;
+            let (results, pipeline) = finish_field(field.stage, gpu).await;
             let now = Instant::now();
             let measured_from = last_finished.map_or(field.begun_at, |t| t.max(field.begun_at));
             let elapsed = now.duration_since(measured_from);

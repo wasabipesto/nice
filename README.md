@@ -72,103 +72,103 @@ Arguments:
 
           Possible values:
           - detailed: Get detailed stats on all numbers, important for long-term analytics
-          - niceonly: Implements optimizations to speed up the search, usually by a factor of around 20. Does not keep statistics and cannot be quickly verified
-          
+          - niceonly: Implements optimizations to speed up the search by many orders of magnitude. Does not keep statistics and cannot be quickly verified
+
           [env: NICE_MODE=]
           [default: detailed]
 
 Options:
       --api-base <API_BASE>
           The base API URL to connect to
-          
+
           [env: NICE_API_BASE=]
           [default: https://api.nicenumbers.net]
 
       --api-max-retries <API_MAX_RETRIES>
           If an API call encounters a retryable error, retry with exponential backoff this many times
-          
+
           [env: NICE_API_MAX_RETRIES=]
           [default: 10]
 
   -u, --username <USERNAME>
           The username to send alongside your contribution
-          
+
           [env: NICE_USERNAME=]
           [default: anonymous]
 
   -r, --repeat
           Run indefinitely with the current settings
-          
+
           [env: NICE_REPEAT=]
 
   -n, --no-progress
           Hide the progress bar
-          
+
           [env: NICE_NO_PROGRESS=]
 
   -t, --threads <THREADS>
           Run parallel with this many threads. 0 means every logical CPU the process can see
-          
+
           [env: NICE_THREADS=]
           [default: 4]
 
       --prefetch-seconds <PREFETCH_SECONDS>
           Keep roughly this many seconds of work claimed ahead of the processor. Set to 0 to force the old single-field prefetch
-          
+
           [env: NICE_PREFETCH_SECONDS=]
           [default: 2]
 
       --prefetch-max <PREFETCH_MAX>
           Never hold more than this many claimed fields at once
-          
+
           [env: NICE_PREFETCH_MAX=]
           [default: 16]
 
       --prefetch-concurrency <PREFETCH_CONCURRENCY>
           Allow this many claim requests to be in flight at once
-          
+
           [env: NICE_PREFETCH_CONCURRENCY=]
           [default: 4]
 
   -b, --benchmark
           Run an offline benchmark sweep and print a detailed report. Implied by the other --benchmark-* options
-          
+
           [env: NICE_BENCHMARK=]
 
       --benchmark-secs <BENCHMARK_SECS>
           Approximate time budget for the benchmark sweep, in seconds
-          
+
           [env: NICE_BENCHMARK_SECS=]
           [default: 10]
 
       --benchmark-upload
           Upload benchmark results without prompting
-          
+
           [env: NICE_BENCHMARK_UPLOAD=]
 
       --benchmark-json
           Print the benchmark report as machine-readable JSON instead of the table; everything else (progress, upload chatter) moves to stderr so stdout is exactly one JSON document
-          
+
           [env: NICE_BENCHMARK_JSON=]
 
       --telemetry
           Attach hardware/config telemetry to each submission
-          
+
           [env: NICE_TELEMETRY=]
 
       --validate
           Validate results against the server before submitting
-          
+
           [env: NICE_VALIDATE=]
 
       --gpu
           Use GPU acceleration (requires a build with the gpu feature). Implied by the other --gpu-* options
-          
+
           [env: NICE_GPU=]
 
       --gpu-device <GPU_DEVICE>
           GPU device to use (0 for first GPU, 1 for second, etc.)
-          
+
           [env: NICE_GPU_DEVICE=]
           [default: 0]
 
@@ -176,23 +176,24 @@ Options:
           Which GPU backend to use with --gpu
 
           Possible values:
-          - auto:        Fastest measured order for the mode: detailed tries `cubecl-cuda`, `cubecl`, CUDA, then Vulkan; niceonly tries CUDA, `cubecl`, then Vulkan. See `init_gpu` for the numbers behind the ordering
-          - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC
-          - vulkan:      Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe). Experimental: only present in builds with the `vulkan` feature, which the `gpu` umbrella no longer includes
+          - auto:        Fastest measured order for the mode: detailed tries `cubecl-cuda`, `cubecl`, CUDA, then Vulkan; niceonly tries CUDA (with join), `cubecl`, then Vulkan
+          - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In niceonly this uses the CUDA stride pipeline
+          - vulkan:      Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe) (needs the experimental `vulkan` feature)
           - cubecl:      `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base
           - cubecl-cuda: `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature and, like `cuda`, the CUDA toolkit at runtime for NVRTC)
-          
+          - cubecl-hip:  `CubeCL` over its native HIP runtime (AMD; needs the `cubecl-hip` feature, which links against `ROCm` at build time). Never chosen by `auto`
+
           [env: NICE_GPU_BACKEND=]
           [default: auto]
 
       --gpu-wgpu-device <GPU_WGPU_DEVICE>
           Which wgpu adapter the `CubeCL` backend uses, in `CubeCL`'s device spelling: `DiscreteGpu(0)`, `IntegratedGpu(1)`, `Cpu`, ... Unset picks the best adapter. This exists because --gpu-device indexes a per-backend namespace (CUDA ordinals != Vulkan ordinals != wgpu adapters), so on a multi-GPU box no single number is right for every backend; the chosen adapter and its graphics API are always logged
-          
+
           [env: NICE_GPU_WGPU_DEVICE=]
 
   -l, --log-level <LOG_LEVEL>
           Set the log level (overrides `RUST_LOG` environment variable)
-          
+
           [env: NICE_LOG_LEVEL=]
           [possible values: off, error, warn, info, debug, trace]
 
