@@ -359,7 +359,7 @@ fn run_field_scenario(
     cache: &mut TableCache,
 ) -> ScenarioResult {
     let threads = if def.single_thread { 1 } else { cli.threads };
-    let range = FieldSize::new(def.start, def.end());
+    let range = def.measured(cli.gpu);
     let outcome = if cli.gpu {
         gpu_join_sample(gpu, def, &range, share_secs)
     } else {
@@ -370,8 +370,8 @@ fn run_field_scenario(
         base: def.base,
         character: def.character,
         threads,
-        window_start: def.start,
-        window_size: def.size,
+        window_start: range.start(),
+        window_size: range.size(),
         repetitions: 0,
         seconds: 0.0,
         rate: 0.0,
@@ -379,7 +379,7 @@ fn run_field_scenario(
         msd_floor: None,
         field: None,
     };
-    let size = approx_f64(def.size);
+    let size = approx_f64(range.size());
     let measure = match outcome {
         JoinOutcome::Sampled {
             measure,

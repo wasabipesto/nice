@@ -21,6 +21,7 @@
 //! the whole field. Every machine measures the same partitions first, and a
 //! faster one covers more of the field in its share.
 
+use crate::FieldSize;
 use crate::base_range::get_base_range_u128;
 
 /// Version of the benchmark JSON report layout. Bump on breaking changes.
@@ -68,9 +69,15 @@ impl ScenarioDef {
 pub struct FieldScenario {
     pub key: &'static str,
     pub base: u32,
-    /// The field, a real one from the server's table.
+    /// The field: one on the server's grid of fields for the base
+    /// (`range_start + k·size` at the base's field size), or a window of one.
     pub start: u128,
     pub size: u128,
+    /// How much of the field, from its start, the CPU times. The CPU's
+    /// sample is at least two partitions a thread, and a partition of a 1e16
+    /// field takes seconds, so the larger fields time a leading part chosen
+    /// to have the field's density.
+    pub cpu_size: u128,
     /// For human readers of the report.
     pub character: &'static str,
     /// Run with a single thread instead of the configured thread count (see
@@ -84,21 +91,30 @@ pub struct FieldScenario {
 }
 
 impl FieldScenario {
-    /// The field's end (exclusive).
+    /// The part of the field a device times: all of it on a GPU, the
+    /// leading `cpu_size` on the CPU.
     #[must_use]
-    pub fn end(&self) -> u128 {
-        self.start + self.size
+    pub fn measured(&self, gpu: bool) -> FieldSize {
+        let size = if gpu { self.size } else { self.cpu_size };
+        FieldSize::new(self.start, self.start + size)
     }
 }
 
+/// The nice-only fields, at the bases searched next, in their production
+/// sizes. The overlap join's work in a field is its top layer, the prefixes
+/// the MSD certificates cannot reject: an `msd-weak` field is dense with
+/// them, the join's most work per number, and the `msd-strong` one is
+/// mostly rejected, so its time is mostly the join's fixed work per
+/// partition and the host's setup.
 pub const NICEONLY_FIELDS: &[FieldScenario] = &[
-    // Base 57's frontier when the overlap join landed (field 206295804).
+    // A dense b58 field (grid index 7680, density 0.45).
     FieldScenario {
-        key: "b57_1e14",
-        base: 57,
-        start: 28_151_599_893_042_801_193,
-        size: 100_000_000_000_000,
-        character: "b57 field",
+        key: "b58_msd_weak",
+        base: 58,
+        start: 104_400_216_587_923_470_200,
+        size: 1_000_000_000_000_000,
+        cpu_size: 1_000_000_000_000_000,
+        character: "msd-weak",
         single_thread: false,
         stride_window_cpu: 2_000_000_000,
         stride_window_gpu: 1_000_000_000_000,
@@ -106,24 +122,55 @@ pub const NICEONLY_FIELDS: &[FieldScenario] = &[
     // The same field on one thread, so the pair decomposes into per-core
     // rate × parallel efficiency.
     FieldScenario {
-        key: "b57_1e14_1t",
-        base: 57,
-        start: 28_151_599_893_042_801_193,
-        size: 100_000_000_000_000,
-        character: "b57 field",
+        key: "b58_msd_weak_1t",
+        base: 58,
+        start: 104_400_216_587_923_470_200,
+        size: 1_000_000_000_000_000,
+        cpu_size: 1_000_000_000_000_000,
+        character: "msd-weak",
         single_thread: true,
         stride_window_cpu: 2_000_000_000,
         stride_window_gpu: 0,
     },
-    // A base-58 field (206813862) of the size the server hands out there,
-    // in a region with candidates: half of base 58's fields have none and
-    // would measure only the join's setup.
+    // A b58 field (grid index 1592) whose first 8e14 the MSD certificates
+    // reject outright (density 0.056). On the stride path its windows time
+    // that rejection, as the old msd-strong windows did.
     FieldScenario {
-        key: "b58_1e15",
+        key: "b58_msd_strong",
         base: 58,
-        start: 102_121_216_587_923_470_200,
+        start: 98_312_216_587_923_470_200,
         size: 1_000_000_000_000_000,
-        character: "b58 field",
+        cpu_size: 1_000_000_000_000_000,
+        character: "msd-strong",
+        single_thread: false,
+        stride_window_cpu: 2_000_000_000,
+        stride_window_gpu: 1_000_000_000_000,
+    },
+    // A dense b60 field (grid index 60118, density 0.41) whose leading part
+    // has its density, which the GPU's sample of the first slice and the
+    // CPU's first 3e15 rely on.
+    FieldScenario {
+        key: "b60_msd_weak",
+        base: 60,
+        start: 1_157_209_612_114_824_200_908,
+        size: 10_000_000_000_000_000,
+        cpu_size: 3_000_000_000_000_000,
+        character: "msd-weak",
+        single_thread: false,
+        stride_window_cpu: 2_000_000_000,
+        stride_window_gpu: 1_000_000_000_000,
+    },
+    // A dense 1e16 window of a b62 field (the last 1e16 of grid index
+    // 12468 of 1e17, density 0.34). No 1e17 field there starts with its own
+    // density, as a sample of the first slice needs; the window is still
+    // several slices on a GPU, so it carries a 1e17 field's per-slice cost.
+    FieldScenario {
+        key: "b62_msd_weak",
+        base: 62,
+        start: 4_473_156_762_334_864_396_992,
+        size: 10_000_000_000_000_000,
+        cpu_size: 3_000_000_000_000_000,
+        character: "msd-weak",
         single_thread: false,
         stride_window_cpu: 2_000_000_000,
         stride_window_gpu: 1_000_000_000_000,
@@ -191,14 +238,9 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
 /// browser scoring 550 where the native client scores 1000 on the same box
 /// is information, not a bug.
 pub const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
-    ("b57_1e14", false, 1.4e12),
-    ("b57_1e14_1t", false, 2.8e11),
-    ("b58_1e15", false, 3.1e12),
     ("b40_detailed", false, 4.2e7),
     ("b50_detailed", false, 1.7e7),
     ("b50_detailed_1t", false, 2.8e6),
-    ("b57_1e14", true, 2.5e13),
-    ("b58_1e15", true, 5.6e13),
     ("b40_detailed", true, 2.4e9),
     ("b50_detailed", true, 1.5e9),
 ];
@@ -257,8 +299,9 @@ mod tests {
 
     #[test]
     fn every_scenario_has_its_references() {
-        // Every scenario scores on the CPU, and every one a GPU runs (all but
-        // the single-thread ones) on the GPU too, or the score silently thins.
+        // Every detailed scenario scores on the CPU, and every one a GPU runs
+        // (all but the single-thread ones) on the GPU too, or the score
+        // silently thins. The nice-only fields wait for the next re-pin.
         let has = |key: &str, gpu: bool| {
             SCORE_REFERENCES
                 .iter()
@@ -269,7 +312,8 @@ mod tests {
             .map(|d| (d.key, d.single_thread))
             .chain(NICEONLY_FIELDS.iter().map(|d| (d.key, d.single_thread)))
             .collect();
-        for &(key, single_thread) in &scenarios {
+        for def in DETAILED_SCENARIOS {
+            let (key, single_thread) = (def.key, def.single_thread);
             assert!(has(key, false), "missing CPU score reference for {key}");
             assert!(
                 single_thread || has(key, true),
@@ -297,27 +341,31 @@ mod tests {
 
     #[test]
     fn field_scenarios_are_production_join_fields() {
-        // Each field lies in its base's range and is one the overlap join
-        // takes, so the scenario measures the production route.
+        // Each field lies in its base's range, and the overlap join takes
+        // both what the GPU times and what the CPU times, so the scenario
+        // measures the production route.
         for def in NICEONLY_FIELDS {
             let range = get_base_range_u128(def.base).unwrap().unwrap();
+            let field = def.measured(true);
             assert!(
-                range.start() <= def.start && def.end() <= range.end(),
+                range.start() <= field.start() && field.end() <= range.end(),
                 "{} is outside base {}",
                 def.key,
                 def.base
             );
-            let field = crate::FieldSize::new(def.start, def.end());
-            assert!(
-                crate::overlap_join::join_verdict_routed(
-                    def.base,
-                    &field,
-                    crate::overlap_join::RouteOverride::Auto
-                )
-                .is_ok(),
-                "{} does not take the overlap join",
-                def.key
-            );
+            assert!(def.cpu_size <= def.size, "{}", def.key);
+            for part in [field, def.measured(false)] {
+                assert!(
+                    crate::overlap_join::join_verdict_routed(
+                        def.base,
+                        &part,
+                        crate::overlap_join::RouteOverride::Auto
+                    )
+                    .is_ok(),
+                    "{} {part:?} does not take the overlap join",
+                    def.key
+                );
+            }
             // The stride windows stay below the join's minimum, so they time
             // the stride path wherever the field takes it.
             for w in [def.stride_window_cpu, def.stride_window_gpu] {
@@ -328,8 +376,8 @@ mod tests {
                 assert!(def.single_thread);
                 let pair = NICEONLY_FIELDS.iter().find(|d| d.key == multi).unwrap();
                 assert_eq!(
-                    (pair.base, pair.start, pair.size),
-                    (def.base, def.start, def.size)
+                    (pair.base, pair.start, pair.size, pair.cpu_size),
+                    (def.base, def.start, def.size, def.cpu_size)
                 );
             }
         }
