@@ -14,6 +14,7 @@
 - Re-pin the NiceMark reference rates, including the new nice-only fields.
 - Add a test for the fixed-width arithmetic's "n³ fits in 256 bits" precondition.
 - Add a brute-force oracle test for the MSD filter's Hall check.
+- Show a progress bar on GPU runs, like the CPU path has. It follows the field in progress: launched batches in detailed mode, and in nice-only mode MSD blocks filtered (stride path) or partitions run (overlap join).
 - Bump dependency versions, including minimum Rust version 1.99.
 
 ## Nice v3.4.5

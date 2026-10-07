@@ -8,9 +8,10 @@
 //! no-op.
 //!
 //! What a unit means is up to the caller and only needs to be monotone:
-//! detailed fields count launched batches, niceonly fields count MSD blocks
-//! filtered on the host. Fields are identified by their range, since the
-//! niceonly pipeline keeps more than one open at a time.
+//! detailed fields count launched batches, niceonly fields on the stride
+//! pipeline count MSD blocks filtered on the host, and fields on the overlap
+//! join count partitions the device has run. Fields are identified by their
+//! range, since the niceonly pipeline keeps more than one open at a time.
 
 use crate::FieldSize;
 use std::sync::OnceLock;
@@ -52,10 +53,11 @@ pub(crate) fn finish(range: &FieldSize) {
     }
 }
 
-/// A field's progress for a loop that owns it start to finish: ticks count
+/// A field's progress for a loop that owns it start to finish: units count
 /// up, and dropping it (on any exit path) finishes the field.
 pub(crate) struct FieldProgress {
     range: FieldSize,
+    units: u64,
     done: u64,
 }
 
@@ -64,17 +66,32 @@ impl FieldProgress {
     /// partial).
     pub(crate) fn begin(range: &FieldSize, unit: u128) -> Self {
         let units = u64::try_from(range.size().div_ceil(unit)).unwrap_or(u64::MAX);
-        begin(range, units, unit);
+        Self::with_units(range, units, unit)
+    }
+
+    /// Begin a field of `units` units of about `numbers_per_unit` numbers.
+    pub(crate) fn with_units(range: &FieldSize, units: u64, numbers_per_unit: u128) -> Self {
+        begin(range, units, numbers_per_unit);
         Self {
             range: *range,
+            units,
             done: 0,
         }
     }
 
     /// One more unit done.
     pub(crate) fn tick(&mut self) {
-        self.done += 1;
-        advance(&self.range, self.done);
+        self.add(1);
+    }
+
+    /// `n` more units done. The count stops at the field's units, so work
+    /// that runs again (a join batch whose survivor list overflowed) cannot
+    /// take the bar past its end.
+    pub(crate) fn add(&mut self, n: u64) {
+        if n > 0 {
+            self.done = self.done.saturating_add(n).min(self.units);
+            advance(&self.range, self.done);
+        }
     }
 }
 

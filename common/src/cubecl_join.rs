@@ -39,7 +39,6 @@
 //! overflows that is re-run on halves of its top layer.
 #![cfg(feature = "cubecl")]
 
-use crate::NiceNumberSimple;
 use crate::cubecl_backend::{LaunchFence, NICEONLY_STRIDE, launch_fence, wide_chunk_for};
 use crate::gpu_config::{chunk_constants, chunk_constants_u16, n_limbs};
 use crate::gpu_niceonly::{NiceonlyStats, fields_in_flight};
@@ -48,6 +47,8 @@ use crate::join_plan::{
     BATCHES_IN_FLIGHT, Footprint, JoinCeiling, JoinField, JoinLimits, JoinPlan, NICE_RECORD_BYTES,
 };
 use crate::overlap_join::{FieldSetup, JoinTelemetry};
+use crate::progress::FieldProgress;
+use crate::{FieldSize, NiceNumberSimple};
 use anyhow::{Result, anyhow, ensure};
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -1848,6 +1849,9 @@ pub(crate) struct JoinFieldStats {
 /// A device that does not run a layout gets the work again in one of at
 /// most half the size, and keeps that `ceiling` for every later layout.
 ///
+/// The field reports its progress ([`crate::progress`]) in partitions run,
+/// every slice's, from when the device starts on it.
+///
 /// # Errors
 /// Device failures, a device that runs no layout of the field, or a single
 /// top prefix of one partition that overflows the re-run's list (which
@@ -1858,7 +1862,21 @@ pub(crate) fn run_field<R: Runtime>(
     ceiling: &JoinCeiling,
 ) -> Result<(Vec<NiceNumberSimple>, JoinFieldStats)> {
     let parts: Vec<u32> = (0..u32::try_from(field.fs.nparts)?).collect();
-    run_slices(client, field, field.slices.len(), &parts, ceiling)
+    let range = match (field.slices.first(), field.slices.last()) {
+        (Some(first), Some(last)) => FieldSize::new(first.start(), last.end()),
+        _ => return Ok((Vec::new(), JoinFieldStats::default())),
+    };
+    let units = (parts.len() * field.slices.len()) as u64;
+    let mut progress =
+        FieldProgress::with_units(&range, units, range.size() / u128::from(units.max(1)));
+    run_slices_with(
+        client,
+        field,
+        field.slices.len(),
+        &parts,
+        ceiling,
+        Some(&mut progress),
+    )
 }
 
 /// The first `count` slices of `field`, each on the partitions `parts`:
@@ -1873,6 +1891,18 @@ pub(crate) fn run_slices<R: Runtime>(
     count: usize,
     parts: &[u32],
     ceiling: &JoinCeiling,
+) -> Result<(Vec<NiceNumberSimple>, JoinFieldStats)> {
+    run_slices_with(client, field, count, parts, ceiling, None)
+}
+
+/// [`run_slices`], counting the partitions run on `progress`.
+fn run_slices_with<R: Runtime>(
+    client: &ComputeClient<R>,
+    field: &JoinField,
+    count: usize,
+    parts: &[u32],
+    ceiling: &JoinCeiling,
+    mut progress: Option<&mut FieldProgress>,
 ) -> Result<(Vec<NiceNumberSimple>, JoinFieldStats)> {
     let mut st = JoinFieldStats {
         partitions: usize::try_from(field.fs.nparts)?,
@@ -1908,7 +1938,16 @@ pub(crate) fn run_slices<R: Runtime>(
         std::thread::scope(|scope| -> Result<()> {
             let prep = later.map(|sl| scope.spawn(|| field.fs.sub_range(sl.start(), sl.end())));
             let used = run_slice(
-                client, fs, layouts, field.lim, ceiling, slots_hint, parts, &mut st, &mut hits,
+                client,
+                fs,
+                layouts,
+                field.lim,
+                ceiling,
+                slots_hint,
+                parts,
+                &mut st,
+                &mut hits,
+                progress.as_deref_mut(),
             )?;
             // A slice that kept its batch size lets the next one try twice
             // that (up to its own plan's), so one dense slice does not hold
@@ -1953,8 +1992,13 @@ fn run_slice<R: Runtime>(
     parts: &[u32],
     st: &mut JoinFieldStats,
     hits: &mut Vec<u128>,
+    mut progress: Option<&mut FieldProgress>,
 ) -> Result<usize> {
     if fs.tlay.is_empty() || parts.is_empty() {
+        // Nothing for the device: the slice's partitions are done.
+        if let Some(p) = progress {
+            p.add(parts.len() as u64);
+        }
         return Ok(slots_hint);
     }
     let t0 = Instant::now();
@@ -1964,7 +2008,7 @@ fn run_slice<R: Runtime>(
     let mut todo = parts.to_vec();
     loop {
         st.min_slots = st.min_slots.min(slots);
-        let left = run_pass(client, &mut dev, &todo, slots, st)?;
+        let left = run_pass(client, &mut dev, &todo, slots, st, progress.as_deref_mut())?;
         if let Some(why) = left.refused {
             // What the batches that ran found stays found; the rest goes
             // again, with what overflowed, in a smaller layout.
@@ -2075,20 +2119,34 @@ fn run_pass<R: Runtime>(
     parts: &[u32],
     slots: usize,
     st: &mut JoinFieldStats,
+    mut progress: Option<&mut FieldProgress>,
 ) -> Result<Leftover> {
-    let mut inflight: VecDeque<LaunchFence> = VecDeque::new();
+    // Each fence stands for the partitions launched before it: once it
+    // resolves, the device has run them.
+    let mut inflight: VecDeque<(LaunchFence, usize)> = VecDeque::new();
+    let (mut launched, mut counted) = (0, 0);
+    let mut count_to = |upto: usize| {
+        if let Some(p) = progress.as_deref_mut() {
+            p.add((upto - counted) as u64);
+        }
+        counted = upto;
+    };
     let mut recs = Vec::new();
     for batch in parts.chunks(slots) {
         while inflight.len() >= BATCHES_IN_FLIGHT {
             let tw = Instant::now();
-            if let Some(f) = inflight.pop_front() {
+            if let Some((f, upto)) = inflight.pop_front() {
                 cubecl::future::block_on(f).map_err(|e| anyhow!("launch fence failed: {e:?}"))?;
+                count_to(upto);
             }
             st.device_wait_secs += tw.elapsed().as_secs_f64();
         }
         let rec = dev.launch_batch(batch, false)?;
-        if let Some(f) = launch_fence(client)? {
-            inflight.push_back(f);
+        launched += batch.len();
+        match launch_fence(client)? {
+            Some(f) => inflight.push_back((f, launched)),
+            // Nothing was pending: the batch has already run.
+            None => count_to(launched),
         }
         st.batches += 1;
         recs.push((batch, rec));
@@ -2099,6 +2157,7 @@ fn run_pass<R: Runtime>(
         .collect();
     let counts = cubecl::future::block_on(client.read_async(handles))
         .map_err(|e| anyhow!("read failed: {e:?}"))?;
+    count_to(launched);
     let mut left = Leftover::default();
     for (i, (batch, rec)) in recs.iter().enumerate() {
         if let Err(why) = dev.ensure_ran(u32::from_bytes(&counts[3 * i + 2]), &rec.expect) {
