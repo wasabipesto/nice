@@ -57,7 +57,7 @@ pub const DETAILED_SEARCH_MAX_FIELD_SIZE: u128 = 1_000_000_000;
 pub enum SearchMode {
     /// Get detailed stats on all numbers, important for long-term analytics.
     Detailed,
-    /// Implements optimizations to speed up the search, usually by a factor of around 20.
+    /// Implements optimizations to speed up the search by many orders of magnitude.
     /// Does not keep statistics and cannot be quickly verified.
     Niceonly,
 }

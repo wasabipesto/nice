@@ -66,18 +66,14 @@ use nice_common::vulkan::VulkanContext;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
     /// Fastest measured order for the mode: detailed tries `cubecl-cuda`,
-    /// `cubecl`, CUDA, then Vulkan; niceonly tries CUDA (with `CubeCL`'s CUDA
-    /// runtime beside it for the overlap join's production-size fields),
-    /// `cubecl`, then Vulkan. See `init_gpu` for the numbers behind the
-    /// ordering.
+    /// `cubecl`, CUDA, then Vulkan; niceonly tries CUDA (with join),
+    /// `cubecl`, then Vulkan.
     Auto,
     /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In
-    /// niceonly mode every field stays on hand-CUDA's stride pipeline: the
-    /// overlap join needs `auto` or `cubecl-cuda`.
+    /// niceonly this uses the CUDA stride pipeline.
     Cuda,
     /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA,
-    /// llvmpipe). Experimental: only present in builds with the `vulkan`
-    /// feature, which the `gpu` umbrella no longer includes.
+    /// llvmpipe) (needs the experimental `vulkan` feature).
     Vulkan,
     /// `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base.
     Cubecl,
