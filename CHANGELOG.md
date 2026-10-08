@@ -10,11 +10,11 @@
 - Update `--threads 0` (and `NICE_THREADS=0`) to explicitly spawn as many threads as the host has CPU cores instead of falling back to edge case behavior. `RAYON_NUM_THREADS` no longer influences the client. Omitting this option still defaults to 4 threads.
 - Lower the CPU MSD recursion floor from 8000 to 4000 since both node checks and survivor checks are cheaper.
 - Record the build commit SHA alongside the version for benchmarks, telemetry, and api `/status`. 
+- Show a progress bar on GPU runs, like the CPU path has.
 - Update the nice-only benchmark scenarios to use larger fields in bases 58, 60 and 62 so that they can properly measure the overlap join. 
 - Re-pin the NiceMark reference rates, including the new nice-only fields.
 - Add a test for the fixed-width arithmetic's "n³ fits in 256 bits" precondition.
 - Add a brute-force oracle test for the MSD filter's Hall check.
-- Show a progress bar on GPU runs, like the CPU path has. It follows the field in progress: launched batches in detailed mode, and in nice-only mode MSD blocks filtered (stride path) or partitions run (overlap join).
 - Bump dependency versions, including minimum Rust version 1.99.
 
 ## Nice v3.4.5
