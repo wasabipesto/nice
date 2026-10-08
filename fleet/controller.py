@@ -213,8 +213,12 @@ DEFAULT_CONFIG = {
     "explore_cooldown_days": 14,
     "explore_ttl_minutes": 30,
     # --- offer filters (vast search query) ---
+    # cuda_vers is the host driver's CUDA ceiling. The GPU image is built on
+    # CUDA 12.8, and a host below that can't run it: its PTX needs a 12.8
+    # driver, and the image's forward-compat libcuda is refused on consumer
+    # cards. Those hosts only ever produced CPU-only sweeps.
     "offer_query": (
-        "reliability>0.95 num_gpus=1 gpu_ram>=8 cuda_vers>=12.0 rentable=true "
+        "reliability>0.95 num_gpus=1 gpu_ram>=8 cuda_vers>=12.8 rentable=true "
         "inet_down>100 disk_space>=30 dph_total<0.40"
     ),
     "offer_type": "bid",

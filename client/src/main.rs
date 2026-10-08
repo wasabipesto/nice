@@ -386,10 +386,48 @@ fn compiled_backends() -> String {
 /// with no NVIDIA driver fails differently ("driver library could not be
 /// loaded", or the cubecl runtime's worker dying) and is the ordinary `auto`
 /// fall-through, which stays quiet.
-#[cfg(any(feature = "cuda", feature = "cubecl-cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "cubecl-cuda"))]
 fn cuda_toolkit_missing(e: &anyhow::Error) -> bool {
     let text = format!("{e:#}").to_ascii_lowercase();
     text.contains("nvrtc") || text.contains("cuda toolkit")
+}
+
+/// Whether a CUDA-family init failure came from a driver that loaded and then
+/// refused, which cudarc reports as `DriverError(CUDA_ERROR_*, ..)`.
+///
+/// Seen on rented hosts whose container puts a CUDA forward-compatibility
+/// libcuda ahead of the host's (`CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE` on
+/// a consumer card, `CUDA_ERROR_SYSTEM_DRIVER_MISMATCH` under a newer driver),
+/// and on drivers too old for the toolkit's PTX
+/// (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`). A machine with no NVIDIA driver
+/// never gets as far as a driver error code.
+#[cfg(any(test, feature = "cuda", feature = "cubecl-cuda"))]
+fn cuda_driver_rejected(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("CUDA_ERROR_")
+}
+
+/// Log a CUDA-family backend falling through in `auto`.
+///
+/// No NVIDIA driver is the ordinary fall-through and stays at info. A driver
+/// that loaded but could not be used is a warning: this machine has a GPU
+/// that is not running its fastest backend, and the reason is in the error.
+#[cfg(any(feature = "cuda", feature = "cubecl-cuda"))]
+fn log_cuda_fallthrough(backend: &str, e: &anyhow::Error) {
+    if cuda_toolkit_missing(e) {
+        warn!(
+            "{backend} unavailable, falling back to the next backend: {e:#}. This machine \
+             has an NVIDIA driver; installing the CUDA toolkit (NVRTC) would enable the \
+             faster backend"
+        );
+    } else if cuda_driver_rejected(e) {
+        warn!(
+            "{backend} unavailable, falling back to the next backend: {e:#}. The NVIDIA \
+             driver loaded but failed to initialize"
+        );
+    } else {
+        info!("{backend} unavailable; trying the next backend");
+        debug!("  {backend} init failed: {e:#}");
+    }
 }
 
 /// Try to bring up CUDA, turning `cudarc`'s panics into errors.
@@ -478,6 +516,9 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
     }
     let want = cli.gpu_backend;
     let detailed = cli.mode == SearchMode::Detailed;
+    // Why each backend `auto` passed over failed, for the final error.
+    #[allow(unused_mut)]
+    let mut tried: Vec<String> = Vec::new();
 
     // Mesa prints "<driver> is not a conformant Vulkan implementation" straight
     // to stderr — driver chatter our log filter can't reach. Silence it through
@@ -522,19 +563,8 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 std::process::exit(1);
             }
             Err(e) => {
-                // No NVIDIA driver is the ordinary fall-through and stays at
-                // info. A driver that loaded but no toolkit is actionable:
-                // this box could be running the faster backend.
-                if cuda_toolkit_missing(&e) {
-                    warn!(
-                        "CubeCL CUDA unavailable, falling back to wgpu: {e:#}. This machine \
-                         has an NVIDIA driver; installing the CUDA toolkit (NVRTC) would \
-                         enable the faster backend"
-                    );
-                } else {
-                    info!("CubeCL CUDA unavailable; trying the next backend");
-                    debug!("  CubeCL CUDA init failed: {e:#}");
-                }
+                log_cuda_fallthrough("CubeCL CUDA", &e);
+                tried.push(format!("cubecl-cuda ({e:#})"));
             }
         }
     }
@@ -594,17 +624,8 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                     }
                     std::process::exit(1);
                 }
-                // Same distinction as the CubeCL CUDA arm above.
-                if cuda_toolkit_missing(&e) {
-                    warn!(
-                        "CUDA unavailable, falling back to the next backend: {e:#}. This \
-                         machine has an NVIDIA driver; installing the CUDA toolkit (NVRTC) \
-                         would enable the faster backend"
-                    );
-                } else {
-                    info!("CUDA unavailable; trying the next backend");
-                    debug!("  CUDA init failed: {e:#}");
-                }
+                log_cuda_fallthrough("CUDA", &e);
+                tried.push(format!("cuda ({e:#})"));
             }
         }
     }
@@ -652,6 +673,7 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
             Err(e) => {
                 info!("CubeCL unavailable; trying the next backend");
                 debug!("  CubeCL init failed: {e:#}");
+                tried.push(format!("cubecl ({e:#})"));
             }
         }
     }
@@ -661,14 +683,19 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
     // Vulkan ICD and a CubeCL regression).
     #[cfg(feature = "cuda")]
     if want == GpuBackend::Auto && detailed {
-        if let Ok(ctx) = try_init_cuda(cli.gpu_device) {
-            info!(
-                "GPU initialized: CUDA device {}, batch size {}",
-                cli.gpu_device, CUDA_BATCH_SIZE
-            );
-            return Some(Arc::new(GpuHandle::Cuda(ctx)));
+        match try_init_cuda(cli.gpu_device) {
+            Ok(ctx) => {
+                info!(
+                    "GPU initialized: CUDA device {}, batch size {}",
+                    cli.gpu_device, CUDA_BATCH_SIZE
+                );
+                return Some(Arc::new(GpuHandle::Cuda(ctx)));
+            }
+            Err(e) => {
+                log_cuda_fallthrough("CUDA", &e);
+                tried.push(format!("cuda ({e:#})"));
+            }
         }
-        info!("CUDA unavailable; trying Vulkan");
     }
 
     #[cfg(feature = "vulkan")]
@@ -695,8 +722,13 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
         }
     }
 
+    let reasons = if tried.is_empty() {
+        String::new()
+    } else {
+        format!("; tried {}", tried.join(", "))
+    };
     error!(
-        "No usable GPU backend for --gpu-backend {want:?}; this build has: {}",
+        "No usable GPU backend for --gpu-backend {want:?}; this build has: {}{reasons}",
         compiled_backends()
     );
     std::process::exit(1);
@@ -1673,6 +1705,39 @@ mod tests {
     // would make clap exit the test binary outright. Testing the plain function
     // against the named defaults keeps the assertions about the shipped
     // behavior without making them hostage to the shell they run in.
+
+    #[test]
+    fn cuda_init_failures_are_classified() {
+        use super::{cuda_driver_rejected, cuda_toolkit_missing};
+        // Errors seen on rented hosts, where the driver loaded and refused.
+        for text in [
+            "initializing CUDA device 0: DriverError(CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE, \
+             \"forward compatibility was attempted on non supported HW\")",
+            "initializing CUDA device 0: DriverError(CUDA_ERROR_SYSTEM_DRIVER_MISMATCH, \
+             \"system has unsupported display driver / cuda driver combination\")",
+            "loading smoke-test module: DriverError(CUDA_ERROR_UNSUPPORTED_PTX_VERSION, \
+             \"the provided PTX was compiled with an unsupported toolchain.\")",
+        ] {
+            let e = anyhow!(text);
+            assert!(cuda_driver_rejected(&e), "{text}");
+            assert!(!cuda_toolkit_missing(&e), "{text}");
+        }
+        // No NVIDIA driver at all: cudarc's dlopen panic, or cubecl's worker
+        // dying. Neither is a driver error, so `auto` stays quiet.
+        for text in [
+            "Unable to dynamically load the \"cuda\" shared library - searched for library \
+             names: [\"libcuda.so\", \"libcuda.so.1\"].",
+            "called `Result::unwrap()` on an `Err` value: RecvError",
+        ] {
+            let e = anyhow!(text);
+            assert!(!cuda_driver_rejected(&e), "{text}");
+            assert!(!cuda_toolkit_missing(&e), "{text}");
+        }
+        // Driver present, toolkit missing: the existing warning.
+        let e = anyhow!("Unable to dynamically load the \"nvrtc\" shared library");
+        assert!(cuda_toolkit_missing(&e));
+        assert!(!cuda_driver_rejected(&e));
+    }
 
     #[test]
     fn slow_clients_keep_the_historical_depth() {
