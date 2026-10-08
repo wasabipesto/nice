@@ -45,6 +45,8 @@ log = { version = "0.4" }
 rayon = { version = "1.11" }
 serde_json = { version = "1.0" }
 simple-tqdm = {version = "0.2", features = ["rayon"]}
+# The GPU progress bars; the same version simple-tqdm draws with.
+indicatif = "0.17"
 # cuda-12080 is the binding *surface*, not a driver floor: cudarc dlopens
 # lazily, so a symbol must exist only if called. The hand-CUDA path calls
 # nothing newer than 12.0; cubecl-cuda compiles against 12.8 declarations
