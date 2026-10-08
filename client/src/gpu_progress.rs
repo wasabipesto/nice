@@ -48,8 +48,11 @@ impl GpuProgress {
     /// Draw `bar`, the oldest open field's.
     fn show(&self, bar: &ProgressBar) {
         let bar = self.multi.add(bar.clone());
-        // Keep the clock moving while the host waits on the device.
-        bar.enable_steady_tick(Duration::from_millis(250));
+        // indicatif draws a bar that has a steady tick only on the tick, not
+        // when its position moves, so the tick is the refresh rate: 20 Hz,
+        // the CPU bar's cap. It also keeps the clock moving while the host
+        // waits on the device.
+        bar.enable_steady_tick(Duration::from_millis(50));
     }
 
     /// A writer that prints above the bars instead of through them, so the
@@ -62,30 +65,58 @@ impl GpuProgress {
     }
 }
 
-/// The same shape as the CPU bar: `simple-tqdm`'s template, with the rate in
-/// numbers per second (a unit is `numbers_per_unit` of them, not always a
-/// power of ten: a join partition is a field's share).
+/// The same shape as the CPU bar: `simple-tqdm`'s template and keys, with
+/// the rate in numbers per second (a unit is `numbers_per_unit` of them,
+/// not always a power of ten: a join partition is a field's share).
 fn style(numbers_per_unit: u128) -> ProgressStyle {
     #[allow(clippy::cast_precision_loss)]
     let scale = numbers_per_unit.max(1) as f64;
-    ProgressStyle::with_template(
-        "{percent}|{wide_bar:.white}| {pos}/{len} [{elapsed}<{eta}, {per_sec}{msg}]",
+    tqdm_keys(
+        ProgressStyle::with_template(
+            "{percent}|{wide_bar:.white}| {pos}/{len} [{elapsed}<{eta}, {per_sec}{msg}]",
+        )
+        .expect("static template"),
     )
-    .expect("static template")
     .with_key(
         "per_sec",
         move |state: &ProgressState, w: &mut dyn std::fmt::Write| {
             let _ = write!(w, "{:.2e}/s", state.per_sec() * scale);
         },
     )
-    .progress_chars("█▉▊▋▌▍▎▏ ")
 }
 
 /// Once the host is done with a field and the device drains it, the rate
 /// would only decay towards zero; the bar shows the time it has waited.
 fn waiting_style() -> ProgressStyle {
-    ProgressStyle::with_template("{percent}|{wide_bar:.white}| {pos}/{len} [{elapsed}{msg}]")
-        .expect("static template")
+    tqdm_keys(
+        ProgressStyle::with_template("{percent}|{wide_bar:.white}| {pos}/{len} [{elapsed}{msg}]")
+            .expect("static template"),
+    )
+}
+
+/// `simple-tqdm`'s percentage (right-aligned, with its sign), its `MM:SS`
+/// times and its bar characters.
+fn tqdm_keys(style: ProgressStyle) -> ProgressStyle {
+    let mm_ss = |d: Duration, w: &mut dyn std::fmt::Write| {
+        let _ = write!(w, "{:0>2}:{:0>2}", d.as_secs() / 60, d.as_secs() % 60);
+    };
+    style
+        .with_key(
+            "percent",
+            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                #[allow(clippy::cast_possible_truncation)]
+                let percent = (state.fraction() * 100.0) as i32;
+                let _ = write!(w, "{percent: >3}%");
+            },
+        )
+        .with_key(
+            "elapsed",
+            move |state: &ProgressState, w: &mut dyn std::fmt::Write| mm_ss(state.elapsed(), w),
+        )
+        .with_key(
+            "eta",
+            move |state: &ProgressState, w: &mut dyn std::fmt::Write| mm_ss(state.eta(), w),
+        )
         .progress_chars("█▉▊▋▌▍▎▏ ")
 }
 
@@ -227,6 +258,66 @@ mod tests {
         assert_eq!(open_fields(&p), [((0, 10), 0), ((20, 30), 0)]);
         p.finish(&a);
         assert_eq!(open_fields(&p), [((20, 30), 0)]);
+    }
+
+    /// A terminal that keeps what is drawn on it.
+    #[derive(Debug, Clone, Default)]
+    struct Capture(std::sync::Arc<Mutex<Vec<String>>>);
+
+    impl indicatif::TermLike for Capture {
+        fn width(&self) -> u16 {
+            100
+        }
+        fn move_cursor_up(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_down(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_right(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_left(&self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_line(&self, s: &str) -> io::Result<()> {
+            self.0.lock().unwrap().push(s.to_string());
+            Ok(())
+        }
+        fn write_str(&self, s: &str) -> io::Result<()> {
+            self.write_line(s)
+        }
+        fn clear_line(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_bar_reads_like_the_cpu_bar() {
+        let term = Capture::default();
+        let target = ProgressDrawTarget::term_like(Box::new(term.clone()));
+        let bar = ProgressBar::with_draw_target(Some(100), target).with_style(style(1_000));
+        bar.set_position(5);
+        bar.set_style(waiting_style());
+        bar.set_message(", waiting on device");
+        bar.set_position(100);
+        let lines = term.0.lock().unwrap().clone();
+        // A right-aligned percentage with its sign, and MM:SS times.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("  5%|") && l.contains("| 5/100 [00:00<")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("100%|") && l.ends_with("[00:00, waiting on device]")),
+            "{lines:?}"
+        );
     }
 
     #[test]
