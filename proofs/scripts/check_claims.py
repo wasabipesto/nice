@@ -3,8 +3,10 @@
 
 Checks, in order:
 1. Every row parses and has a known status.
-2. Every `Lean:` tag in the Rust sources (`/// Lean: `Nice.Foo.bar` (ID)`) names a
-   registry row whose `lean` column is that declaration.
+2. Every `Lean:` tag in the Rust sources (`/// Lean: `Nice.Foo.bar` (ID)`, several
+   comma-separated pairs allowed on one line) names a registry row whose `lean`
+   column is that declaration, and no such pair appears on a line without
+   `Lean:` (where it would go unchecked).
 3. Every declaration with status `def`, `proved`, `stated`, `conjecture` or
    `refuted` exists in the built library (`#check`).
 4. Every `proved` (and `def`) declaration depends on no axiom beyond
@@ -34,7 +36,8 @@ STATUSES = {"def", "proved", "stated", "planned", "conjecture", "refuted",
             "rust-test", "device-test", "sql-audit"}
 LEAN_STATUSES = {"def", "proved", "stated", "conjecture", "refuted"}
 AXIOM_OK = {"propext", "Classical.choice", "Quot.sound"}
-TAG_RE = re.compile(r"Lean:\s*`?([A-Za-z0-9_.'«»]+)`?\s*\(([A-Z]+-[0-9A-Za-z]+)\)")
+ROOT = "Nice"  # the Lean root namespace
+PAIR_RE = re.compile(r"`([A-Za-z0-9_.'«»]+)`\s*\(([A-Z]+-[0-9A-Za-z]+)\)")
 
 
 def parse_claims() -> list[dict]:
@@ -56,16 +59,23 @@ def parse_claims() -> list[dict]:
     return rows
 
 
-def rust_tags() -> list[tuple[Path, int, str, str]]:
-    out = []
+def rust_tags() -> tuple[list[tuple[Path, int, str, str]], list[tuple[Path, int, str, str]]]:
+    """Every `decl` (ID) pair after `Lean:` on a line, and every pair naming a
+    declaration of the root namespace on a line without `Lean:` (orphans)."""
+    out, orphans = [], []
     for root in RUST_ROOTS:
         if not root.exists():
             continue
         for path in list(root.rglob("*.rs")) + list(root.rglob("*.cu")):
             for lineno, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
-                for m in TAG_RE.finditer(line):
-                    out.append((path, lineno, m.group(1), m.group(2)))
-    return out
+                if "Lean:" in line:
+                    for m in PAIR_RE.finditer(line.split("Lean:", 1)[1]):
+                        out.append((path, lineno, m.group(1), m.group(2)))
+                else:
+                    for m in PAIR_RE.finditer(line):
+                        if m.group(1).startswith(ROOT + "."):
+                            orphans.append((path, lineno, m.group(1), m.group(2)))
+    return out, orphans
 
 
 def lean_query(decls: list[str], axioms_for: list[str]) -> dict[str, dict]:
@@ -119,7 +129,10 @@ def main() -> int:
         if r["status"] in LEAN_STATUSES and not r["lean"]:
             failures.append(f"{r['id']}: status {r['status']} needs a lean declaration")
 
-    for path, lineno, decl, cid in rust_tags():
+    tags, orphans = rust_tags()
+    for path, lineno, decl, cid in orphans:
+        failures.append(f"{path.relative_to(REPO)}:{lineno}: {decl} ({cid}) is not on a `Lean:` line")
+    for path, lineno, decl, cid in tags:
         where = f"{path.relative_to(REPO)}:{lineno}"
         row = by_id.get(cid)
         if row is None:
