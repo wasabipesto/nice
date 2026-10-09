@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// The MSD/descriptor pipeline these two constants belong to now lives in
-/// [`crate::gpu_niceonly`], which the Vulkan backend shares. Re-exported so the
+/// [`crate::gpu_niceonly`], which the `CubeCL` backend shares. Re-exported so the
 /// CUDA path's public surface is unchanged.
 pub use crate::gpu_niceonly::{GPU_LSD_K, PROCESSING_CHUNK_SIZE};
 
