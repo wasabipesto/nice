@@ -392,8 +392,7 @@ impl NiceonlyGpu for CudaContext {
 /// NVIDIA nice-only with the overlap join: hand-CUDA's stride pipeline, and
 /// `CubeCL`'s CUDA runtime for the join, which hand-CUDA does not have yet.
 /// Each field's ticket says which of the two holds it. The client uses this
-/// under `--gpu-backend auto`; an explicit `cuda` keeps every field on
-/// hand-CUDA.
+/// for nice-only under `--gpu-backend auto` and `cuda` alike.
 #[cfg(feature = "cubecl-cuda")]
 pub struct CudaWithJoin {
     pub cuda: CudaContext,

@@ -62,8 +62,9 @@ use nice_common::vulkan::VulkanContext;
 ///
 /// Every backend `dlopen`s its driver at runtime, so a single binary can carry
 /// all of them and require none at build time. `Auto` tries CUDA first on
-/// NVIDIA, and in nice-only mode pairs it with `CubeCL`'s CUDA runtime for the
-/// overlap join (see `init_gpu`).
+/// NVIDIA. In nice-only mode CUDA, whether `auto` picked it or it was named,
+/// is paired with `CubeCL`'s CUDA runtime for the overlap join (see
+/// `init_gpu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
     /// Fastest measured order for the mode: detailed tries `cubecl-cuda`,
@@ -71,7 +72,8 @@ enum GpuBackend {
     /// `cubecl`, then Vulkan.
     Auto,
     /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In
-    /// niceonly this uses the CUDA stride pipeline.
+    /// niceonly, as with `auto`, fields the overlap join takes run on
+    /// `CubeCL`'s CUDA runtime (in builds with `cubecl-cuda`).
     Cuda,
     /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA,
     /// llvmpipe) (needs the experimental `vulkan` feature).
@@ -103,9 +105,9 @@ enum GpuHandle {
     Vulkan(VulkanContext),
     #[cfg(feature = "cubecl")]
     Cubecl(CubeclContext),
-    /// NVIDIA nice-only under `--gpu-backend auto`: hand-CUDA, with
-    /// `CubeCL`'s CUDA runtime for the fields the overlap join takes, where
-    /// it is several times faster (see `CudaWithJoin`).
+    /// NVIDIA nice-only under `--gpu-backend auto` or `cuda`: hand-CUDA,
+    /// with `CubeCL`'s CUDA runtime for the fields the overlap join takes,
+    /// where it is several times faster (see `CudaWithJoin`).
     #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
     CudaJoin(CudaWithJoin),
 }
@@ -485,6 +487,15 @@ fn guarded_init<T>(
     }
 }
 
+/// Whether hand-CUDA, brought up for `want` in `mode`, gets `CubeCL`'s CUDA
+/// runtime beside it for the overlap join: in nice-only, under `auto` and an
+/// explicit `cuda` alike. Without it, nice-only fields the join would take
+/// run on the stride pipeline, 10-21x slower per field at bases 57-58.
+#[cfg(any(test, feature = "cuda"))]
+fn cuda_pairs_join(want: GpuBackend, mode: SearchMode) -> bool {
+    mode == SearchMode::Niceonly && matches!(want, GpuBackend::Auto | GpuBackend::Cuda)
+}
+
 /// Bring up the GPU backend the user asked for.
 ///
 /// `Auto`'s order is per mode, from the measured tables in the `CubeCL`
@@ -505,11 +516,14 @@ fn guarded_init<T>(
 ///   fields at the frontier (`join_plan::plan_join`) and is several
 ///   times faster there; so on NVIDIA, a build with `cubecl-cuda` pairs the
 ///   hand-CUDA context with a `CubeCL` CUDA one (`GpuHandle::CudaJoin`) and
-///   routes each field to the faster of the two.
+///   routes each field to the faster of the two. An explicit `cuda` is
+///   paired the same way (`cuda_pairs_join`).
 ///
 /// An **explicitly named** backend that fails to initialize is fatal rather
 /// than falling back: for a distributed compute client, silently dropping to
-/// a much slower path is a worse outcome than stopping and saying so.
+/// a much slower path is a worse outcome than stopping and saying so. The
+/// join's runtime is not the named backend, so its failing to start is a
+/// warning under `cuda` as under `auto`.
 #[allow(unused_variables)]
 fn init_gpu(cli: &Cli) -> GpuCtx {
     if !cli.gpu {
@@ -583,11 +597,11 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 {
                     info!("  GPU: {name}");
                 }
-                // Nice-only auto also brings up CubeCL's CUDA runtime for the
+                // Nice-only also brings up CubeCL's CUDA runtime for the
                 // overlap join, which takes production-size fields; without
                 // it every field stays on hand-CUDA.
                 #[cfg(feature = "cubecl-cuda")]
-                if want == GpuBackend::Auto {
+                if cuda_pairs_join(want, cli.mode) {
                     let attempt =
                         guarded_init("the CubeCL CUDA runtime could not be started", || {
                             CubeclContext::new_cuda(cli.gpu_device)
@@ -606,6 +620,15 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                             );
                         }
                     }
+                }
+                #[cfg(not(feature = "cubecl-cuda"))]
+                if cuda_pairs_join(want, cli.mode) {
+                    warn!(
+                        "  this build has no overlap join (it needs the cubecl-cuda feature, \
+                         which the gpu feature includes): nice-only fields of 1e{} and up \
+                         take the slower stride path",
+                        nice_common::overlap_join::JOIN_MIN_FIELD_SIZE.ilog10()
+                    );
                 }
                 return Some(Arc::new(GpuHandle::Cuda(ctx)));
             }
@@ -1752,6 +1775,23 @@ mod tests {
         let e = anyhow!("Unable to dynamically load the \"nvrtc\" shared library");
         assert!(cuda_toolkit_missing(&e));
         assert!(!cuda_driver_rejected(&e));
+    }
+
+    #[test]
+    fn hand_cuda_pairs_the_join_for_niceonly_under_auto_and_cuda() {
+        use super::{GpuBackend, cuda_pairs_join};
+        use clap::ValueEnum;
+        use nice_common::SearchMode;
+        // A named `cuda` gets the join exactly as `auto` does.
+        assert!(cuda_pairs_join(GpuBackend::Auto, SearchMode::Niceonly));
+        assert!(cuda_pairs_join(GpuBackend::Cuda, SearchMode::Niceonly));
+        for &want in GpuBackend::value_variants() {
+            // Detailed has no join; every other backend never runs hand-CUDA.
+            assert!(!cuda_pairs_join(want, SearchMode::Detailed), "{want:?}");
+            if !matches!(want, GpuBackend::Auto | GpuBackend::Cuda) {
+                assert!(!cuda_pairs_join(want, SearchMode::Niceonly), "{want:?}");
+            }
+        }
     }
 
     #[test]
