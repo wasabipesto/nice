@@ -62,6 +62,8 @@ impl FwDigits {
 /// Digits peeled per wide division in the chunked extraction: the largest
 /// `e` with `base^e < 2^32`, so a chunk fits a `u32` and its digits come
 /// out of cheap 32-bit constant divisions.
+///
+/// Lean: `NiceSearch.chunkExp_spec` (NUM-6)
 const fn chunk_digits(base: u32) -> u32 {
     let mut e = 0;
     let mut div: u64 = 1;
@@ -295,6 +297,9 @@ fn hall_augment(i: usize, doms: &[u64], visited: &mut u64, owner: &mut [usize; 6
 /// the matching, and they are few. Same verdict as running Kuhn on the full
 /// set, at up to 1.6x lower cost on bases 50-60 (the codebase's pinned
 /// tests compare the two).
+///
+/// Lean: `NiceSearch.no_nice_of_not_hasSDR` (MSD-4)
+/// Lean: `NiceSearch.sdrClosure_iff` (MSD-10)
 fn has_distinct_assignment_closure(doms: &[u64]) -> bool {
     let mut single: u64 = 0;
     let mut rest = [0u64; HALL_MAX_POSITIONS];

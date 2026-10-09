@@ -598,4 +598,190 @@ theorem analyzeRange_mono {b lo hi lo' hi' : ℕ} (hb : 2 ≤ b) (h1 : lo ≤ lo
   rw [h] at this
   exact Bool.false_ne_true this
 
+/-! ### Singleton closure (MSD-10)
+
+`has_distinct_assignment_closure` first lets every one-digit domain take its
+digit and removes that digit from the other domains, repeating while new
+one-digit domains appear and failing on an emptied domain; only what is
+left goes to the matching. Each step preserves the existence of an SDR in
+both directions (`hasSDR_cons_singleton_iff`), and the order of the
+constraints does not matter (`hasSDR_perm`), so the closure's verdict is the
+SDR verdict (`sdrClosure_iff`). -/
+
+deriving instance DecidableEq for Constraint
+
+/-- Remove digit `x` from every domain. -/
+def eraseDigit (x : ℕ) (cs : List Constraint) : List Constraint :=
+  cs.map fun c => ⟨c.e, c.j, c.dom.erase x⟩
+
+/-- A chosen digit lies in the domain of some constraint. -/
+theorem exists_dom_of_mem {cs : List Constraint} {ds : List ℕ}
+    (hf : List.Forall₂ (fun c d => d ∈ c.dom) cs ds) {d : ℕ} (hd : d ∈ ds) :
+    ∃ c ∈ cs, d ∈ c.dom := by
+  revert hd
+  induction hf with
+  | nil => intro hd; simp at hd
+  | cons h _ ih =>
+    intro hd
+    rw [List.mem_cons] at hd
+    rcases hd with rfl | hd
+    · exact ⟨_, List.mem_cons.mpr (Or.inl rfl), h⟩
+    · obtain ⟨c, hc, hdc⟩ := ih hd
+      exact ⟨c, List.mem_cons.mpr (Or.inr hc), hdc⟩
+
+/-- Every constraint gets a digit of its domain. -/
+theorem dom_nonempty_of_mem {cs : List Constraint} {ds : List ℕ}
+    (hf : List.Forall₂ (fun c d => d ∈ c.dom) cs ds) {c : Constraint} (hc : c ∈ cs) :
+    c.dom.Nonempty := by
+  revert hc
+  induction hf with
+  | nil => intro hc; simp at hc
+  | cons h _ ih =>
+    intro hc
+    rw [List.mem_cons] at hc
+    rcases hc with rfl | hc
+    · exact ⟨_, h⟩
+    · exact ih hc
+
+/-- An emptied domain has no representative. -/
+theorem not_hasSDR_of_empty {cs : List Constraint} {c : Constraint} (hc : c ∈ cs)
+    (he : c.dom = ∅) : ¬ HasSDR cs := by
+  rintro ⟨ds, hf, -⟩
+  have := dom_nonempty_of_mem hf hc
+  rw [he] at this
+  exact Finset.not_nonempty_empty this
+
+theorem forall₂_eraseDigit {x : ℕ} {cs : List Constraint} {ds : List ℕ}
+    (hf : List.Forall₂ (fun c d => d ∈ c.dom) cs ds) (hx : x ∉ ds) :
+    List.Forall₂ (fun c d => d ∈ c.dom) (eraseDigit x cs) ds := by
+  revert hx
+  induction hf with
+  | nil => intro _; exact List.Forall₂.nil
+  | cons h _ ih =>
+    intro hx
+    rw [List.mem_cons, not_or] at hx
+    exact List.Forall₂.cons (Finset.mem_erase.mpr ⟨fun e => hx.1 e.symm, h⟩) (ih hx.2)
+
+/-- A one-digit domain `{x}` takes `x`, which then leaves every other domain. -/
+theorem hasSDR_cons_singleton_iff {c : Constraint} {x : ℕ} (hx : c.dom = {x})
+    {cs : List Constraint} : HasSDR (c :: cs) ↔ HasSDR (eraseDigit x cs) := by
+  constructor
+  · rintro ⟨ds, hf, hnd⟩
+    cases hf with
+    | cons hd hf' =>
+      rename_i d ds'
+      rw [hx, Finset.mem_singleton] at hd
+      subst hd
+      rw [List.nodup_cons] at hnd
+      exact ⟨ds', forall₂_eraseDigit hf' hnd.1, hnd.2⟩
+  · rintro ⟨ds, hf, hnd⟩
+    refine ⟨x :: ds, List.Forall₂.cons (by rw [hx]; exact Finset.mem_singleton_self x) ?_, ?_⟩
+    · unfold eraseDigit at hf
+      rw [List.forall₂_map_left_iff] at hf
+      exact hf.imp fun _ _ h => Finset.mem_of_mem_erase h
+    · rw [List.nodup_cons]
+      refine ⟨fun hxd => ?_, hnd⟩
+      obtain ⟨c', hc', hxc⟩ := exists_dom_of_mem hf hxd
+      unfold eraseDigit at hc'
+      rw [List.mem_map] at hc'
+      obtain ⟨c'', -, rfl⟩ := hc'
+      exact Finset.notMem_erase x c''.dom hxc
+
+/-- Representatives follow the constraints through a permutation. -/
+theorem forall₂_of_perm {cs cs' : List Constraint} (hp : cs.Perm cs') :
+    ∀ {ds : List ℕ}, List.Forall₂ (fun c d => d ∈ c.dom) cs ds →
+      ∃ ds', List.Forall₂ (fun c d => d ∈ c.dom) cs' ds' ∧ ds'.Perm ds := by
+  induction hp with
+  | nil => intro ds hf; exact ⟨ds, hf, List.Perm.refl _⟩
+  | cons c _ ih =>
+    intro ds hf
+    cases hf with
+    | cons hd hf' =>
+      obtain ⟨ds', hf'', hp'⟩ := ih hf'
+      exact ⟨_ :: ds', List.Forall₂.cons hd hf'', hp'.cons _⟩
+  | swap c₁ c₂ l =>
+    intro ds hf
+    cases hf with
+    | cons h₁ hf' =>
+      cases hf' with
+      | cons h₂ hf'' =>
+        exact ⟨_, List.Forall₂.cons h₂ (List.Forall₂.cons h₁ hf''), List.Perm.swap _ _ _⟩
+  | trans _ _ ih₁ ih₂ =>
+    intro ds hf
+    obtain ⟨ds₁, hf₁, hp₁⟩ := ih₁ hf
+    obtain ⟨ds₂, hf₂, hp₂⟩ := ih₂ hf₁
+    exact ⟨ds₂, hf₂, hp₂.trans hp₁⟩
+
+/-- An SDR does not depend on the order of the constraints. -/
+theorem hasSDR_perm {cs cs' : List Constraint} (hp : cs.Perm cs') (h : HasSDR cs) :
+    HasSDR cs' := by
+  obtain ⟨ds, hf, hnd⟩ := h
+  obtain ⟨ds', hf', hp'⟩ := forall₂_of_perm hp hf
+  exact ⟨ds', hf', hp'.nodup_iff.mpr hnd⟩
+
+/-- `has_distinct_assignment_closure`: a constraint whose domain has one digit
+takes it, which removes the digit from every other domain; an emptied domain
+fails; with no such constraint left, the plain SDR question decides (Kuhn's
+matching in the Rust, the brute-force search here). The Rust collects the
+singletons first and loops to closure, which only reorders these steps. One
+step per constraint, so `fuel = cs.length` suffices. -/
+def sdrClosure (b : ℕ) : ℕ → List Constraint → Bool
+  | 0, cs => sdrExists b cs
+  | fuel + 1, cs =>
+    match cs.find? (fun c => decide (c.dom.card ≤ 1)) with
+    | none => sdrExists b cs
+    | some c =>
+      match c.dom.sort (· ≤ ·) with
+      | [x] => sdrClosure b fuel (eraseDigit x (cs.erase c))
+      | _ => false
+
+/-- Claim MSD-10: the singleton closure decides exactly whether an SDR exists. -/
+theorem sdrClosure_iff {b : ℕ} : ∀ (fuel : ℕ) (cs : List Constraint), cs.length ≤ fuel →
+    (∀ c ∈ cs, ∀ d ∈ c.dom, d < b) → (sdrClosure b fuel cs = true ↔ HasSDR cs) := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro cs _ hsub
+    exact sdrExists_iff cs hsub
+  | succ fuel ih =>
+    intro cs hlen hsub
+    rw [sdrClosure]
+    split
+    · exact sdrExists_iff cs hsub
+    · rename_i c hfind
+      have hc : c ∈ cs := List.mem_of_find?_eq_some hfind
+      have hcard : c.dom.card ≤ 1 := by
+        have := List.find?_some hfind
+        simpa using this
+      have hlen' : (c.dom.sort (· ≤ ·)).length = c.dom.card := Finset.length_sort _
+      split
+      · rename_i x hsort
+        have hdom : c.dom = {x} := by
+          ext y
+          have hy : y ∈ c.dom.sort (· ≤ ·) ↔ y ∈ c.dom := Finset.mem_sort _
+          rw [hsort, List.mem_singleton] at hy
+          rw [Finset.mem_singleton, ← hy]
+        have hlen'' : (eraseDigit x (cs.erase c)).length ≤ fuel := by
+          unfold eraseDigit
+          rw [List.length_map, List.length_erase_of_mem hc]
+          omega
+        have hsub' : ∀ c' ∈ eraseDigit x (cs.erase c), ∀ d ∈ c'.dom, d < b := by
+          intro c' hc' d hd
+          unfold eraseDigit at hc'
+          rw [List.mem_map] at hc'
+          obtain ⟨c'', hc'', rfl⟩ := hc'
+          exact hsub c'' (List.mem_of_mem_erase hc'') d (Finset.mem_of_mem_erase hd)
+        rw [ih _ hlen'' hsub', ← hasSDR_cons_singleton_iff hdom]
+        exact ⟨hasSDR_perm (List.perm_cons_erase hc).symm, hasSDR_perm (List.perm_cons_erase hc)⟩
+      · rename_i hnot
+        have hempty : c.dom = ∅ := by
+          rcases Nat.lt_or_ge c.dom.card 1 with h0 | h1
+          · exact Finset.card_eq_zero.mp (by omega)
+          · exfalso
+            obtain ⟨x, hx⟩ := Finset.card_eq_one.mp (by omega : c.dom.card = 1)
+            apply hnot x
+            rw [hx, Finset.sort_singleton]
+        simp only [Bool.false_eq_true, false_iff]
+        exact not_hasSDR_of_empty hc hempty
+
 end NiceSearch

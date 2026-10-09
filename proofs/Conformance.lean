@@ -213,8 +213,8 @@ def checkPipeline (r : Report) : IO Report := do
           (model == want)
       | _ => throw (IO.userError "masked leaves shape")
     let nice ← orFail (getNatList j "nice")
-    -- production constants: MSD_RECURSIVE_MIN_RANGE_SIZE = 8000, MAX_DEPTH = 22
-    let model := NiceSearch.processRangeNiceonly b k 8000 22 start stop
+    -- production constants: MSD_RECURSIVE_MIN_RANGE_SIZE = 4000, MAX_DEPTH = 22
+    let model := NiceSearch.processRangeNiceonly b k 4000 22 start stop
     r := r.check s!"process_range_niceonly {b}" (model == nice)
   pure r
 
