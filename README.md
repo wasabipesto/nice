@@ -225,11 +225,11 @@ Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack
 
 There are also a few scripts, to be used with [rust-script](https://rust-script.org/). You can install it with `cargo install rust-script` then run the scripts directly. It will take a while to build the first time you run it.
 
-If you want to run a copy of this server yourself, a SQL schema file has been provided. You can build the bases and fields with the `insert_fields` script.
+If you want to run a copy of this server yourself, a SQL schema file has been provided. You can build the bases and fields with the `scripts/insert_new_fields.rs` script (e.g. `./scripts/insert_new_fields.rs --base 40 --field-size 1e9`, with `DATABASE_URL` set).
 
 ## GPU backends
 
-The GPU-enabled client (the `nice_client-gpu-*` release binaries, the `-gpu` docker tag, or a `--features gpu` build) carries multiple backends in one binary and picks one at runtime; the CPU path is always available as a fallback and for verification. Kernels are JIT-compiled per base at first use, so the first field on a new base takes a few extra seconds.
+The GPU-enabled client (the `nice_client-gpu-*` release binaries, the `-gpu` docker tag, or a `--features gpu` build) carries multiple backends in one binary and picks one at runtime; the CPU path is always available as a fallback and for verification. Kernels are JIT-compiled per base at first use, so the first field on a new base takes a few extra seconds. The `-gpu` docker image is built on CUDA 12.8, so on NVIDIA it needs a host driver that supports CUDA 12.8 or newer (`nvidia-smi` reports the driver's `CUDA Version`).
 
 The `gpu` umbrella feature needs nothing installed to build on any platform, since every included backend loads its driver at runtime. Some opt-in features have additional dependencies listed below.
 
