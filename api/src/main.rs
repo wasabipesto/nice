@@ -165,7 +165,8 @@ fn claim_helper(
             (FieldClaimStrategy::Next, 0, u128::MAX)
         }
         SearchMode::Detailed => {
-            // For Detailed, only ever get the next unchecked field
+            // For Detailed, draw a strategy: the thin chunk, the next unchecked field,
+            // or a recheck. `Random` is kept but currently never drawn.
             match rng.random_range(1..=100) {
                 // 40% chance: get random field in the current thin chunk
                 1..=40 => (FieldClaimStrategy::Thin, 1, DETAILED_SEARCH_MAX_FIELD_SIZE),
@@ -189,12 +190,13 @@ fn claim_helper(
     // This reduces latency from ~90ms (database query + locking + update) to <1ms (memory access).
     // The queue automatically refills by bulk-claiming fields at once when it drops below a threshold.
     //
-    // For detailed mode, `Thin` (80%) and both `Next` strategies (15% at cl<=1, 4% recheck at
+    // For detailed mode, `Thin` (40%) and both `Next` strategies (55% at cl<=1, 5% recheck at
     // cl<=2) are served from pre-claimed queues too. `Next` used to go straight to the
     // database on the grounds that it is per-request stateful; but its state is just "the
     // lowest-id claimable field", which a queue filled in frontier order reproduces exactly,
     // and the direct query re-sorts the frontier chunk on every request — 14 ms alone, over
-    // 100 ms when sixteen clients ask at once. Only `Random` (1%) still claims directly.
+    // 100 ms when sixteen clients ask at once. Only `Random` (0% today) would still claim
+    // directly, apart from the fallbacks below when a queue is empty.
     let search_field = if search_mode == SearchMode::Niceonly {
         // Try to get from queue first
         if let Some(queued_field) = queue.claim_niceonly(&mut conn) {
