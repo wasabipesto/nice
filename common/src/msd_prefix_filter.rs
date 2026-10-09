@@ -39,6 +39,7 @@ use crate::fixed_width::U256;
 // For b62: k=12, b%5=2 → n³ has 3k+1 = 37 digits.
 // For b64: k=12, b%5=4 → n³ has 3k+2 = 38 digits.
 // 38 covers all specialized bases ≤ 64.
+// Lean: `NiceSearch.Const.max_fw_digits` (NUM-3)
 const MAX_FW_DIGITS: usize = 38;
 
 /// Stack-resident digit sequence used by the fixed-width MSD path. Stores
@@ -61,6 +62,8 @@ impl FwDigits {
 /// Digits peeled per wide division in the chunked extraction: the largest
 /// `e` with `base^e < 2^32`, so a chunk fits a `u32` and its digits come
 /// out of cheap 32-bit constant divisions.
+///
+/// Lean: `NiceSearch.chunkExp_spec` (NUM-6)
 const fn chunk_digits(base: u32) -> u32 {
     let mut e = 0;
     let mut div: u64 = 1;
@@ -212,6 +215,8 @@ const HALL_MAX_POSITIONS: usize = 2 * MAX_FW_DIGITS + 2;
 /// `diff >= base - 1` the domain covers all digits and every lower position
 /// is unconstrained (the width only grows as `j` decreases).
 ///
+/// Lean: `NiceSearch.digit_mem_cyclicInterval` (MSD-1), `NiceSearch.width_recurrence` (MSD-2)
+///
 /// A `diff == 0` position is a singleton — exactly a digit of the classic
 /// common MSD prefix — so this generalizes the previous prefix extraction.
 /// `fixed_lsd_k` and `fixed` feed the cross-end residue filter: a singleton
@@ -292,6 +297,9 @@ fn hall_augment(i: usize, doms: &[u64], visited: &mut u64, owner: &mut [usize; 6
 /// the matching, and they are few. Same verdict as running Kuhn on the full
 /// set, at up to 1.6x lower cost on bases 50-60 (the codebase's pinned
 /// tests compare the two).
+///
+/// Lean: `NiceSearch.no_nice_of_not_hasSDR` (MSD-4)
+/// Lean: `NiceSearch.sdrClosure_iff` (MSD-10)
 fn has_distinct_assignment_closure(doms: &[u64]) -> bool {
     let mut single: u64 = 0;
     let mut rest = [0u64; HALL_MAX_POSITIONS];
@@ -333,6 +341,7 @@ fn has_distinct_assignment_closure(doms: &[u64]) -> bool {
     nr == 0 || has_distinct_assignment(&rest[..nr])
 }
 
+/// Lean: `NiceSearch.no_nice_of_not_hasSDR` (MSD-4)
 /// Can every constrained position be assigned a distinct digit from its
 /// domain? By Hall's theorem this fails exactly when some set of positions
 /// collectively offers fewer digits than positions — which makes a nice
@@ -361,6 +370,7 @@ fn has_distinct_assignment(doms: &[u64]) -> bool {
     true
 }
 
+/// Lean: `NiceSearch.powerDomains_sound` (MSD-3), `NiceSearch.Sound.sublist` (MSD-6)
 /// Interval digit-domain analysis (Hall check) given pre-extracted endpoint
 /// digit arrays. Factored out so both u128 and U256 paths share identical
 /// post-extraction logic.
@@ -570,6 +580,7 @@ pub enum MsdAnalysis {
     Live { fixed_mask: u64 },
 }
 
+/// Lean: `NiceSearch.no_nice_of_cross` (CRS-1)
 /// Interval-domain MSD analysis returning the full certificate.
 ///
 /// `fixed_lsd_k` is the stride table's LSD depth: singleton digits at
@@ -674,6 +685,7 @@ pub fn analyze_range(range: FieldSize, base: u32, fixed_lsd_k: usize) -> MsdAnal
 /// The classic common-MSD-prefix duplicate/overlap analysis for bases above
 /// 64, whose digits don't fit u64 domain masks. Never emits a certificate
 /// (`fixed_mask` stays 0), matching the empty `low_digit_masks` there.
+// Lean: `NiceSearch.no_nice_of_equal_singletons` (MSD-8)
 fn analyze_range_over_64(range: FieldSize, base: u32) -> MsdAnalysis {
     // Bases above 64 don't fit u64 digit masks; keep the classic
     // common-MSD-prefix duplicate/overlap analysis for them.
@@ -726,6 +738,7 @@ fn analyze_range_over_64(range: FieldSize, base: u32) -> MsdAnalysis {
         return MsdAnalysis::Rejected;
     }
 
+    // Lean: `NiceSearch.msd_lsd_skip_unsound` (REF-1)
     // NOTE (2026-08 theory review): a "cross MSD×LSD collision check" used to
     // live here, gated on `range.first() / b^k == range.last() / b^k`. That
     // condition only means the range fits inside one quotient block of b^k;
@@ -740,6 +753,7 @@ fn analyze_range_over_64(range: FieldSize, base: u32) -> MsdAnalysis {
     MsdAnalysis::Live { fixed_mask: 0 }
 }
 
+/// Lean: `NiceSearch.validRanges_cover` (MSD-7)
 /// Recursively subdivide a range to find sub-ranges that need to be processed.
 ///
 /// This function applies the MSD prefix filter recursively:
@@ -910,6 +924,9 @@ pub fn get_valid_ranges_recursive_masked(
 /// endpoints as analyzing every child from scratch (measured 47-49% of
 /// endpoints are shared on production windows). Identical traversal and
 /// output to [`recurse_generic`].
+///
+/// Lean: `NiceSearch.validRangesMasked_cover` (CRS-2)
+/// Lean: `NiceSearch.validRanges_cover` (MSD-7)
 fn recurse_fw<const BASE: u32>(
     range: FieldSize,
     lo: &Endpoint,
@@ -982,6 +999,9 @@ fn recurse_fw<const BASE: u32>(
 
 /// The masked recursion for unspecialized bases, analyzing every range from
 /// scratch through [`analyze_range`].
+///
+/// Lean: `NiceSearch.validRangesMasked_cover` (CRS-2)
+/// Lean: `NiceSearch.validRanges_cover` (MSD-7)
 fn recurse_generic(
     range: FieldSize,
     params: &MaskedRecursion,

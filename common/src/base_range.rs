@@ -10,6 +10,12 @@ use malachite::natural::Natural;
 ///
 /// **Range semantics**: This represents a half-open range [`range_start`, `range_end`),
 /// following Rust's standard convention where `range_start` is inclusive and `range_end` is exclusive.
+///
+/// Lean: `NiceSearch.nice_digit_count` (RNG-1) — a nice number's powers have `b` digits between
+/// them, which is what these intervals are solved from.
+/// Lean: `NiceSearch.memBaseRange_of_inBaseRange` (RNG-2) — the intervals cover every such n.
+/// Lean: `NiceSearch.inBaseRange_of_memBaseRange` (RNG-2b) — and contain nothing else (`memBaseRange_iff`).
+/// Lean: `NiceSearch.not_inBaseRange_of_one_mod_five` (RNG-4) — the `1 => None` arm.
 #[must_use]
 pub fn get_base_range_natural(base: u32) -> Option<(Natural, Natural)> {
     let b = Natural::from(base);

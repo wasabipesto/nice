@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `proofs/`, a Lean 4 + Mathlib project that proves the mathematics the search relies on: the base range, the numeric cutoffs, every filter of the nice-only stride pipeline and of the overlap join, and that both modelled pipelines report exactly the nice numbers of a field. A `Lean proofs` CI job builds it, checks the model against tables the Rust emits, and validates the claims registry `proofs/CLAIMS.md` against `Lean:` tags in the Rust.
+
 ## Nice v3.4.6
 
 - Add an overlap join as the primary nice-only path for large fields. It skips much of the existing filter work by joining an overlapping list of the top-digit prefixes and bottom-digit residues which eliminates more candidates with the same underlying strategies. When the device or backend doesn't support this path it falls back to the existing stride implementation. Major thanks to [danstoyell](https://github.com/danstoyell) for the report and prototype.

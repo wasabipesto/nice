@@ -174,3 +174,19 @@ wasm-dev: wasm-build dev
 profile *args:
     cargo build --profile profiling --bin nice_client
     samply record cargo run --profile profiling --bin nice_client -- --benchmark large {{ args }}
+
+# Build the Lean proofs (proofs/): fetches the Mathlib cache on first run
+lean-build:
+    cd proofs && lake exe cache get && lake build
+
+# Validate proofs/CLAIMS.md against the built Lean library and the Rust `Lean:` tags
+lean-claims:
+    cd proofs && python3 scripts/check_claims.py
+
+# Regenerate proofs/fixtures/*.json from the Rust tables (rust-script)
+lean-fixtures:
+    rust-script scripts/lean_fixtures.rs
+
+# Check the Lean model against the Rust fixtures
+lean-conformance:
+    cd proofs && lake exe conformance
