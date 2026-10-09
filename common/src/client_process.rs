@@ -541,7 +541,6 @@ fn get_is_nice_natural(num: u128, base: u32) -> bool {
     true
 }
 
-/// Lean: `Nice.niceonly_complete` (END-1)
 /// Process a field by looking for completely nice numbers.
 /// Implements several optimizations over the detailed search.
 #[must_use]
@@ -566,6 +565,8 @@ pub fn process_niceonly(claim_data: &DataToClient, username: &String) -> DataToS
 ///
 /// **Range semantics**: Expects a half-open range [`range_start`, `range_end`) where `range_start`
 /// is inclusive and `range_end` is exclusive, following Rust's standard convention.
+///
+/// Lean: `Nice.niceonly_complete` (END-1)
 #[must_use]
 pub fn process_range_niceonly(
     range: &FieldSize,

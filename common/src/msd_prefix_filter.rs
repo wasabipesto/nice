@@ -860,7 +860,6 @@ pub fn get_valid_ranges(range: FieldSize, base: u32) -> Vec<FieldSize> {
     )
 }
 
-/// Lean: `Nice.validRangesMasked_cover` (CRS-2)
 /// `get_valid_ranges_recursive` with the cross-end certificate: each emitted
 /// leaf carries the union of every analyzed ancestor's `fixed_mask` — a fact
 /// proved for a range holds on all of its subranges, so leaves that stop at
@@ -920,6 +919,9 @@ pub fn get_valid_ranges_recursive_masked(
 /// endpoints as analyzing every child from scratch (measured 47-49% of
 /// endpoints are shared on production windows). Identical traversal and
 /// output to [`recurse_generic`].
+///
+/// Lean: `Nice.validRangesMasked_cover` (CRS-2)
+/// Lean: `Nice.validRanges_cover` (MSD-7)
 fn recurse_fw<const BASE: u32>(
     range: FieldSize,
     lo: &Endpoint,
@@ -992,6 +994,9 @@ fn recurse_fw<const BASE: u32>(
 
 /// The masked recursion for unspecialized bases, analyzing every range from
 /// scratch through [`analyze_range`].
+///
+/// Lean: `Nice.validRangesMasked_cover` (CRS-2)
+/// Lean: `Nice.validRanges_cover` (MSD-7)
 fn recurse_generic(
     range: FieldSize,
     params: &MaskedRecursion,

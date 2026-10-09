@@ -1,6 +1,6 @@
 /-
 The cross-end certificate and the niceonly pipeline. Rust:
-`msd_prefix_filter::{analyze_range, get_valid_ranges_recursive_masked}`,
+`msd_prefix_filter::{analyze_range, recurse_generic, recurse_fw}`,
 `stride_filter::iterate_range_masked`, `client_process::process_range_niceonly`.
 
 A singleton domain at an output position `j ≥ k` means every `n` in the
@@ -100,8 +100,9 @@ theorem no_nice_of_cross {b lo hi k n : ℕ} (hb : 2 ≤ b) (hlo : lo ≤ n) (hh
 
 /-! ### The masked recursion (CRS-2) -/
 
-/-- `get_valid_ranges_recursive_masked`: leaves carry the union of every
-analyzed ancestor's certificate. -/
+/-- `get_valid_ranges_recursive_masked` (`recurse_generic`, and `recurse_fw`
+with the same traversal): leaves carry the union of every analyzed
+ancestor's certificate. -/
 def validRangesMasked (b k minSize : ℕ) :
     ℕ → ℕ → ℕ → Finset ℕ → List (ℕ × ℕ × Finset ℕ)
   | 0, start, stop, inh => [(start, stop, inh)]
