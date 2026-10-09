@@ -15,7 +15,7 @@ the one-AND test and the nice check (END-1).
 import Nice.Model.Msd
 import Nice.Model.Seeded
 
-namespace Nice
+namespace NiceSearch
 
 /-! ### The certificate -/
 
@@ -375,4 +375,4 @@ theorem validRangesMasked_block {b k minSize C : ℕ} (hb : 2 ≤ b) (hC : minSi
       funext i
       congr 1 <;> ring
 
-end Nice
+end NiceSearch

@@ -3,7 +3,7 @@
 
 Checks, in order:
 1. Every row parses and has a known status.
-2. Every `Lean:` tag in the Rust sources (`/// Lean: `Nice.Foo.bar` (ID)`, several
+2. Every `Lean:` tag in the Rust sources (`/// Lean: `NiceSearch.Foo.bar` (ID)`, several
    comma-separated pairs allowed on one line) names a registry row whose `lean`
    column is that declaration, and no such pair appears on a line without
    `Lean:` (where it would go unchecked).
@@ -36,7 +36,7 @@ STATUSES = {"def", "proved", "stated", "planned", "conjecture", "refuted",
             "rust-test", "device-test", "sql-audit"}
 LEAN_STATUSES = {"def", "proved", "stated", "conjecture", "refuted"}
 AXIOM_OK = {"propext", "Classical.choice", "Quot.sound"}
-ROOT = "Nice"  # the Lean root namespace
+ROOT = "NiceSearch"  # the Lean root namespace (the library and modules are `Nice`)
 PAIR_RE = re.compile(r"`([A-Za-z0-9_.'«»]+)`\s*\(([A-Z]+-[0-9A-Za-z]+)\)")
 
 

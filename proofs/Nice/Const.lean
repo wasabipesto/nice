@@ -12,9 +12,9 @@ import Nice.Spec.Range
 -- `Nat.reducePow` refuses exponents above this; the bounds here go to 2^512.
 set_option exponentiation.threshold 1024
 
-namespace Nice.Const
+namespace NiceSearch.Const
 
-open Nice
+open NiceSearch
 
 /-- Per class of `b mod 5`, the exponent `c` with `(hi - 1)^6 < b^(6k + c)`. -/
 def classExp (b : ℕ) : ℕ :=
@@ -161,4 +161,4 @@ theorem mod_m_bound {M : ℕ} (hM : M < 2 ^ 32) : M * M + M < 2 ^ 64 :=
 histogram bin (`DRAIN_INTERVAL · CUBECL_BATCH_SIZE`). -/
 theorem histogram_bins : 64 * 50_000_000 < 2 ^ 32 := by norm_num
 
-end Nice.Const
+end NiceSearch.Const

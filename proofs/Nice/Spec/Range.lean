@@ -11,7 +11,7 @@ form.
 import Nice.Spec.Nice
 import Mathlib.Tactic
 
-namespace Nice
+namespace NiceSearch
 
 /-- The set the search covers: digit counts of the two powers sum to `b`. -/
 def InBaseRange (b n : ℕ) : Prop := numDigits b (n ^ 2) + numDigits b (n ^ 3) = b
@@ -354,4 +354,4 @@ theorem inBaseRange_of_memBaseRange {b n : ℕ} (hb : 2 ≤ b) (h : MemBaseRange
 theorem memBaseRange_iff {b n : ℕ} (hb : 2 ≤ b) : MemBaseRange b n ↔ InBaseRange b n :=
   ⟨inBaseRange_of_memBaseRange hb, memBaseRange_of_inBaseRange hb⟩
 
-end Nice
+end NiceSearch

@@ -12,7 +12,7 @@ nothing new. Filters that are only invariant at the bottom `k` positions
 import Mathlib.Tactic
 import Mathlib.Data.Nat.Digits.Defs
 
-namespace Nice
+namespace NiceSearch
 
 /-- The weighted digit statistic `Σ w_i d_i`, digits least significant first. -/
 def wsum (w : ℕ → ℤ) : List ℤ → ℤ
@@ -96,4 +96,4 @@ theorem collapse_of_invariant {m b : ℤ} {w : ℕ → ℤ}
     wsum w ds ≡ w 0 * value b ds [ZMOD m] :=
   collapse w (weight_rel_of_invariant hinv) ds
 
-end Nice
+end NiceSearch

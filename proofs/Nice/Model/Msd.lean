@@ -14,7 +14,7 @@ is in the range (MSD-4).
 import Nice.Model.Lsd
 import Mathlib.Tactic
 
-namespace Nice
+namespace NiceSearch
 
 /-! ### Cyclic interval domains -/
 
@@ -598,4 +598,4 @@ theorem analyzeRange_mono {b lo hi lo' hi' : ℕ} (hb : 2 ≤ b) (h1 : lo ≤ lo
   rw [h] at this
   exact Bool.false_ne_true this
 
-end Nice
+end NiceSearch

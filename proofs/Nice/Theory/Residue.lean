@@ -8,7 +8,7 @@ Bases 11, 15, 19, 23, 27, 43, 47, … are dead for this reason.
 -/
 import Nice.Model.Residue
 
-namespace Nice
+namespace NiceSearch
 
 theorem even_sq_add_cube (n : ℕ) : Even (n ^ 2 + n ^ 3) := by
   have h : n ^ 2 + n ^ 3 = n * (n * (n + 1)) := by ring
@@ -57,4 +57,4 @@ theorem no_nice_of_three_mod_four {b : ℕ} (hb : b % 4 = 3) : ∀ n, ¬ IsNice 
 /-- Base 11, the smallest dead base, as an instance. -/
 example : ∀ n, ¬ IsNice 11 n := no_nice_of_three_mod_four (by norm_num)
 
-end Nice
+end NiceSearch

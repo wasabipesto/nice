@@ -11,7 +11,7 @@ least `k` digits, which `three_le_numDigits_of_inBaseRange` gives for
 import Nice.Spec.Range
 import Mathlib.Data.List.Sublists
 
-namespace Nice
+namespace NiceSearch
 
 /-! ### LSD-1: low digits are determined by the suffix -/
 
@@ -102,4 +102,4 @@ example : 12 ∉ lsdBitmap 10 2 := by decide
 /-- 69's suffix survives at every depth. -/
 example : 69 % 10 ^ 2 ∈ lsdBitmap 10 2 := by decide
 
-end Nice
+end NiceSearch

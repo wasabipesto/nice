@@ -5,7 +5,7 @@ is strictly incomplete (THY-6).
 -/
 import Nice.Model.Cross
 
-namespace Nice
+namespace NiceSearch
 
 /-- Claim THY-3: once some output digits are fixed, the rest sum to the
 complement — a digit-sum window on the unassigned positions is vacuous. -/
@@ -61,4 +61,4 @@ project's cost model is `λ_b` times an empirical tail correction. -/
 noncomputable def witnessRate (b : ℕ) : ℚ :=
   (baseRangeSize b : ℚ) * (Nat.factorial b : ℚ) / ((b : ℚ) ^ b)
 
-end Nice
+end NiceSearch

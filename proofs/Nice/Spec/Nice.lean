@@ -9,7 +9,7 @@ import Mathlib.Data.List.Perm.Basic
 import Mathlib.Data.Finset.Card
 import Mathlib.Algebra.BigOperators.Group.List.Basic
 
-namespace Nice
+namespace NiceSearch
 
 /-- The concatenated output digits of `n`, least significant first within each power. -/
 def outputDigits (b n : ℕ) : List ℕ := Nat.digits b (n ^ 2) ++ Nat.digits b (n ^ 3)
@@ -66,4 +66,4 @@ theorem nice_digit_sum {b n : ℕ} (h : IsNice b n) :
     (outputDigits b n).sum = b * (b - 1) / 2 := by
   rw [h.sum_eq, sum_range_eq]
 
-end Nice
+end NiceSearch

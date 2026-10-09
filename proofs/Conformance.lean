@@ -63,7 +63,7 @@ def checkResidues (r : Report) : IO Report := do
   for j in ← load "residue.json" do
     let b ← orFail (getNat j "base")
     let want ← orFail (getNatList j "residues")
-    r := r.check s!"residueFilter {b}" (sortedList (Nice.residueFilter b) == want)
+    r := r.check s!"residueFilter {b}" (sortedList (NiceSearch.residueFilter b) == want)
   pure r
 
 def checkLsd (r : Report) : IO Report := do
@@ -72,13 +72,13 @@ def checkLsd (r : Report) : IO Report := do
     let b ← orFail (getNat j "base")
     let k ← orFail (getNat j "k")
     let want ← orFail (getNatList j "valid")
-    r := r.check s!"lsdBitmap {b} {k}" (sortedList (Nice.lsdBitmap b k) == want)
+    r := r.check s!"lsdBitmap {b} {k}" (sortedList (NiceSearch.lsdBitmap b k) == want)
   pure r
 
 /-- Is `n` the least valid number at or after `start`? Checked by scanning. -/
 def leastValidFrom (b k start n : ℕ) : Bool :=
-  start ≤ n && decide (Nice.IsValid b k n) &&
-    (List.range (n - start)).all fun d => !decide (Nice.IsValid b k (start + d))
+  start ≤ n && decide (NiceSearch.IsValid b k n) &&
+    (List.range (n - start)).all fun d => !decide (NiceSearch.IsValid b k (start + d))
 
 def checkStride (r : Report) : IO Report := do
   let mut r := r
@@ -88,8 +88,8 @@ def checkStride (r : Report) : IO Report := do
     let modulus ← orFail (getNat j "modulus")
     let residues ← orFail (getNatList j "valid_residues")
     let gaps ← orFail (getNatList j "gap_table")
-    r := r.check s!"strideModulus {b} {k}" (Nice.strideModulus b k == modulus)
-    let model := Nice.residueList b k
+    r := r.check s!"strideModulus {b} {k}" (NiceSearch.strideModulus b k == modulus)
+    let model := NiceSearch.residueList b k
     r := r.check s!"validResidues {b} {k}" (model == residues)
     -- gaps: each entry is the distance to the next residue, wrapping at the modulus
     let n := residues.length
@@ -104,7 +104,7 @@ def checkStride (r : Report) : IO Report := do
       a.toList.mapM fun x => match x with
         | .num m => pure m.mantissa.toNat
         | _ => throw "low_digits element")
-    let modelLows := residues.map fun res => sortedList (Nice.lowMask b k res)
+    let modelLows := residues.map fun res => sortedList (NiceSearch.lowMask b k res)
     r := r.check s!"low_digit_masks {b} {k}" (modelLows == lowSets)
     -- first_valid_at_or_after against the spec
     for fv in ← orFail (getArr j "first_valid") do
@@ -126,8 +126,8 @@ def checkRanges (r : Report) : IO Report := do
     let ok := match start, stop with
       | some s, some e =>
         (List.range (e + e / 4 + 8)).all fun n =>
-          decide (Nice.InBaseRange b n) == (s ≤ n && n < e)
-      | none, none => (List.range (b ^ 3 + 8)).all fun n => !decide (Nice.InBaseRange b n)
+          decide (NiceSearch.InBaseRange b n) == (s ≤ n && n < e)
+      | none, none => (List.range (b ^ 3 + 8)).all fun n => !decide (NiceSearch.InBaseRange b n)
       | _, _ => false
     r := r.check s!"baseRange {b}" ok
   pure r
@@ -143,8 +143,8 @@ def checkSeeded (r : Report) : IO Report := do
       match arr.toList with
       | [.str nStr, .bool seeded, .bool plain] =>
         let some n := nStr.toNat? | throw (IO.userError "seeded sample n")
-        r := r.check s!"seeded {b} {k} {n}" (decide (Nice.seededDigits b k n).Nodup == seeded)
-        r := r.check s!"isNice {b} {n}" (decide (Nice.IsNice b n) == plain)
+        r := r.check s!"seeded {b} {k} {n}" (decide (NiceSearch.seededDigits b k n).Nodup == seeded)
+        r := r.check s!"isNice {b} {n}" (decide (NiceSearch.IsNice b n) == plain)
       | _ => throw (IO.userError "seeded sample shape")
   pure r
 
@@ -160,7 +160,7 @@ def checkMsd (r : Report) : IO Report := do
         let some stop := e.toNat? | throw (IO.userError "verdict end")
         -- Rust `has_duplicate_msd_prefix` is true exactly when the model's
         -- SDR search fails (size-1 ranges are always Live in Rust).
-        let model := if stop - start ≤ 1 then false else !Nice.analyzeRange b start (stop - 1)
+        let model := if stop - start ≤ 1 then false else !NiceSearch.analyzeRange b start (stop - 1)
         r := r.check s!"analyze_range {b} [{start}, {stop})" (model == rejected)
       | _ => throw (IO.userError "verdict shape")
     for l in ← orFail (getArr j "leaves") do
@@ -179,7 +179,7 @@ def checkMsd (r : Report) : IO Report := do
             | _, _ => throw "leaf nat"
           | _ => throw "leaf shape")
         r := r.check s!"get_valid_ranges_recursive {b} depth {depth} min {minSize}"
-          (Nice.validRanges b minSize depth start stop == want)
+          (NiceSearch.validRanges b minSize depth start stop == want)
       | _ => throw (IO.userError "leaves shape")
   pure r
 
@@ -207,14 +207,14 @@ def checkPipeline (r : Report) : IO Report := do
             | some a, some b => pure (a, b, digits)
             | _, _ => throw "leaf nat"
           | _ => throw "masked leaf shape")
-        let model := (Nice.validRangesMasked b k minSize depth start stop ∅).map fun r =>
+        let model := (NiceSearch.validRangesMasked b k minSize depth start stop ∅).map fun r =>
           (r.1, r.2.1, sortedList r.2.2)
         r := r.check s!"get_valid_ranges_recursive_masked {b} depth {depth} min {minSize}"
           (model == want)
       | _ => throw (IO.userError "masked leaves shape")
     let nice ← orFail (getNatList j "nice")
     -- production constants: MSD_RECURSIVE_MIN_RANGE_SIZE = 8000, MAX_DEPTH = 22
-    let model := Nice.processRangeNiceonly b k 8000 22 start stop
+    let model := NiceSearch.processRangeNiceonly b k 8000 22 start stop
     r := r.check s!"process_range_niceonly {b}" (model == nice)
   pure r
 
@@ -230,14 +230,14 @@ def checkGpuConfig (r : Report) : IO Report := do
     let b ← orFail (getNat j "base")
     let (e, d) ← orFail (getPair j "chunk")
     let (e16, d16) ← orFail (getPair j "chunk_u16")
-    r := r.check s!"chunk_constants {b}" (Nice.chunkExp b (2 ^ 31) == e && b ^ e == d)
-    r := r.check s!"chunk_constants_u16 {b}" (Nice.chunkExp b (2 ^ 16) == e16 && b ^ e16 == d16)
+    r := r.check s!"chunk_constants {b}" (NiceSearch.chunkExp b (2 ^ 31) == e && b ^ e == d)
+    r := r.check s!"chunk_constants_u16 {b}" (NiceSearch.chunkExp b (2 ^ 16) == e16 && b ^ e16 == d16)
     let pf ← orFail (getNatOpt j "prefilter_digits")
     let start ← orFail (getNatOpt j "range_start")
     match pf, start with
     | some p, some s =>
       -- the Rust depth (float log, minus one for safety) never exceeds the exact depth
-      r := r.check s!"prefilter_digits {b}" (p ≤ Nice.prefilterDepth b s)
+      r := r.check s!"prefilter_digits {b}" (p ≤ NiceSearch.prefilterDepth b s)
     | some _, none => r := r.check s!"prefilter_digits {b} without a range" false
     | none, _ => pure ()
   pure r

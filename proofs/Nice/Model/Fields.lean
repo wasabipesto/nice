@@ -10,7 +10,7 @@ SQL match in `reassign_fields_to_chunks` relies on (FLD-1).
 -/
 import Mathlib.Tactic
 
-namespace Nice
+namespace NiceSearch
 
 /-- The field containing `n`. -/
 def fieldIndex (lo s n : ℕ) : ℕ := (n - lo) / s
@@ -75,4 +75,4 @@ theorem chunk_of_field_start {lo s per i : ℕ} (hs : 0 < s) (hper : 0 < per) :
       _ ≤ (i / per + 1) * per * s := Nat.mul_le_mul_right _ this
       _ = (i / per + 1) * (per * s) := by ring
 
-end Nice
+end NiceSearch

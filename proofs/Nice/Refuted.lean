@@ -4,7 +4,7 @@ a result: it is what stops the idea being re-derived.
 -/
 import Nice.Model.Lsd
 
-namespace Nice
+namespace NiceSearch
 
 /-- Claim REF-1: the cross MSD×LSD skip shipped in v3.2.12–v3.2.15 treated
 `first / b^k = last / b^k` as "the low digits are constant over the range"
@@ -34,4 +34,4 @@ theorem mod_pow_not_constant {b k n : ℕ} (hb : 2 ≤ b) (hk : 1 ≤ k) :
   rw [Nat.mod_eq_of_lt hpos] at this
   exact one_ne_zero this
 
-end Nice
+end NiceSearch

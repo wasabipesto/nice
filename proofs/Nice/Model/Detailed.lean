@@ -8,7 +8,7 @@ is `b` exactly for nice numbers (DEF-2), and it is never zero (DEF-3).
 -/
 import Nice.Model.Seeded
 
-namespace Nice
+namespace NiceSearch
 
 /-- Claim DEF-2: inside the range, `num_uniques = b` is niceness. -/
 theorem numUniques_eq_iff_isNice {b n : ℕ} (hb : 2 ≤ b) (hr : InBaseRange b n) :
@@ -68,4 +68,4 @@ theorem isNearMiss_of_isNice {b n : ℕ} (hb : 2 ≤ b) (h : IsNice b n) : IsNea
   unfold nearMissCutoff
   omega
 
-end Nice
+end NiceSearch

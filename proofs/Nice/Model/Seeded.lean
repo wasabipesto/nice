@@ -12,7 +12,7 @@ import Nice.Model.Stride
 
 open scoped List
 
-namespace Nice
+namespace NiceSearch
 
 /-- A list of exactly `b` digits below `b` permutes `0..b-1` iff it has no repeats. -/
 theorem perm_range_iff_nodup {b : ℕ} {l : List ℕ} (hlen : l.length = b) (hlt : ∀ d ∈ l, d < b) :
@@ -82,4 +82,4 @@ theorem seeded_iff_isNice {b n k : ℕ} (hb : 2 ≤ b) (hr : InBaseRange b n)
     (seededDigits b k n).Nodup ↔ IsNice b n := by
   rw [isNice_iff_nodup hb hr, (seededDigits_perm hb hk2 hk3).nodup_iff]
 
-end Nice
+end NiceSearch

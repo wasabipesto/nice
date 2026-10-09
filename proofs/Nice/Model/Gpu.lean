@@ -16,7 +16,7 @@ enumerate exactly the stride candidates (`walk_eq_filter`).
 import Nice.Model.Stride
 import Mathlib.Data.Finset.Sort
 
-namespace Nice
+namespace NiceSearch
 
 /-- The Rust `valid_residues` vector: the residue set, sorted. -/
 def residueList (b k : ℕ) : List ℕ := (validResidues b k).sort (· ≤ ·)
@@ -117,4 +117,4 @@ theorem exists_ordinal_eq {b k B0 n : ℕ} (hb : 2 ≤ b)
     rw [Nat.add_mod, hB0, Nat.add_zero, Nat.mod_mod]
   omega
 
-end Nice
+end NiceSearch

@@ -12,7 +12,7 @@ import Mathlib.Data.Nat.Digits.Lemmas
 import Mathlib.Data.Nat.Log
 import Mathlib.Data.List.GetD
 
-namespace Nice
+namespace NiceSearch
 
 /-- Digit `j` of `n` in base `b`, least significant first. -/
 def digit (b n j : ℕ) : ℕ := n / b ^ j % b
@@ -50,4 +50,4 @@ theorem numDigits_le_iff {b : ℕ} (hb : 2 ≤ b) {n : ℕ} (hn : n ≠ 0) (j : 
 theorem lt_pow_numDigits {b : ℕ} (hb : 2 ≤ b) (n : ℕ) : n < b ^ numDigits b n :=
   Nat.lt_base_pow_length_digits hb
 
-end Nice
+end NiceSearch

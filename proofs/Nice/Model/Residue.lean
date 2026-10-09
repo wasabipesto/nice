@@ -8,7 +8,7 @@ The filter keeps the residues `r < b-1` with `r² + r³ ≡ b(b-1)/2`.
 import Nice.Spec.Nice
 import Mathlib.Data.Nat.Digits.Lemmas
 
-namespace Nice
+namespace NiceSearch
 
 /-- The target residue: `b(b-1)/2 mod (b-1)`. -/
 def residueTarget (b : ℕ) : ℕ := b * (b - 1) / 2 % (b - 1)
@@ -67,4 +67,4 @@ theorem no_nice_eleven : ∀ n, ¬ IsNice 11 n :=
 /-- The base-10 table the Rust test pins: `[0, 3, 6, 8]`. -/
 theorem residueFilter_ten : residueFilter 10 = {0, 3, 6, 8} := by decide
 
-end Nice
+end NiceSearch

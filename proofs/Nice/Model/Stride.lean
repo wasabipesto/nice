@@ -13,7 +13,7 @@ import Nice.Model.Residue
 import Nice.Model.Lsd
 import Mathlib.Data.List.Sort
 
-namespace Nice
+namespace NiceSearch
 
 /-- The combined modulus `M = (b-1)·b^k`. -/
 def strideModulus (b k : ℕ) : ℕ := (b - 1) * b ^ k
@@ -225,4 +225,4 @@ theorem walk_eq_filter {b k : ℕ} (hb : 2 ≤ b) (hV : (validResidues b k).None
   intro x
   rw [mem_walk, mem_strideCandidates]
 
-end Nice
+end NiceSearch

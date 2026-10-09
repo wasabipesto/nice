@@ -9,7 +9,7 @@ here says the replacement is exact and stays inside its word size.
 import Nice.Model.Lsd
 import Mathlib.Tactic
 
-namespace Nice
+namespace NiceSearch
 
 /-! ### GPU-4: lane tiling -/
 
@@ -305,4 +305,4 @@ theorem limb_step_lt {B a c acc carry : ℕ} (hB : B ≤ 2 ^ 16) (ha : a < B) (h
   have h2 : (B - 1) * (B - 1) ≤ (2 ^ 16 - 1) * (2 ^ 16 - 1) := Nat.mul_le_mul (by omega) (by omega)
   omega
 
-end Nice
+end NiceSearch
