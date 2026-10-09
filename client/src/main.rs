@@ -1084,7 +1084,7 @@ fn field_lookahead(cli: &Cli) -> usize {
     #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
     {
         if cli.gpu && cli.mode == SearchMode::Niceonly && cli.repeat {
-            return nice_common::gpu_niceonly::fields_in_flight().saturating_sub(1);
+            return nice_common::gpu_niceonly::FIELDS_IN_FLIGHT.saturating_sub(1);
         }
     }
     let _ = cli;

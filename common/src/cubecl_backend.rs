@@ -32,8 +32,8 @@ use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
 use crate::gpu_niceonly::{
-    DeviceResult, GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline, NiceonlyStats, PendingField,
-    RangeSink, batches_in_flight, lane_shift_for, stride_chunk_bits,
+    BATCHES_IN_FLIGHT, DeviceResult, GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline,
+    NiceonlyStats, PendingField, RangeSink, lane_shift_for, stride_chunk_bits,
 };
 use crate::gpu_route::{FieldTicket, NiceonlyGpu, Route};
 use crate::join_plan::{JoinCeiling, JoinField, JoinLimits, plan_join};
@@ -2394,7 +2394,7 @@ struct CubeclNiceonlySink<R: cubecl::prelude::Runtime> {
     open: HashMap<u64, CubeclNiceonlyRun<R>>,
     /// One fence per launched batch, oldest first: the `CubeCL` analogue of
     /// the CUDA sink's event ring. Before the ring exceeds
-    /// [`batches_in_flight`] the oldest fence is awaited, so the dispatch
+    /// [`BATCHES_IN_FLIGHT`] the oldest fence is awaited, so the dispatch
     /// thread blocks for exactly one batch at a time and the descriptor
     /// channel keeps draining. A full `client.sync()` every N launches was
     /// tried first and is the wrong shape: it parks the dispatch thread for N
@@ -2422,8 +2422,8 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlySink<R> {
             .get_mut(&field)
             .ok_or_else(|| anyhow::anyhow!("launch for a field that is not open ({field})"))?;
         // Backpressure: wait for the oldest batch before adding another,
-        // once `batches_in_flight` are outstanding.
-        while self.inflight.len() >= batches_in_flight() {
+        // once `BATCHES_IN_FLIGHT` are outstanding.
+        while self.inflight.len() >= BATCHES_IN_FLIGHT {
             if let Some(oldest) = self.inflight.pop_front() {
                 cubecl::future::block_on(oldest)
                     .map_err(|e| anyhow::anyhow!("launch fence failed: {e:?}"))?;
@@ -3185,15 +3185,16 @@ mod tests {
     /// still be identical.
     /// Throughput of the continuous pipeline on a fixed run of fields on
     /// the default wgpu device, so two configurations can be compared on
-    /// identical work. Env as in production (`NICE_GPU_FIELDS_IN_FLIGHT`,
-    /// `NICE_GPU_MSD_FLOOR`); `NICE_TEST_FIELDS` (required: it is also the
-    /// opt-in, since the parity workflow runs this module's ignored tests on
-    /// lavapipe) fields of 1e13 in base 54 from the Anvil region.
+    /// identical work. Fields are queued `FIELDS_IN_FLIGHT` deep as in
+    /// production, and `NICE_GPU_MSD_FLOOR` applies as there;
+    /// `NICE_TEST_FIELDS` (required: it is also the opt-in, since the parity
+    /// workflow runs this module's ignored tests on lavapipe) fields of 1e13
+    /// in base 54 from the Anvil region.
     #[test]
     #[ignore = "requires a wgpu device; prints throughput"]
     #[allow(clippy::cast_precision_loss)]
     fn pipeline_throughput_fixed_fields() {
-        use crate::gpu_niceonly::{fields_in_flight, msd_floor_in_use};
+        use crate::gpu_niceonly::{FIELDS_IN_FLIGHT, msd_floor_in_use};
         use crate::gpu_route::{NiceonlyStarted, begin_niceonly};
         // The parity workflow runs every ignored test in this module on a
         // software rasterizer; a throughput run there is hours of nothing.
@@ -3214,7 +3215,7 @@ mod tests {
         if let NiceonlyStarted::Queued(ticket) = begin_niceonly(&ctx, &warm, base).unwrap() {
             ctx.finish(ticket).unwrap();
         }
-        let lookahead = fields_in_flight().saturating_sub(1);
+        let lookahead = FIELDS_IN_FLIGHT.saturating_sub(1);
         let t = std::time::Instant::now();
         let mut queued = std::collections::VecDeque::new();
         let mut found = 0usize;
@@ -3233,7 +3234,7 @@ mod tests {
         let secs = t.elapsed().as_secs_f64();
         eprintln!(
             "THROUGHPUT fields_in_flight={} floor_now={} fields={n} secs={secs:.2} rate={:.3e} n/s found={found}",
-            fields_in_flight(),
+            FIELDS_IN_FLIGHT,
             msd_floor_in_use(),
             (n as f64) * (size as f64) / secs
         );
