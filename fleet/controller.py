@@ -192,6 +192,27 @@ DEFAULT_CONFIG = {
         "exec nice_client {mode} --gpu --repeat --telemetry --no-progress "
         "--api-base {api_base} --username {username} --threads {threads}"
     ),
+    # With `host_cpu_client` on, an exploit also runs a CPU client of its own
+    # mode on the host's spare threads. It starts after the sweep, so the box's
+    # benchmarks aren't skewed, and dies with the container when the GPU client
+    # (PID 1) exits. The overlap join keeps the host busy for only 0.2-4% of a
+    # GPU field, and on an Anvil A100 a CPU client beside the GPU left the GPU's
+    # rate unchanged (-0.7%).
+    "onstart_exploit_host_cpu": (
+        _BENCH_SWEEP + " ; "
+        "( nice_client {mode} --repeat --telemetry --no-progress "
+        "--api-base {api_base} --username {username} --threads {cpu_threads} "
+        "> /dev/null 2>&1 & ) ; "
+        "exec nice_client {mode} --gpu --repeat --telemetry --no-progress "
+        "--api-base {api_base} --username {username} --threads {threads}"
+    ),
+    # Run that CPU client (per mode via exploit_modes; off by default). It gets
+    # the host's threads less `host_cpu_reserve_threads`, and is skipped where
+    # that leaves fewer than `host_cpu_min_threads`: a nice-only field takes a
+    # thread-starved client long enough to outlive its claim.
+    "host_cpu_client": False,
+    "host_cpu_reserve_threads": 2,
+    "host_cpu_min_threads": 4,
     # Explore runs the sweep then retires itself using the instance-scoped API
     # key Vast injects; the controller's TTL is the backstop if that fails.
     "onstart_explore": (
@@ -825,17 +846,44 @@ def reconcile_invoices(cfg, db, dry):
     )
 
 
+def host_cpu_threads(cfg, purpose, mode, threads):
+    """Threads for an exploit's host CPU client, or 0 for none: off unless
+    `host_cpu_client` is on for the mode, and none where the host's spare
+    threads fall below `host_cpu_min_threads`."""
+    if purpose != "exploit":
+        return 0
+    on = mcfg(cfg, mode, "host_cpu_client") if mode else cfg.get("host_cpu_client")
+    if not on:
+        return 0
+    spare = threads - int(cfg["host_cpu_reserve_threads"])
+    return spare if spare >= int(cfg["host_cpu_min_threads"]) else 0
+
+
+def render_onstart(cfg, purpose, mode, offer):
+    """The instance's start script: explore's sweep-and-retire, or exploit's
+    sweep then work loop, with a host CPU client beside it when configured."""
+    threads = int(offer.get("cpu_cores_effective") or 4)
+    cpu_threads = host_cpu_threads(cfg, purpose, mode, threads)
+    if purpose != "exploit":
+        tpl = cfg["onstart_explore"]
+    elif cpu_threads:
+        tpl = cfg["onstart_exploit_host_cpu"]
+    else:
+        tpl = cfg["onstart_exploit"]
+    return tpl.format(
+        mode=mode or cfg.get("mode", "niceonly"),  # exploit runs this mode; explore ignores it
+        api_base=cfg["api_base"],
+        username=cfg["username"],
+        threads=threads,
+        cpu_threads=cpu_threads,
+    )
+
+
 def create_instance(cfg, db, offer, purpose, bid, ttl_hours, ev, pounce, dry, mode=None,
                     version=None):
     if not version:
         raise ValueError("create_instance needs the client version it launches")
-    onstart_tpl = cfg["onstart_exploit"] if purpose == "exploit" else cfg["onstart_explore"]
-    onstart = onstart_tpl.format(
-        mode=mode or cfg.get("mode", "niceonly"),  # exploit runs this mode; explore ignores it
-        api_base=cfg["api_base"],
-        username=cfg["username"],
-        threads=int(offer.get("cpu_cores_effective") or 4),
-    )
+    onstart = render_onstart(cfg, purpose, mode, offer)
     label = f"{cfg['label_prefix']}-{purpose}"
     desc = (
         f"{purpose} offer {offer['id']} {offer.get('gpu_name')} / "

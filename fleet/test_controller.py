@@ -1295,5 +1295,55 @@ class OnstartTemplateTests(unittest.TestCase):
         self.assertTrue(expl.startswith(sweep) and expo.startswith(sweep))
 
 
+class HostCpuClientTests(unittest.TestCase):
+    def cfg(self, **over):
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update(api_base="http://x", username="u")
+        cfg.update(over)
+        return cfg
+
+    def test_off_by_default_leaves_the_exploit_script_unchanged(self):
+        cfg = self.cfg()
+        got = controller.render_onstart(cfg, "exploit", "niceonly", {"cpu_cores_effective": 16})
+        want = DEFAULT_CONFIG["onstart_exploit"].format(
+            mode="niceonly", api_base="http://x", username="u", threads=16)
+        self.assertEqual(got, want)
+
+    def test_on_runs_a_cpu_client_of_the_same_mode_after_the_sweep(self):
+        cfg = self.cfg(host_cpu_client=True)
+        for mode in ("niceonly", "detailed"):
+            got = controller.render_onstart(cfg, "exploit", mode, {"cpu_cores_effective": 16})
+            cpu = (f"( nice_client {mode} --repeat --telemetry --no-progress "
+                   "--api-base http://x --username u --threads 14 > /dev/null 2>&1 & )")
+            gpu = f"exec nice_client {mode} --gpu --repeat"
+            sweep = controller._BENCH_SWEEP.format(
+                mode=mode, api_base="http://x", username="u", threads=16)
+            self.assertTrue(got.startswith(sweep), mode)
+            self.assertIn(cpu, got, mode)
+            self.assertLess(got.index(cpu), got.index(gpu), mode)
+            # The GPU client keeps every thread as its label, as before.
+            self.assertIn("--threads 16", got[got.index(gpu):], mode)
+
+    def test_too_few_spare_threads_runs_no_cpu_client(self):
+        cfg = self.cfg(host_cpu_client=True)
+        for cores in (2, 4, 5):
+            got = controller.render_onstart(cfg, "exploit", "niceonly", {"cpu_cores_effective": cores})
+            self.assertNotIn("( nice_client", got, cores)
+        got = controller.render_onstart(cfg, "exploit", "niceonly", {"cpu_cores_effective": 6})
+        self.assertIn("--threads 4 > /dev/null", got)
+
+    def test_per_mode_override_and_explore_untouched(self):
+        cfg = self.cfg(exploit_modes={"niceonly": {"host_cpu_client": True}, "detailed": {}})
+        self.assertIn("( nice_client", controller.render_onstart(
+            cfg, "exploit", "niceonly", {"cpu_cores_effective": 12}))
+        self.assertNotIn("( nice_client", controller.render_onstart(
+            cfg, "exploit", "detailed", {"cpu_cores_effective": 12}))
+        cfg = self.cfg(host_cpu_client=True)
+        self.assertEqual(
+            controller.render_onstart(cfg, "explore", None, {"cpu_cores_effective": 12}),
+            DEFAULT_CONFIG["onstart_explore"].format(
+                mode="niceonly", api_base="http://x", username="u", threads=12))
+
+
 if __name__ == "__main__":
     unittest.main()
