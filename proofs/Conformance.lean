@@ -242,6 +242,23 @@ def checkGpuConfig (r : Report) : IO Report := do
     | none, _ => pure ()
   pure r
 
+def checkAffine (r : Report) : IO Report := do
+  let mut r := r
+  for j in ← load "affine.json" do
+    let b ← orFail (getNat j "base")
+    for s in ← orFail (getArr j "samples") do
+      let arr ← orFail s.getArr?
+      match arr.toList with
+      | [.str nStr, .arr known, .bool survives] =>
+        let some nmod := nStr.toNat? | throw (IO.userError "affine nmod")
+        let ks ← orFail (known.toList.mapM fun v => match v with
+          | .num m => pure m.mantissa.toNat
+          | _ => throw "known digit")
+        r := r.check s!"affine_filter::survives {b} {nmod}"
+          (NiceSearch.affineSurvives b 3 nmod ks.toFinset == survives)
+      | _ => throw (IO.userError "affine sample shape")
+  pure r
+
 end Conformance
 
 open Conformance in
@@ -255,6 +272,7 @@ def main : IO UInt32 := do
   r ← checkPipeline r
   r ← checkGpuConfig r
   r ← checkSeeded r
+  r ← checkAffine r
   for f in r.failures.reverse do
     IO.println s!"FAIL: {f}"
   IO.println s!"{r.checks} checks, {r.failures.length} failures"

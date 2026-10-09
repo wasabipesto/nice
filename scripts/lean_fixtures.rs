@@ -11,6 +11,7 @@
 //! tables the code builds, not throughput. Regenerate with
 //! `just lean-fixtures`; the output is checked in.
 
+use nice_common::affine_filter;
 use nice_common::base_range::get_base_range_u128;
 use nice_common::client_process::{get_is_nice, get_is_nice_with_known_lsd};
 use nice_common::lsd_filter::get_valid_multi_lsd_bitmap;
@@ -104,6 +105,26 @@ struct Seeded {
     k: u32,
     /// (n, seeded verdict, plain verdict)
     samples: Vec<(String, bool, bool)>,
+}
+
+#[derive(Serialize)]
+struct Affine {
+    base: u32,
+    /// (n mod b^6, known digits, `affine_filter::survives`)
+    samples: Vec<(String, Vec<u32>, bool)>,
+}
+
+/// A deterministic stream for the samples (64-bit LCG, high half).
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 16
+    }
 }
 
 fn digits_of_mask(mask: u64) -> Vec<u32> {
@@ -332,5 +353,38 @@ fn main() {
         serde_json::to_string_pretty(&seeded).unwrap(),
     )
     .unwrap();
+    // The affine middle-digit filter on every specialised base: random
+    // n mod b^6 against random known-digit masks of 4 to 15 digits, plus
+    // empty masks, so both verdicts occur.
+    let mut rng = Lcg(0x5eed_1234_abcd_ef01);
+    let affine: Vec<Affine> = (40..=64)
+        .filter(|&base| affine_filter::supports(base, 3))
+        .map(|base| {
+            let b6 = u64::from(base).pow(6);
+            let samples = (0..160)
+                .map(|i| {
+                    let nmod = rng.next() % b6;
+                    let mut known = 0u64;
+                    if i % 4 != 0 {
+                        for _ in 0..(4 + rng.next() % 12) {
+                            known |= 1u64 << (rng.next() % u64::from(base));
+                        }
+                    }
+                    (
+                        nmod.to_string(),
+                        digits_of_mask(known),
+                        affine_filter::survives(base, nmod, known),
+                    )
+                })
+                .collect();
+            Affine { base, samples }
+        })
+        .collect();
+    fs::write(
+        out.join("affine.json"),
+        serde_json::to_string_pretty(&affine).unwrap(),
+    )
+    .unwrap();
+
     println!("fixtures written to {}", out.display());
 }

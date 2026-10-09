@@ -226,6 +226,7 @@ impl StrideTable {
     ///
     /// Lean: `NiceSearch.walk_eq_filter` (STR-2) — the walk visits exactly the valid
     /// candidates of the range, in order.
+    /// Lean: `NiceSearch.affine_mid_digit` (AFF-1) — the filter and its gate.
     #[must_use]
     pub fn iterate_range_masked(
         &self,

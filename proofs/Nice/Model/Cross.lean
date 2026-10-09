@@ -10,9 +10,10 @@ would repeat it across two distinct positions, so none of its candidates
 in the range is nice (CRS-1). A certificate proved for a range holds on
 its sub-ranges, so leaves inherit their ancestors' digits (CRS-2). The
 pipeline is: masked subdivision, then for each leaf the stride walk with
-the one-AND test and the nice check (END-1).
+the one-AND test, the affine middle-digit filter where the walk applies it
+(AFF-1), and the nice check (END-1).
 -/
-import Nice.Model.Msd
+import Nice.Model.Affine
 import Nice.Model.Seeded
 
 namespace NiceSearch
@@ -116,19 +117,22 @@ def validRangesMasked (b k minSize : ℕ) :
         validRangesMasked b k minSize d start (start + (stop - start) / 2) mask ++
           validRangesMasked b k minSize d (start + (stop - start) / 2) stop mask
 
-/-- Claim CRS-2 with MSD-7: every nice `n` of the input lies in a leaf whose
-mask consists of high digits of `n`. -/
-theorem validRangesMasked_cover {b k minSize : ℕ} (hb : 2 ≤ b) (d : ℕ) :
-    ∀ start stop inh n, start ≤ n → n < stop → IsNice b n →
-      (∀ x ∈ inh, HighDigit b k n x) →
+/-- The masked recursion's cover for any property `Q` of mask digits that every
+analysed range's certificate has: every nice `n` of the input lies in a leaf
+whose mask digits all have `Q`. (An analysed range `[lo, hi]` holds more than
+`minSize` numbers.) -/
+theorem validRangesMasked_cover_of {b k minSize n : ℕ} (hb : 2 ≤ b) (hn : IsNice b n)
+    (Q : ℕ → Prop)
+    (hQ : ∀ lo hi, lo ≤ n → n ≤ hi → minSize < hi + 1 - lo → ∀ x ∈ fixedDigits b lo hi k, Q x)
+    (d : ℕ) : ∀ start stop inh, start ≤ n → n < stop → (∀ x ∈ inh, Q x) →
       ∃ r ∈ validRangesMasked b k minSize d start stop inh,
-        r.1 ≤ n ∧ n < r.2.1 ∧ ∀ x ∈ r.2.2, HighDigit b k n x := by
+        r.1 ≤ n ∧ n < r.2.1 ∧ ∀ x ∈ r.2.2, Q x := by
   induction d with
   | zero =>
-    intro start stop inh n h1 h2 _ hinh
+    intro start stop inh h1 h2 hinh
     exact ⟨(start, stop, inh), by simp [validRangesMasked], h1, h2, hinh⟩
   | succ d ih =>
-    intro start stop inh n h1 h2 hn hinh
+    intro start stop inh h1 h2 hinh
     unfold validRangesMasked
     split_ifs with hsmall hrej hnw
     · exact ⟨(start, stop, inh), by simp, h1, h2, hinh⟩
@@ -138,18 +142,74 @@ theorem validRangesMasked_cover {b k minSize : ℕ} (hb : 2 ≤ b) (d : ℕ) :
       rw [Finset.mem_union] at hx
       rcases hx with hx | hx
       · exact hinh x hx
-      · exact highDigit_of_mem_fixedDigits hb h1 (by omega) hx
-    · have hmask : ∀ x ∈ inh ∪ fixedDigits b start (stop - 1) k, HighDigit b k n x := by
+      · exact hQ start (stop - 1) h1 (by omega) (by omega) x hx
+    · have hmask : ∀ x ∈ inh ∪ fixedDigits b start (stop - 1) k, Q x := by
         intro x hx
         rw [Finset.mem_union] at hx
         rcases hx with hx | hx
         · exact hinh x hx
-        · exact highDigit_of_mem_fixedDigits hb h1 (by omega) hx
+        · exact hQ start (stop - 1) h1 (by omega) (by omega) x hx
       rcases Nat.lt_or_ge n (start + (stop - start) / 2) with hmid | hmid
-      · obtain ⟨r, hr, hr1, hr2, hr3⟩ := ih start _ _ n h1 hmid hn hmask
+      · obtain ⟨r, hr, hr1, hr2, hr3⟩ := ih start _ _ h1 hmid hmask
         exact ⟨r, List.mem_append_left _ hr, hr1, hr2, hr3⟩
-      · obtain ⟨r, hr, hr1, hr2, hr3⟩ := ih _ stop _ n hmid h2 hn hmask
+      · obtain ⟨r, hr, hr1, hr2, hr3⟩ := ih _ stop _ hmid h2 hmask
         exact ⟨r, List.mem_append_right _ hr, hr1, hr2, hr3⟩
+
+/-- Claim CRS-2 with MSD-7: every nice `n` of the input lies in a leaf whose
+mask consists of high digits of `n`. -/
+theorem validRangesMasked_cover {b k minSize : ℕ} (hb : 2 ≤ b) (d : ℕ) :
+    ∀ start stop inh n, start ≤ n → n < stop → IsNice b n →
+      (∀ x ∈ inh, HighDigit b k n x) →
+      ∃ r ∈ validRangesMasked b k minSize d start stop inh,
+        r.1 ≤ n ∧ n < r.2.1 ∧ ∀ x ∈ r.2.2, HighDigit b k n x :=
+  fun start stop inh n h1 h2 hn hinh =>
+    validRangesMasked_cover_of hb hn (HighDigit b k n)
+      (fun _ _ hlo hhi _ _ hx => highDigit_of_mem_fixedDigits hb hlo hhi hx) d start stop inh
+      h1 h2 hinh
+
+/-- At or above `b^(2k-1)`, the certificate of a range of two or more numbers
+holds no digit from below position `2k`: consecutive squares there differ by
+more than `b^(2k-1)`, so no such position is constant over the range. This is
+what lets the affine filter test positions `k .. 2k-1` against the certificate. -/
+theorem highDigit_two_of_mem_fixedDigits {b lo hi k n x : ℕ} (hb : 2 ≤ b) (hlo : lo ≤ n)
+    (hhi : n ≤ hi) (hlt : lo < hi) (hn : b ^ (2 * k - 1) ≤ n) (hx : x ∈ fixedDigits b lo hi k) :
+    HighDigit b (2 * k) n x := by
+  unfold fixedDigits at hx
+  rw [List.mem_toFinset, List.mem_map] at hx
+  obtain ⟨c, hc, rfl⟩ := hx
+  rw [List.mem_filter, decide_eq_true_iff] at hc
+  obtain ⟨hc, -, hw⟩ := hc
+  have ⟨he, hpos⟩ := rangeDomains_sound b lo hi c hc
+  have ⟨hj, hmem⟩ := hpos n hlo hhi
+  rw [rangeDomains_dom hc, hw, cyclicInterval_one (digit_lt_base (by omega) _ _),
+    Finset.mem_singleton] at hmem
+  refine ⟨c.e, c.j, he, ?_, hj, hmem⟩
+  -- width zero: the endpoints' powers agree from position `j` up, so they
+  -- differ by less than `b^j`
+  unfold width at hw
+  have hle := Nat.div_le_div_right (c := b ^ c.j) (Nat.pow_le_pow_left hlt.le c.e)
+  have hq : hi ^ c.e / b ^ c.j = lo ^ c.e / b ^ c.j := by omega
+  have hdiff : hi ^ c.e < lo ^ c.e + b ^ c.j := by
+    have h1 := Nat.div_add_mod (hi ^ c.e) (b ^ c.j)
+    have h2 := Nat.div_add_mod (lo ^ c.e) (b ^ c.j)
+    have h3 : hi ^ c.e % b ^ c.j < b ^ c.j := Nat.mod_lt _ (Nat.pow_pos (by omega))
+    rw [hq] at h1
+    generalize hi ^ c.e % b ^ c.j = r₁ at h1 h3
+    generalize lo ^ c.e % b ^ c.j = r₂ at h2
+    generalize b ^ c.j * (lo ^ c.e / b ^ c.j) = q at h1 h2
+    omega
+  -- but the powers of `hi` and of anything below it differ by at least `hi`
+  have hgap : lo ^ c.e + hi ≤ hi ^ c.e := by
+    obtain ⟨h, rfl⟩ : ∃ h, hi = h + 1 := ⟨hi - 1, by omega⟩
+    have hlo' : lo ^ c.e ≤ h ^ c.e := Nat.pow_le_pow_left (by omega) _
+    rcases he with he | he <;> rw [he] at hlo' ⊢
+    · have : (h + 1) ^ 2 = h ^ 2 + 2 * h + 1 := by ring
+      omega
+    · have : (h + 1) ^ 3 = h ^ 3 + 3 * h ^ 2 + 3 * h + 1 := by ring
+      omega
+  have hlt' : b ^ (2 * k - 1) < b ^ c.j := by omega
+  have := (Nat.pow_lt_pow_iff_right (by omega : 1 < b)).mp hlt'
+  omega
 
 theorem validRangesMasked_subset {b k minSize : ℕ} (d : ℕ) :
     ∀ start stop inh r, r ∈ validRangesMasked b k minSize d start stop inh →
@@ -173,30 +233,92 @@ theorem validRangesMasked_subset {b k minSize : ℕ} (d : ℕ) :
 
 /-! ### END-1: the niceonly pipeline -/
 
-/-- `process_range_niceonly`: masked subdivision, then per leaf the stride
-walk, the one-AND certificate test, and the nice check (which the seeded
-check implements, `seeded_iff_isNice`). -/
+/-- `affine_filter::supports`: the bases with a specialised affine path, at stride
+depth 3. -/
+def affineSupports (b k : ℕ) : Bool :=
+  k == 3 && [40, 42, 43, 44, 45, 47, 48, 49, 50, 52, 53, 54, 55, 57, 58, 59, 60, 62, 64].contains b
+
+/-- Whether the walk runs the affine filter on a leaf `[start, stop)`
+(`iterate_range_masked`, `walk_masked`): a supported base, a leaf starting at or
+above `b^(2k-1)`, and fewer than `2^62` numbers (the two-phase walk's offsets;
+otherwise the plain loop runs, without the filter). -/
+def affineGate (b k start stop : ℕ) : Bool :=
+  affineSupports b k && decide (b ^ (2 * k - 1) ≤ start) && decide (stop - start < 2 ^ 62)
+
+/-- The affine stage of a leaf `[start, stop)` with certificate `mask`: the filter
+where the gate holds (`known` = the residue's low digits and the certificate),
+a pass elsewhere. -/
+def affineStage (b k start stop : ℕ) (mask : Finset ℕ) (n : ℕ) : Bool :=
+  !affineGate b k start stop ||
+    affineSurvives b k (n % b ^ (2 * k)) (lowMask b k (n % strideModulus b k) ∪ mask)
+
+/-- `process_range_niceonly`: masked subdivision, then per leaf the stride walk,
+the one-AND certificate test, the affine stage, and the nice check (which the
+seeded check implements, `seeded_iff_isNice`). -/
 def processRangeNiceonly (b k minSize depth start stop : ℕ) : List ℕ :=
   (validRangesMasked b k minSize depth start stop ∅).flatMap fun r =>
     (strideCandidates b k r.1 r.2.1).filter fun n =>
-      decide (Disjoint (lowMask b k (n % strideModulus b k)) r.2.2) && decide (IsNice b n)
+      decide (Disjoint (lowMask b k (n % strideModulus b k)) r.2.2) &&
+        affineStage b k r.1 r.2.1 r.2.2 n && decide (IsNice b n)
 
-/-- Claim END-1 (completeness): every nice number of the range is reported. -/
+/-- The affine stage keeps a nice number of a leaf whose certificate digits are
+high digits of it, and above position `2k` once it is at least `b^(2k-1)`. -/
+theorem affineStage_of_isNice {b k start stop n : ℕ} {mask : Finset ℕ} (hb : 6 ≤ b)
+    (hs : start ≤ n) (h : IsNice b n)
+    (hmask : ∀ x ∈ mask, b ^ (2 * k - 1) ≤ n → HighDigit b (2 * k) n x) :
+    affineStage b k start stop mask n = true := by
+  unfold affineStage
+  cases hg : affineGate b k start stop
+  · rfl
+  simp only [Bool.not_true, Bool.false_or]
+  have hn : b ^ (2 * k - 1) ≤ n := by
+    unfold affineGate at hg
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hg
+    obtain ⟨⟨-, hg1⟩, -⟩ := hg
+    omega
+  have h2 := two_mul_le_numDigits (by omega) hn (Or.inl rfl)
+  have h3 := two_mul_le_numDigits (by omega) hn (Or.inr rfl)
+  apply affineSurvives_of_isNice (by omega) h h2 h3
+  intro x hx
+  rw [Finset.mem_union] at hx
+  rcases hx with hx | hx
+  · rw [lowMask_eq, List.mem_toFinset, List.mem_append] at hx
+    unfold lowDigits at hx
+    rcases hx with hx | hx <;> rw [List.mem_map] at hx <;> obtain ⟨j, hj, rfl⟩ := hx <;>
+      rw [List.mem_range] at hj
+    · exact ⟨2, j, Or.inl rfl, Or.inl hj, by omega, rfl⟩
+    · exact ⟨3, j, Or.inr rfl, Or.inl hj, by omega, rfl⟩
+  · obtain ⟨e, j, he, hj2, hj, hd⟩ := hmask x hx hn
+    exact ⟨e, j, he, Or.inr hj2, hj, hd⟩
+
+/-- Claim END-1 (completeness): every nice number of the range is reported. The
+floor must be at least 1, so that every analysed range holds two numbers: the
+affine stage needs certificates free of positions `k .. 2k-1`. -/
 theorem niceonly_complete {b k minSize depth start stop n : ℕ} (hb : 6 ≤ b) (hk : k ≤ 3)
-    (hs : start ≤ n) (he : n < stop) (h : IsNice b n) :
+    (hmin : 1 ≤ minSize) (hs : start ≤ n) (he : n < stop) (h : IsNice b n) :
     n ∈ processRangeNiceonly b k minSize depth start stop := by
+  -- mask digits are high digits of `n`, above `2k` once `n ≥ b^(2k-1)`
+  have hQ : ∀ lo hi, lo ≤ n → n ≤ hi → minSize < hi + 1 - lo → ∀ x ∈ fixedDigits b lo hi k,
+      HighDigit b k n x ∧ (b ^ (2 * k - 1) ≤ n → HighDigit b (2 * k) n x) :=
+    fun lo hi hlo hhi hsize x hx =>
+      ⟨highDigit_of_mem_fixedDigits (by omega) hlo hhi hx,
+        fun hn => highDigit_two_of_mem_fixedDigits (by omega) hlo hhi (by omega) hn hx⟩
   obtain ⟨r, hr, hr1, hr2, hmask⟩ :=
-    validRangesMasked_cover (b := b) (k := k) (minSize := minSize) (by omega) depth
-      start stop ∅ n hs he h (by simp)
+    validRangesMasked_cover_of (k := k) (minSize := minSize) (by omega) h _ hQ depth
+      start stop ∅ hs he (by simp)
   unfold processRangeNiceonly
   rw [List.mem_flatMap]
   refine ⟨r, hr, ?_⟩
-  rw [List.mem_filter, Bool.and_eq_true, decide_eq_true_iff, decide_eq_true_iff]
-  refine ⟨mem_strideCandidates_of_isNice hb hk hr1 hr2 h, ?_, h⟩
+  rw [List.mem_filter]
+  refine ⟨mem_strideCandidates_of_isNice hb hk hr1 hr2 h, ?_⟩
   have ⟨hk2, hk3⟩ := three_le_numDigits_of_inBaseRange hb (inBaseRange_of_isNice h)
-  rw [Finset.disjoint_left]
-  intro x hlow hhigh
-  exact no_nice_of_low_high (by omega) (by omega) (by omega) hlow (hmask x hhigh) h
+  have hdisj : Disjoint (lowMask b k (n % strideModulus b k)) r.2.2 := by
+    rw [Finset.disjoint_left]
+    intro x hlow hhigh
+    exact no_nice_of_low_high (by omega) (by omega) (by omega) hlow (hmask x hhigh).1 h
+  have hstage := affineStage_of_isNice (stop := r.2.1) hb hr1 h fun x hx => (hmask x hx).2
+  simp only [Bool.and_eq_true, decide_eq_true_eq]
+  exact ⟨⟨hdisj, hstage⟩, h⟩
 
 /-- Claim END-1 (soundness): everything reported is a nice number of the range. -/
 theorem niceonly_sound {b k minSize depth start stop n : ℕ}
@@ -205,7 +327,7 @@ theorem niceonly_sound {b k minSize depth start stop n : ℕ}
   unfold processRangeNiceonly at h
   rw [List.mem_flatMap] at h
   obtain ⟨r, hr, hn⟩ := h
-  rw [List.mem_filter, Bool.and_eq_true, decide_eq_true_iff, decide_eq_true_iff] at hn
+  simp only [List.mem_filter, Bool.and_eq_true, decide_eq_true_eq] at hn
   obtain ⟨hc, -, hnice⟩ := hn
   obtain ⟨h1, h2, -⟩ := mem_strideCandidates.mp hc
   obtain ⟨h3, h4⟩ := validRangesMasked_subset depth start stop ∅ r hr
