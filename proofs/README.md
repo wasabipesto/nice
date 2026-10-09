@@ -27,8 +27,9 @@ Three layers. **Spec** states mathematics only. **Model** contains
 computable Lean functions that do what the Rust does at the algorithmic
 level, each with a soundness theorem against Spec ("if the model rejects,
 no nice number is lost"). **Theory** is what is true about the problem
-independent of the code. The end-to-end target is `END-1`: the modelled
-niceonly pipeline reports every nice number in a field.
+independent of the code. The end-to-end targets are `END-1` and `END-2`:
+the modelled stride pipeline and the modelled overlap join each report
+exactly the nice numbers of a field.
 
 Declarations live in the namespace `NiceSearch`; the library, its modules
 and their paths stay `Nice` (`import Nice.Model.Cross`). The namespace
@@ -59,9 +60,11 @@ dumps the residue tables, LSD bitmaps, stride tables (residues, gaps,
 low-digit masks, `first_valid_at_or_after` samples), base ranges and
 seeded-check verdicts for small parameters into `fixtures/*.json`.
 `just lean-conformance` recomputes each from the executable Lean model
-and diffs (about 9,000 checks, ~10 s). Theorems pin "model = spec"; this
-pins "model = code". The fixtures are checked in; regenerate them when
-the Rust tables change.
+and diffs. The fixtures also hold the affine filter's verdicts and the
+overlap join on small windows: certificates, the bottom list, every
+partition's survivors, the prefilter's count and the slicing. Theorems
+pin "model = spec"; this pins "model = code". The fixtures are checked
+in; regenerate them when the Rust tables change.
 
 ## The registry and the Rust tags
 
@@ -101,11 +104,12 @@ the theorem's hypotheses are the implementation's spec.
 |---|---|---|---|---|---|
 | 0 | 1 | 3 | 0 | 0 | 0 |
 | 1 | 1 | 17 | 0 | 0 | 0 |
-| 2 | 0 | 10 | 0 | 0 | 0 |
-| 3 | 0 | 8 | 0 | 1 | 0 |
-| 4 | 0 | 4 | 0 | 0 | 1 |
+| 2 | 0 | 10 | 0 | 0 | 1 |
+| 3 | 0 | 9 | 0 | 1 | 0 |
+| 4 | 0 | 5 | 0 | 0 | 1 |
 | 5 | 0 | 12 | 0 | 0 | 0 |
-| 6 | 1 | 4 | 0 | 4 | 0 |
+| 6 | 1 | 5 | 0 | 3 | 0 |
+| 7 | 0 | 7 | 0 | 0 | 0 |
 | — | 0 | 0 | 0 | 0 | 2 |
 
 Proved or defined so far:
@@ -127,7 +131,7 @@ Proved or defined so far:
 - **NUM-4** `NiceSearch.Const.stride_modulus_u32`: `(b−1)·b^3 < 2^32` for `b ≤ 256` (u32 stride table)
 - **NUM-4a** `NiceSearch.Const.stride_modulus_gpu`: `(b−1)·b^3 < 2^28` for `b ≤ 128` (`MAX_STRIDE_MODULUS`)
 - **NUM-5** `NiceSearch.Const.mask_width`: digit masks need `b ≤ 64` (u64) / `b ≤ 128` (two words)
-- **NUM-6** `NiceSearch.chunkExp_spec`: GPU chunk constants: `b^e < bound ≤ b^(e+1)` for `e = chunkExp b bound` (maximal), and the split16 shift bound `(div−1)·2^16 < 2^32` (`split16_shift_bound`)
+- **NUM-6** `NiceSearch.chunkExp_spec`: chunk constants: `b^e < bound ≤ b^(e+1)` for `e = chunkExp b bound` (maximal), for the GPU chunks (bounds `2^31`, `2^16`) and the MSD endpoint extraction's chunks (`chunk_digits`, bound `2^32`); and the split16 shift bound `(div−1)·2^16 < 2^32` (`split16_shift_bound`)
 - **NUM-7** `NiceSearch.prefilter_sound`: the prefilter depth `min(numDigits(start²), numDigits(start³)) − 1` computed exactly from the range start is sound for every candidate at or after it
 - **NUM-8** `NiceSearch.Const.mod_m_bound`: `M² + M < 2^64` for `M < 2^32`
 - **NUM-9** `NiceSearch.Const.histogram_bins`: histogram bins cannot overflow u32
@@ -146,6 +150,7 @@ Proved or defined so far:
 - **MSD-2** `NiceSearch.width_recurrence`: width recurrence `diff_j = b·diff_{j+1} + (yd_j − xd_j)` is exact; once `diff ≥ b−1` every lower position is too (`width_ge_of_succ`)
 - **MSD-3** `NiceSearch.powerDomains_sound`: dropping a power's domains (unequal digit counts) is sound
 - **MSD-4** `NiceSearch.no_nice_of_not_hasSDR`: Hall soundness: no injective digit choice ⇒ no nice n in the range; model form `no_nice_of_analyzeRange` for the executable `analyzeRange`
+- **MSD-10** `NiceSearch.sdrClosure_iff`: singleton closure preserves SDR existence: a one-digit domain `{x}` takes `x`, which then leaves every other domain, in both directions (`hasSDR_cons_singleton_iff`); the order of the constraints does not matter (`hasSDR_perm`) and an emptied domain has no SDR (`not_hasSDR_of_empty`); so the closure decides exactly whether an SDR exists (`sdrClosure_iff`)
 - **MSD-6** `NiceSearch.Sound.sublist`: domain-slot overflow only drops constraints
 - **MSD-7** `NiceSearch.validRanges_cover`: recursive subdivision (factor 2, depth fuel, floor): every nice n of the input lies in some emitted leaf; leaves are sub-intervals (`validRanges_subset`)
 - **MSD-8** `NiceSearch.no_nice_of_equal_singletons`: the over-64 prefix path is the singleton-domain case of MSD-4
@@ -154,7 +159,8 @@ Proved or defined so far:
 - **CRS-2** `NiceSearch.validRangesMasked_cover`: the masked recursion: every nice n lies in a leaf whose inherited mask consists of high digits of n (a certificate for a range holds on every sub-range)
 - **CRS-3** `NiceSearch.validRangesMasked_cover`: an empty or partial certificate is sound (mask soundness holds for any accumulated mask, so ignoring certificates only checks more candidates)
 - **REF-1** `NiceSearch.msd_lsd_skip_unsound`: the removed MSD×LSD skip is unsound: witness b=10, k=2, `[68,70)` (quotient test passes, low digits differ, 69 is nice); generally `n mod b^k` is never constant on a range of size > 1 (`mod_pow_not_constant`)
-- **END-1** `NiceSearch.niceonly_complete`: the modelled niceonly pipeline (masked subdivision × stride walk × one-AND × nice check) reports every nice n of the range (`niceonly_complete`, for b ≥ 6, k ≤ 3) and only nice n of the range (`niceonly_sound`)
+- **AFF-1** `NiceSearch.affine_mid_digit`: for `n = s + b^k·t` and `i < m ≤ k`, digit `k + i` of `n²` (of `n³`) is digit `i` of `(⌊s²/b^k⌋ + 2st) mod b^m` (of `(⌊s³/b^k⌋ + 3s²t) mod b^m`); the filter keeps a nice number whose middle positions are real digits and whose known digits sit below `k` or at `2k` and above (`affineSurvives_of_isNice`); at or above `b^(2k−1)` the certificate of a range of two or more numbers holds no position below `2k` (`highDigit_two_of_mem_fixedDigits`)
+- **END-1** `NiceSearch.niceonly_complete`: the modelled niceonly pipeline (masked subdivision × stride walk × one-AND × affine stage × nice check) reports every nice n of the range (`niceonly_complete`, for b ≥ 6, k ≤ 3, floor ≥ 1) and only nice n of the range (`niceonly_sound`)
 - **GPU-1** `NiceSearch.blockTiling_cover`: block tiling (64-chunk blocks, descending powers of two, partial chunk) sums to the field size and covers it without overlap (`blockLens_sum`, `tile_cover`, `tile_disjoint`)
 - **GPU-2** `NiceSearch.validRangesMasked_block`: block starts yield the same leaves and masks as chunk starts: with chunks wider than the floor and the block given j extra depth levels, the masked recursion on a 2^j-chunk block equals the concatenation of the per-chunk recursions (`validRangesMasked_block`; uses MSD-9 and `fixedDigits_sub`)
 - **GPU-3** `NiceSearch.validRangesMasked_cover`: mixing floors within a field loses nothing: the cover theorem holds for every floor and depth, so any per-block choice is sound
@@ -169,7 +175,15 @@ Proved or defined so far:
 - **DET-1b** `NiceSearch.topN_of_superset`: top-N compaction drops nothing: an element with fewer than N strictly larger keys in the whole list has fewer than N in any batch (ties not modelled)
 - **THY-2** `NiceSearch.collapse_of_invariant`: carry-blind collapse: a linear digit statistic invariant under every carry move has `w_{i+1} ≡ b·w_i` (`weight_rel_of_invariant`) and equals `w₀·N (mod m)` (`collapse`)
 - **THY-3** `NiceSearch.complement_sum`: once some output digits are fixed, the rest sum to the complement and form the complement set (`complement_set`): a digit-sum window on the unassigned positions is vacuous
+- **THY-4** `NiceSearch.sieve_b2_complete`: the `b²−1` sieve on `n² + n³` adds nothing to casting out `b−1`s when both powers have at least 3 digits (every nice band with `b ≥ 6`, RNG-3): every residue mod `b²−1` that the digit-sum congruence allows is `(x + y) mod (b²−1)` for digit words `x`, `y` of those lengths with nonzero leading digits that use every digit once (`sieve_b2_complete`; the `c`-subset sums of `0..b−1` fill an interval, `exists_subset_sum`). False without the length condition: base 4, lengths (2, 2) (Janzert's `base_four_sieve_is_incomplete`)
 - **THY-5** `NiceSearch.window_sound`: middle-window filter is sound (digits at `p..p+w` depend on `n mod b^(p+w)`)
 - **THY-6** `NiceSearch.hall_relaxation_incomplete`: the interval-domain Hall check is strictly incomplete: base 10, `[47, 60]` has an SDR but no nice number (by `decide`)
 - **THY-9** `NiceSearch.witnessRate`: witness model `λ_b = range_b · b!/b^b` (definition only)
+- **JOIN-1** `NiceSearch.highDigit_of_cert`: top certificate: the digits common to `a^j` and `e^j` at positions `≥ cap`, from the top down to the first disagreement (`x/b^i = y/b^i`), are digits of `n^j` at positions at or above `cert_floor` for every `n` in `[a, e]` (`highDigit_of_cert`); a repeat among them rules the interval out (`not_isNice_of_cert_none`); the top layer keeps every nice number's prefix (`mem_topLayer_of_isNice`)
+- **JOIN-2** `NiceSearch.mem_bottomList_of_isNice`: bottom side: `bot_dfs`'s digit step is AFF-1 with one digit (`botDigits_eq`), and the search keeps every nice number's residue mod `b^k` with its exact low output digits, the partition's digits forced (`mem_bottomList_of_isNice`)
+- **JOIN-3** `NiceSearch.disjoint_high_lowSet`: the AND: a nice number's high digits (positions `≥ k`) and its low digits (positions `< k`) are disjoint, so its pair passes
+- **JOIN-4** `NiceSearch.joinSlices_flatMap`: the slices concatenate to the field, in order, so every number is in exactly one
+- **JOIN-5** `NiceSearch.mem_joinPartition_of_isNice`: every `n` is exactly one (prefix, low part) pair (`join_pair_unique`); the join finds each nice `n` of the field in partition `⌊n/b^f0⌋ mod b^p`: its prefix's ancestor is in the top layer, its certificate passes, its residue is in the bottom list, the probe of root `n mod (b−1)` reaches its bucket (key digits, digit-sum class `class_eq`) and the AND passes (`mem_joinPartition_of_isNice`)
+- **JOIN-6** `NiceSearch.prefilterAt_of_isNice`: the prefilter keeps every nice `n` whose powers have `k2` digits: its low output digits are distinct, and the certificate is tested only when the floor the Rust uses is at least `k2` (a whole block's `full_floor` is at most its own floor, `certFloor_block_mono`)
+- **END-2** `NiceSearch.joinField_complete`: the modelled overlap join (slices × partitions × top layer × bottom search × probe × AND × prefilter × nice check) reports every nice n of a field of `L`-digit numbers (`joinField_complete`, for `t ≤ L`, `k < L < t + k`, `p ≤ t + k − L` and a prefilter depth `s²` reaches; `joinField_slices_complete` with the client's slicing) and only nice n of the field (`joinField_sound`)
 <!-- status:end -->
