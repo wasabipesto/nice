@@ -58,7 +58,7 @@ theorem may not silently regress.
 | 3 | MSD interval domains, width recurrence, Hall soundness, recursive subdivision cover, monotone rejection; Kuhn completeness last | subdivision cover theorem sorry-free |
 | 4 | cross-end certificate with its `j ≥ k` guard, certificate inheritance, refutation of the 2026-02 skip, **END-1** | END-1 sorry-free; CI job wired; PR leaves draft |
 | 5 | GPU tiling / lane partition / split16 / Horner / prefilter, field generators, detailed-mode lemmas | |
-| 6 | residue-count closed form, carry-blind collapse, block-filter collapses, Hall-relaxation witness, tree recurrences | open-ended |
+| 6 | residue-count closed form, carry-blind collapse, the `b²−1` sieve adds nothing for words of three or more digits, Hall-relaxation witness, tree recurrences | open-ended |
 
 END-1: `∀ n ∈ range ⊆ baseRange b, IsNice b n → n ∈ Model.processRangeNiceonly b k range`,
 and every reported number is nice. After it exists, "add a filter" means

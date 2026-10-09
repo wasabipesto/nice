@@ -16,4 +16,5 @@ import Nice.Refuted
 import Nice.Theory.Residue
 import Nice.Theory.Collapse
 import Nice.Theory.Misc
+import Nice.Theory.Sieve
 import Nice.Examples
