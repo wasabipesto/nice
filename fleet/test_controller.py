@@ -1332,6 +1332,19 @@ class HostCpuClientTests(unittest.TestCase):
         got = controller.render_onstart(cfg, "exploit", "niceonly", {"cpu_cores_effective": 6})
         self.assertIn("--threads 4 > /dev/null", got)
 
+    def test_min_threads_per_mode(self):
+        cfg = self.cfg(exploit_modes={
+            "niceonly": {"host_cpu_client": True, "host_cpu_min_threads": 16},
+            "detailed": {"host_cpu_client": True},
+        })
+        # 12 spare threads: below nice-only's floor of 16, above detailed's 4.
+        self.assertNotIn("( nice_client", controller.render_onstart(
+            cfg, "exploit", "niceonly", {"cpu_cores_effective": 14}))
+        self.assertIn("--threads 12 > /dev/null", controller.render_onstart(
+            cfg, "exploit", "detailed", {"cpu_cores_effective": 14}))
+        self.assertIn("--threads 30 > /dev/null", controller.render_onstart(
+            cfg, "exploit", "niceonly", {"cpu_cores_effective": 32}))
+
     def test_per_mode_override_and_explore_untouched(self):
         cfg = self.cfg(exploit_modes={"niceonly": {"host_cpu_client": True}, "detailed": {}})
         self.assertIn("( nice_client", controller.render_onstart(

@@ -206,10 +206,13 @@ DEFAULT_CONFIG = {
         "exec nice_client {mode} --gpu --repeat --telemetry --no-progress "
         "--api-base {api_base} --username {username} --threads {threads}"
     ),
-    # Run that CPU client (per mode via exploit_modes; off by default). It gets
-    # the host's threads less `host_cpu_reserve_threads`, and is skipped where
-    # that leaves fewer than `host_cpu_min_threads`: a nice-only field takes a
-    # thread-starved client long enough to outlive its claim.
+    # Run that CPU client (all three keys settable per mode in exploit_modes;
+    # off by default). It gets the host's threads less
+    # `host_cpu_reserve_threads`, and is skipped where that leaves fewer than
+    # `host_cpu_min_threads`. Nice-only wants a high floor: a base-60 field
+    # (1e16) takes a CPU client about 30,000 s / threads on a Haswell Xeon, so
+    # below about 16 threads a field and its prefetched claim outlive the
+    # one-hour claim and get searched twice.
     "host_cpu_client": False,
     "host_cpu_reserve_threads": 2,
     "host_cpu_min_threads": 4,
@@ -852,11 +855,14 @@ def host_cpu_threads(cfg, purpose, mode, threads):
     threads fall below `host_cpu_min_threads`."""
     if purpose != "exploit":
         return 0
-    on = mcfg(cfg, mode, "host_cpu_client") if mode else cfg.get("host_cpu_client")
-    if not on:
+
+    def get(key):
+        return mcfg(cfg, mode, key) if mode else cfg[key]
+
+    if not get("host_cpu_client"):
         return 0
-    spare = threads - int(cfg["host_cpu_reserve_threads"])
-    return spare if spare >= int(cfg["host_cpu_min_threads"]) else 0
+    spare = threads - int(get("host_cpu_reserve_threads"))
+    return spare if spare >= int(get("host_cpu_min_threads")) else 0
 
 
 def render_onstart(cfg, purpose, mode, offer):

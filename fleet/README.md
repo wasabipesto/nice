@@ -116,7 +116,10 @@ threads: a nice-only deployment runs nice-only on the CPU, a detailed one
 detailed. It starts after the benchmark sweep and exits with the container
 when the GPU client does. It gets the host's threads less
 `host_cpu_reserve_threads` (2), and none on a host where that leaves fewer than
-`host_cpu_min_threads` (4). The estimator does not price this work yet, so it is
+`host_cpu_min_threads` (4); all three keys can be set per mode. For nice-only
+set the floor high (16 or so): from base 60 on, a CPU client with fewer threads
+takes long enough per field that its claims expire and fields get searched
+twice. The estimator does not price this work yet, so it is
 a free addition to the GPU's, and its submissions carry the instance's
 `CONTAINER_ID` like the GPU client's.
 
