@@ -10,6 +10,7 @@ import Nice.Model.Gpu
 import Nice.Model.Msd
 import Nice.Model.Affine
 import Nice.Model.Cross
+import Nice.Model.Join
 import Nice.Model.GpuArith
 import Nice.Model.Fields
 import Nice.Model.Detailed

@@ -210,6 +210,8 @@ impl SmallDiv {
 }
 
 /// A field prepared for the CPU join.
+///
+/// Lean: `NiceSearch.joinField_complete` (END-2)
 pub struct CpuJoin {
     fs: FieldSetup,
     k: u32,
@@ -591,6 +593,8 @@ impl CpuJoin {
 
     /// One top against one class of bottoms: a 64-bit AND each, eight at a
     /// time; the (rare) pairs that pass go to [`Self::survivor`].
+    ///
+    /// Lean: `NiceSearch.disjoint_high_lowSet` (JOIN-3)
     fn scan(
         &self,
         pass: &Pass,
@@ -734,6 +738,9 @@ impl CpuJoin {
     /// next digits) they are the digits of `⌊R²/b^k⌋ + 2RD` and
     /// `⌊R³/b^k⌋ + 3R²D` mod `b^mid` when `k >= mid` (the production
     /// parameters), with `2R`, `3R²` (`p2`, `p3`) the bottom's.
+    ///
+    /// Lean: `NiceSearch.prefilterAt_of_isNice` (JOIN-6)
+    /// Lean: `NiceSearch.affine_mid_digit` (AFF-1)
     #[inline]
     fn prefilter(&self, top: &Top, bmask: u64, carries: u32, p2: u32, p3: u32) -> bool {
         let dm = u64::from(top.dm);

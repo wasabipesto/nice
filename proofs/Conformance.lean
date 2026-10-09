@@ -259,6 +259,81 @@ def checkAffine (r : Report) : IO Report := do
       | _ => throw (IO.userError "affine sample shape")
   pure r
 
+def digitList (v : Json) : Except String (List Nat) := do
+  let a ← v.getArr?
+  a.toList.mapM fun x => match x with
+    | .num m => pure m.mantissa.toNat
+    | _ => throw "digit"
+
+def checkJoin (r : Report) : IO Report := do
+  let mut r := r
+  for j in ← load "join.json" do
+    let b ← orFail (getNat j "base")
+    let s ← orFail (getNat j "start")
+    let e ← orFail (getNat j "end")
+    let t ← orFail (getNat j "t")
+    let k ← orFail (getNat j "k")
+    let p ← orFail (getNat j "p")
+    let L ← orFail (getNat j "l")
+    let k2 ← orFail (getNat j "k2")
+    let tag := s!"{b} [{s}, {e}) t={t} k={k} p={p}"
+    -- certificates and their floors
+    for c in ← orFail (getArr j "certs") do
+      let arr ← orFail c.getArr?
+      match arr.toList with
+      | [.str aS, .str eS, .num cap, digits, .num floor] =>
+        let some a := aS.toNat? | throw (IO.userError "cert a")
+        let some ee := eS.toNat? | throw (IO.userError "cert e")
+        let want ← match digits with
+          | .null => pure none
+          | v => do pure (some (← orFail (digitList v)))
+        let cap := cap.mantissa.toNat
+        r := r.check s!"cert {tag} [{a}, {ee}] cap {cap}"
+          ((NiceSearch.cert b a ee cap).map sortedList == want)
+        r := r.check s!"cert_floor {tag} [{a}, {ee}] cap {cap}"
+          (NiceSearch.certFloor b a ee cap == floor.mantissa.toNat)
+      | _ => throw (IO.userError "cert shape")
+    -- the bottom list's first level
+    let want ← orFail ((← orFail (getArr j "bpre")).mapM fun q => do
+      let a ← q.getArr?
+      match a.toList with
+      | [.str rS, ds] => match rS.toNat? with
+        | some rr => pure (rr, ← digitList ds)
+        | none => throw "bpre residue"
+      | _ => throw "bpre shape")
+    r := r.check s!"bot_dfs {tag}"
+      ((NiceSearch.botDfs b (L - t) 0 0 (L - t) 0 0 ∅).map (fun q => (q.1, sortedList q.2)) == want)
+    -- every partition: survivors in order, the prefilter's count, the hits
+    for part in ← orFail (getArr j "parts") do
+      let v ← orFail (getNat part "v")
+      let surv ← orFail (getNatList part "survivors")
+      let checked ← orFail (getNat part "checked")
+      let hits ← orFail (getNatList part "hits")
+      let model := NiceSearch.joinPartition b L t k p s e v
+      r := r.check s!"join_range {tag} partition {v}" (model == surv)
+      r := r.check s!"prefilter {tag} partition {v}"
+        ((model.filter fun n => NiceSearch.prefilterAt b L t k k2 s e n).length == checked)
+      r := r.check s!"hits {tag} partition {v}"
+        (model.filter (fun n => decide (NiceSearch.IsNice b n)) == hits)
+    -- the slicing
+    for sl in ← orFail (getArr j "slices") do
+      let arr ← orFail sl.getArr?
+      match arr.toList with
+      | [.str mS, .arr ss] =>
+        let some m := mS.toNat? | throw (IO.userError "slices max")
+        let want ← orFail (ss.toList.mapM fun x => do
+          let a ← x.getArr?
+          match a.toList with
+          | [.str aS, .str bS] => match aS.toNat?, bS.toNat? with
+            | some a, some b => pure (a, b)
+            | _, _ => throw "slice bound"
+          | _ => throw "slice shape")
+        let block := b ^ (L - t + p)
+        r := r.check s!"join_slices {tag} max {m}"
+          (NiceSearch.joinSlices block (block * max m 1) (e - s) s e == want)
+      | _ => throw (IO.userError "slices shape")
+  pure r
+
 end Conformance
 
 open Conformance in
@@ -273,6 +348,7 @@ def main : IO UInt32 := do
   r ← checkGpuConfig r
   r ← checkSeeded r
   r ← checkAffine r
+  r ← checkJoin r
   for f in r.failures.reverse do
     IO.println s!"FAIL: {f}"
   IO.println s!"{r.checks} checks, {r.failures.length} failures"

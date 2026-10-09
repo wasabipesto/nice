@@ -59,12 +59,18 @@ theorem may not silently regress.
 | 4 | cross-end certificate with its `j ≥ k` guard, certificate inheritance, refutation of the 2026-02 skip, the affine middle-digit stage (AFF-1), **END-1** | END-1 sorry-free; CI job wired; PR leaves draft |
 | 5 | GPU tiling / lane partition / split16 / Horner / prefilter, field generators, detailed-mode lemmas | |
 | 6 | residue-count closed form, carry-blind collapse, the `b²−1` sieve adds nothing for words of three or more digits, Hall-relaxation witness, tree recurrences | open-ended |
+| 7 | the overlap join: certificates, the bottom search, the AND, slices, the partition and probe, the prefilter, **END-2** | END-2 sorry-free |
 
 END-1: `∀ n ∈ range ⊆ baseRange b, IsNice b n → n ∈ Model.processRangeNiceonly b k range`,
 and every reported number is nice. After it exists, "add a filter" means
 "add a model function, prove its lemma, re-prove END-1 with it in the
 chain"; the affine stage was added that way, and it is why END-1 needs a
 floor of at least 1 (certificates come from ranges of two or more numbers).
+
+END-2 is the same statement for the overlap join, which production
+nice-only fields at bases 40–64 take: `joinField_complete` /
+`joinField_sound` over the slices, partitions, top layer, bottom search,
+probe, AND, prefilter and full check.
 
 ## Workflow
 

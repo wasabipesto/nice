@@ -21,6 +21,8 @@ use nice_common::msd_prefix_filter::{
     get_valid_ranges_recursive, get_valid_ranges_recursive_masked, has_duplicate_msd_prefix,
     MaskedRecursion,
 };
+use nice_common::cpu_join::{CpuJoin, Scratch};
+use nice_common::overlap_join::{join_range, join_slices, prefix_block, Base, FieldSetup, JoinParams};
 use nice_common::FieldSize;
 use nice_common::residue_filter::get_residue_filter;
 use nice_common::stride_filter::StrideTable;
@@ -112,6 +114,38 @@ struct Affine {
     base: u32,
     /// (n mod b^6, known digits, `affine_filter::survives`)
     samples: Vec<(String, Vec<u32>, bool)>,
+}
+
+#[derive(Serialize)]
+struct JoinPart {
+    v: u32,
+    /// The reference join's survivors (pairs that pass the AND), in its order.
+    survivors: Vec<String>,
+    /// Of those, the ones the CPU join's prefilter passes (`checked`).
+    checked: u64,
+    /// The reference join's nice numbers.
+    hits: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct Join {
+    base: u32,
+    start: String,
+    end: String,
+    t: u32,
+    k: u32,
+    p: u32,
+    /// The field's digit length and the prefilter depth (`FieldSetup::k2`).
+    l: u32,
+    k2: u32,
+    /// `Base::cert` and `Base::cert_floor` of sample intervals:
+    /// (a, e inclusive, cap, digits or null, floor).
+    certs: Vec<(String, String, u32, Option<Vec<u32>>, u32)>,
+    /// `Base::bot_dfs` to depth `f0` without forced digits: (residue, digits).
+    bpre: Vec<(String, Vec<u32>)>,
+    parts: Vec<JoinPart>,
+    /// `join_slices` at the prefix block: (max prefixes, slices).
+    slices: Vec<(String, Vec<(String, String)>)>,
 }
 
 /// A deterministic stream for the samples (64-bit LCG, high half).
@@ -385,6 +419,84 @@ fn main() {
         serde_json::to_string_pretty(&affine).unwrap(),
     )
     .unwrap();
+
+    // The overlap join on small windows (base 10's band holds 69; the base
+    // 20 windows are from the Rust tests): certificates, the bottom list's
+    // first level, every partition's survivors, the CPU prefilter's count
+    // and the hits, and the slicing.
+    let mut joins = Vec::new();
+    for &(base, s, e, t, k, p) in &[
+        (10u32, 47u128, 100u128, 2u32, 1u32, 0u32),
+        (20, 58_945, 160_000, 3, 2, 0),
+        (20, 58_945, 160_000, 2, 3, 1),
+        (20, 60_001, 150_003, 2, 3, 1),
+    ] {
+        let jp = JoinParams { t, k, p };
+        let bs = Base::try_new(base, s, e - 1).unwrap();
+        let fs = FieldSetup::new(base, s, e, jp).unwrap();
+        let f0 = bs.l - t;
+        let mut certs = Vec::new();
+        for i in 0..120u64 {
+            let a = s + u128::from(rng.next()) % (e - s);
+            let width = [1u128, 2, 3, 7, 40, 400, 9_000][(i % 7) as usize];
+            let ee = (a + width - 1).min(e - 1);
+            let cap = [0u32, k, k + 1][(i % 3) as usize];
+            certs.push((
+                a.to_string(),
+                ee.to_string(),
+                cap,
+                bs.cert(a, ee, cap).map(digits_of_mask),
+                bs.cert_floor(a, ee, cap),
+            ));
+        }
+        let mut bpre = Vec::new();
+        bs.bot_dfs(0, 0, 0, f0, f0, 0, 0, &mut bpre);
+        let join = CpuJoin::new(base, &FieldSize::new(s, e), jp).unwrap();
+        let mut scratch = Scratch::default();
+        let parts = (0..base.pow(p))
+            .map(|v| {
+                let mut survivors = Vec::new();
+                let st = join_range(&bs, s, e, jp, Some(&[u128::from(v)]), Some(&mut survivors));
+                JoinPart {
+                    v,
+                    survivors: survivors.iter().map(u128::to_string).collect(),
+                    checked: join.run_partition(v, &mut scratch).checked,
+                    hits: st.hits.iter().map(u128::to_string).collect(),
+                }
+            })
+            .collect();
+        let block = prefix_block(base, bs.l, jp);
+        let slices = [1u128, 2, 3, 7, 1_000_000]
+            .iter()
+            .map(|&m| {
+                (
+                    m.to_string(),
+                    join_slices(&FieldSize::new(s, e), block, m)
+                        .iter()
+                        .map(|f| (f.start().to_string(), f.end().to_string()))
+                        .collect(),
+                )
+            })
+            .collect();
+        joins.push(Join {
+            base,
+            start: s.to_string(),
+            end: e.to_string(),
+            t,
+            k,
+            p,
+            l: bs.l,
+            k2: fs.k2,
+            certs,
+            bpre: bpre
+                .iter()
+                .map(|&(r, m)| (r.to_string(), digits_of_mask(m)))
+                .collect(),
+            parts,
+            slices,
+        });
+    }
+    fs::write(out.join("join.json"), serde_json::to_string_pretty(&joins).unwrap()).unwrap();
 
     println!("fixtures written to {}", out.display());
 }
