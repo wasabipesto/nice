@@ -108,6 +108,15 @@ same version, so the two cannot drift apart:
 This relies on a release's tag matching the workspace version the client
 reports (the `v3.4.5` tag carries `version = "3.4.5"`).
 
+## Host CUDA version
+
+The GPU image is built on CUDA 12.8, and a host whose driver supports less
+can't run it. `min_cuda_version` (default `"12.8"`) is applied to every offer
+search on top of `offer_query`: a query with no `cuda_vers` floor gets
+`cuda_vers>=12.8` appended, a lower floor is replaced (with a `WARN` event
+each tick), and an equal or higher one is kept. `null` searches with no
+minimum.
+
 ## Notes / known gaps
 
 - **First live explore run validates the launch incantation.** The GPU

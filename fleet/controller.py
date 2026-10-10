@@ -213,14 +213,18 @@ DEFAULT_CONFIG = {
     "explore_cooldown_days": 14,
     "explore_ttl_minutes": 30,
     # --- offer filters (vast search query) ---
-    # cuda_vers is the host driver's CUDA ceiling. The GPU image is built on
-    # CUDA 12.8, and a host below that can't run it: its PTX needs a 12.8
-    # driver, and the image's forward-compat libcuda is refused on consumer
-    # cards. Those hosts only ever produced CPU-only sweeps.
     "offer_query": (
-        "reliability>0.95 num_gpus=1 gpu_ram>=8 cuda_vers>=12.8 rentable=true "
+        "reliability>0.95 num_gpus=1 gpu_ram>=8 rentable=true "
         "inet_down>100 disk_space>=30 dph_total<0.40"
     ),
+    # The lowest host CUDA version any offer search accepts, applied on top of
+    # offer_query (see enforce_min_cuda), so a config whose query predates the
+    # image can't buy hosts the image can't use. cuda_vers is the host
+    # driver's CUDA ceiling. The GPU image is built on CUDA 12.8, and a host
+    # below that can't run it: its PTX needs a 12.8 driver, and the image's
+    # forward-compat libcuda is refused on consumer cards. Those hosts only
+    # ever produced CPU-only sweeps. None searches with no minimum.
+    "min_cuda_version": "12.8",
     "offer_type": "bid",
 }
 
@@ -729,9 +733,60 @@ class InsufficientCredit(Exception):
     futile creates), so the buy phase aborts for the tick."""
 
 
-def search_offers(cfg):
+# A cuda_vers term in a Vast search query, in the operator spellings the SDK's
+# parser accepts. cuda_max_good is the field the SDK translates cuda_vers to.
+_CUDA_TERM = re.compile(
+    r"(?<![A-Za-z0-9_])(?:cuda_vers|cuda_max_good)"
+    r"( *[=><!]+| +(?:[lg]te?|nin|neq|eq|not ?eq|not ?in|in) )( *)"
+    r"(\[[^\]]+\]|\"[^\"]+\"|[^ ]+)"
+)
+# The operators that put a floor under it; the rest (<, !=, in, ...) don't.
+_CUDA_FLOOR_OPS = {">=", "gte", ">", "gt", "=", "==", "eq"}
+
+
+def enforce_min_cuda(query, min_version):
+    """`query`, narrowed to hosts whose CUDA version is at least `min_version`.
+
+    A query with no floor on cuda_vers gets `cuda_vers>=<min_version>`
+    appended. A floor below the minimum is replaced by that term; one at or
+    above it is left alone, as are terms that set no floor. Returns
+    (query, replaced), where replaced lists the terms taken out. A falsy
+    `min_version` returns the query unchanged."""
+    query = query or ""
+    if not min_version:
+        return query, []
+    minimum = float(min_version)
+    term = f"cuda_vers>={min_version}"
+    floored = False
+    replaced = []
+
+    def check(m):
+        nonlocal floored
+        if m.group(1).strip() not in _CUDA_FLOOR_OPS:
+            return m.group(0)
+        floored = True
+        try:
+            if float(m.group(3).strip('"')) >= minimum:
+                return m.group(0)
+        except ValueError:
+            pass  # unreadable, so not known to be strict enough
+        replaced.append(m.group(0))
+        return term
+
+    query = _CUDA_TERM.sub(check, query)
+    if not floored:
+        query = f"{query.rstrip()} {term}".lstrip()
+    return query, replaced
+
+
+def search_offers(cfg, db):
+    query, replaced = enforce_min_cuda(cfg["offer_query"], cfg.get("min_cuda_version"))
+    if replaced:
+        log_event(db, "WARN", f"offer_query's {' '.join(replaced)} is below min_cuda_version "
+                              f"{cfg['min_cuda_version']}; searching with "
+                              f"cuda_vers>={cfg['min_cuda_version']} instead")
     return vast_client(cfg).search_offers(
-        query=cfg["offer_query"], type=cfg["offer_type"], limit=200
+        query=query, type=cfg["offer_type"], limit=200
     )
 
 
@@ -1712,7 +1767,7 @@ def tick(cfg):
 
     # 4. Market snapshot + estimates, priced for each exploit mode.
     try:
-        offers = search_offers(cfg)
+        offers = search_offers(cfg, db)
     except Exception as e:
         log_event(db, "ERROR", f"offer search failed: {e!r}")
         return
