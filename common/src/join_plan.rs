@@ -11,7 +11,7 @@
 //! [`FieldSetup`]. Nothing here depends on a GPU runtime: the `CubeCL` stage
 //! (`crate::cubecl_join`) allocates exactly the buffers [`Footprint`]
 //! counts.
-#![cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+#![cfg(any(feature = "cuda", feature = "cubecl"))]
 // Only `CubeCL` runs the join so far: without it a field is still planned
 // (the route is decided the same way everywhere) but nothing reads the plan.
 #![cfg_attr(not(feature = "cubecl"), allow(dead_code))]

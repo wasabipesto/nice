@@ -12,18 +12,16 @@
 //! previous one, and the device never waits for a field boundary either. The
 //! floor is steered by which side is behind — see [`FloorController`] — so
 //! neither side idles in steady state. [`run_range_pipeline`] is the one-field
-//! synchronous form of the same machinery, for backends whose device handle
-//! cannot leave the calling thread and for tests.
+//! synchronous form of the same machinery, for tests.
 //!
 //! Everything here is independent of the device API, so it lives here rather
 //! than being written per backend. The backends supply a [`RangeSink`]: CUDA
 //! enqueues asynchronous launches on its stream, `CubeCL` submits to its
-//! client, Vulkan records and submits a dispatch. This is the same split as
-//! [`crate::gpu_config`], which holds the per-base kernel constants for the
-//! same reason — [`crate::client_process_cuda`] is `#![cfg(feature = "cuda")]`
-//! and unreachable from a Vulkan-only build.
+//! client. This is the same split as [`crate::gpu_config`], which holds the
+//! per-base kernel constants for the same reason — [`crate::client_process_cuda`]
+//! is `#![cfg(feature = "cuda")]` and unreachable from a build without it.
 
-#![cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+#![cfg(any(feature = "cuda", feature = "cubecl"))]
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use crate::gpu_route::{FieldTicket, Route};
@@ -50,8 +48,8 @@ pub const PROCESSING_CHUNK_SIZE: u128 = 1_000_000;
 /// per-candidate work, and the u32 residue/gap representation keeps the larger
 /// table cheap. Both GPU backends upload the host-built table, so they inherit
 /// the reduction without a kernel change — but the k=3 modulus is `b³`, which
-/// is what `stride_modulus_fits_the_byte_horner_bound` in the Vulkan codegen
-/// now has to hold against.
+/// is what `stride_modulus_fits_the_chunked_horner_bound` (in this module's
+/// tests) now has to hold against.
 pub const GPU_LSD_K: u32 = 3;
 
 /// Ranges buffered before each dispatch. Big enough to amortize submission and
@@ -64,8 +62,9 @@ pub const LAUNCH_BATCH_RANGES: usize = 1 << 16;
 ///
 /// The consumer's cost per item is what makes this matter, and it differs by
 /// backend. A CUDA launch is asynchronous, so that consumer never really
-/// blocks and any bound is slack. A Vulkan dispatch blocks on a fence, so with
-/// an unbounded channel the workers would race arbitrarily far ahead: a base-52
+/// blocks and any bound is slack. A consumer that blocks on its device (a
+/// `CubeCL` launch waits on a fence once its ring is full) would, with
+/// an unbounded channel, let the workers race arbitrarily far ahead: a base-52
 /// field at floor 250 is ~9e7 surviving ranges, and 20 bytes apiece is nearly two
 /// gigabytes of queued descriptors. Bounding the channel keeps the overlap —
 /// workers refill the queue while the consumer waits on the device.
@@ -550,7 +549,7 @@ pub trait PendingField {
 /// [`batches_in_flight`] launched batches outstanding and blocks in `launch`
 /// until the oldest completes. That blocking is what the pipeline measures
 /// as "the device is behind"; a backend whose launches are synchronous
-/// (Vulkan) blocks naturally.
+/// blocks naturally.
 pub trait RangeSink {
     type Pending: PendingField;
 
@@ -1151,8 +1150,7 @@ fn complete_field<P: PendingField>(
 /// Run one niceonly field on the calling thread: MSD workers stream
 /// descriptors while this thread batches them into launches, then the
 /// field's results are waited for and returned. This is the one-field form
-/// of [`NiceonlyPipeline`], for a sink that cannot leave the calling thread
-/// (Vulkan) and for tests; it has no cross-field overlap.
+/// of [`NiceonlyPipeline`], for tests; it has no cross-field overlap.
 ///
 /// **Range semantics**: half-open [`range_start`, `range_end`).
 ///
@@ -1370,8 +1368,8 @@ pub fn report_field(backend: &str, base: u32, stats: NiceonlyStats) {
 /// So this has to be checked before any stride table is built.
 ///
 /// [`crate::gpu_route::begin_niceonly`] calls it first for the CUDA and
-/// `CubeCL` pipelines, and the Vulkan path ahead of its CPU fallback, so it
-/// also covers bases the GPU itself cannot take.
+/// `CubeCL` pipelines, ahead of their CPU fallback, so it also covers bases
+/// the GPU itself cannot take.
 #[must_use]
 pub fn residue_empty_result(base: u32) -> Option<FieldResults> {
     if residue_filter::get_residue_filter_u128(&base).is_empty() {
@@ -1385,9 +1383,9 @@ pub fn residue_empty_result(base: u32) -> Option<FieldResults> {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel-shape constants shared by the range-descriptor backends (Vulkan and
-// CubeCL). CUDA predates the descriptor pipeline's tiling and keeps its fixed
-// one-warp-per-range shape, so only the newer backends read these.
+// Kernel-shape constants for the CubeCL range-descriptor kernels. CUDA
+// predates the descriptor pipeline's tiling and keeps its fixed
+// one-warp-per-range shape, so only CubeCL reads these.
 // ---------------------------------------------------------------------------
 
 /// Most threads that may cooperate on one MSD-valid range — CUDA's
@@ -1451,11 +1449,11 @@ pub fn lane_shift_for(num_ranges: u64, mean_len: u64, stride_m: u32, stride_r: u
 /// Largest stride modulus the descriptor kernels' residue reduction accepts.
 ///
 /// `n mod M` cannot be computed as a 64-bit division by a constant — that is
-/// the one construct RADV/ACO does not strength-reduce (see the Vulkan module
-/// docs). Instead the kernel reduces the range's 64-bit *offset* one chunk at
-/// a time, `acc = (acc << c | chunk) % M`, with `M` a 32-bit compile-time
-/// constant. The running remainder satisfies `acc < M`, so the shift stays
-/// inside a u32 exactly while `M <= 2^(32-c)`.
+/// the one construct RADV/ACO does not strength-reduce (it expands into a
+/// ~220-instruction loop). Instead the kernel reduces the range's 64-bit
+/// *offset* one chunk at a time, `acc = (acc << c | chunk) % M`, with `M` a
+/// 32-bit compile-time constant. The running remainder satisfies `acc < M`,
+/// so the shift stays inside a u32 exactly while `M <= 2^(32-c)`.
 ///
 /// `c` is picked per base by [`stride_chunk_bits`]. It used to be a fixed 8,
 /// on the premise that `M = (b-1)·b^k` with `k = 2` put even base 128 at
@@ -2112,5 +2110,115 @@ mod tests {
         assert!(checked > 0, "base {base} produced no candidates to check");
         // 69 is the one nice number in base 10, so it had better be in there.
         assert!(covered.iter().any(|&(s, e)| 69 >= s && 69 < e));
+    }
+
+    /// Bases with `b % 4 == 3` have an empty residue set, and the stride table
+    /// panics rather than returning when indexed. Niceonly must answer "nothing
+    /// here" instead of taking the client down, and must decide that *before*
+    /// building any stride table.
+    #[test]
+    fn residue_empty_bases_short_circuit_before_the_stride_table() {
+        let mut checked = 0;
+        for base in 10..=60 {
+            let empty = residue_filter::get_residue_filter_u128(&base).is_empty();
+            assert_eq!(
+                empty,
+                base % 4 == 3,
+                "base {base}: residue-emptiness should track b mod 4 == 3"
+            );
+            match residue_empty_result(base) {
+                Some(out) => {
+                    assert!(empty, "base {base} short-circuited but has residues");
+                    assert!(out.nice_numbers.is_empty() && out.distribution.is_empty());
+                    checked += 1;
+                }
+                None => assert!(!empty, "base {base} is residue-empty but was not caught"),
+            }
+        }
+        assert!(
+            checked >= 10,
+            "only {checked} residue-empty bases exercised"
+        );
+    }
+
+    /// Every base the GPU takes must have a stride modulus inside the
+    /// kernels' chunked offset reduction bound — the invariant that lets
+    /// `acc << c` stay in a u32 and so keeps every divisor 32-bit. The
+    /// `CubeCL` plan refuses anything past it rather than computing the wrong
+    /// residue.
+    ///
+    /// The margin is no longer generous. At the k=3 stride depth #88 introduced,
+    /// `M = (b-1)·b³` reaches 266 338 304 at base 128 against the 4-bit chunk's
+    /// 2^28 = 268 435 456 — under 1% of headroom. A k=4 table, or a supported
+    /// base above 128, would need a 2-bit chunk; this test is what would catch it.
+    #[test]
+    fn stride_modulus_fits_the_chunked_horner_bound() {
+        use crate::gpu_config::{MAX_GPU_DIGIT_MASK_BASE, gpu_supports_base};
+        use crate::stride_filter::StrideTable;
+        let mut n = 0;
+        for base in 10..=MAX_GPU_DIGIT_MASK_BASE {
+            if !gpu_supports_base(base) || residue_filter::get_residue_filter_u128(&base).is_empty()
+            {
+                continue;
+            }
+            let table = StrideTable::new(base, GPU_LSD_K);
+            assert!(
+                table.modulus <= MAX_STRIDE_MODULUS,
+                "base {base}: M={} exceeds {MAX_STRIDE_MODULUS}",
+                table.modulus
+            );
+            n += 1;
+        }
+        assert!(n > 20, "only {n} bases checked");
+    }
+
+    /// The lane tiling must track the range size, never leave the kernels'
+    /// representable band, and never hand a range more lanes than it has
+    /// candidates — which is the whole failure it exists to fix.
+    #[test]
+    fn lane_tiling_follows_the_range_size() {
+        use crate::stride_filter::StrideTable;
+        let table = StrideTable::new(40, GPU_LSD_K);
+        let (m, r) = (table.modulus as u32, table.valid_residues.len() as u32);
+
+        // A full batch of floor-250 ranges: ~490 numbers each, i.e. ~39
+        // candidates — the configuration where a fixed 32 lanes leaves 1.2
+        // candidates apiece, and where one lane each measured fastest.
+        let batch = LAUNCH_BATCH_RANGES as u64;
+        assert_eq!(
+            lane_shift_for(batch, 490, m, r),
+            0,
+            "short ranges want 1 lane"
+        );
+        // Long ranges keep the full warp.
+        assert_eq!(
+            lane_shift_for(batch, 1 << 20, m, r),
+            MAX_LANES_PER_RANGE.ilog2()
+        );
+        // A range with no candidates at all still gets one lane, not zero.
+        assert_eq!(lane_shift_for(batch, 0, m, r), 0);
+        // A batch too small to fill the device buys threads with lanes instead,
+        // even though the work rule alone would ask for one.
+        assert!(
+            lane_shift_for(64, 490, m, r) > lane_shift_for(batch, 490, m, r),
+            "a tiny batch must widen the tiling"
+        );
+
+        let mut prev = 0;
+        for len in (0..24).map(|k| 1u64 << k) {
+            let shift = lane_shift_for(batch, len, m, r);
+            assert!(shift >= prev, "tiling must not shrink as ranges grow");
+            assert!(
+                1 << shift <= MAX_LANES_PER_RANGE,
+                "len {len}: too many lanes"
+            );
+            let candidates = len * u64::from(r) / u64::from(m);
+            assert!(
+                (1u64 << shift) <= candidates.max(1),
+                "len {len}: {} lanes for {candidates} candidates",
+                1u64 << shift
+            );
+            prev = shift;
+        }
     }
 }
