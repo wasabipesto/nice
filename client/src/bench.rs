@@ -463,7 +463,7 @@ fn run_field_scenario(
 }
 
 /// The GPU's overlap join, if its backend has one: `CubeCL` alone, or paired
-/// with hand-CUDA (`--gpu-backend auto` on NVIDIA).
+/// with hand-CUDA (`--gpu-backend auto` or `cuda` on NVIDIA).
 #[cfg(feature = "cubecl")]
 fn join_context(gpu: &GpuCtx) -> Option<&CubeclContext> {
     match &**gpu.as_ref()? {

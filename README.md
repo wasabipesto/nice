@@ -177,7 +177,7 @@ Options:
 
           Possible values:
           - auto:        Fastest measured order for the mode: detailed tries `cubecl-cuda`, `cubecl`, CUDA, then Vulkan; niceonly tries CUDA (with join), `cubecl`, then Vulkan
-          - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In niceonly this uses the CUDA stride pipeline
+          - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In niceonly, as with `auto`, fields the overlap join takes run on `CubeCL`'s CUDA runtime (in builds with `cubecl-cuda`)
           - vulkan:      Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe) (needs the experimental `vulkan` feature)
           - cubecl:      `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base
           - cubecl-cuda: `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature and, like `cuda`, the CUDA toolkit at runtime for NVRTC)
