@@ -295,16 +295,11 @@ fn niceonly_defines(base: u32) -> Result<(Vec<String>, stride_filter::StrideTabl
     } else {
         debug!("modular prefilter disabled for base {base}");
     }
-    // Cross-end residue filter (and its warp compaction): on by default
-    // wherever the low-mask table exists (base <= 64); NICE_CUDA_CROSS=0 /
-    // NICE_CUDA_COMPACT=0 disable them for A/B measurement.
-    let cross = !table.low_digit_masks.is_empty()
-        && std::env::var("NICE_CUDA_CROSS").map_or(true, |v| v != "0");
-    if cross {
+    // Cross-end residue filter, with its warp compaction: wherever the
+    // low-mask table exists (base <= 64).
+    if !table.low_digit_masks.is_empty() {
         defines.push("CROSS_FILTER".to_string());
-        if std::env::var("NICE_CUDA_COMPACT").map_or(true, |v| v != "0") {
-            defines.push("COMPACT".to_string());
-        }
+        defines.push("COMPACT".to_string());
         // Affine middle-digit filter on the cross survivors (NICE_CUDA_AFFINE=0
         // disables it for A/B measurement).
         if let Some(aff) = affine_params(base, GPU_LSD_K)
@@ -1553,11 +1548,14 @@ mod tests {
                 "b{base}"
             );
             assert!(defines.iter().any(|d| d == "CROSS_FILTER"), "b{base}");
+            assert!(defines.iter().any(|d| d == "COMPACT"), "b{base}");
         }
-        // No low-mask table above 64, so no cross filter and no affine filter.
+        // No low-mask table above 64, so no cross filter, no compaction and
+        // no affine filter.
         for base in [68u32, 70] {
             let (defines, _) = niceonly_defines(base).unwrap();
             assert!(!defines.iter().any(|d| d == "CROSS_FILTER"), "b{base}");
+            assert!(!defines.iter().any(|d| d == "COMPACT"), "b{base}");
             assert!(!defines.iter().any(|d| d == "AFFINE"), "b{base}");
         }
     }
@@ -1603,8 +1601,10 @@ mod tests {
                 compile_kernel_ptx(&defines).unwrap_or_else(|e| {
                     panic!("niceonly kernel failed to compile for b{base}: {e:?}")
                 });
-                // Also cover the variants the env toggles can produce:
-                // cross without compaction, and neither.
+                // Also cover the kernel's other variants: cross without
+                // compaction (no longer selected, but still in the source),
+                // without the affine filter (NICE_CUDA_AFFINE=0), and
+                // neither, as bases above 64 compile it.
                 if defines.iter().any(|d| d == "CROSS_FILTER") {
                     let no_compact: Vec<String> = defines
                         .iter()
