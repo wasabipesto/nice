@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add a `host_cpu_client` fleet option (off by default) that runs a CPU client of the deployment's mode beside the GPU client on each exploit's spare threads.
+
 ## Nice v3.4.6
 
 - Add an overlap join as the primary nice-only path for large fields. It skips much of the existing filter work by joining an overlapping list of the top-digit prefixes and bottom-digit residues which eliminates more candidates with the same underlying strategies. When the device or backend doesn't support this path it falls back to the existing stride implementation. Major thanks to [danstoyell](https://github.com/danstoyell) for the report and prototype.

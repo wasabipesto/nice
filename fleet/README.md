@@ -108,6 +108,21 @@ same version, so the two cannot drift apart:
 This relies on a release's tag matching the workspace version the client
 reports (the `v3.4.5` tag carries `version = "3.4.5"`).
 
+## Host CPU client
+
+`host_cpu_client: true` (off by default; per mode inside `exploit_modes`)
+makes each exploit also run a CPU client of its own mode on the host's spare
+threads: a nice-only deployment runs nice-only on the CPU, a detailed one
+detailed. It starts after the benchmark sweep and exits with the container
+when the GPU client does. It gets the host's threads less
+`host_cpu_reserve_threads` (2), and none on a host where that leaves fewer than
+`host_cpu_min_threads` (4); all three keys can be set per mode. For nice-only
+set the floor high (16 or so): from base 60 on, a CPU client with fewer threads
+takes long enough per field that its claims expire and fields get searched
+twice. The estimator does not price this work yet, so it is
+a free addition to the GPU's, and its submissions carry the instance's
+`CONTAINER_ID` like the GPU client's.
+
 ## Notes / known gaps
 
 - **First live explore run validates the launch incantation.** The GPU
