@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Remove the `NICE_GPU_FIELDS_IN_FLIGHT` and `NICE_GPU_BATCHES_IN_FLIGHT` environment variables; the GPU nice-only pipeline keeps its defaults of 2 fields and 16 batches in flight.
+
 ## Nice v3.4.6
 
 - Add an overlap join as the primary nice-only path for large fields. It skips much of the existing filter work by joining an overlapping list of the top-digit prefixes and bottom-digit residues which eliminates more candidates with the same underlying strategies. When the device or backend doesn't support this path it falls back to the existing stride implementation. Major thanks to [danstoyell](https://github.com/danstoyell) for the report and prototype.

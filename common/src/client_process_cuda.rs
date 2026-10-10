@@ -40,7 +40,7 @@ use crate::gpu_config::{
     MAX_GPU_DIGIT_MASK_BASE, affine_params, chunk_constants, gpu_supports_base, prefilter_params,
 };
 use crate::gpu_niceonly::{
-    DeviceResult, NiceonlyPipeline, NiceonlyStats, PendingField, RangeSink, batches_in_flight,
+    BATCHES_IN_FLIGHT, DeviceResult, NiceonlyPipeline, NiceonlyStats, PendingField, RangeSink,
 };
 use crate::gpu_route::{FieldTicket, NiceonlyGpu};
 use crate::{
@@ -576,7 +576,7 @@ impl RangeSink for CudaNiceonlySink {
             open.start = Some(record_timing_event(&stream)?);
         }
         let nice_capacity = NICE_OUT_CAPACITY as u32;
-        let max_inflight = batches_in_flight();
+        let max_inflight = BATCHES_IN_FLIGHT;
         for ((batch_offsets, batch_lens), batch_masks) in offsets
             .chunks(RANGES_PER_LAUNCH)
             .zip(lens.chunks(RANGES_PER_LAUNCH))
@@ -849,14 +849,15 @@ mod tests {
     /// Throughput of the continuous pipeline on a fixed run of fields, so two
     /// configurations can be compared on identical work (production claims
     /// hand every run different regions, whose MSD character varies 2x).
-    /// Env: `NICE_GPU_FIELDS_IN_FLIGHT`, `NICE_GPU_MSD_FLOOR` as in
-    /// production; `NICE_TEST_FIELDS` (required: it is also the opt-in) fields
-    /// of 1e13 in base 54 from the region the Anvil runs covered.
+    /// Fields are queued `FIELDS_IN_FLIGHT` deep and `NICE_GPU_MSD_FLOOR`
+    /// applies, as in production; `NICE_TEST_FIELDS` (required: it is also
+    /// the opt-in) fields of 1e13 in base 54 from the region the Anvil runs
+    /// covered.
     #[test]
     #[ignore = "requires an NVIDIA device; prints throughput"]
     #[allow(clippy::cast_precision_loss)]
     fn pipeline_throughput_fixed_fields() {
-        use crate::gpu_niceonly::{fields_in_flight, msd_floor_in_use};
+        use crate::gpu_niceonly::{FIELDS_IN_FLIGHT, msd_floor_in_use};
         use crate::gpu_route::{NiceonlyStarted, begin_niceonly};
         // The parity workflow runs every ignored test in this module on a
         // software rasterizer; a throughput run there is hours of nothing.
@@ -882,7 +883,7 @@ mod tests {
                 "device busy time missing from the pipeline stats: {stats:?}"
             );
         }
-        let lookahead = fields_in_flight().saturating_sub(1);
+        let lookahead = FIELDS_IN_FLIGHT.saturating_sub(1);
         let t = Instant::now();
         let mut queued = std::collections::VecDeque::new();
         let mut found = 0usize;
@@ -901,7 +902,7 @@ mod tests {
         let secs = t.elapsed().as_secs_f64();
         eprintln!(
             "THROUGHPUT fields_in_flight={} floor_now={} fields={n} secs={secs:.2} rate={:.3e} n/s found={found}",
-            fields_in_flight(),
+            FIELDS_IN_FLIGHT,
             msd_floor_in_use(),
             (n as f64) * (size as f64) / secs
         );

@@ -423,36 +423,17 @@ pub fn msd_floor_in_use() -> u128 {
 }
 
 /// Fields the client keeps open in the pipeline at once: with two, the next
-/// field's MSD work overlaps the device's tail on the current one. One is the
-/// old field-serial behaviour, for A/B runs. `NICE_GPU_FIELDS_IN_FLIGHT`.
-#[must_use]
-pub fn fields_in_flight() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("NICE_GPU_FIELDS_IN_FLIGHT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(2)
-    })
-}
+/// field's MSD work overlaps the device's tail on the current one. The
+/// overlap join's pipeline is sized by it too.
+pub const FIELDS_IN_FLIGHT: usize = 2;
 
 /// Launched batches a backend keeps in flight before it blocks the dispatch
 /// thread. This is the device-side queue depth: deep enough that the device
 /// never runs dry between batches, shallow enough that a backed-up device is
 /// felt as `launch` blocking within a fraction of a second, which is the
-/// controller's "device is behind" signal. `NICE_GPU_BATCHES_IN_FLIGHT`.
-#[must_use]
-pub fn batches_in_flight() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("NICE_GPU_BATCHES_IN_FLIGHT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(16)
-    })
-}
+/// controller's "device is behind" signal. (The overlap join has its own,
+/// `join_plan::BATCHES_IN_FLIGHT`.)
+pub const BATCHES_IN_FLIGHT: usize = 16;
 
 /// Per-field statistics from the pipeline.
 #[derive(Clone, Copy, Debug, Default)]
@@ -503,8 +484,8 @@ impl NiceonlyStats {
     pub fn telemetry_json(&self) -> serde_json::Value {
         serde_json::json!({
             "msd_floor": self.floor.to_string(),
-            "fields_in_flight": fields_in_flight(),
-            "batches_in_flight": batches_in_flight(),
+            "fields_in_flight": FIELDS_IN_FLIGHT,
+            "batches_in_flight": BATCHES_IN_FLIGHT,
             "msd_secs": self.msd_secs,
             "total_secs": self.total_secs,
             "cpu_wait_secs": self.cpu_wait_secs,
@@ -542,12 +523,12 @@ pub trait PendingField {
 /// descriptors for it, and closes it. Fields are opened in order, but a
 /// field is opened while the previous one may still have batches in flight
 /// and is closed only once every one of its batches has been handed over; up
-/// to [`fields_in_flight`] fields are open at a time, and a batch always
+/// to [`FIELDS_IN_FLIGHT`] fields are open at a time, and a batch always
 /// names its field. Closing returns a [`PendingField`] that is waited for on
 /// another thread, so it must own whatever the wait needs.
 ///
 /// `launch` is the backpressure point: a backend keeps at most
-/// [`batches_in_flight`] launched batches outstanding and blocks in `launch`
+/// [`BATCHES_IN_FLIGHT`] launched batches outstanding and blocks in `launch`
 /// until the oldest completes. That blocking is what the pipeline measures
 /// as "the device is behind"; a backend whose launches are synchronous
 /// (Vulkan) blocks naturally.
@@ -1234,7 +1215,7 @@ impl<P: PendingField + Send + 'static> NiceonlyPipeline<P> {
         let workers = worker_count();
         let shared = Arc::new(new_shared(workers));
         let (tx, rx) = sync_channel::<Msg>(PIPELINE_DEPTH);
-        let (results_tx, results) = sync_channel::<FieldReady<P>>(fields_in_flight() + 1);
+        let (results_tx, results) = sync_channel::<FieldReady<P>>(FIELDS_IN_FLIGHT + 1);
         let worker_error = Arc::new(Mutex::new(None));
         let mut threads = Vec::with_capacity(workers + 1);
         for _ in 0..workers {
