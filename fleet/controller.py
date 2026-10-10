@@ -9,8 +9,9 @@ One tick per cron invocation:
 
   1. kill-switch check, then reconcile (always first: orphaned instances are
      the #1 cost risk) — diff our ledger against live Vast instances,
-     destroy anything expired or unknown, charge runtime spend to the bucket
-  2. accrue budget into the token bucket (sustained rate, capped)
+     destroy anything expired or unknown, charge runtime spend to its bucket
+  2. accrue budget into each exploit mode's token bucket (sustained rate,
+     capped)
   3. search bid offers and estimate each locally, against a corpus of
      benchmark reports mirrored from the API's database, at the client version
      the fleet launches (the newest release image, or a pinned version)
@@ -24,8 +25,9 @@ State lives in a sqlite ledger next to the config. Dry-run mode (the
 default) plans and prints everything but creates and destroys nothing.
 
 Design notes live in scratchpad/2026-08-vast-fleet/PLAN.md; budget scheme:
-token bucket, ~$30/mo accrual, ~$7 cap, half-full reserve line, pounce at
->=1.4x trailing median EV with a one-hour probe.
+one token bucket per exploit mode (`exploit_modes`), each with its own
+accrual and cap (defaults $30/mo and $7), a half-full reserve line, and
+pounces at >=1.4x the mode's trailing median EV with a one-hour probe.
 """
 
 import argparse

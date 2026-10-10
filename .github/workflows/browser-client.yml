@@ -19,7 +19,7 @@
 #                      live server
 #
 # Not covered: real GPU hardware. WebGPU on a physical adapter is validated
-# manually — see the browser notes in the README.
+# manually, with the harness's --hw mode (see wasm-client/e2e/e2e.mjs).
 name: Browser Client
 
 on:

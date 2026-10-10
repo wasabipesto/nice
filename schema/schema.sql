@@ -82,7 +82,9 @@ CREATE TABLE submissions (
 
 -- BENCHMARKS: UPLOADED --benchmark SWEEP REPORTS
 -- Full versioned report in `data`; client_version extracted for filtering.
--- Not granted to web_anon: rows carry user_ip.
+-- Readable by web_anon (granted below): the fleet controller mirrors this
+-- table through PostgREST. The API stores user_ip as "unknown", so rows carry
+-- no client IP; revisit the grant if that ever changes.
 CREATE TABLE benchmarks (
     id BIGSERIAL PRIMARY KEY,
     submit_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
