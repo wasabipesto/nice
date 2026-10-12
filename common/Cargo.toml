@@ -75,7 +75,7 @@ naga = { version = "30.0", features = ["wgsl-in", "spv-out"], optional = true }
 # otherwise leave them off. No effect on native builds.
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
-cubecl-common = { version = "0.10", features = ["serde"], optional = true }
+cubecl-common = { version = "0.11", features = ["serde"], optional = true }
 
 [build-dependencies]
 cc = { version = "1.2", optional = true }
