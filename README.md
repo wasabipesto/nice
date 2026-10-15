@@ -176,8 +176,8 @@ Options:
           Which GPU backend to use with --gpu
 
           Possible values:
-          - auto:        Fastest measured order for the mode: detailed tries `cubecl-cuda`, `cubecl`, then CUDA; niceonly tries CUDA (with join), then `cubecl`
-          - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In niceonly, as with `auto`, fields the overlap join takes run on `CubeCL`'s CUDA runtime (in builds with `cubecl-cuda`)
+          - auto:        Fastest measured order: `cubecl-cuda`, `cubecl`, then CUDA, in both modes
+          - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In niceonly, fields the overlap join takes run on `CubeCL`'s CUDA runtime beside it (in builds with `cubecl-cuda`)
           - cubecl:      `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base
           - cubecl-cuda: `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature and, like `cuda`, the CUDA toolkit at runtime for NVRTC)
           - cubecl-hip:  `CubeCL` over its native HIP runtime (AMD; needs the `cubecl-hip` feature, which links against `ROCm` at build time). Never chosen by `auto`
