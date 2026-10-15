@@ -1502,6 +1502,7 @@ mod tests {
     /// `NICE_TEST_CERT_TOPS` tops per field (default 40).
     #[test]
     #[ignore = "brute force over real tops; minutes of CPU"]
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
     fn cert_is_sound_on_real_tops() {
         use malachite::base::num::arithmetic::traits::Pow;
         use malachite::base::num::conversion::traits::Digits;
