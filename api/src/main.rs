@@ -167,10 +167,10 @@ fn claim_helper(
         SearchMode::Detailed => {
             // For Detailed, only ever get the next unchecked field
             match rng.random_range(1..=100) {
-                // 40% chance: get random field in the current thin chunk
-                1..=40 => (FieldClaimStrategy::Thin, 1, DETAILED_SEARCH_MAX_FIELD_SIZE),
-                // 55% chance: get first unchecked field in any chunk
-                41..=95 => (FieldClaimStrategy::Next, 1, DETAILED_SEARCH_MAX_FIELD_SIZE),
+                // 5% chance: get random field in the current thin chunk
+                1..=5 => (FieldClaimStrategy::Thin, 1, DETAILED_SEARCH_MAX_FIELD_SIZE),
+                // 90% chance: get first unchecked field in any chunk
+                6..=95 => (FieldClaimStrategy::Next, 1, DETAILED_SEARCH_MAX_FIELD_SIZE),
                 // 5% chance: recheck a previously checked field
                 96..=100 => (FieldClaimStrategy::Next, 2, DETAILED_SEARCH_MAX_FIELD_SIZE),
                 // 0% chance: get random unchecked field
