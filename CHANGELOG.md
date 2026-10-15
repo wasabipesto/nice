@@ -11,6 +11,7 @@
 - Remove the `NICE_GPU_FIELDS_IN_FLIGHT` and `NICE_GPU_BATCHES_IN_FLIGHT` environment variables; the GPU nice-only pipeline keeps its defaults of 2 fields and 16 batches in flight.
 - Remove the `NICE_CUDA_CROSS`, `NICE_CUDA_COMPACT`, `NICE_CUBECL_CROSS` and `NICE_CUBECL_COMPACT` environment variables, as v3.4.1 announced; the cross-end filter and its compaction now always run where they apply.
 - Make the fleet require the GPU image's CUDA version on every offer search (`min_cuda_version`, default 12.8), even when a config's `offer_query` asks for less.
+- Use the GPU runs' progress bar on CPU runs too, with log lines printed above it and every finished field logged, even when stderr is not a terminal.
 
 ## Nice v3.4.6
 

@@ -688,7 +688,7 @@ pub fn process_range_detailed_cuda(
     // `DETAILED_INFLIGHT` launches back before adding another. With that
     // many queued the device never starves, and the wait is what keeps the
     // bar honest.
-    let mut progress = crate::progress::FieldProgress::begin(range, CUDA_BATCH_SIZE as u128);
+    let progress = crate::progress::FieldProgress::begin(range, CUDA_BATCH_SIZE as u128);
     let mut inflight: VecDeque<CudaEvent> = VecDeque::with_capacity(DETAILED_INFLIGHT);
 
     for batch in range.chunks(CUDA_BATCH_SIZE as u128) {
