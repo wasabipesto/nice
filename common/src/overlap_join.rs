@@ -529,6 +529,48 @@ pub struct Base {
 /// field the join takes has at most 39, at bases 40-64.
 const DIGIT_BUF: usize = 48;
 
+/// Digits `lo..=hi` as a mask (`lo <= hi < 64`).
+fn digit_range_mask(lo: u8, hi: u8) -> u64 {
+    let width = u32::from(hi - lo) + 1;
+    let ones = if width >= 64 {
+        u64::MAX
+    } else {
+        (1 << width) - 1
+    };
+    ones << lo
+}
+
+/// The certificate `mask` closed over `doms`, the digit intervals at the
+/// first disagreement of n² and of n³ (0 where a power has none). Every n
+/// with distinct digits takes a digit there that `mask` leaves free, and a
+/// different one in each power. So an interval with no free digit rules
+/// every such n out, and one with a single free digit adds it to the mask,
+/// which can empty or force the other interval in turn. For two positions
+/// that is all of Hall's condition.
+fn close_certificate(mut mask: u64, doms: [u64; 2]) -> Option<u64> {
+    let mut forced = [false; 2];
+    loop {
+        let mut changed = false;
+        for (&dom, forced) in doms.iter().zip(&mut forced) {
+            if dom == 0 || *forced {
+                continue;
+            }
+            let free = dom & !mask;
+            if free == 0 {
+                return None;
+            }
+            if free.is_power_of_two() {
+                mask |= free;
+                *forced = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Some(mask);
+        }
+    }
+}
+
 impl Base {
     /// `lo..=hi` must share the digit length of n, n² and n³ (true inside
     /// any field of a nice band), and n³ must have at most [`DIGIT_BUF`]
@@ -689,14 +731,19 @@ impl Base {
         }
     }
 
-    /// Certificate of `[a, e]`: the mask of the output digits of n² and n³
-    /// at positions `>= cap` that are the same for every n in the interval,
-    /// or `None` if two of them coincide.
+    /// Certificate of `[a, e]`: a mask of output digits of n² and n³ at
+    /// positions `>= cap` that every n in the interval whose digits there
+    /// are distinct (every nice n) must have, or `None` if there is no such
+    /// n.
     ///
-    /// n ↦ n^j is increasing, so those digits are exactly the common top
-    /// digits of `a^j` and `e^j`, scanned down to the first disagreement.
-    /// The scan starts at `ndig(e^j − a^j)`: the two cannot agree on every
-    /// position `>= i` unless `e^j − a^j < b^i`.
+    /// n ↦ n^j is increasing, so the digits that are the same for every n
+    /// are exactly the common top digits of `a^j` and `e^j`, scanned down to
+    /// the first disagreement. The scan starts at `ndig(e^j − a^j)`: the two
+    /// cannot agree on every position `>= i` unless `e^j − a^j < b^i`.
+    ///
+    /// At the first disagreement every n's digit lies between `a^j`'s and
+    /// `e^j`'s, since the digits above it are fixed; [`close_certificate`]
+    /// uses those two intervals.
     #[must_use]
     pub fn cert(&self, a: u128, e: u128, cap: u32) -> Option<u64> {
         let a2 = W4::mul_u128_u128(a, a);
@@ -706,7 +753,8 @@ impl Base {
         let mut mask = 0u64;
         let mut dx = [0u8; DIGIT_BUF];
         let mut dy = [0u8; DIGIT_BUF];
-        for (x, y, sp) in [(a2, e2, self.s2), (a3, e3, self.s3)] {
+        let mut doms = [0u64; 2];
+        for (dom, (x, y, sp)) in doms.iter_mut().zip([(a2, e2, self.s2), (a3, e3, self.s3)]) {
             let c0 = cap.max(self.ndig_w(&y.sub(&x)));
             if c0 >= sp {
                 continue;
@@ -718,6 +766,8 @@ impl Base {
             self.digits_w(qy, len, &mut dy);
             for i in (0..len as usize).rev() {
                 if dx[i] != dy[i] {
+                    // a^j < e^j and they agree above i, so dx < dy here.
+                    *dom = digit_range_mask(dx[i], dy[i]);
                     break;
                 }
                 let bit = 1u64 << dx[i];
@@ -727,7 +777,7 @@ impl Base {
                 mask |= bit;
             }
         }
-        Some(mask)
+        close_certificate(mask, doms)
     }
 
     /// Lowest output position the certificate of `[a, e]` (cap `cap`) can
@@ -1363,14 +1413,39 @@ mod tests {
         (seen, repeat)
     }
 
-    /// `cert` against its definition, for every n of random intervals: a
-    /// mask only if every n has all of its digits among those of n² and n³
-    /// at positions `>= cap` (so the join's rejection of a bottom digit in
-    /// it is a real repeat), and `None` only if every n repeats a digit
-    /// there. Raising the cap to `cert_floor` changes nothing, which is what
-    /// lets the prefilter treat the certificate as sitting at or above it.
+    /// The closure's rule on its own: an interval with no free digit
+    /// rejects, a single free digit is forced, and a forced digit can empty
+    /// or force the other interval.
     #[test]
-    fn certificates_hold_for_every_n_of_their_interval() {
+    fn closing_a_certificate() {
+        let m = |ds: &[u8]| ds.iter().fold(0u64, |acc, &d| acc | 1 << d);
+        assert_eq!(close_certificate(m(&[1, 2]), [0, 0]), Some(m(&[1, 2])));
+        assert_eq!(close_certificate(m(&[1]), [m(&[3, 4]), 0]), Some(m(&[1])));
+        assert_eq!(close_certificate(m(&[3, 4]), [m(&[3, 4]), 0]), None);
+        assert_eq!(
+            close_certificate(m(&[4]), [0, m(&[3, 4])]),
+            Some(m(&[3, 4]))
+        );
+        // The square's forced digit empties the cube's interval.
+        assert_eq!(close_certificate(m(&[4]), [m(&[3, 4]), m(&[3, 4])]), None);
+        // The cube's forced digit forces the square's.
+        assert_eq!(
+            close_certificate(m(&[6]), [m(&[2, 3]), m(&[3, 6])]),
+            Some(m(&[2, 3, 6]))
+        );
+        assert_eq!(digit_range_mask(3, 4), m(&[3, 4]));
+        assert_eq!(digit_range_mask(0, 63), u64::MAX);
+    }
+
+    /// `cert` against its definition, for every n of random intervals: a
+    /// mask only if every n whose digits of n² and n³ at positions `>= cap`
+    /// are distinct (every nice n) has all of the mask's digits among them,
+    /// so the join's rejection of a bottom digit in it never drops a nice
+    /// number; and `None` only if every n repeats a digit there. Raising the
+    /// cap to `cert_floor` changes nothing, which is what lets the prefilter
+    /// treat the certificate as sitting at or above it.
+    #[test]
+    fn certificates_hold_for_every_distinct_digit_n_of_their_interval() {
         let mut rng = Rng(0x0BAD_5EED);
         let (mut masks, mut collisions) = (0, 0);
         for b in [5u32, 7, 10, 12, 16, 20, 23, 31, 40] {
@@ -1396,11 +1471,14 @@ mod tests {
                 for n in a..=e {
                     let (seen, repeat) = top_digits(&base, n, cap);
                     match cert {
-                        Some(m) => assert_eq!(
+                        // The closure's forced digits hold only where no
+                        // digit repeats.
+                        Some(m) if !repeat => assert_eq!(
                             m & !seen,
                             0,
                             "b{b} [{a}, {e}] cap {cap}: {n} lacks a certified digit"
                         ),
+                        Some(_) => {}
                         None => assert!(
                             repeat,
                             "b{b} [{a}, {e}] cap {cap}: {n} has no repeat at those positions"
@@ -1413,6 +1491,123 @@ mod tests {
             masks > 50 && collisions > 50,
             "{masks} certificates, {collisions} collisions: a case is barely tested"
         );
+    }
+
+    /// The certificate on real tops, by brute force. For production-shaped
+    /// fields at b58-64, random partition-extended tops
+    /// (the CPU join's `tops`: p = p0 * b^p + v over the field's top layer,
+    /// each covering b^f0 numbers) that the certificate keeps are checked by
+    /// brute force: every locally viable n in the top must have every
+    /// certified digit; and a rejected top must hold no locally viable n.
+    /// `NICE_TEST_CERT_TOPS` tops per field (default 40).
+    #[test]
+    #[ignore = "brute force over real tops; minutes of CPU"]
+    fn cert_is_sound_on_real_tops() {
+        use malachite::base::num::arithmetic::traits::Pow;
+        use malachite::base::num::conversion::traits::Digits;
+        use malachite::natural::Natural;
+        let per: usize = std::env::var("NICE_TEST_CERT_TOPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+        let fields: [(u32, u128, u128); 4] = [
+            (58, 183_859_216_587_923_470_200, 1_000_000_000_000_000),
+            (60, 795_599_612_114_824_200_908, 10_000_000_000_000_000),
+            (62, 12_255_736_762_397_899_821_056, 10_000_000_000_000_000),
+            (64, 72_806_461_862_957_161_709_568, 10_000_000_000_000_000),
+        ];
+        let dig = |x: &Natural, b: &Natural| -> Vec<u64> {
+            x.to_digits_asc(b)
+                .iter()
+                .map(|d| u64::try_from(d).unwrap())
+                .collect()
+        };
+        let handles: Vec<_> = fields
+            .into_iter()
+            .map(|(b, s0, size)| {
+                std::thread::spawn(move || {
+                    let range = FieldSize::new(s0, s0 + size);
+                    let jp = join_params_for(b, &range).expect("a join field");
+                    let fs = FieldSetup::new(b, s0, s0 + size, jp).unwrap();
+                    let cap = jp.k;
+                    let mut rng = Rng(u64::from(b) * 0x9E37_79B9);
+                    let bn = Natural::from(b);
+                    let (mut kept, mut rejected, mut viable, mut bits, mut tries) =
+                        (0u64, 0u64, 0u64, 0u64, 0u64);
+                    while kept + rejected < per as u64 && tries < 100_000 {
+                        tries += 1;
+                        let (p0, _) = fs.tlay[rng.below(fs.tlay.len() as u128) as usize];
+                        let v = rng.below(fs.nparts);
+                        let p = p0 * fs.nparts + v;
+                        if p < fs.plo || p > fs.phi {
+                            continue;
+                        }
+                        let lo = p * fs.w;
+                        let a = lo.max(fs.s);
+                        let e = (lo + fs.w - 1).min(fs.e - 1);
+                        let got = fs.base.cert(a, e, cap);
+                        let lows: Vec<usize> = [2u64, 3]
+                            .iter()
+                            .map(|&k| {
+                                let x = Natural::from(a).pow(k);
+                                let y = Natural::from(e).pow(k);
+                                let (dx, dy) = (dig(&x, &bn), dig(&y, &bn));
+                                let c0 = (cap as usize).max(dig(&(&y - &x), &bn).len());
+                                let mut l = c0;
+                                for i in (c0..dx.len()).rev() {
+                                    if dx[i] != dy[i] {
+                                        l = i;
+                                        break;
+                                    }
+                                }
+                                l
+                            })
+                            .collect();
+                        for n in a..=e {
+                            let nn = Natural::from(n);
+                            let mut seen = 0u64;
+                            let mut ok = true;
+                            for (k, &l) in [2u64, 3].iter().zip(&lows) {
+                                for &x in dig(&nn.clone().pow(*k), &bn).iter().skip(l) {
+                                    if seen & (1 << x) != 0 {
+                                        ok = false;
+                                    }
+                                    seen |= 1 << x;
+                                }
+                            }
+                            if !ok {
+                                continue;
+                            }
+                            viable += 1;
+                            let m = got.unwrap_or_else(|| {
+                                panic!(
+                                    "b{b} top {p} [{a}, {e}] rejected but n = {n} is locally viable"
+                                )
+                            });
+                            assert_eq!(
+                                m & !seen,
+                                0,
+                                "b{b} top {p}: certified {m:#x} not all among n = {n}'s {seen:#x}"
+                            );
+                        }
+                        match got {
+                            None => rejected += 1,
+                            Some(m) => {
+                                kept += 1;
+                                bits += u64::from(m.count_ones());
+                            }
+                        }
+                    }
+                    (b, kept, rejected, viable, bits)
+                })
+            })
+            .collect();
+        for h in handles {
+            let (b, kept, rejected, viable, bits) = h.join().unwrap();
+            eprintln!(
+                "cert on real tops b{b}: {kept} kept ({bits} certified digits), {rejected} rejected, {viable} locally viable numbers"
+            );
+        }
     }
 
     /// `bot_dfs` against brute force: exactly the residues r mod b^k whose
