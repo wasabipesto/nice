@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Pair an explicit `--gpu-backend cuda` with the overlap join in nice-only mode.
+- Make nice-only `auto` on NVIDIA run on `CubeCL`'s CUDA runtime alone, as detailed already does; hand-CUDA stays available with `--gpu-backend cuda`.
+
 ## Nice v3.4.6
 
 - Add an overlap join as the primary nice-only path for large fields. It skips much of the existing filter work by joining an overlapping list of the top-digit prefixes and bottom-digit residues which eliminates more candidates with the same underlying strategies. When the device or backend doesn't support this path it falls back to the existing stride implementation. Major thanks to [danstoyell](https://github.com/danstoyell) for the report and prototype.
