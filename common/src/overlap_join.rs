@@ -412,6 +412,21 @@ impl W4 {
         W4(r)
     }
 
+    /// The sum; the caller keeps it below 2^256.
+    #[inline]
+    #[must_use]
+    pub fn add(&self, o: &W4) -> W4 {
+        let mut r = [0u64; 4];
+        let mut carry = 0u64;
+        for i in 0..4 {
+            let (s1, c1) = self.0[i].overflowing_add(o.0[i]);
+            let (s2, c2) = s1.overflowing_add(carry);
+            r[i] = s2;
+            carry = u64::from(c1 | c2);
+        }
+        W4(r)
+    }
+
     #[inline]
     #[must_use]
     pub fn lt(&self, o: &W4) -> bool {
@@ -683,8 +698,9 @@ impl Base {
         u32::try_from(lo).unwrap_or(u32::MAX)
     }
 
-    /// floor(x / b^c).
-    #[inline]
+    /// floor(x / b^c): the tests' reference for [`Self::shift_down_rem`],
+    /// which the certificate uses.
+    #[cfg(test)]
     fn shift_down(&self, mut x: W4, mut c: u32) -> W4 {
         while c >= self.chd {
             self.dpow[self.chd as usize].divrem_w4(&mut x);
@@ -694,6 +710,25 @@ impl Base {
             self.dpow[c as usize].divrem_w4(&mut x);
         }
         x
+    }
+
+    /// floor(x / b^c) and x mod b^c, the remainder put back together from
+    /// the remainders of the division steps.
+    #[inline]
+    fn shift_down_rem(&self, mut x: W4, mut c: u32) -> (W4, W4) {
+        let mut rem = W4::default();
+        let mut at = 0usize;
+        while c >= self.chd {
+            let r = self.dpow[self.chd as usize].divrem_w4(&mut x);
+            rem = rem.add(&self.poww[at].mul_u128(u128::from(r)));
+            at += self.chd as usize;
+            c -= self.chd;
+        }
+        if c > 0 {
+            let r = self.dpow[c as usize].divrem_w4(&mut x);
+            rem = rem.add(&self.poww[at].mul_u128(u128::from(r)));
+        }
+        (x, rem)
     }
 
     /// Digits of x (least significant first), exactly `len` of them
@@ -738,39 +773,52 @@ impl Base {
     ///
     /// n ↦ n^j is increasing, so the digits that are the same for every n
     /// are exactly the common top digits of `a^j` and `e^j`, scanned down to
-    /// the first disagreement. The scan starts at `ndig(e^j − a^j)`: the two
-    /// cannot agree on every position `>= i` unless `e^j − a^j < b^i`.
+    /// the first disagreement. The scan starts at c0 >= `ndig(e^j − a^j)`:
+    /// the two cannot agree on every position `>= i` unless
+    /// `e^j − a^j < b^i`.
     ///
-    /// At the first disagreement every n's digit lies between `a^j`'s and
-    /// `e^j`'s, since the digits above it are fixed; [`close_certificate`]
-    /// uses those two intervals.
+    /// That also means floor(e^j / b^c0) is floor(a^j / b^c0) or one more,
+    /// so only a^j's digits are needed. If equal, every digit from c0 up is
+    /// common. If one more, the two differ exactly on a^j's trailing run of
+    /// (b − 1)s and the digit above it, which goes from d to d + 1: the
+    /// common digits are the ones above that, and every n's digit there is
+    /// d or d + 1, which [`close_certificate`] uses.
     #[must_use]
     pub fn cert(&self, a: u128, e: u128, cap: u32) -> Option<u64> {
         let a2 = W4::mul_u128_u128(a, a);
         let e2 = W4::mul_u128_u128(e, e);
         let a3 = a2.mul_u128(a);
         let e3 = e2.mul_u128(e);
+        // A digit, below b <= 64.
+        #[allow(clippy::cast_possible_truncation)]
+        let top = (self.b - 1) as u8;
         let mut mask = 0u64;
         let mut dx = [0u8; DIGIT_BUF];
-        let mut dy = [0u8; DIGIT_BUF];
         let mut doms = [0u64; 2];
         for (dom, (x, y, sp)) in doms.iter_mut().zip([(a2, e2, self.s2), (a3, e3, self.s3)]) {
-            let c0 = cap.max(self.ndig_w(&y.sub(&x)));
+            let d = y.sub(&x);
+            let c0 = cap.max(self.ndig_w(&d));
             if c0 >= sp {
                 continue;
             }
-            let len = sp - c0;
-            let qx = self.shift_down(x, c0);
-            let qy = self.shift_down(y, c0);
-            self.digits_w(qx, len, &mut dx);
-            self.digits_w(qy, len, &mut dy);
-            for i in (0..len as usize).rev() {
-                if dx[i] != dy[i] {
-                    // a^j < e^j and they agree above i, so dx < dy here.
-                    *dom = digit_range_mask(dx[i], dy[i]);
-                    break;
+            // e^j's shifted value is one more than a^j's exactly when a^j
+            // mod b^c0 plus (e^j − a^j) reaches b^c0. Both terms are below
+            // b^c0 <= a^j < 2^255, so the sum fits.
+            let (qx, rem) = self.shift_down_rem(x, c0);
+            let one_more = !rem.add(&d).lt(&self.poww[c0 as usize]);
+            self.digits_w(qx, sp - c0, &mut dx);
+            let mut from = 0usize;
+            if one_more {
+                // e^j's value there is below b^(sp − c0), so the run ends
+                // before the top digit.
+                while dx[from] == top {
+                    from += 1;
                 }
-                let bit = 1u64 << dx[i];
+                *dom = digit_range_mask(dx[from], dx[from] + 1);
+                from += 1;
+            }
+            for &digit in &dx[from..(sp - c0) as usize] {
+                let bit = 1u64 << digit;
                 if mask & bit != 0 {
                     return None;
                 }
@@ -1411,6 +1459,125 @@ mod tests {
             }
         }
         (seen, repeat)
+    }
+
+    /// [`Base::cert`] the long way: both endpoints' digits, compared from
+    /// the top down to their first disagreement.
+    fn cert_reference(base: &Base, a: u128, e: u128, cap: u32) -> Option<u64> {
+        let a2 = W4::mul_u128_u128(a, a);
+        let e2 = W4::mul_u128_u128(e, e);
+        let (a3, e3) = (a2.mul_u128(a), e2.mul_u128(e));
+        let (mut mask, mut doms) = (0u64, [0u64; 2]);
+        let (mut dx, mut dy) = ([0u8; DIGIT_BUF], [0u8; DIGIT_BUF]);
+        for (dom, (x, y, sp)) in doms.iter_mut().zip([(a2, e2, base.s2), (a3, e3, base.s3)]) {
+            let c0 = cap.max(base.ndig_w(&y.sub(&x)));
+            if c0 >= sp {
+                continue;
+            }
+            let len = sp - c0;
+            base.digits_w(base.shift_down(x, c0), len, &mut dx);
+            base.digits_w(base.shift_down(y, c0), len, &mut dy);
+            for i in (0..len as usize).rev() {
+                if dx[i] != dy[i] {
+                    *dom = digit_range_mask(dx[i], dy[i]);
+                    break;
+                }
+                if mask & (1 << dx[i]) != 0 {
+                    return None;
+                }
+                mask |= 1 << dx[i];
+            }
+        }
+        close_certificate(mask, doms)
+    }
+
+    /// The certificate from `a^j`'s digits and a remainder equals the one
+    /// from both endpoints' digits: on partition-extended tops of
+    /// production-shaped fields at bases 58-64, and on arbitrary intervals
+    /// and caps at smaller bases (where c0 is often the cap). More with
+    /// `NICE_TEST_CERT_SAMPLES` per field and base (default 20,000).
+    #[test]
+    fn the_fast_certificate_matches_the_reference() {
+        let per: u64 = std::env::var("NICE_TEST_CERT_SAMPLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        let mut certified = 0u64;
+        for (b, s0, size) in [
+            (58, 183_859_216_587_923_470_200, 1_000_000_000_000_000),
+            (60, 795_599_612_114_824_200_908, 10_000_000_000_000_000),
+            (62, 12_255_736_762_397_899_821_056, 10_000_000_000_000_000),
+            (64, 72_806_461_862_957_161_709_568, 10_000_000_000_000_000),
+        ] {
+            let range = FieldSize::new(s0, s0 + size);
+            let jp = join_params_for(b, &range).expect("a join field");
+            let fs = FieldSetup::new(b, s0, s0 + size, jp).unwrap();
+            let mut rng = Rng(u64::from(b) * 0x51ED_2701);
+            for _ in 0..per {
+                let (p0, _) = fs.tlay[rng.below(fs.tlay.len() as u128) as usize];
+                let p = p0 * fs.nparts + rng.below(fs.nparts);
+                if p < fs.plo || p > fs.phi {
+                    continue;
+                }
+                let lo = p * fs.w;
+                let (a, e) = (lo.max(fs.s), (lo + fs.w - 1).min(fs.e - 1));
+                let want = cert_reference(&fs.base, a, e, jp.k);
+                assert_eq!(fs.base.cert(a, e, jp.k), want, "b{b} [{a}, {e}]");
+                certified += u64::from(want.is_some());
+            }
+        }
+        for b in [10u32, 12, 20, 30, 40, 47, 50, 57] {
+            let mut rng = Rng(u64::from(b) * 0x2545_F491);
+            for _ in 0..per / 4 {
+                let l = u32::try_from(rng.below(30)).unwrap() + 2;
+                let start = u128::from(b).pow(l / 2).max(2);
+                let a = start + rng.below(start * 3);
+                let shift = rng.below(40);
+                let e = a + rng.below(1 << shift);
+                let Some(base) = Base::try_new(b, a, e) else {
+                    continue;
+                };
+                let cap = u32::try_from(rng.below(6)).unwrap();
+                let want = cert_reference(&base, a, e, cap);
+                assert_eq!(base.cert(a, e, cap), want, "b{b} [{a}, {e}] cap {cap}");
+                certified += u64::from(want.is_some());
+            }
+        }
+        assert!(
+            certified > per,
+            "{certified} certificates: the kept case is barely tested"
+        );
+    }
+
+    /// `shift_down_rem` against `shift_down`, and its remainder against the
+    /// low digits it must hold.
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn shift_down_keeps_its_remainder() {
+        let mut rng = Rng(0x5EED_0C0F);
+        for b in [10u32, 40, 57, 58, 60, 62, 63, 64] {
+            let base = Base::try_new(b, 1 << 40, (1 << 40) + 1).expect("a base");
+            for _ in 0..20_000 {
+                let top = rng.next() >> (1 + rng.next() % 63);
+                let w = W4([rng.next(), rng.next(), rng.next(), top]);
+                let len = base.ndig_w(&w);
+                if len as usize >= DIGIT_BUF {
+                    continue;
+                }
+                let c = u32::try_from(rng.below(u128::from(len.max(1)))).unwrap();
+                let (q, r) = base.shift_down_rem(w, c);
+                assert_eq!(q, base.shift_down(w, c), "b{b} {w:?} c {c}");
+                assert!(r.lt(&base.poww[c as usize]), "b{b} {w:?} c {c}: remainder");
+                let (mut x, mut y) = ([0u8; DIGIT_BUF], [0u8; DIGIT_BUF]);
+                base.digits_w(w, len, &mut x);
+                base.digits_w(r, c, &mut y);
+                assert_eq!(
+                    x[..c as usize],
+                    y[..c as usize],
+                    "b{b} {w:?} c {c}: low digits"
+                );
+            }
+        }
     }
 
     /// The closure's rule on its own: an interval with no free digit
