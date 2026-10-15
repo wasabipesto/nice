@@ -25,10 +25,9 @@ const REFILL_AMOUNT: usize = 200; // Claim this many fields when refilling
 const DETAILED_REFILL_THRESHOLD: usize = 50;
 const DETAILED_REFILL_AMOUNT: usize = 100;
 
-/// Refill sizes for the detailed `Next` queues, which serve a fifth of the
-/// detailed traffic the thin queue does (15% and 4% of claims against 80%).
-/// A batch of 100 is one frontier-chunk query either way; the lower threshold
-/// keeps the number of fields held for the rarer strategies proportionate.
+/// Refill sizes for the detailed `Next` queues: 90% of detailed claims at
+/// cl<=1 and 5% rechecks at cl<=2, against `Thin`'s 5%. A batch of 100 is
+/// one frontier-chunk query either way.
 const NEXT_REFILL_THRESHOLD: usize = 20;
 const NEXT_REFILL_AMOUNT: usize = 100;
 
