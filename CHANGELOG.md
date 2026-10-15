@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Speed up the overlap join at bases 62 and up by giving each GPU thread six bottom entries instead of four.
+
 ## Nice v3.4.6
 
 - Add an overlap join as the primary nice-only path for large fields. It skips much of the existing filter work by joining an overlapping list of the top-digit prefixes and bottom-digit residues which eliminates more candidates with the same underlying strategies. When the device or backend doesn't support this path it falls back to the existing stride implementation. Major thanks to [danstoyell](https://github.com/danstoyell) for the report and prototype.
