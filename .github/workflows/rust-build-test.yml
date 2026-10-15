@@ -166,6 +166,13 @@ jobs:
         steps:
             - uses: actions/checkout@v6
 
+            # The action installs `toolchain` with the target, but cargo then
+            # runs the version rust-toolchain.toml pins, so pass that version.
+            - name: Read the pinned toolchain
+              id: toolchain
+              shell: bash
+              run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
             # Test, using cross when needed. This action can also install required toolchains.
             - name: Run tests
               # Skip tests for targets that can't run on the host system (e.g. freebsd)
@@ -173,6 +180,7 @@ jobs:
               # https://github.com/houseabsolute/actions-rust-cross
               uses: houseabsolute/actions-rust-cross@v1
               with:
+                  toolchain: ${{ steps.toolchain.outputs.channel }}
                   command: test
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release --no-fail-fast"
@@ -189,6 +197,7 @@ jobs:
               if: ${{ matrix.platform.gpu_features }}
               uses: houseabsolute/actions-rust-cross@v1
               with:
+                  toolchain: ${{ steps.toolchain.outputs.channel }}
                   command: build
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release --features ${{ matrix.platform.gpu_features }}"
@@ -216,6 +225,7 @@ jobs:
               # https://github.com/houseabsolute/actions-rust-cross
               uses: houseabsolute/actions-rust-cross@v1
               with:
+                  toolchain: ${{ steps.toolchain.outputs.channel }}
                   command: build
                   target: ${{ matrix.platform.rust_target }}
                   args: "${{ matrix.platform.packages }} --locked --release"
