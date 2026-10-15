@@ -19,6 +19,11 @@
 //! `--full` re-evaluates every field with detailed submissions and recomputes
 //! every chunk and base, exactly like the job always did, and then advances
 //! the watermark like any other successful run.
+//!
+//! The same goes for the leaderboard and activity chart: they are derived from
+//! daily search totals that each run only adds its new submissions to (see
+//! `db_util::cache`), and a manual edit reaches them only when `--full`
+//! rebuilds the totals from every submission.
 
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::too_many_lines)]
@@ -40,6 +45,11 @@ use std::time::Instant;
 /// back means such stragglers are re-examined next run. Everything keyed on
 /// the watermark is idempotent, so the only cost is re-processing a few
 /// seconds' worth of submissions twice (~58/s arrive as of writing).
+///
+/// The search totals are counted up to the same boundary, on the same
+/// assumption that anything this far below the snapshot has committed. Their
+/// cursor is exact rather than re-processed, so the newest submissions are
+/// counted by a later run instead of twice.
 const WATERMARK_SAFETY_MARGIN: i64 = 10_000;
 
 fn main() {
@@ -59,9 +69,11 @@ fn main() {
     let mut conn = db_util::get_database_connection();
     println!("Database connection established. Scheduled jobs started.");
 
-    // Establish the submission window for this run. The watermark is read even
-    // in full mode so a missing migration fails here rather than at the end.
+    // Establish the submission window for this run. The watermark and the
+    // search totals' cursor are read even in full mode so a missing migration
+    // fails here rather than at the end.
     let watermark = db_util::job_state::get_watermark(&mut conn).unwrap();
+    db_util::job_state::get_cache_cursor(&mut conn).unwrap();
     let max_submission_id = db_util::submissions::get_max_submission_id(&mut conn).unwrap();
     let window_start = if full { 0 } else { watermark };
     println!(
@@ -380,6 +392,19 @@ fn main() {
     println!("Watermark advanced: {watermark} -> {new_watermark}.");
 
     println!("=== REFRESHING SEARCH CACHES ===");
+    let totals_up_to = (max_submission_id - WATERMARK_SAFETY_MARGIN).max(0);
+    if full {
+        db_util::cache::rebuild_search_totals(&mut conn, totals_up_to).unwrap();
+        println!("Search totals rebuilt through submission {totals_up_to}.");
+    } else {
+        for (after, up_to) in db_util::cache::update_search_totals(&mut conn, totals_up_to).unwrap()
+        {
+            println!(
+                "Search totals: added submissions {} through {up_to}.",
+                after + 1
+            );
+        }
+    }
     db_util::cache::refresh_search_caches(&mut conn).unwrap();
     println!("Search caches refreshed.");
 
