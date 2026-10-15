@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Size the overlap join's working memory to the GPU, up to 4 GiB instead of 1 GiB, so a production field at bases 60-64 runs as one slice instead of five to seven.
+
 ## Nice v3.4.6
 
 - Add an overlap join as the primary nice-only path for large fields. It skips much of the existing filter work by joining an overlapping list of the top-digit prefixes and bottom-digit residues which eliminates more candidates with the same underlying strategies. When the device or backend doesn't support this path it falls back to the existing stride implementation. Major thanks to [danstoyell](https://github.com/danstoyell) for the report and prototype.
