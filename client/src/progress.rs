@@ -1,10 +1,9 @@
-//! The GPU progress bar: an indicatif sink for [`nice_common::progress`].
+//! The progress bar: an indicatif sink for [`nice_common::progress`].
 //!
-//! The CPU path's bar comes from `simple-tqdm` over the rayon iterator. The
-//! GPU paths report through `nice_common::progress` instead, and this is
-//! what the client hangs on the other end: one bar, for the oldest field
-//! still open. The niceonly stride pipeline opens a field before the one
-//! ahead of it is done (the host filters one field's blocks after the
+//! The CPU and GPU paths report through `nice_common::progress`, and this
+//! is what the client hangs on the other end: one bar, for the oldest field
+//! still open. The GPU's niceonly stride pipeline opens a field before the
+//! one ahead of it is done (the host filters one field's blocks after the
 //! other's, while the device drains the first), so a bar per open field
 //! left one line standing still. Every open field keeps a bar of its own,
 //! with its own position, and a clock that starts with its first unit of
@@ -20,15 +19,15 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// The bar for the oldest field open on the device.
-pub struct GpuProgress {
+/// The bar for the oldest open field.
+pub struct Progress {
     multi: MultiProgress,
     /// Every open field's bar, in the order the fields began; only the
     /// first is drawn.
     fields: Mutex<VecDeque<((u128, u128), ProgressBar)>>,
 }
 
-impl GpuProgress {
+impl Progress {
     /// `None` when stderr is not a terminal: there is nothing to draw on,
     /// and log lines routed through a hidden group would be dropped.
     pub fn new() -> Option<Self> {
@@ -50,8 +49,8 @@ impl GpuProgress {
         let bar = self.multi.add(bar.clone());
         // indicatif draws a bar that has a steady tick only on the tick, not
         // when its position moves, so the tick is the refresh rate: 20 Hz,
-        // the CPU bar's cap. It also keeps the clock moving while the host
-        // waits on the device.
+        // the most indicatif draws to stderr. It also keeps the clock moving
+        // while the host waits on the device.
         bar.enable_steady_tick(Duration::from_millis(50));
     }
 
@@ -65,9 +64,9 @@ impl GpuProgress {
     }
 }
 
-/// The same shape as the CPU bar: `simple-tqdm`'s template and keys, with
-/// the rate in numbers per second (a unit is `numbers_per_unit` of them,
-/// not always a power of ten: a join partition is a field's share).
+/// tqdm's template and keys, with the rate in numbers per second (a unit is
+/// `numbers_per_unit` of them, not always a power of ten: a join partition
+/// is a field's share).
 fn style(numbers_per_unit: u128) -> ProgressStyle {
     #[allow(clippy::cast_precision_loss)]
     let scale = numbers_per_unit.max(1) as f64;
@@ -94,8 +93,8 @@ fn waiting_style() -> ProgressStyle {
     )
 }
 
-/// `simple-tqdm`'s percentage (right-aligned, with its sign), its `MM:SS`
-/// times and its bar characters.
+/// tqdm's percentage (right-aligned, with its sign), its `MM:SS` times and
+/// its bar characters.
 fn tqdm_keys(style: ProgressStyle) -> ProgressStyle {
     let mm_ss = |d: Duration, w: &mut dyn std::fmt::Write| {
         let _ = write!(w, "{:0>2}:{:0>2}", d.as_secs() / 60, d.as_secs() % 60);
@@ -124,7 +123,7 @@ fn key(range: &FieldSize) -> (u128, u128) {
     (range.start(), range.end())
 }
 
-impl ProgressSink for GpuProgress {
+impl ProgressSink for Progress {
     fn begin(&self, range: &FieldSize, units: u64, numbers_per_unit: u128) {
         let bar = ProgressBar::with_draw_target(Some(units), ProgressDrawTarget::hidden())
             .with_style(style(numbers_per_unit));
@@ -138,6 +137,11 @@ impl ProgressSink for GpuProgress {
     fn advance(&self, range: &FieldSize, done: u64) {
         let fields = self.fields.lock().unwrap();
         if let Some((_, bar)) = fields.iter().find(|(k, _)| *k == key(range)) {
+            // Threads sharing a field report in any order; a position
+            // behind the bar's is stale.
+            if done < bar.position() {
+                return;
+            }
             let started = bar.position() == 0 && done > 0;
             bar.set_position(done);
             if started {
@@ -202,7 +206,7 @@ mod tests {
     use super::*;
 
     /// The open fields, oldest (the drawn one) first, with their positions.
-    fn open_fields(p: &GpuProgress) -> Vec<((u128, u128), u64)> {
+    fn open_fields(p: &Progress) -> Vec<((u128, u128), u64)> {
         p.fields
             .lock()
             .unwrap()
@@ -213,7 +217,7 @@ mod tests {
 
     #[test]
     fn the_oldest_open_field_has_the_bar() {
-        let p = GpuProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let p = Progress::with_draw_target(ProgressDrawTarget::hidden());
         let a = FieldSize::new(0, 1_000);
         let b = FieldSize::new(1_000, 3_000);
         p.begin(&a, 10, 100);
@@ -245,7 +249,7 @@ mod tests {
 
     #[test]
     fn a_later_field_can_finish_first() {
-        let p = GpuProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let p = Progress::with_draw_target(ProgressDrawTarget::hidden());
         let (a, b, c) = (
             FieldSize::new(0, 10),
             FieldSize::new(10, 20),
@@ -258,6 +262,19 @@ mod tests {
         assert_eq!(open_fields(&p), [((0, 10), 0), ((20, 30), 0)]);
         p.finish(&a);
         assert_eq!(open_fields(&p), [((20, 30), 0)]);
+    }
+
+    #[test]
+    fn a_position_behind_the_bar_is_ignored() {
+        let p = Progress::with_draw_target(ProgressDrawTarget::hidden());
+        let a = FieldSize::new(0, 1_000);
+        p.begin(&a, 1_000, 1);
+        // Threads sharing the field can report out of order.
+        p.advance(&a, 500);
+        p.advance(&a, 300);
+        assert_eq!(open_fields(&p), [((0, 1_000), 500)]);
+        p.advance(&a, 800);
+        assert_eq!(open_fields(&p), [((0, 1_000), 800)]);
     }
 
     /// A terminal that keeps what is drawn on it.
@@ -296,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_reads_like_the_cpu_bar() {
+    fn the_bar_reads_like_tqdm() {
         let term = Capture::default();
         let target = ProgressDrawTarget::term_like(Box::new(term.clone()));
         let bar = ProgressBar::with_draw_target(Some(100), target).with_style(style(1_000));
@@ -322,7 +339,7 @@ mod tests {
 
     #[test]
     fn log_writer_splits_lines() {
-        let p = GpuProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let p = Progress::with_draw_target(ProgressDrawTarget::hidden());
         let mut w = p.log_writer();
         w.write_all(b"one\ntwo\nthr").unwrap();
         w.write_all(b"ee\n").unwrap();

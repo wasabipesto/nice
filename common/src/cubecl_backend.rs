@@ -1971,7 +1971,7 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
     // Ticks on submission: without a per-batch sync there is nothing cheap
     // to wait on here, so the bar runs ahead of the device by however many
     // batches the runtime queues. It still shows the field is moving.
-    let mut progress = crate::progress::FieldProgress::begin(range, CUBECL_BATCH_SIZE);
+    let progress = crate::progress::FieldProgress::begin(range, CUBECL_BATCH_SIZE);
 
     for batch in range.chunks(CUBECL_BATCH_SIZE) {
         let start = batch.start();

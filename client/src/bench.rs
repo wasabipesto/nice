@@ -275,11 +275,6 @@ pub async fn run_benchmark_sweep(cli: &Arc<Cli>, gpu: &GpuCtx, client: &Client) 
 
 /// The blocking part: calibrate and run every scenario within the budget.
 fn run_sweep(cli: &Arc<Cli>, gpu: &GpuCtx) -> (Vec<ScenarioResult>, HashMap<u32, f64>) {
-    // The progress bar is noise at benchmark window sizes.
-    let mut quiet = (**cli).clone();
-    quiet.no_progress = true;
-    let quiet = Arc::new(quiet);
-
     let mut cache = TableCache {
         tables: HashMap::new(),
         build_secs: HashMap::new(),
@@ -295,7 +290,7 @@ fn run_sweep(cli: &Arc<Cli>, gpu: &GpuCtx) -> (Vec<ScenarioResult>, HashMap<u32,
             #[allow(clippy::cast_precision_loss)]
             let share = cli.benchmark_secs / defs.len() as f64;
             defs.iter()
-                .map(|def| run_field_scenario(&quiet, gpu, def, share, &mut cache))
+                .map(|def| run_field_scenario(cli, gpu, def, share, &mut cache))
                 .collect()
         }
         SearchMode::Detailed => {
@@ -306,7 +301,7 @@ fn run_sweep(cli: &Arc<Cli>, gpu: &GpuCtx) -> (Vec<ScenarioResult>, HashMap<u32,
             #[allow(clippy::cast_precision_loss)]
             let share = cli.benchmark_secs / defs.len() as f64;
             defs.iter()
-                .map(|def| run_scenario(&quiet, gpu, def, share, &mut cache))
+                .map(|def| run_scenario(cli, gpu, def, share, &mut cache))
                 .collect()
         }
     };
