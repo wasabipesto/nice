@@ -109,10 +109,11 @@ pub use kernels::{
     clippy::unreadable_literal,
     // Shared memory is passed by reference, the comptime `if` must stay
     // separate from the runtime one, and the integer helpers clippy suggests
-    // (midpoint) are not cube intrinsics.
+    // (midpoint, is_power_of_two) are not cube intrinsics.
     clippy::trivially_copy_pass_by_ref,
     clippy::collapsible_else_if,
-    clippy::manual_midpoint
+    clippy::manual_midpoint,
+    clippy::manual_is_power_of_two
 )]
 mod kernels {
     use super::{DEAD_MASK, JOIN_WG, SURV_FLUSH, SURV_SH_CAP, TOP_CAP};
