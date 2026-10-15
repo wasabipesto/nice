@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Speed up the CPU overlap join: an AVX-512 scan where the CPU has it, and a top certificate built from one endpoint's digits instead of both, with half the 256-bit divisions.
+- Strengthen the overlap join's prefix certificate: at the first position where an interval's powers differ, the digit's range of possible values can rule the interval out or fix one more digit. Fewer candidates reach the later stages on the CPU and the GPU.
+
 ## Nice v3.4.6
 
 - Add an overlap join as the primary nice-only path for large fields. It skips much of the existing filter work by joining an overlapping list of the top-digit prefixes and bottom-digit residues which eliminates more candidates with the same underlying strategies. When the device or backend doesn't support this path it falls back to the existing stride implementation. Major thanks to [danstoyell](https://github.com/danstoyell) for the report and prototype.
