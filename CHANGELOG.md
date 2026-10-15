@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Pair an explicit `--gpu-backend cuda` with the overlap join in nice-only mode, as `auto` already does.
+- Pair an explicit `--gpu-backend cuda` with the overlap join in nice-only mode.
+- Make nice-only `auto` on NVIDIA run on `CubeCL`'s CUDA runtime alone, as detailed already does; hand-CUDA stays available with `--gpu-backend cuda`.
 
 ## Nice v3.4.6
 
