@@ -39,6 +39,8 @@
 //! the AND of the two masks is zero. Nothing else is assumed: this is the
 //! client's own MSD, LSD, residue and cross-end reasoning, enumerated as a
 //! join.
+//!
+//! Lean: `NiceSearch.joinField_complete` (END-2)
 
 use crate::FieldSize;
 use crate::client_process::get_is_nice;
@@ -325,6 +327,8 @@ pub fn prefix_block(base: u32, l: u32, jp: JoinParams) -> u128 {
 /// all of them are bounded by `max_prefixes` whatever the field's size, at
 /// the cost of the per-field fixed work (the bottom side, every partition)
 /// once per slice.
+///
+/// Lean: `NiceSearch.joinSlices_flatMap` (JOIN-4)
 #[must_use]
 pub fn join_slices(range: &FieldSize, block: u128, max_prefixes: u128) -> Vec<FieldSize> {
     let step = block.saturating_mul(max_prefixes.max(1));
@@ -697,6 +701,8 @@ impl Base {
     /// digits of `a^j` and `e^j`, scanned down to the first disagreement.
     /// The scan starts at `ndig(e^j − a^j)`: the two cannot agree on every
     /// position `>= i` unless `e^j − a^j < b^i`.
+    ///
+    /// Lean: `NiceSearch.highDigit_of_cert` (JOIN-1)
     #[must_use]
     pub fn cert(&self, a: u128, e: u128, cap: u32) -> Option<u64> {
         let a2 = W4::mul_u128_u128(a, a);
@@ -733,6 +739,8 @@ impl Base {
     /// Lowest output position the certificate of `[a, e]` (cap `cap`) can
     /// cover, over both powers: every certified digit of n² (n³) sits at a
     /// position `>= max(cap, ndig(e² − a²))` (resp. the cube).
+    ///
+    /// Lean: `NiceSearch.highDigit_of_cert` (JOIN-1)
     #[must_use]
     pub fn cert_floor(&self, a: u128, e: u128, cap: u32) -> u32 {
         let a2 = W4::mul_u128_u128(a, a);
@@ -747,6 +755,8 @@ impl Base {
     /// Top prefixes of depth `depth` meeting `[s, e_incl]` whose certificate
     /// (cap `cap`) passes, breadth first; a failing prefix's children all
     /// fail (a sub-interval's common digits include its parent's).
+    ///
+    /// Lean: `NiceSearch.highDigit_of_cert` (JOIN-1)
     #[must_use]
     #[allow(clippy::many_single_char_names)] // b, w, p, a, e as in the docs
     pub fn top_layer(&self, s: u128, e_incl: u128, depth: u32, cap: u32) -> Vec<(u128, u64)> {
@@ -778,6 +788,8 @@ impl Base {
     /// depth `k`, with positions `[f0, f0 + pp)` forced to the digits of `v`.
     /// Digit `j` of `(r + d·b^j)²` is `(⌊r²/b^j⌋ + 2d·(r mod b)) mod b` and of
     /// the cube `(⌊r³/b^j⌋ + 3d·(r mod b)²) mod b` (`d²`, `d³` at `j = 0`).
+    ///
+    /// Lean: `NiceSearch.mem_bottomList_of_isNice` (JOIN-2)
     // The recursion's state is the argument list; a residue is below
     // b^k < 2^40 (`JoinParams::supported`), so it fits u64.
     #[allow(
@@ -869,6 +881,7 @@ pub struct FieldSetup {
     pub k2: u32,
     /// Certificate floor of every full-width block in the field (monotone in
     /// `P`, so the first full block bounds them all).
+    /// Lean: `NiceSearch.prefilterAt_of_isNice` (JOIN-6)
     pub full_floor: u32,
     pub secs: f64,
 }
@@ -1023,6 +1036,10 @@ pub struct JoinStats {
 /// = all `b^p`): every survivor is fully checked with `get_is_nice`, and
 /// recorded in `record` if given. The GPU stage must produce exactly these
 /// survivors.
+///
+/// Lean: `NiceSearch.disjoint_high_lowSet` (JOIN-3)
+/// Lean: `NiceSearch.mem_joinPartition_of_isNice` (JOIN-5)
+/// Lean: `NiceSearch.joinField_complete` (END-2)
 ///
 /// # Panics
 /// If `jp` does not fit the field's digit length (`t + k > L`, `t <= L`,

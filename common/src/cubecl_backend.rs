@@ -815,6 +815,7 @@ pub(crate) fn candidate_check(
 
 /// `lanes = 1 << lane_shift` threads cooperate on each range, striding
 /// through its candidates by index — pure index arithmetic, no subgroup ops.
+/// Lean: `NiceSearch.exists_ordinal_eq` (GPU-0)
 /// The g-th valid candidate at or after a range start is
 /// `B0 + (g / R) * M + residues[g % R]`.
 ///
@@ -1939,6 +1940,7 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
 ) -> Result<FieldResults> {
     /// Batches launched between blocking histogram drains; the overflow
     /// bound is checked below.
+    // Lean: `NiceSearch.Const.histogram_bins` (NUM-9)
     const DRAIN_INTERVAL: usize = 64;
     const _: () = assert!((DRAIN_INTERVAL as u128) * CUBECL_BATCH_SIZE < u32::MAX as u128);
 

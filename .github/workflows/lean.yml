@@ -1,0 +1,47 @@
+name: Lean proofs
+
+on:
+    push:
+        branches: ["main"]
+        paths:
+            - "proofs/**"
+            - "scripts/lean_fixtures.rs"
+            - ".github/workflows/lean.yml"
+    pull_request:
+        branches: ["main"]
+        paths:
+            - "proofs/**"
+            - "scripts/lean_fixtures.rs"
+            - ".github/workflows/lean.yml"
+    workflow_dispatch:
+
+concurrency:
+    group: lean-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    build:
+        name: lake build, conformance, claims
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            # Builds the library with Mathlib's cache (a few minutes of
+            # download; the proofs themselves compile in seconds).
+            - uses: leanprover/lean-action@v1
+              with:
+                  lake-package-directory: proofs
+                  build-args: "--wfail"
+                  test: false
+                  lint: false
+
+            # The Lean model against the checked-in Rust tables.
+            - name: Conformance
+              working-directory: proofs
+              run: lake exe conformance
+
+            # Every `Lean:` tag in the Rust names its registry row; every
+            # `proved` row exists and is sorry-free with standard axioms.
+            - name: Claims registry
+              working-directory: proofs
+              run: python3 scripts/check_claims.py

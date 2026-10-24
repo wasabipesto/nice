@@ -80,6 +80,8 @@ pub const fn supports(base: u32, k: u32) -> bool {
 ///
 /// Callers must check [`supports`] first; other bases return `true`
 /// (no filtering).
+///
+/// Lean: `NiceSearch.affine_mid_digit` (AFF-1)
 #[must_use]
 #[inline]
 pub fn survives(base: u32, nmod: u64, known: u64) -> bool {
