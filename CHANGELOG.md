@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Remove the `NICE_CUDA_CROSS`, `NICE_CUDA_COMPACT`, `NICE_CUBECL_CROSS` and `NICE_CUBECL_COMPACT` environment variables, as v3.4.1 announced; the cross-end filter and its compaction now always run where they apply.
 - Make the fleet require the GPU image's CUDA version on every offer search (`min_cuda_version`, default 12.8), even when a config's `offer_query` asks for less.
 
 ## Nice v3.4.6
