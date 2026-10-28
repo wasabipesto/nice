@@ -11,7 +11,7 @@
 //! [`FieldSetup`]. Nothing here depends on a GPU runtime: the `CubeCL` stage
 //! (`crate::cubecl_join`) allocates exactly the buffers [`Footprint`]
 //! counts.
-#![cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+#![cfg(any(feature = "cuda", feature = "cubecl"))]
 // Only `CubeCL` runs the join so far: without it a field is still planned
 // (the route is decided the same way everywhere) but nothing reads the plan.
 #![cfg_attr(not(feature = "cubecl"), allow(dead_code))]
@@ -33,9 +33,11 @@ const SLOTS: usize = 16;
 /// Launched batches kept in flight before the driver waits for the oldest
 /// (each holds a little scratch of its own, counted in [`Footprint`]).
 pub(crate) const BATCHES_IN_FLIGHT: usize = 4;
-/// Prefilter survivors one batch may produce (each 8 bytes). A base-57
-/// partition yields 1.5-2.7e6 join survivors, of which ~6% pass the
-/// prefilter, so 16 partitions make ~2.6e6 at most.
+/// Prefilter survivors one batch may produce (each 8 bytes) on a device
+/// with a [`JOIN_MEMORY`] budget or less. A base-57 partition yields
+/// 1.5-2.7e6 join survivors, of which ~6% pass the prefilter, so 16
+/// partitions make ~2.6e6 at most. A device with a larger budget gives the
+/// list a quarter of it instead ([`list_bound`]).
 const SURV_CAP: u32 = 1 << 24;
 /// The same for the overflow re-run (one partition per launch).
 const SURV_CAP_RETRY: u32 = 1 << 26;
@@ -51,10 +53,16 @@ const NICE_CAP: u32 = 1 << 10;
 /// Bytes per hit in the output list: `n` as four `u32` limbs, as the check
 /// kernels write it.
 pub(crate) const NICE_RECORD_BYTES: usize = 16;
-/// The join's whole device working set may take at most this much; a field
-/// at bases 40-64 needs 0.3-0.9 GiB at 16 partitions per launch. See
-/// [`JoinLimits`].
+/// The join's working-set budget on a device whose largest buffer is this
+/// size or smaller (down to half of it); a field at bases 40-64 needs
+/// 0.3-0.9 GiB at 16 partitions per launch. See [`JoinLimits`].
 const JOIN_MEMORY: usize = 1 << 30;
+/// The largest working-set budget, reached by devices of 16 GiB and more on
+/// CUDA. With a quarter of it for the survivor list, a 1e16 field at bases
+/// 60-64 is one slice instead of 5-7, which saves the per-slice fixed work
+/// (every partition's bottom side and launches): 1.07-1.17x per field on an
+/// RTX 3060, RTX 3080, RTX 4090 and A100.
+const JOIN_MEMORY_MAX: usize = 4 << 30;
 /// An upper bound on the prefilter survivors one partition yields per
 /// top-layer prefix of the field: measured 0.8-1.6 at bases 57-64 on fields
 /// of 1e14-1e15 (b57 frontier 1.08, b58 1.09-1.11, b60 0.79, Dan's dense
@@ -81,16 +89,32 @@ impl JoinLimits {
     /// on wgpu the adapter's `max_storage_buffer_binding_size` (128 MiB on
     /// lavapipe, 1-4 GiB on desktop drivers); on CUDA, and on Vulkan with
     /// 64-bit indexing, `CubeCL` reports a quarter of the device's memory.
-    /// The budget is [`JOIN_MEMORY`] but at most twice the largest buffer:
-    /// half the device where the runtime knows its size, and a small working
-    /// set where buffers are small (software rasterizers, embedded GPUs).
+    /// The budget is that largest buffer, between [`JOIN_MEMORY`] and
+    /// [`JOIN_MEMORY_MAX`], and at most twice it: a quarter of the device
+    /// where the runtime knows its size, and a small working set where
+    /// buffers are small (software rasterizers, embedded GPUs).
     #[must_use]
     pub fn for_buffer(max_buffer: u64) -> Self {
         let max_binding = usize::try_from(max_buffer).unwrap_or(usize::MAX).max(1);
         Self {
             max_binding,
-            budget: JOIN_MEMORY.min(max_binding.saturating_mul(2)),
+            budget: max_binding
+                .clamp(JOIN_MEMORY, JOIN_MEMORY_MAX)
+                .min(max_binding.saturating_mul(2)),
         }
+    }
+}
+
+/// The most prefilter survivors a batch's list may hold on a device with
+/// `lim`, before its share of the budget: [`SURV_CAP`] up to a
+/// [`JOIN_MEMORY`] budget, as it always was, and otherwise whatever a
+/// quarter of the budget holds. Below that budget a longer list costs
+/// partitions per launch at bases 62-64 more than it saves in slices.
+fn list_bound(lim: JoinLimits) -> u32 {
+    if lim.budget > JOIN_MEMORY {
+        u32::MAX
+    } else {
+        SURV_CAP
     }
 }
 
@@ -287,7 +311,7 @@ impl JoinPlan {
     /// `None` if the device cannot hold one partition with a re-run list of
     /// [`MIN_RETRY_CAP`].
     pub(crate) fn for_field(fs: &FieldSetup, lim: JoinLimits) -> Option<(Self, Self)> {
-        let main = Self::new(fs, lim, SLOTS, SURV_CAP, 1, lim.budget / 4)?;
+        let main = Self::new(fs, lim, SLOTS, list_bound(lim), 1, lim.budget / 4)?;
         let fp = Footprint::of(fs, NICE_CAP);
         let spare = lim.budget.saturating_sub(fp.fixed + fp.per_slot());
         let retry = Self::new(fs, lim, 1, SURV_CAP_RETRY, MIN_RETRY_CAP, spare)?;
@@ -311,7 +335,7 @@ pub(crate) fn max_slice_prefixes(fs: &FieldSetup, lim: JoinLimits) -> usize {
     let per_fixed = two.fixed - one.fixed;
     let per_slot = two.per_slot() - one.per_slot();
     let per_largest = two.top.max(two.tl) - one.top.max(one.tl);
-    let list_cap = (SURV_CAP as usize)
+    let list_cap = (list_bound(lim) as usize)
         .min(lim.max_binding / 8)
         .min(lim.budget / 4 / 8);
     let s = SLICE_SLOTS;
@@ -503,6 +527,49 @@ pub(crate) mod tests {
     /// The densest base-58 region the probes found (2026-10-05), where a 1e15
     /// field overran the join kernel's survivor stage before it flushed per
     /// chunk.
+    /// The budget is the largest buffer between 1 and 4 GiB and at most
+    /// twice it, and the list keeps its historical bound up to 1 GiB.
+    #[test]
+    fn budgets_follow_the_largest_buffer() {
+        const MIB: u64 = 1 << 20;
+        for (buffer, budget) in [
+            (128 * MIB, 256 * MIB),
+            (512 * MIB, 1024 * MIB),
+            (1024 * MIB, 1024 * MIB),
+            (3072 * MIB, 3072 * MIB),
+            (6144 * MIB, 4096 * MIB),
+            (u64::MAX, 4096 * MIB),
+        ] {
+            let lim = JoinLimits::for_buffer(buffer);
+            assert_eq!(lim.budget as u64, budget, "buffer {buffer}");
+            let bound = if lim.budget > JOIN_MEMORY {
+                u32::MAX
+            } else {
+                SURV_CAP
+            };
+            assert_eq!(list_bound(lim), bound, "buffer {buffer}");
+        }
+    }
+
+    /// A device with the largest budget (16 GiB and up on CUDA) takes a
+    /// typical 1e16 field at bases 60 and 62 in one slice, within budget,
+    /// with a quarter of the budget for the survivor list.
+    #[test]
+    fn a_large_device_takes_a_production_field_whole() {
+        let lim = JoinLimits::for_buffer(6 << 30);
+        assert_eq!(lim.budget, JOIN_MEMORY_MAX);
+        for (base, start) in [
+            (60, 795_599_612_114_824_200_908u128),
+            (62, 12_255_736_762_397_899_821_056),
+        ] {
+            let range = FieldSize::new(start, start + 10_000_000_000_000_000);
+            let field = plan_join(base, &range, lim).expect("a join field");
+            assert_eq!(field.slices.len(), 1, "b{base}");
+            assert!(field.plan.bytes <= lim.budget, "b{base}: {:?}", field.plan);
+            assert_eq!(field.plan.list_cap as usize, lim.budget / 4 / 8, "b{base}");
+        }
+    }
+
     pub(crate) const DENSE_58: u128 = 102_121_216_587_923_470_200;
 
     /// A field of 1e14 at base `base`, from the middle of its band.

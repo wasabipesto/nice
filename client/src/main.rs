@@ -43,10 +43,6 @@ mod gpu_progress;
 use nice_common::client_process_cuda::CudaWithJoin;
 #[cfg(feature = "cuda")]
 use nice_common::client_process_cuda::{CUDA_BATCH_SIZE, CudaContext, process_range_detailed_cuda};
-#[cfg(feature = "vulkan")]
-use nice_common::client_process_vulkan::{
-    VULKAN_BATCH_SIZE, process_range_detailed_vulkan, process_range_niceonly_vulkan,
-};
 #[cfg(feature = "cubecl")]
 use nice_common::cubecl_backend::{
     CUBECL_BATCH_SIZE, CubeclContext, process_range_detailed_cubecl,
@@ -55,27 +51,23 @@ use nice_common::cubecl_backend::{
 use nice_common::gpu_route::{
     FieldTicket, NiceonlyGpu, NiceonlyStarted, begin_niceonly, finish_niceonly, process_niceonly,
 };
-#[cfg(feature = "vulkan")]
-use nice_common::vulkan::VulkanContext;
 
 /// Which GPU backend to drive.
 ///
 /// Every backend `dlopen`s its driver at runtime, so a single binary can carry
 /// all of them and require none at build time. `Auto` tries CUDA first on
-/// NVIDIA, and in nice-only mode pairs it with `CubeCL`'s CUDA runtime for the
-/// overlap join (see `init_gpu`).
+/// NVIDIA. In nice-only mode CUDA, whether `auto` picked it or it was named,
+/// is paired with `CubeCL`'s CUDA runtime for the overlap join (see
+/// `init_gpu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GpuBackend {
     /// Fastest measured order for the mode: detailed tries `cubecl-cuda`,
-    /// `cubecl`, CUDA, then Vulkan; niceonly tries CUDA (with join),
-    /// `cubecl`, then Vulkan.
+    /// `cubecl`, then CUDA; niceonly tries CUDA (with join), then `cubecl`.
     Auto,
     /// NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In
-    /// niceonly this uses the CUDA stride pipeline.
+    /// niceonly, as with `auto`, fields the overlap join takes run on
+    /// `CubeCL`'s CUDA runtime (in builds with `cubecl-cuda`).
     Cuda,
-    /// Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA,
-    /// llvmpipe) (needs the experimental `vulkan` feature).
-    Vulkan,
     /// `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base.
     Cubecl,
     /// `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda`
@@ -99,44 +91,40 @@ enum GpuBackend {
 enum GpuHandle {
     #[cfg(feature = "cuda")]
     Cuda(CudaContext),
-    #[cfg(feature = "vulkan")]
-    Vulkan(VulkanContext),
     #[cfg(feature = "cubecl")]
     Cubecl(CubeclContext),
-    /// NVIDIA nice-only under `--gpu-backend auto`: hand-CUDA, with
-    /// `CubeCL`'s CUDA runtime for the fields the overlap join takes, where
-    /// it is several times faster (see `CudaWithJoin`).
+    /// NVIDIA nice-only under `--gpu-backend auto` or `cuda`: hand-CUDA,
+    /// with `CubeCL`'s CUDA runtime for the fields the overlap join takes,
+    /// where it is several times faster (see `CudaWithJoin`).
     #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
     CudaJoin(CudaWithJoin),
 }
 
 impl GpuHandle {
-    /// The nice-only pipelines behind this handle; `None` for Vulkan, which
-    /// processes each field on the calling thread.
+    /// The nice-only pipelines behind this handle.
     #[cfg(any(feature = "cuda", feature = "cubecl"))]
-    fn niceonly(&self) -> Option<&dyn NiceonlyGpu> {
+    fn niceonly(&self) -> &dyn NiceonlyGpu {
         match self {
             #[cfg(feature = "cuda")]
-            GpuHandle::Cuda(ctx) => Some(ctx),
+            GpuHandle::Cuda(ctx) => ctx,
             #[cfg(feature = "cubecl")]
-            GpuHandle::Cubecl(ctx) => Some(ctx),
+            GpuHandle::Cubecl(ctx) => ctx,
             #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
-            GpuHandle::CudaJoin(pair) => Some(pair),
-            #[cfg(feature = "vulkan")]
-            GpuHandle::Vulkan(_) => None,
+            GpuHandle::CudaJoin(pair) => pair,
         }
     }
 
     /// The name of the device this backend is actually running on, for the
     /// benchmark report and submission telemetry.
     ///
-    /// Asking the live handle rather than the CLI flag is what keeps the two
-    /// backends apart: on a box with both, `--gpu-backend vulkan` (or a CUDA
-    /// init that failed over to Vulkan) would otherwise be reported under the
-    /// CUDA device's name. Vulkan recorded its name at init; the CUDA handle
-    /// does not carry one, so that arm asks the driver again by device index.
+    /// Asking the live handle rather than the CLI flag is what keeps the
+    /// backends apart: on a box with several, `--gpu-backend cubecl` (or a
+    /// CUDA init that failed over to `CubeCL`) would otherwise be reported
+    /// under the CUDA device's name. `CubeCL` recorded its name at init; the
+    /// CUDA handle does not carry one, so that arm asks the driver again by
+    /// device index.
     // Both lints fire only in configurations this function degenerates in: a
-    // Vulkan-only build reaches no `None` arm, and a build with no backend at
+    // `CubeCL`-only build reaches no `None` arm, and a build with no backend at
     // all reaches neither `self` nor `device`.
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn device_name(&self, device: usize) -> Option<String> {
@@ -145,7 +133,7 @@ impl GpuHandle {
         // reference and references are always considered inhabited, so an
         // empty match does not type-check. Same `#[cfg]` split as
         // `process_field_sync`.
-        #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+        #[cfg(any(feature = "cuda", feature = "cubecl"))]
         {
             match self {
                 #[cfg(feature = "cuda")]
@@ -154,13 +142,11 @@ impl GpuHandle {
                     .and_then(|d| d.name().ok()),
                 #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
                 GpuHandle::CudaJoin(pair) => Some(pair.join.device_name()),
-                #[cfg(feature = "vulkan")]
-                GpuHandle::Vulkan(ctx) => Some(ctx.device_name.clone()),
                 #[cfg(feature = "cubecl")]
                 GpuHandle::Cubecl(ctx) => Some(ctx.device_name()),
             }
         }
-        #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
+        #[cfg(not(any(feature = "cuda", feature = "cubecl")))]
         {
             None
         }
@@ -174,7 +160,7 @@ impl GpuHandle {
     // Same degenerate-configuration lints as `device_name`.
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn backend_name(&self) -> Option<&'static str> {
-        #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+        #[cfg(any(feature = "cuda", feature = "cubecl"))]
         {
             match self {
                 #[cfg(feature = "cuda")]
@@ -184,13 +170,11 @@ impl GpuHandle {
                 // `overlap_join`.
                 #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
                 GpuHandle::CudaJoin(_) => Some("cuda"),
-                #[cfg(feature = "vulkan")]
-                GpuHandle::Vulkan(_) => Some("vulkan"),
                 #[cfg(feature = "cubecl")]
                 GpuHandle::Cubecl(ctx) => Some(ctx.backend_name()),
             }
         }
-        #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
+        #[cfg(not(any(feature = "cuda", feature = "cubecl")))]
         {
             None
         }
@@ -335,8 +319,8 @@ pub struct Cli {
     /// Which wgpu adapter the `CubeCL` backend uses, in `CubeCL`'s device
     /// spelling: `DiscreteGpu(0)`, `IntegratedGpu(1)`, `Cpu`, ... Unset picks
     /// the best adapter. This exists because --gpu-device indexes a
-    /// per-backend namespace (CUDA ordinals != Vulkan ordinals != wgpu
-    /// adapters), so on a multi-GPU box no single number is right for every
+    /// per-backend namespace (CUDA ordinals != wgpu adapters), so on a
+    /// multi-GPU box no single number is right for every
     /// backend; the chosen adapter and its graphics API are always logged.
     #[arg(long, env = "NICE_GPU_WGPU_DEVICE")]
     gpu_wgpu_device: Option<String>,
@@ -351,9 +335,6 @@ fn compiled_backends() -> String {
     let mut have = Vec::new();
     if cfg!(feature = "cuda") {
         have.push("cuda");
-    }
-    if cfg!(feature = "vulkan") {
-        have.push("vulkan");
     }
     if cfg!(feature = "cubecl") {
         have.push("cubecl");
@@ -485,19 +466,27 @@ fn guarded_init<T>(
     }
 }
 
+/// Whether hand-CUDA, brought up for `want` in `mode`, gets `CubeCL`'s CUDA
+/// runtime beside it for the overlap join: in nice-only, under `auto` and an
+/// explicit `cuda` alike. Without it, nice-only fields the join would take
+/// run on the stride pipeline, 10-21x slower per field at bases 57-58.
+#[cfg(any(test, feature = "cuda"))]
+fn cuda_pairs_join(want: GpuBackend, mode: SearchMode) -> bool {
+    mode == SearchMode::Niceonly && matches!(want, GpuBackend::Auto | GpuBackend::Cuda)
+}
+
 /// Bring up the GPU backend the user asked for.
 ///
 /// `Auto`'s order is per mode, from the measured tables in the `CubeCL`
 /// evaluation (RTX 4060, RX 9070 XT, Apple M4, plus review runs on Intel
 /// iGPU and an RTX A1000):
 ///
-/// - **Detailed**: `cubecl-cuda` → `cubecl` → `cuda` → `vulkan`. The
+/// - **Detailed**: `cubecl-cuda` → `cubecl` → `cuda`. The
 ///   `CubeCL` family wins detailed on every vendor tested (1.03-1.07x over hand-CUDA
 ///   on NVIDIA, 1.2-2.6x over hand-Vulkan elsewhere), and a failed
 ///   `cubecl-cuda` init (no CUDA toolkit) falls through to `cubecl`, which
-///   needs only a driver — so NVIDIA-without-toolkit gets wgpu speed instead
-///   of the hand-WGSL fallback.
-/// - **Niceonly**: `cuda` → `cubecl` → `vulkan`. Hand-CUDA keeps a slim edge
+///   needs only a driver.
+/// - **Niceonly**: `cuda` → `cubecl`. Hand-CUDA keeps a slim edge
 ///   at the b50+ bases where long-run wall time concentrates; everywhere
 ///   without a toolkit, `CubeCL` is the best available (wins RADV b50+ and
 ///   NVIDIA-over-wgpu outright, runs out of the box on Apple). Both `CubeCL`
@@ -505,11 +494,14 @@ fn guarded_init<T>(
 ///   fields at the frontier (`join_plan::plan_join`) and is several
 ///   times faster there; so on NVIDIA, a build with `cubecl-cuda` pairs the
 ///   hand-CUDA context with a `CubeCL` CUDA one (`GpuHandle::CudaJoin`) and
-///   routes each field to the faster of the two.
+///   routes each field to the faster of the two. An explicit `cuda` is
+///   paired the same way (`cuda_pairs_join`).
 ///
 /// An **explicitly named** backend that fails to initialize is fatal rather
 /// than falling back: for a distributed compute client, silently dropping to
-/// a much slower path is a worse outcome than stopping and saying so.
+/// a much slower path is a worse outcome than stopping and saying so. The
+/// join's runtime is not the named backend, so its failing to start is a
+/// warning under `cuda` as under `auto`.
 #[allow(unused_variables)]
 fn init_gpu(cli: &Cli) -> GpuCtx {
     if !cli.gpu {
@@ -583,11 +575,11 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 {
                     info!("  GPU: {name}");
                 }
-                // Nice-only auto also brings up CubeCL's CUDA runtime for the
+                // Nice-only also brings up CubeCL's CUDA runtime for the
                 // overlap join, which takes production-size fields; without
                 // it every field stays on hand-CUDA.
                 #[cfg(feature = "cubecl-cuda")]
-                if want == GpuBackend::Auto {
+                if cuda_pairs_join(want, cli.mode) {
                     let attempt =
                         guarded_init("the CubeCL CUDA runtime could not be started", || {
                             CubeclContext::new_cuda(cli.gpu_device)
@@ -607,6 +599,15 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                         }
                     }
                 }
+                #[cfg(not(feature = "cubecl-cuda"))]
+                if cuda_pairs_join(want, cli.mode) {
+                    warn!(
+                        "  this build has no overlap join (it needs the cubecl-cuda feature, \
+                         which the gpu feature includes): nice-only fields of 1e{} and up \
+                         take the slower stride path",
+                        nice_common::overlap_join::JOIN_MIN_FIELD_SIZE.ilog10()
+                    );
+                }
                 return Some(Arc::new(GpuHandle::Cuda(ctx)));
             }
             Err(e) => {
@@ -620,9 +621,6 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                     eprintln!("2. Verify CUDA toolkit is installed (nvcc --version)");
                     eprintln!("3. Check that GPU {} exists (nvidia-smi)", cli.gpu_device);
                     eprintln!("4. Try a different device with --gpu-device <N>");
-                    if cfg!(feature = "vulkan") {
-                        eprintln!("5. Or use the Vulkan backend: --gpu-backend vulkan");
-                    }
                     std::process::exit(1);
                 }
                 log_cuda_fallthrough("CUDA", &e);
@@ -699,30 +697,6 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
         }
     }
 
-    #[cfg(feature = "vulkan")]
-    if matches!(want, GpuBackend::Auto | GpuBackend::Vulkan) {
-        match VulkanContext::new(cli.gpu_device) {
-            Ok(ctx) => {
-                info!(
-                    "GPU initialized: Vulkan device {} ({}), batch size {}",
-                    cli.gpu_device, ctx.device_name, VULKAN_BATCH_SIZE
-                );
-                return Some(Arc::new(GpuHandle::Vulkan(ctx)));
-            }
-            Err(e) => {
-                error!(
-                    "Failed to initialize Vulkan on device {}: {e:?}",
-                    cli.gpu_device
-                );
-                eprintln!("Troubleshooting:");
-                eprintln!("1. Ensure a Vulkan driver is installed (try vulkaninfo)");
-                eprintln!("2. The device must support shaderInt64");
-                eprintln!("3. Try a different device with --gpu-device <N>");
-                std::process::exit(1);
-            }
-        }
-    }
-
     let reasons = if tried.is_empty() {
         String::new()
     } else {
@@ -745,7 +719,7 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
 // Without a GPU feature the GPU branch below only exits, so clippy reads its
 // `else` as redundant.
 #[cfg_attr(
-    not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")),
+    not(any(feature = "cuda", feature = "cubecl")),
     allow(clippy::redundant_else)
 )]
 fn process_field_sync(
@@ -757,7 +731,7 @@ fn process_field_sync(
     let mode = cli.mode;
     if cli.gpu {
         // GPU processing path
-        #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+        #[cfg(any(feature = "cuda", feature = "cubecl"))]
         {
             let handle = gpu.as_ref().expect("GPU context failed to initialize");
             let range: FieldSize = claim_data.into();
@@ -777,15 +751,6 @@ fn process_field_sync(
                     }
                     SearchMode::Niceonly => process_niceonly(pair, &range, claim_data.base),
                 },
-                #[cfg(feature = "vulkan")]
-                GpuHandle::Vulkan(ctx) => match mode {
-                    SearchMode::Detailed => {
-                        process_range_detailed_vulkan(ctx, &range, claim_data.base)
-                    }
-                    SearchMode::Niceonly => {
-                        process_range_niceonly_vulkan(ctx, &range, claim_data.base)
-                    }
-                },
                 #[cfg(feature = "cubecl")]
                 GpuHandle::Cubecl(ctx) => match mode {
                     SearchMode::Detailed => {
@@ -803,7 +768,7 @@ fn process_field_sync(
                 }
             }
         }
-        #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "cubecl")))]
+        #[cfg(not(any(feature = "cuda", feature = "cubecl")))]
         {
             let _ = gpu; // there is no context to look at in this build
             error!("GPU support not compiled in");
@@ -975,15 +940,13 @@ fn process_field_join(
 /// one of the GPU's pipelines, which hands its results back for its ticket.
 enum FieldStage {
     Done(Vec<FieldResults>, PipelineTelemetry),
-    // Only the CUDA and `CubeCL` backends have pipelines (Vulkan processes a
-    // field on the calling thread).
+    // Only the CUDA and `CubeCL` backends have pipelines.
     #[cfg(any(feature = "cuda", feature = "cubecl"))]
     Queued(FieldTicket),
 }
 
 /// Start a field. GPU nice-only fields go into the backend's pipelines and
-/// come back `Queued`; everything else, Vulkan nice-only included, is
-/// processed here and now.
+/// come back `Queued`; everything else is processed here and now.
 ///
 /// Splitting start from finish is what lets the caller keep one field ahead
 /// of the device: the next field's MSD filtering (or the join's field setup)
@@ -993,7 +956,7 @@ fn begin_field_sync(claim_data: &DataToClient, cli: &Cli, gpu: &GpuCtx) -> Field
     #[cfg(any(feature = "cuda", feature = "cubecl"))]
     if cli.gpu
         && cli.mode == SearchMode::Niceonly
-        && let Some(niceonly) = gpu.as_deref().and_then(GpuHandle::niceonly)
+        && let Some(niceonly) = gpu.as_deref().map(GpuHandle::niceonly)
     {
         let range: FieldSize = claim_data.into();
         return match begin_niceonly(niceonly, &range, claim_data.base) {
@@ -1024,7 +987,7 @@ fn finish_field_sync(stage: FieldStage, gpu: &GpuCtx) -> (Vec<FieldResults>, Pip
         FieldStage::Queued(ticket) => {
             let niceonly = gpu
                 .as_deref()
-                .and_then(GpuHandle::niceonly)
+                .map(GpuHandle::niceonly)
                 .expect("only a GPU with pipelines queues a field");
             match finish_niceonly(niceonly, ticket) {
                 Ok((results, stats)) => (vec![results], Some(stats.telemetry_json())),
@@ -1081,10 +1044,10 @@ async fn process_field(
 /// GPU niceonly pipeline overlaps fields; everything else finishes a field
 /// in `begin`, so lookahead would just hold claims.
 fn field_lookahead(cli: &Cli) -> usize {
-    #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+    #[cfg(any(feature = "cuda", feature = "cubecl"))]
     {
         if cli.gpu && cli.mode == SearchMode::Niceonly && cli.repeat {
-            return nice_common::gpu_niceonly::fields_in_flight().saturating_sub(1);
+            return nice_common::gpu_niceonly::FIELDS_IN_FLIGHT.saturating_sub(1);
         }
     }
     let _ = cli;
@@ -1643,8 +1606,7 @@ async fn main() -> Result<()> {
     }
 
     // Check for GPU support
-    if cli.gpu && !(cfg!(feature = "cuda") || cfg!(feature = "vulkan") || cfg!(feature = "cubecl"))
-    {
+    if cli.gpu && !(cfg!(feature = "cuda") || cfg!(feature = "cubecl")) {
         error!(
             "This build carries no GPU backends. Use a GPU release binary \
              (or the `-gpu` docker tag), or rebuild with --features gpu."
@@ -1660,7 +1622,7 @@ async fn main() -> Result<()> {
     #[allow(unused_mut)]
     let mut cpu_or_gpu = format!("CPU with {} threads", cli.threads);
 
-    #[cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+    #[cfg(any(feature = "cuda", feature = "cubecl"))]
     if cli.gpu {
         cpu_or_gpu = format!("GPU device {}", cli.gpu_device);
     };
@@ -1752,6 +1714,23 @@ mod tests {
         let e = anyhow!("Unable to dynamically load the \"nvrtc\" shared library");
         assert!(cuda_toolkit_missing(&e));
         assert!(!cuda_driver_rejected(&e));
+    }
+
+    #[test]
+    fn hand_cuda_pairs_the_join_for_niceonly_under_auto_and_cuda() {
+        use super::{GpuBackend, cuda_pairs_join};
+        use clap::ValueEnum;
+        use nice_common::SearchMode;
+        // A named `cuda` gets the join exactly as `auto` does.
+        assert!(cuda_pairs_join(GpuBackend::Auto, SearchMode::Niceonly));
+        assert!(cuda_pairs_join(GpuBackend::Cuda, SearchMode::Niceonly));
+        for &want in GpuBackend::value_variants() {
+            // Detailed has no join; every other backend never runs hand-CUDA.
+            assert!(!cuda_pairs_join(want, SearchMode::Detailed), "{want:?}");
+            if !matches!(want, GpuBackend::Auto | GpuBackend::Cuda) {
+                assert!(!cuda_pairs_join(want, SearchMode::Niceonly), "{want:?}");
+            }
+        }
     }
 
     #[test]
@@ -1886,9 +1865,9 @@ mod tests {
 
     /// `cudarc` panics rather than returning when the CUDA shared library is
     /// missing, which took the whole client down before `--gpu-backend auto`
-    /// could fall through to Vulkan. Whatever this machine has installed,
-    /// initialization must *return* — Ok on a CUDA box, Err on one without —
-    /// and never unwind past here.
+    /// could fall through to another backend. Whatever this machine has
+    /// installed, initialization must *return* — Ok on a CUDA box, Err on one
+    /// without — and never unwind past here.
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_init_returns_instead_of_panicking() {

@@ -34,5 +34,6 @@
   "explore_cooldown_days": 14,
   "explore_ttl_minutes": 30,
 
-  "offer_query": "reliability>0.95 num_gpus=1 gpu_ram>=8 cuda_vers>=12.8 rentable=true inet_down>100 disk_space>=30 dph_total<0.40"
+  "offer_query": "reliability>0.95 num_gpus=1 gpu_ram>=8 rentable=true inet_down>100 disk_space>=30 dph_total<0.40",
+  "min_cuda_version": "12.8"
 }
