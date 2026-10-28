@@ -41,7 +41,7 @@
 
 use crate::cubecl_backend::{LaunchFence, NICEONLY_STRIDE, launch_fence, wide_chunk_for};
 use crate::gpu_config::{chunk_constants, chunk_constants_u16, n_limbs};
-use crate::gpu_niceonly::{NiceonlyStats, fields_in_flight};
+use crate::gpu_niceonly::{FIELDS_IN_FLIGHT, NiceonlyStats};
 use crate::gpu_route::{FieldTicket, Route};
 use crate::join_plan::{
     BATCHES_IN_FLIGHT, Footprint, JoinCeiling, JoinField, JoinLimits, JoinPlan, NICE_RECORD_BYTES,
@@ -2290,7 +2290,7 @@ impl JoinPipeline {
     /// The pipeline for the device `client`, whose layouts stay within
     /// `ceiling` (shared with the device's planning).
     pub(crate) fn start<R: Runtime>(client: ComputeClient<R>, ceiling: Arc<JoinCeiling>) -> Self {
-        let depth = fields_in_flight() + 1;
+        let depth = FIELDS_IN_FLIGHT + 1;
         let (tx, jobs) = sync_channel::<JoinJob>(depth);
         let (results_tx, results) = sync_channel::<JoinDone>(depth);
         let thread = std::thread::spawn(move || {
@@ -3064,7 +3064,7 @@ mod tests {
     ];
 
     /// Throughput of production fields through the client's route
-    /// (`plan_join`, then the join's pipeline with `fields_in_flight()`
+    /// (`plan_join`, then the join's pipeline with `FIELDS_IN_FLIGHT`
     /// fields queued, as the client runs them): `NICE_TEST_JOIN_FIELDS`
     /// fields per base (also the opt-in, since the parity workflow runs this
     /// module's ignored tests on lavapipe) after one untimed warm-up field,
@@ -3076,7 +3076,7 @@ mod tests {
     #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn join_throughput(ctx: &CubeclContext) {
         use crate::cubecl_backend::memory_usage;
-        use crate::gpu_niceonly::fields_in_flight;
+        use crate::gpu_niceonly::FIELDS_IN_FLIGHT;
         let Ok(n) = std::env::var("NICE_TEST_JOIN_FIELDS") else {
             eprintln!("skipping: set NICE_TEST_JOIN_FIELDS to run the throughput harness");
             return;
@@ -3100,7 +3100,7 @@ mod tests {
             let fields: Vec<FieldSize> = (0..n)
                 .map(|i| FieldSize::new(start + i * size, start + (i + 1) * size))
                 .collect();
-            let lookahead = fields_in_flight().saturating_sub(1);
+            let lookahead = FIELDS_IN_FLIGHT.saturating_sub(1);
             let t = std::time::Instant::now();
             let (mut queued, mut found) = (std::collections::VecDeque::new(), Vec::new());
             let mut per_field: Vec<(NiceonlyStats, JoinFieldStats)> = Vec::new();
@@ -3142,7 +3142,7 @@ mod tests {
                  batches={:.0} slots={} plan_mib={} | empty_top={} retried={} splits={} \
                  survivors={} checked={} found={} | peak_in_use_mib={} peak_reserved_mib={}",
                 ctx.device_name(),
-                fields_in_flight(),
+                FIELDS_IN_FLIGHT,
                 secs / nf,
                 (n * size) as f64 / secs,
                 mean(&|x| x.0.msd_secs),
