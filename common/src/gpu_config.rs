@@ -3,12 +3,13 @@
 //! Everything here derives per-base constants from the search range and the
 //! stride/residue machinery, with no reference to any particular GPU API. It
 //! exists because [`crate::client_process_cuda`] is `#![cfg(feature = "cuda")]` —
-//! nothing in it is reachable from a Vulkan-only build — while the constants
+//! nothing in it is reachable from a build without it — while the constants
 //! themselves are the same whichever backend consumes them.
 //!
-//! The CUDA path bakes these into NVRTC `-D` defines; the Vulkan path bakes
-//! them into generated WGSL. Both must agree, and both must agree with the CPU
-//! implementation, so there is exactly one derivation and it lives here.
+//! The CUDA path bakes these into NVRTC `-D` defines; the `CubeCL` path bakes
+//! them into its kernels as comptime constants. Both must agree, and both must
+//! agree with the CPU implementation, so there is exactly one derivation and it
+//! lives here.
 
 use crate::base_range;
 
@@ -70,14 +71,14 @@ pub fn chunk_constants(base: u32) -> (u32, u32) {
     chunk_constants_below(base, 1 << 31)
 }
 
-/// Chunk constants for the Vulkan backend: `base^e < 2^16`.
+/// Chunk constants for the split16 digit scan (`CubeCL` on wgpu): `base^e < 2^16`.
 ///
 /// The tighter bound is not arbitrary. RADV/ACO strength-reduces division by a
 /// 32-bit compile-time constant to `v_mul_hi_u32`, but **not** division by a
 /// 64-bit one — NIR's `nir_opt_idiv_const` only handles widths up to 32, so a
 /// `u64 / const` expands to a ~220-instruction restoring shift-subtract loop.
 /// Keeping `base^e < 2^16` lets the chunk split be done as two 32-bit constant
-/// divisions over 16-bit halves instead (see the `split16` codegen), which is
+/// divisions over 16-bit halves instead (see `crate::cubecl_backend`), which is
 /// exact and entirely multiply-high.
 ///
 /// Measured on base 40, RTX-free (AMD Radeon 860M / RADV GFX1152): 3.88e8
@@ -223,10 +224,11 @@ pub fn affine_params(base: u32, k: u32) -> Option<AffineParams> {
     })
 }
 
-/// Parameters for the Vulkan niceonly shader's low-digit prefilter.
+/// Parameters for the `CubeCL` niceonly kernel's low-digit prefilter (named
+/// for the hand-written Vulkan backend it was first written for).
 ///
 /// Same idea as [`PrefilterParams`], different number representation. CUDA
-/// holds `n^k mod b^p` in a u64 and reduces with `% b^p`; the Vulkan shader
+/// holds `n^k mod b^p` in a u64 and reduces with `% b^p`; the `CubeCL` kernel
 /// holds it as [`limbs`](Self::limbs) digits-chunks of base `chunk_div`, so
 /// that every divisor it ever names is a 32-bit constant. See
 /// [`vulkan_prefilter_params`] for why that matters.
@@ -272,7 +274,7 @@ pub const VULKAN_PREFILTER_LIMBS: u32 = 3;
 /// chunks of `chunk_digits` digits each, in base `chunk_div = base^chunk_digits
 /// < 2^16` — the same chunk the digit scan already uses. A truncated schoolbook
 /// multiply over those chunks needs only `u32` intermediates (see
-/// [`VulkanPrefilterParams`] and the codegen), the digits fall straight out of
+/// [`VulkanPrefilterParams`] and `crate::cubecl_backend`), the digits fall straight out of
 /// each chunk with 32-bit divisions, and nothing 64-bit-divided is ever named.
 #[must_use]
 pub fn vulkan_prefilter_params(base: u32) -> Option<VulkanPrefilterParams> {
