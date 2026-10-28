@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Pin the Rust toolchain to 1.99.0, so a new stable release can't fail CI on unchanged code; Dependabot proposes each new release as its own PR.
 - Pair an explicit `--gpu-backend cuda` with the overlap join in nice-only mode, as `auto` already does.
 - Remove the experimental hand-written Vulkan backend (`--gpu-backend vulkan`, first contributed by [Janzert](https://github.com/Janzert) in #96), which the `cubecl` backend now supersedes on every device it served.
 - Remove the `NICE_GPU_FIELDS_IN_FLIGHT` and `NICE_GPU_BATCHES_IN_FLIGHT` environment variables; the GPU nice-only pipeline keeps its defaults of 2 fields and 16 batches in flight.
