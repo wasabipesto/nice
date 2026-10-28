@@ -39,8 +39,7 @@ env_logger = { version = "0.11" }
 log = { version = "0.4" }
 rayon = { version = "1.11" }
 serde_json = { version = "1.0" }
-simple-tqdm = {version = "0.2", features = ["rayon"]}
-# The GPU progress bars; the same version simple-tqdm draws with.
+# The progress bar (src/progress.rs).
 indicatif = "0.17"
 # cuda-12080 is the binding *surface*, not a driver floor: cudarc dlopens
 # lazily, so a symbol must exist only if called. The hand-CUDA path calls

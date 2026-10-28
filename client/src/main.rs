@@ -11,6 +11,7 @@ use nice_common::client_api_async::{
 use nice_common::client_process::{process_range_detailed, process_range_niceonly};
 use nice_common::cpu_join::{CpuJoin, PartitionResult, Scratch, slices_for};
 use nice_common::overlap_join::{JoinParams, JoinTelemetry, StrideReason, join_verdict};
+use nice_common::progress::FieldProgress;
 use nice_common::stride_filter;
 use nice_common::{
     CLIENT_REQUEST_TIMEOUT_SECS, CLIENT_VERSION, DataToClient, DataToServer, FieldResults,
@@ -37,7 +38,7 @@ const DEFAULT_PREFETCH_CONCURRENCY: usize = 4;
 const MAX_SUBMITS_IN_FLIGHT: usize = 8;
 
 mod bench;
-mod gpu_progress;
+mod progress;
 
 #[cfg(all(feature = "cuda", feature = "cubecl-cuda"))]
 use nice_common::client_process_cuda::CudaWithJoin;
@@ -196,7 +197,6 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use env_logger::Env;
 use log::{LevelFilter, debug, error, info, warn};
 use rayon::prelude::*;
-use simple_tqdm::ParTqdm;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -790,7 +790,7 @@ fn process_field_sync(
                     range.end(),
                     slices.len()
                 );
-                if let Some((results, join)) = process_field_join(base, jp, &slices, cli) {
+                if let Some((results, join)) = process_field_join(base, &range, jp, &slices) {
                     let telemetry = serde_json::json!({ "route": "join", "join": join.json() });
                     return (vec![results], Some(telemetry));
                 }
@@ -837,29 +837,24 @@ fn process_field_sync(
             None
         };
 
-        // Configure TQDM
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation
-        )]
-        let chunk_scale = (chunk_size as f32).log10() as u32;
-        let tqdm_config = simple_tqdm::Config::new()
-            .with_unit(format!("e{chunk_scale}"))
-            .with_disable(cli.no_progress);
+        // The field's progress counts chunks as threads finish them.
+        let progress = FieldProgress::begin(&range, chunk_size);
 
         // Process each chunk and gather the results
         let results = chunks
             .par_iter()
-            .tqdm_config(tqdm_config)
-            .map(|chunk| match mode {
-                SearchMode::Detailed => process_range_detailed(chunk, claim_data.base),
-                SearchMode::Niceonly => {
-                    let stride_table = stride_table_opt
-                        .as_ref()
-                        .expect("Stride table not initialized");
-                    process_range_niceonly(chunk, claim_data.base, stride_table)
-                }
+            .map(|chunk| {
+                let result = match mode {
+                    SearchMode::Detailed => process_range_detailed(chunk, claim_data.base),
+                    SearchMode::Niceonly => {
+                        let stride_table = stride_table_opt
+                            .as_ref()
+                            .expect("Stride table not initialized");
+                        process_range_niceonly(chunk, claim_data.base, stride_table)
+                    }
+                };
+                progress.tick();
+                result
             })
             .collect();
         (results, telemetry)
@@ -867,22 +862,23 @@ fn process_field_sync(
 }
 
 /// A nice-only field through the CPU overlap join, a slice at a time (one,
-/// below about 1e16), each slice's partitions on the thread pool with the
-/// progress bar counting them. Returns its results and the join's account,
-/// or `None` if the join cannot set the field up (then it takes the stride
-/// walk).
+/// below about 1e16), each slice's partitions on the thread pool. The
+/// field's progress counts partitions, every slice's. Returns its results
+/// and the join's account, or `None` if the join cannot set the field up
+/// (then it takes the stride walk).
 fn process_field_join(
     base: u32,
+    range: &FieldSize,
     jp: JoinParams,
     slices: &[FieldSize],
-    cli: &Cli,
 ) -> Option<(FieldResults, JoinTelemetry)> {
     let mut tel = JoinTelemetry {
         slices: slices.len(),
         ..JoinTelemetry::default()
     };
     let mut hits: Vec<u128> = Vec::new();
-    for (i, slice) in slices.iter().enumerate() {
+    let mut field_progress = None;
+    for slice in slices {
         let t0 = Instant::now();
         let join = match CpuJoin::new(base, slice, jp) {
             Ok(join) => join,
@@ -898,20 +894,20 @@ fn process_field_join(
         };
         tel.setup_secs += t0.elapsed().as_secs_f64();
         tel.partitions = usize::try_from(join.partitions()).unwrap_or(usize::MAX);
+        // The progress begins once the first slice is set up, so a field
+        // that falls back to the stride walk shows no join bar. Every slice
+        // has the same partitions.
+        let progress: &FieldProgress = field_progress.get_or_insert_with(|| {
+            let units = u64::from(join.partitions()) * slices.len() as u64;
+            FieldProgress::with_units(range, units, range.size() / u128::from(units.max(1)))
+        });
         let t1 = Instant::now();
-        let tqdm_config = simple_tqdm::Config::new()
-            .with_unit("partitions")
-            .with_desc(if slices.len() > 1 {
-                format!("slice {}/{}", i + 1, slices.len())
-            } else {
-                String::new()
-            })
-            .with_disable(cli.no_progress);
         let out = (0..join.partitions())
             .into_par_iter()
-            .tqdm_config(tqdm_config)
             .map_init(Scratch::default, |scratch, v| {
-                join.run_partition(v, scratch)
+                let out = join.run_partition(v, scratch);
+                progress.tick();
+                out
             })
             .reduce(PartitionResult::default, |mut a, b| {
                 a.add(b);
@@ -1061,13 +1057,10 @@ struct InFlightField {
     begun_at: Instant,
 }
 
-/// Report the processing rate, for the runs where the progress bar isn't
-/// already showing it.
+/// Log a finished field's processing rate: the line that stays once its
+/// progress bar is cleared, and the only one when there is no bar.
 #[allow(clippy::cast_precision_loss)]
-fn log_field_rate(claim_data: &DataToClient, elapsed: Duration, cli: &Cli) {
-    if !cli.no_progress && !cli.gpu {
-        return;
-    }
+fn log_field_rate(claim_data: &DataToClient, elapsed: Duration) {
     let range_size = claim_data.range_size as f64;
     let seconds = elapsed.as_secs_f64();
     info!(
@@ -1199,7 +1192,7 @@ async fn run_validation(cli: &Arc<Cli>, client: &Client, gpu: &GpuCtx) -> Result
         );
 
         let (claim_data, results, elapsed) = process_field(claim_data, cli, gpu).await;
-        log_field_rate(&claim_data, elapsed, cli);
+        log_field_rate(&claim_data, elapsed);
 
         let submit_data = compile_results(results, &claim_data, &cli.username, cli.mode, None);
 
@@ -1414,7 +1407,7 @@ async fn complete_field(
     telemetry_base: Option<&serde_json::Value>,
     field_process_ewma: &mut Option<f64>,
 ) -> Result<()> {
-    log_field_rate(&claim_data, elapsed, cli);
+    log_field_rate(&claim_data, elapsed);
 
     // Feed the buffer sizer.
     let elapsed_secs = elapsed.as_secs_f64();
@@ -1579,19 +1572,19 @@ async fn main() -> Result<()> {
     if let Some(level) = cli.log_level {
         builder.filter_level(level.into());
     }
-    // The GPU paths report progress through nice_common::progress; give them
-    // bars, and route the log above the bars so the two don't collide. The
-    // benchmark sweep goes without, like the CPU bar it silences.
-    let gpu_progress = if cli.gpu && !cli.no_progress && !cli.benchmark {
-        gpu_progress::GpuProgress::new()
+    // The CPU and GPU paths report progress through nice_common::progress;
+    // give them a bar, and route the log above it so the two don't collide.
+    // The benchmark sweep goes without: its windows are too short for one.
+    let bar = if !cli.no_progress && !cli.benchmark {
+        progress::Progress::new()
     } else {
         None
     };
-    if let Some(p) = &gpu_progress {
+    if let Some(p) = &bar {
         builder.target(env_logger::Target::Pipe(p.log_writer()));
     }
     builder.init();
-    if let Some(p) = gpu_progress {
+    if let Some(p) = bar {
         nice_common::progress::install(p);
     }
 
