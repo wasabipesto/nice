@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Size the overlap join's working memory to the GPU, up to 4 GiB instead of 1 GiB, so a production field at bases 60-64 runs as one slice instead of five to seven.
 - Strengthen the overlap join's prefix certificate: at the first position where an interval's powers differ, the digit's range of possible values can rule the interval out or fix one more digit. Fewer candidates reach the later stages on the CPU and the GPU.
 - Pin the Rust toolchain to 1.99.0, so a new stable release can't fail CI on unchanged code; Dependabot proposes each new release as its own PR.
 - Pair an explicit `--gpu-backend cuda` with the overlap join in nice-only mode, as `auto` already does.
