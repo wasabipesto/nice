@@ -2,5 +2,5 @@
 # Dependabot (rust-toolchain ecosystem) proposes each new release as a PR.
 # CI reads `channel` from here; see .github/workflows/rust-build-test.yml.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
