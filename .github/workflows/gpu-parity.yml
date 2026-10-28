@@ -69,6 +69,10 @@ jobs:
     metal:
         name: cubecl (Metal) on macOS
         runs-on: macos-latest
+        # A healthy run takes 9-16 minutes, build included. The MSL step has
+        # occasionally hung with three tests stalled at once, and without a
+        # limit it holds a macOS runner for GitHub's 6-hour maximum.
+        timeout-minutes: 30
         steps:
             - uses: actions/checkout@v6
 
