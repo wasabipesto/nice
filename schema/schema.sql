@@ -1,5 +1,6 @@
 -- DROP TABLES IN REVERSE ORDER
 DROP TABLE IF EXISTS cache_notable_numbers;
+DROP TABLE IF EXISTS cache_search_daily_totals;
 DROP TABLE IF EXISTS cache_search_rate_daily;
 DROP TABLE IF EXISTS cache_search_leaderboard;
 DROP TABLE IF EXISTS submissions;
@@ -126,15 +127,30 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_submissions_field_id ON submissions 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_submissions_claim_id ON submissions (claim_id);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_base_range ON chunks(base_id, range_start, range_end);
 
--- JOB STATE: watermark for incremental scheduled jobs
+-- JOB STATE: watermark for incremental scheduled jobs, and the highest
+-- submission id counted into cache_search_daily_totals (exact; NULL if the
+-- totals have never been built). The totals start empty, so the cursor
+-- starts at 0.
 CREATE TABLE IF NOT EXISTS job_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     last_processed_submission_id BIGINT NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    cache_last_submission_id BIGINT
 );
-INSERT INTO job_state (id, last_processed_submission_id)
-SELECT 1, COALESCE(MAX(id), 0) FROM submissions
+INSERT INTO job_state (id, last_processed_submission_id, cache_last_submission_id)
+SELECT 1, COALESCE(MAX(id), 0), 0 FROM submissions
 ON CONFLICT (id) DO NOTHING;
+
+-- CACHE: All-time daily search totals per user/mode. The scheduled jobs add
+-- each run's new submissions to it and derive the two tables below from it.
+-- Not granted to web_anon; the website reads the derived tables.
+CREATE TABLE IF NOT EXISTS cache_search_daily_totals (
+    date DATE NOT NULL,
+    search_mode VARCHAR NOT NULL,
+    username VARCHAR NOT NULL,
+    total_range DECIMAL NOT NULL,
+    PRIMARY KEY (date, search_mode, username)
+);
 
 -- CACHE: Daily search totals per user/mode
 CREATE TABLE IF NOT EXISTS cache_search_rate_daily (

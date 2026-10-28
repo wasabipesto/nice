@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Update the leaderboard and activity chart caches from each run's new submissions instead of re-reading every submission every hour (migration `2026-10-15_incremental_search_caches.sql`).
 - Speed up the overlap join at bases 62 and up by giving each GPU thread six bottom entries instead of four.
 - Size the overlap join's working memory to the GPU, up to 4 GiB instead of 1 GiB, so a production field at bases 60-64 runs as one slice instead of five to seven.
 - Strengthen the overlap join's prefix certificate: at the first position where an interval's powers differ, the digit's range of possible values can rule the interval out or fix one more digit. Fewer candidates reach the later stages on the CPU and the GPU.
