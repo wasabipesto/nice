@@ -109,10 +109,11 @@ pub use kernels::{
     clippy::unreadable_literal,
     // Shared memory is passed by reference, the comptime `if` must stay
     // separate from the runtime one, and the integer helpers clippy suggests
-    // (midpoint) are not cube intrinsics.
+    // (midpoint, is_power_of_two) are not cube intrinsics.
     clippy::trivially_copy_pass_by_ref,
     clippy::collapsible_else_if,
-    clippy::manual_midpoint
+    clippy::manual_midpoint,
+    clippy::manual_is_power_of_two
 )]
 mod kernels {
     use super::{DEAD_MASK, JOIN_WG, SURV_FLUSH, SURV_SH_CAP, TOP_CAP};
@@ -544,7 +545,10 @@ mod kernels {
     /// lockstep; a position where the digits differ resets the run, so what
     /// is left at the top is exactly the digits `cert` certifies (from the top
     /// down to the first disagreement), with `dup` set if two of them repeat.
-    /// Returns the run mask; `c0` and `dup` via the out-arrays.
+    /// Returns the run mask; `c0` and `dup` via the out-arrays, and in
+    /// `out_dom` the digits of x and y at the topmost disagreement at or
+    /// above c0, which bound every n's digit there (`Base::cert`), or (1, 0)
+    /// if there is none.
     #[cube]
     fn cert_power(
         x: &mut Array<u32>,
@@ -552,6 +556,7 @@ mod kernels {
         pw: &Array<u32>,
         out_c0: &mut Array<u32>,
         out_dup: &mut Array<u32>,
+        out_dom: &mut Array<u32>,
         #[comptime] nl: u32,
         #[comptime] nl3: u32,
         #[comptime] sp: u32,
@@ -612,6 +617,8 @@ mod kernels {
         }
         let mut run = 0u64;
         let mut dup = 0u32;
+        let mut dlo = 1u32;
+        let mut dhi = 0u32;
         let passes = comptime!(sp.div_ceil(chunk_digits));
         #[unroll]
         for pass in 0..passes {
@@ -655,6 +662,8 @@ mod kernels {
                         } else {
                             run = 0u64;
                             dup = 0u32;
+                            dlo = dx;
+                            dhi = dy;
                         }
                     }
                 }
@@ -662,7 +671,24 @@ mod kernels {
         }
         out_c0[0] = c0;
         out_dup[0] = dup;
+        out_dom[0] = dlo;
+        out_dom[1] = dhi;
         run
+    }
+
+    /// Digits `lo..=hi` as a mask, 0 if `hi < lo` (`digit_range_mask`).
+    #[cube]
+    fn dom_mask(lo: u32, hi: u32) -> u64 {
+        let mut m = 0u64;
+        if hi >= lo {
+            let w = hi - lo + 1u32;
+            if w >= 64u32 {
+                m = 0xFFFF_FFFF_FFFF_FFFFu64 << u64::cast_from(lo);
+            } else {
+                m = ((1u64 << u64::cast_from(w)) - 1u64) << u64::cast_from(lo);
+            }
+        }
+        m
     }
 
     /// Stage 0a: certify every top prefix of every slot's partition. Grid: x
@@ -845,12 +871,15 @@ mod kernels {
                 let mut dupa = Array::<u32>::new(1usize);
                 let mut c0b = Array::<u32>::new(1usize);
                 let mut dupb = Array::<u32>::new(1usize);
+                let mut doma = Array::<u32>::new(2usize);
+                let mut domb = Array::<u32>::new(2usize);
                 let msq = cert_power(
                     &mut a2,
                     &mut e2,
                     pw,
                     &mut c0a,
                     &mut dupa,
+                    &mut doma,
                     nl2,
                     nl3,
                     s2,
@@ -865,6 +894,7 @@ mod kernels {
                     pw,
                     &mut c0b,
                     &mut dupb,
+                    &mut domb,
                     nl3,
                     nl3,
                     s3,
@@ -873,8 +903,44 @@ mod kernels {
                     chunk_digits,
                     chunk_div,
                 );
-                if dupa[0] == 0u32 && dupb[0] == 0u32 && (msq & mcu) == 0u64 {
-                    let mask = msq | mcu;
+                let mut mask = msq | mcu;
+                let mut keep = dupa[0] == 0u32 && dupb[0] == 0u32 && (msq & mcu) == 0u64;
+                // `close_certificate` over the two powers' first-disagreement
+                // intervals: an interval with no free digit rejects, and one
+                // with a single free digit forces it. Forcing the cube's
+                // digit can only shrink the square's free set, so one
+                // recheck of the square reaches the same fixed point.
+                let d0 = dom_mask(doma[0], doma[1]);
+                let d1 = dom_mask(domb[0], domb[1]);
+                let mut f0 = false;
+                let mut f1 = false;
+                if keep && d0 != 0u64 {
+                    let fr = d0 & !mask;
+                    if fr == 0u64 {
+                        keep = false;
+                    } else if (fr & (fr - 1u64)) == 0u64 {
+                        mask |= fr;
+                        f0 = true;
+                    }
+                }
+                if keep && d1 != 0u64 {
+                    let fr = d1 & !mask;
+                    if fr == 0u64 {
+                        keep = false;
+                    } else if (fr & (fr - 1u64)) == 0u64 {
+                        mask |= fr;
+                        f1 = true;
+                    }
+                }
+                if keep && d0 != 0u64 && !f0 && f1 {
+                    let fr = d0 & !mask;
+                    if fr == 0u64 {
+                        keep = false;
+                    } else if (fr & (fr - 1u64)) == 0u64 {
+                        mask |= fr;
+                    }
+                }
+                if keep {
                     let mut floor = c0a[0];
                     if c0b[0] < floor {
                         floor = c0b[0];

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Strengthen the overlap join's prefix certificate: at the first position where an interval's powers differ, the digit's range of possible values can rule the interval out or fix one more digit. Fewer candidates reach the later stages on the CPU and the GPU.
 - Pin the Rust toolchain to 1.99.0, so a new stable release can't fail CI on unchanged code; Dependabot proposes each new release as its own PR.
 - Pair an explicit `--gpu-backend cuda` with the overlap join in nice-only mode, as `auto` already does.
 - Remove the experimental hand-written Vulkan backend (`--gpu-backend vulkan`, first contributed by [Janzert](https://github.com/Janzert) in #96), which the `cubecl` backend now supersedes on every device it served.
