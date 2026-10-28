@@ -7,9 +7,9 @@
 #                          macOS arm64 runner (Apple paravirtualized GPU)
 #   cuda (hand-CUDA)     — NOT CI-testable: needs NVIDIA silicon. NVRTC
 #                          compile-tests of every base's kernel do run in the
-#                          normal suite when libnvrtc is present (see README
-#                          "GPU development"); result parity is validated
-#                          manually on real hardware.
+#                          normal suite when libnvrtc is present (in CI, the
+#                          test-gpu-host job in rust-build-test.yml); result
+#                          parity is validated manually on real hardware.
 #   cubecl-cuda          — NOT CI-testable: needs NVIDIA silicon, same as cuda.
 #   cubecl-spirv         — lavapipe on Linux (the direct SPIR-V compiler). Not
 #                          on macOS: wgpu always selects Metal there, so the

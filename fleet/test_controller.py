@@ -1217,8 +1217,8 @@ class TickVersionTests(unittest.TestCase):
             "reconcile_invoices": lambda cfg_, db_, dry: None,
             "sync_corpus": lambda cfg_, db_: 1,
             "current_client_version": lambda cfg_, db_, now: version,
-            "search_offers": lambda cfg_: [{"id": 7, "gpu_name": "RTX 3080",
-                                            "cpu_name": "EPYC", "min_bid": 0.05}],
+            "search_offers": lambda cfg_, db_: [{"id": 7, "gpu_name": "RTX 3080",
+                                                 "cpu_name": "EPYC", "min_bid": 0.05}],
             "estimate_offer": lambda cfg_, db_, offer, mode=None, version=None: (
                 asked.append(version) or {"blended_rate_p25": 1.0e9}),
             "plan_explore": lambda cfg_, db_, by_mode, dry, v: bought.append(("explore", v)),
@@ -1252,6 +1252,72 @@ class TickVersionTests(unittest.TestCase):
         _asked, bought, summary = self._tick(None)
         self.assertEqual(bought, [])
         self.assertIn("image=none", summary)
+
+
+class MinCudaTests(unittest.TestCase):
+    """Every offer search requires min_cuda_version, whatever offer_query says."""
+
+    def test_a_query_without_a_floor_gets_one(self):
+        self.assertEqual(controller.enforce_min_cuda("num_gpus=1 rentable=true", "12.8"),
+                         ("num_gpus=1 rentable=true cuda_vers>=12.8", []))
+        # A bound that sets no floor stays, and the floor is added beside it.
+        self.assertEqual(controller.enforce_min_cuda("cuda_vers<13 num_gpus=1", "12.8"),
+                         ("cuda_vers<13 num_gpus=1 cuda_vers>=12.8", []))
+
+    def test_a_looser_floor_is_replaced(self):
+        for looser in ("cuda_vers>=12.0", "cuda_vers >= 12.0", "cuda_vers>12.4",
+                       "cuda_vers=12.4", "cuda_vers=any", "cuda_max_good>=11.8",
+                       "cuda_vers gte 12.0"):
+            query, replaced = controller.enforce_min_cuda(f"num_gpus=1 {looser} rentable=true",
+                                                          "12.8")
+            self.assertEqual(query, "num_gpus=1 cuda_vers>=12.8 rentable=true", looser)
+            self.assertEqual(replaced, [looser])
+
+    def test_an_equal_or_stricter_floor_is_kept(self):
+        for strict in ("cuda_vers>=12.8", "cuda_vers>=13.0", "cuda_vers>12.8",
+                       "cuda_vers=12.9", "cuda_max_good>=13"):
+            query = f"num_gpus=1 {strict} rentable=true"
+            self.assertEqual(controller.enforce_min_cuda(query, "12.8"), (query, []), strict)
+
+    def test_no_minimum_leaves_the_query_alone(self):
+        for off in (None, ""):
+            self.assertEqual(controller.enforce_min_cuda("cuda_vers>=12.0", off),
+                             ("cuda_vers>=12.0", []))
+
+    def test_the_default_config_searches_at_12_8(self):
+        query, replaced = controller.enforce_min_cuda(DEFAULT_CONFIG["offer_query"],
+                                                      DEFAULT_CONFIG["min_cuda_version"])
+        self.assertIn("cuda_vers>=12.8", query)
+        self.assertEqual(replaced, [])
+
+    def _search(self, c):
+        seen = {}
+
+        class Stub:
+            def search_offers(self, **kw):
+                seen.update(kw)
+                return []
+
+        db = memory_db()
+        orig = controller.vast_client
+        controller.vast_client = lambda cfg_: Stub()
+        try:
+            controller.search_offers(c, db)
+        finally:
+            controller.vast_client = orig
+        warns = [r["detail"] for r in db.execute("SELECT detail FROM events WHERE kind = 'WARN'")]
+        return seen["query"], warns
+
+    def test_search_overrides_a_stale_configured_query_and_says_so(self):
+        query, warns = self._search(cfg(offer_query="num_gpus=1 cuda_vers>=12.0"))
+        self.assertEqual(query, "num_gpus=1 cuda_vers>=12.8")
+        self.assertEqual(len(warns), 1)
+        self.assertIn("cuda_vers>=12.0", warns[0])
+
+    def test_search_with_the_defaults_is_quiet(self):
+        query, warns = self._search(cfg())
+        self.assertTrue(query.endswith(" cuda_vers>=12.8"))
+        self.assertEqual(warns, [])
 
 
 class OnstartTemplateTests(unittest.TestCase):

@@ -2533,8 +2533,8 @@ pub struct NiceonlyPlan {
     /// for the cross-end residue filter; a 2-word dummy when `cross` is off.
     low_masks: cubecl::server::Handle,
     cross: bool,
-    /// Plane-compact the filter's survivors before checking them
-    /// (`NICE_CUBECL_COMPACT=0` opts out; requires `cross`).
+    /// Plane-compact the filter's survivors before checking them (requires
+    /// `cross` and a device with plane ops).
     compact: bool,
     /// Use the plane-scoped compaction queue instead of the cube-scoped one
     /// (default on under `wgpu<spirv>` and `cuda`; `NICE_CUBECL_PLANE_COMPACT=0|1`
@@ -2565,10 +2565,9 @@ impl NiceonlyPlan {
         let stride_m = table.modulus as u32;
         let stride_r = u32::try_from(table.valid_residues.len())
             .with_context(|| format!("residue count overflows u32 for base {base}"))?;
-        // Cross-end residue filter: on by default wherever the low-mask
-        // table exists (base <= 64); NICE_CUBECL_CROSS=0 opts out for A/B.
-        let cross = !table.low_digit_masks.is_empty()
-            && std::env::var("NICE_CUBECL_CROSS").map_or(true, |v| v != "0");
+        // Cross-end residue filter: wherever the low-mask table exists
+        // (base <= 64).
+        let cross = !table.low_digit_masks.is_empty();
         // Compaction needs plane scan/reduce ops; adapters without them
         // (some older wgpu targets) fall back to the naive skip.
         let plane_ok = client
@@ -2576,8 +2575,7 @@ impl NiceonlyPlan {
             .features
             .plane
             .contains(cubecl::ir::features::Plane::Ops);
-        let compact =
-            cross && plane_ok && std::env::var("NICE_CUBECL_COMPACT").map_or(true, |v| v != "0");
+        let compact = cross && plane_ok;
         let plane_sync = client
             .properties()
             .features
