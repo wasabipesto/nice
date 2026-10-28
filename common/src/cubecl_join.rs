@@ -141,7 +141,10 @@ mod kernels {
     /// join kernel reads them), and each surviving entry's two
     /// key-position digits are stepped through every key value d incrementally
     /// (+s2, +s3 mod b); the entry's index goes onto the (slot, d, c) list for
-    /// every d where they are distinct and new. List layout per slot:
+    /// every d where they are distinct and new. Every digit is also tested
+    /// against the field's certificate `fc_lo | fc_hi << 32`, which every
+    /// top's mask contains: an entry that meets it would fail every AND.
+    /// List layout per slot:
     /// `slot*b*nbp + b*seg[c] + d*len(c) + i`; counts at `(slot*b + d)*m1 + c`.
     #[cube(launch_unchecked)]
     pub fn bucket_kernel(
@@ -155,6 +158,8 @@ mod kernels {
         counts: &mut Array<u32>,
         ran: &mut Array<Atomic<u32>>,
         nbp: u32,
+        fc_lo: u32,
+        fc_hi: u32,
         #[comptime] base: u32,
         #[comptime] f0: u32,
         #[comptime] pp: u32,
@@ -163,6 +168,7 @@ mod kernels {
         #[comptime] key_at_zero: bool,
     ) {
         let m1 = comptime!(base - 1);
+        let fc = (u64::cast_from(fc_hi) << 32u64) | u64::cast_from(fc_lo);
         let nkeys = comptime!(if key_level { base } else { 1 });
         let s_cnt = SharedMemory::<Atomic<u32>>::new(64usize);
         let c = CUBE_POS_X;
@@ -228,7 +234,7 @@ mod kernels {
                 let g2 = sq[j as usize];
                 let g3 = cu[j as usize];
                 let bb = (1u64 << u64::cast_from(g2)) | (1u64 << u64::cast_from(g3));
-                if g2 == g3 || (m & bb) != 0u64 {
+                if g2 == g3 || ((m | fc) & bb) != 0u64 {
                     ok = false;
                 }
                 m |= bb;
@@ -236,6 +242,9 @@ mod kernels {
             if !ok {
                 m = DEAD_MASK;
             }
+            // What the key digit must miss: the entry's digits and the
+            // field's.
+            let mf = m | fc;
             let idx = slot * nbp + i;
             ext_m[(2u32 * idx) as usize] = u32::cast_from(m);
             ext_m[(2u32 * idx + 1u32) as usize] = u32::cast_from(m >> 32u64);
@@ -259,7 +268,7 @@ mod kernels {
                             a3 = (a2 * dk) % base;
                         }
                         let bb = (1u64 << u64::cast_from(a2)) | (1u64 << u64::cast_from(a3));
-                        if a2 != a3 && (m & bb) == 0u64 {
+                        if a2 != a3 && (mf & bb) == 0u64 {
                             let at = s_cnt[dk as usize].fetch_add(1u32);
                             lists[(lbase + dk * clen + at) as usize] = i;
                         }
@@ -1335,6 +1344,8 @@ pub(crate) struct JoinDevice<R: Runtime> {
     wide: bool,
     w_f0: u32,
     nbp: u32,
+    /// The field's certificate (`FieldSetup::fc`), low and high words.
+    fc: [u32; 2],
     max_slots: usize,
     /// The layout's bytes, and its largest buffer (for errors).
     bytes: usize,
@@ -1493,6 +1504,10 @@ impl<R: Runtime> JoinDevice<R> {
             wide,
             w_f0: u32::try_from(fs.w)?,
             nbp: u32::try_from(nbp)?,
+            fc: {
+                let w = u32_words(u128::from(fs.fc));
+                [w[0], w[1]]
+            },
             max_slots,
             bytes: plan.bytes,
             largest: (max_slots * fp.largest_per_slot())
@@ -1678,6 +1693,8 @@ impl<R: Runtime> JoinDevice<R> {
                 ),
                 ArrayArg::from_raw_parts(ran.clone(), nran),
                 self.nbp,
+                self.fc[0],
+                self.fc[1],
                 self.b,
                 self.f0,
                 self.pp,
