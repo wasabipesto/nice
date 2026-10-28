@@ -10,7 +10,7 @@ EV (exploit).
 ```sh
 cp config.example.json config.json   # edit: username, api_base if needed
 # vastai CLI must be configured: `uvx vastai set api-key <key>`
-uv run -m unittest discover .        # 11 tests
+uv run -m unittest discover .        # 91 tests
 uv run controller.py --config config.json   # dry-run tick (default)
 ```
 
@@ -50,38 +50,58 @@ unresolvable dependency — which the controller cannot log for itself.
 - Let a TTL lapse with the controller stopped; on restart the instance is
   destroyed on the first reconcile.
 
-## Budget model (token bucket)
+## Budget model (token buckets)
 
-Budget accrues continuously at `accrual_usd_per_month` (default $30) into a
-bucket capped at `bucket_cap_usd` (default $7). Ordinary buys require the
-bucket above `reserve_fraction` of cap. Exceptional deals ("pounces") may
-spend below the reserve when they beat the trailing 3-day median EV by
-`pounce_multiplier` (default 1.4×): they start on a `pounce_probe_hours`
-TTL and are extended only once the estimator — refreshed by the instance's
-own uploaded benchmark — confirms the buy at a trustworthy prediction stage.
-Worst-case month ≈ accrual + one bucket. Runtime spend is charged to the
-bucket every tick from bid × elapsed; reconcile against Vast invoices
-periodically (`uvx vastai show invoices`) until that's automated.
+Each exploit mode has its own token bucket, a row in the `buckets` table.
+`exploit_modes` lists the modes, each with optional overrides of the
+top-level keys; the default is a single `niceonly` mode that inherits
+everything. A mode's budget accrues continuously at its
+`accrual_usd_per_month` (default $30) into a bucket capped at its
+`bucket_cap_usd` (default $7). The buckets are independent, not a split, so
+with several modes give each its own accrual and cap, summing to the total
+you intend. Explore benchmarks every mode and is funded from the first
+(primary) mode's bucket.
+
+Ordinary buys require the mode's bucket above `reserve_fraction` of its cap.
+Exceptional deals ("pounces") may spend below the reserve when they beat the
+mode's trailing 3-day median EV by `pounce_multiplier` (default 1.4×): they
+start on a `pounce_probe_hours` TTL and are extended only once the estimator —
+refreshed by the instance's own uploaded benchmark — confirms the buy at a
+trustworthy prediction stage. Worst-case month ≈ the modes' accruals plus one
+full bucket per mode.
+
+Runtime spend is charged to the instance's bucket every tick from
+bid × elapsed. Every `invoice_reconcile_hours` (default 1; 0 disables) the
+controller also pulls Vast's invoices and corrects each instance's recorded
+spend, and its bucket, to what Vast actually charged. Invoices settle at
+day boundaries, so this lags; a running instance is never reduced, and a pull
+that would cut total recorded spend by more than `invoice_max_drop_fraction`
+(default 25%) is refused. With `"invoice_apply_trueup": false` the pull is
+observe-only: it logs the invoices' shape and what would have moved, and
+changes nothing.
 
 ### Manual bucket adjustments (kickstart / correction)
 
-There is no CLI for this by design; adjust the ledger row directly and always
-tag it so the `events` log stays a complete audit trail. Use a **relative**
-delta (`balance + N`), never an absolute set — the per-tick accrue writes an
-absolute balance, so apply the credit **between ticks** (mid-slot, not near
-`:00`/`:10`) to avoid a race clobbering it. Tag `kind = 'MANUAL-CREDIT'`:
+There is no CLI for this by design; adjust the mode's row in `buckets`
+directly and always tag it so the `events` log stays a complete audit trail.
+Use a **relative** delta (`balance + N`), never an absolute set — the per-tick
+accrue writes an absolute balance, so apply the credit **between ticks**
+(mid-slot, not near `:00`/`:10`) to avoid a race clobbering it. Tag
+`kind = 'MANUAL-CREDIT'`:
 
 ```sh
 sqlite3 fleet.sqlite3 "
-UPDATE bucket SET balance = balance + 2.0 WHERE id = 1;
+UPDATE buckets SET balance = balance + 2.0 WHERE mode = 'niceonly';
 INSERT INTO events (ts, kind, detail)
-VALUES (strftime('%s','now'), 'MANUAL-CREDIT', '+\$2.00 kickstart: <reason>');"
+VALUES (strftime('%s','now'), 'MANUAL-CREDIT', '+\$2.00 niceonly kickstart: <reason>');"
 ```
 
-A credit above `$0` re-enables explores; keep it below the reserve line
-(`reserve_fraction × bucket_cap_usd`) if you want to avoid also unblocking a
-wave of ordinary exploit buys. `MANUAL-CREDIT` is a one-time injection outside
-the accrual bound, so note why.
+A credit above `$0` to the primary mode's bucket re-enables explores; keep a
+bucket below its reserve line (`reserve_fraction × bucket_cap_usd`) if you
+want to avoid also unblocking a wave of that mode's ordinary exploit buys.
+`MANUAL-CREDIT` is a one-time injection outside the accrual bound, so note
+why. (The single-row `bucket` table is legacy: it only seeded the primary
+mode's bucket when `buckets` was created, and editing it does nothing.)
 
 ## Client version
 
@@ -110,18 +130,22 @@ reports (the `v3.4.5` tag carries `version = "3.4.5"`).
 
 ## Notes / known gaps
 
-- **First live explore run validates the launch incantation.** The GPU
-  image's ENTRYPOINT is `nice_client`, so instances override to bash and
-  run `onstart_*` templates from the config. If Vast's create semantics
-  differ from expectation, fix the config strings, not the code.
+- Instances launch in Vast's `ssh` runtype, which bypasses the GPU image's
+  `nice_client` ENTRYPOINT and runs the config's `onstart_*` templates in a
+  shell. If Vast's create semantics change, fix the config strings, not the
+  code.
 - The heat guard and pounce baseline need history (≈20 samples) before they
   act; the first days run permissive-but-reserve-gated.
-- Realized-throughput confirmation currently rides on the benchmark-upload →
-  `/estimate` loop; per-field telemetry correlation is a future refinement.
+- Estimates are computed locally, against a mirror of the API's `benchmarks`
+  table that each tick syncs from `data_base` (PostgREST). Realized-throughput
+  confirmation rides on that: an instance's own benchmark upload reaches the
+  mirror on a later tick's sync, before pounce confirmation and renewal
+  re-estimate it. Per-field telemetry correlation is a future refinement.
 - Explores delete themselves after their benchmark sweep, usually between
   ticks, so reconcile never sees them running. It checks a vanished explore's
   benchmark uploads: one with uploads is recorded `retired` and billed at its
   bid up to its last upload, and its `RETIRED` event names any benchmark that
   didn't upload. One with none, or a failed lookup, is recorded `preempted`.
-- Explore instances are cheap but not free: `explore_per_day` × ~2–5 min of
-  the cheapest matching offer (well under $0.05/day at defaults).
+- Explore instances are cheap but not free: each is billed a few minutes at
+  its bid, up to about $0.015, so explore costs at most about
+  `explore_per_day` × $0.015 a day, charged to the primary mode's bucket.
