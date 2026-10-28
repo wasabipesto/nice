@@ -40,7 +40,7 @@ log = { version = "0.4" }
 rayon = { version = "1.11" }
 serde_json = { version = "1.0" }
 # The progress bar (src/progress.rs).
-indicatif = "0.17"
+indicatif = "0.18"
 # cuda-12080 is the binding *surface*, not a driver floor: cudarc dlopens
 # lazily, so a symbol must exist only if called. The hand-CUDA path calls
 # nothing newer than 12.0; cubecl-cuda compiles against 12.8 declarations
