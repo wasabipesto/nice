@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Make the fleet require the GPU image's CUDA version on every offer search (`min_cuda_version`, default 12.8), even when a config's `offer_query` asks for less.
+
 ## Nice v3.4.6
 
 - Add an overlap join as the primary nice-only path for large fields. It skips much of the existing filter work by joining an overlapping list of the top-digit prefixes and bottom-digit residues which eliminates more candidates with the same underlying strategies. When the device or backend doesn't support this path it falls back to the existing stride implementation. Major thanks to [danstoyell](https://github.com/danstoyell) for the report and prototype.
