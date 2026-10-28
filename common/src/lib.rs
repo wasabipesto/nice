@@ -9,7 +9,6 @@ pub mod bench_defs;
 pub mod client_api_async;
 pub mod client_process;
 pub mod client_process_cuda;
-pub mod client_process_vulkan;
 pub mod consensus;
 pub mod cpu_join;
 pub mod cubecl_backend;
@@ -33,7 +32,6 @@ pub mod overlap_join;
 pub mod progress;
 pub mod residue_filter;
 pub mod stride_filter;
-pub mod vulkan;
 
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
