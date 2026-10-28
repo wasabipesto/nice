@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a `host_cpu_client` fleet option (off by default) that runs a CPU client of the deployment's mode beside the GPU client on each exploit's spare threads.
 - Remove the experimental hand-written Vulkan backend (`--gpu-backend vulkan`, first contributed by [Janzert](https://github.com/Janzert) in #96), which the `cubecl` backend now supersedes on every device it served.
 - Remove the `NICE_GPU_FIELDS_IN_FLIGHT` and `NICE_GPU_BATCHES_IN_FLIGHT` environment variables; the GPU nice-only pipeline keeps its defaults of 2 fields and 16 batches in flight.
 - Remove the `NICE_CUDA_CROSS`, `NICE_CUDA_COMPACT`, `NICE_CUBECL_CROSS` and `NICE_CUBECL_COMPACT` environment variables, as v3.4.1 announced; the cross-end filter and its compaction now always run where they apply.
