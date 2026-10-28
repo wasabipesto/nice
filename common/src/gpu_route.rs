@@ -9,7 +9,7 @@
 //! [`NiceonlyGpu::finish`] for the field's results. Each pipeline is first
 //! in, first out and checks that its tickets come back in order, so a caller
 //! can keep several fields in flight with no routing bookkeeping of its own.
-#![cfg(any(feature = "cuda", feature = "vulkan", feature = "cubecl"))]
+#![cfg(any(feature = "cuda", feature = "cubecl"))]
 
 use crate::client_process::process_range_niceonly;
 use crate::gpu_config::gpu_supports_base;

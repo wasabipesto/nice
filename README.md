@@ -176,9 +176,8 @@ Options:
           Which GPU backend to use with --gpu
 
           Possible values:
-          - auto:        Fastest measured order for the mode: detailed tries `cubecl-cuda`, `cubecl`, CUDA, then Vulkan; niceonly tries CUDA (with join), `cubecl`, then Vulkan
+          - auto:        Fastest measured order for the mode: detailed tries `cubecl-cuda`, `cubecl`, then CUDA; niceonly tries CUDA (with join), then `cubecl`
           - cuda:        NVIDIA only; requires the CUDA toolkit at runtime for NVRTC. In niceonly, as with `auto`, fields the overlap join takes run on `CubeCL`'s CUDA runtime (in builds with `cubecl-cuda`)
-          - vulkan:      Any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe) (needs the experimental `vulkan` feature)
           - cubecl:      `CubeCL` over wgpu: kernels written in Rust, JIT-specialized per base
           - cubecl-cuda: `CubeCL` over its native CUDA runtime (needs the `cubecl-cuda` feature and, like `cuda`, the CUDA toolkit at runtime for NVRTC)
           - cubecl-hip:  `CubeCL` over its native HIP runtime (AMD; needs the `cubecl-hip` feature, which links against `ROCm` at build time). Never chosen by `auto`
@@ -187,7 +186,7 @@ Options:
           [default: auto]
 
       --gpu-wgpu-device <GPU_WGPU_DEVICE>
-          Which wgpu adapter the `CubeCL` backend uses, in `CubeCL`'s device spelling: `DiscreteGpu(0)`, `IntegratedGpu(1)`, `Cpu`, ... Unset picks the best adapter. This exists because --gpu-device indexes a per-backend namespace (CUDA ordinals != Vulkan ordinals != wgpu adapters), so on a multi-GPU box no single number is right for every backend; the chosen adapter and its graphics API are always logged
+          Which wgpu adapter the `CubeCL` backend uses, in `CubeCL`'s device spelling: `DiscreteGpu(0)`, `IntegratedGpu(1)`, `Cpu`, ... Unset picks the best adapter. This exists because --gpu-device indexes a per-backend namespace (CUDA ordinals != wgpu adapters), so on a multi-GPU box no single number is right for every backend; the chosen adapter and its graphics API are always logged
 
           [env: NICE_GPU_WGPU_DEVICE=]
 
@@ -214,7 +213,6 @@ There are some feature flags that enable specific dependencies:
 - `nice_client/rustls-tls` is enabled by default and uses rustls for TLS connections, which doesn't require any external dependencies. Disable it and enable `nice_client/openssl-tls` to use `openssl`.
 - In order to build the client with GPU acceleration, enable the `nice_client/gpu` feature. It is an umbrella over multiple backends below:
   - `nice_client/cuda` is the hand-written CUDA backend (NVIDIA only). It requires the CUDA toolkit at runtime for NVRTC kernel compilation.
-  - `nice_client/vulkan` is the hand-written WGSL backend (**experimental — not part of the `gpu` umbrella**); it runs on any Vulkan 1.2 device with `shaderInt64` (AMD, Intel, NVIDIA, llvmpipe, and MoltenVK on macOS). Every platform it serves is also covered by `cubecl`, which beats it in detailed mode on all vendors measured, so standard builds omit it; build with `--features gpu,vulkan` to include it.
   - `nice_client/cubecl` is the [CubeCL](https://github.com/tracel-ai/cubecl) backend (kernels written in Rust), running over wgpu: Vulkan on Linux/Windows, Metal on macOS. `nice_client/cubecl-cuda` adds its native CUDA runtime. Both modes run on the GPU.
   - `nice_client/cubecl-spirv` and `nice_client/cubecl-metal` switch the `cubecl` backend's shader compiler from naga (WGSL) to CubeCL's own SPIR-V or MSL codegen on Vulkan or Metal respectively. Both are opt-in; neither is part of the `gpu` umbrella.
     - `cubecl-spirv` is worth enabling on Linux/Windows Vulkan devices since it enables plane-scoped compaction, build it with `--features gpu,cubecl-spirv`.
@@ -225,11 +223,11 @@ Building the WASM client requires [wasm-pack](https://drager.github.io/wasm-pack
 
 There are also a few scripts, to be used with [rust-script](https://rust-script.org/). You can install it with `cargo install rust-script` then run the scripts directly. It will take a while to build the first time you run it.
 
-If you want to run a copy of this server yourself, a SQL schema file has been provided. You can build the bases and fields with the `insert_fields` script.
+If you want to run a copy of this server yourself, a SQL schema file has been provided. You can build the bases and fields with the `scripts/insert_new_fields.rs` script (e.g. `./scripts/insert_new_fields.rs --base 40 --field-size 1e9`, with `DATABASE_URL` set).
 
 ## GPU backends
 
-The GPU-enabled client (the `nice_client-gpu-*` release binaries, the `-gpu` docker tag, or a `--features gpu` build) carries multiple backends in one binary and picks one at runtime; the CPU path is always available as a fallback and for verification. Kernels are JIT-compiled per base at first use, so the first field on a new base takes a few extra seconds.
+The GPU-enabled client (the `nice_client-gpu-*` release binaries, the `-gpu` docker tag, or a `--features gpu` build) carries multiple backends in one binary and picks one at runtime; the CPU path is always available as a fallback and for verification. Kernels are JIT-compiled per base at first use, so the first field on a new base takes a few extra seconds. The `-gpu` docker image is built on CUDA 12.8, so on NVIDIA it needs a host driver that supports CUDA 12.8 or newer (`nvidia-smi` reports the driver's `CUDA Version`).
 
 The `gpu` umbrella feature needs nothing installed to build on any platform, since every included backend loads its driver at runtime. Some opt-in features have additional dependencies listed below.
 
@@ -240,7 +238,6 @@ The `gpu` umbrella feature needs nothing installed to build on any platform, sin
 | `cuda` | NVIDIA | nothing | CUDA toolkit (NVRTC) |
 | `cubecl-spirv` (opt-in build) | Vulkan devices, via the `cubecl` backend | nothing on Linux/Windows; on macOS the Vulkan SDK, with `VULKAN_SDK` set | same as `cubecl` |
 | `cubecl-hip` (opt-in build) | AMD via ROCm | ROCm (`hipconfig` on `PATH`) | ROCm |
-| `vulkan` (experimental, opt-in build) | any Vulkan 1.2 device with `shaderInt64` | nothing | a Vulkan driver; on macOS also MoltenVK + the Vulkan loader (`brew install molten-vk vulkan-loader`) |
 
 ## Why are you writing this from scratch for like the tenth time
 

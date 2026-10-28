@@ -1,9 +1,10 @@
-//! `CubeCL` detailed-mode backend: the `vulkan/codegen.rs` detailed kernel
-//! expressed as a `#[cube]` Rust function instead of generated WGSL.
+//! `CubeCL` detailed-mode backend: the hand-written Vulkan backend's detailed
+//! kernel (since removed) expressed as a `#[cube]` Rust function instead of
+//! generated WGSL.
 //!
 //! This is a benchmark-grade port for evaluating `CubeCL` as a replacement for
-//! the string-codegen approach (see PR #96 discussion). It mirrors the Vulkan
-//! backend's structure exactly: same per-base constants from
+//! the string-codegen approach (see PR #96 discussion). It kept the Vulkan
+//! backend's structure: same per-base constants from
 //! [`crate::gpu_config`], same split16 chunk scan (all divisions 32-bit with
 //! comptime-constant divisors), same 4-copy workgroup histogram, same
 //! `MISS_STRIDE` near-miss records, same `FieldResults` out the other end.
@@ -14,7 +15,7 @@
 //! backends: the CPU's MSD prefix filter streams range descriptors in, and
 //! [`niceonly_kernel`] reconstructs the stride filter's candidates on-device
 //! from the residue table — the same reconstruction, offset reduction, lane
-//! tiling, and low-digit prefilter as the Vulkan shader, as Rust.
+//! tiling, and low-digit prefilter as the Vulkan shader had, as Rust.
 
 #![cfg(feature = "cubecl")]
 // The cube macro evaluates comptime! expressions host-side, where fn-level
@@ -32,8 +33,8 @@ use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
 use crate::gpu_niceonly::{
-    DeviceResult, GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline, NiceonlyStats, PendingField,
-    RangeSink, batches_in_flight, lane_shift_for, stride_chunk_bits,
+    BATCHES_IN_FLIGHT, DeviceResult, GPU_LSD_K, MAX_STRIDE_MODULUS, NiceonlyPipeline,
+    NiceonlyStats, PendingField, RangeSink, lane_shift_for, stride_chunk_bits,
 };
 use crate::gpu_route::{FieldTicket, NiceonlyGpu, Route};
 use crate::join_plan::{JoinCeiling, JoinField, JoinLimits, plan_join};
@@ -48,23 +49,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use web_time::Instant;
 
-/// Threads per cube (workgroup); matches the Vulkan backend.
+/// Threads per cube (workgroup).
 pub const WORKGROUP_SIZE: u32 = 256;
 
 /// Upper bound on cubes per dispatch; threads grid-stride past it.
-/// Matches the Vulkan backend's `MAX_WORKGROUPS`.
 pub const MAX_CUBES: u32 = 4096;
 
 /// Workgroup histogram copies, spreading atomic contention like the CUDA
-/// kernel's per-warp histograms and the Vulkan backend's `HIST_COPIES`.
+/// kernel's per-warp histograms.
 pub const HIST_COPIES: u32 = 4;
 
 /// u32 slots per near-miss record: n as four u32 limbs plus its unique count.
-/// Must match the Vulkan backend's `MISS_STRIDE` decode.
 pub const MISS_STRIDE: u32 = 5;
 
-/// Candidates per dispatch; same bound and rationale as `VULKAN_BATCH_SIZE`
-/// (a u32 histogram bin must not overflow before the host drains it).
+/// Candidates per dispatch: small enough that a u32 histogram bin cannot
+/// overflow before the host drains it.
 pub const CUBECL_BATCH_SIZE: u128 = 50_000_000;
 
 /// Near-miss records held on the device per field.
@@ -345,16 +344,14 @@ fn detailed_kernel(
     }
 }
 
-/// u32 slots per niceonly hit: n as four u32 limbs. Must match the Vulkan
-/// backend's `NICE_STRIDE` decode.
+/// u32 slots per niceonly hit: n as four u32 limbs.
 pub const NICEONLY_STRIDE: u32 = 4;
 
 /// Capacity of the niceonly output buffer (in nice numbers) per field.
 /// Genuinely nice numbers are astronomically rare; this is pure headroom.
-/// Matches the Vulkan backend's `NICE_OUT_CAPACITY`.
 const NICEONLY_OUT_CAPACITY: usize = 1 << 16;
 
-/// The niceonly kernel: the `#[cube]` port of the Vulkan backend's
+/// The niceonly kernel: the `#[cube]` port of the removed Vulkan backend's
 /// `niceonly_wgsl`, checking the stride-valid candidates of MSD-surviving
 /// ranges reconstructed on-device from the residue table.
 ///
@@ -1579,8 +1576,8 @@ impl CubeclContext {
                 Self::runtime_options(),
             );
             // Include the resolved graphics API: AutoGraphicsApi may pick
-            // DX12 on Windows, and reports comparing this backend against
-            // the hand-Vulkan one need to know which API actually ran.
+            // DX12 on Windows, and reports need to know which API actually
+            // ran.
             let info = setup.adapter.get_info();
             let client = cubecl::wgpu::WgpuRuntime::client(&device);
             let device_name = format!(
@@ -2023,8 +2020,7 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
         // that matters — the field is — and raising or lowering it does not
         // help.
         //
-        // Flushing per batch is the granularity the hand Vulkan backend has
-        // always used, and it is free: `flush` submits without waiting, and one
+        // Flushing per batch is free: `flush` submits without waiting, and one
         // batch already saturates the device (measured interleaved, 80 batches
         // at base 50: 9.76 s median against 10.00 s for the aggregated form).
         client
@@ -2394,7 +2390,7 @@ struct CubeclNiceonlySink<R: cubecl::prelude::Runtime> {
     open: HashMap<u64, CubeclNiceonlyRun<R>>,
     /// One fence per launched batch, oldest first: the `CubeCL` analogue of
     /// the CUDA sink's event ring. Before the ring exceeds
-    /// [`batches_in_flight`] the oldest fence is awaited, so the dispatch
+    /// [`BATCHES_IN_FLIGHT`] the oldest fence is awaited, so the dispatch
     /// thread blocks for exactly one batch at a time and the descriptor
     /// channel keeps draining. A full `client.sync()` every N launches was
     /// tried first and is the wrong shape: it parks the dispatch thread for N
@@ -2422,8 +2418,8 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlySink<R> {
             .get_mut(&field)
             .ok_or_else(|| anyhow::anyhow!("launch for a field that is not open ({field})"))?;
         // Backpressure: wait for the oldest batch before adding another,
-        // once `batches_in_flight` are outstanding.
-        while self.inflight.len() >= batches_in_flight() {
+        // once `BATCHES_IN_FLIGHT` are outstanding.
+        while self.inflight.len() >= BATCHES_IN_FLIGHT {
             if let Some(oldest) = self.inflight.pop_front() {
                 cubecl::future::block_on(oldest)
                     .map_err(|e| anyhow::anyhow!("launch fence failed: {e:?}"))?;
@@ -2515,7 +2511,7 @@ fn cached_plan<R: cubecl::prelude::Runtime>(
 
 /// Per-base niceonly state that survives across fields: the stride-table
 /// constants and the residue table already on the device. The analog of the
-/// CUDA backend's cached `NiceonlyPlan` and the Vulkan pipeline cache.
+/// CUDA backend's cached `NiceonlyPlan`.
 ///
 /// Building this is *expensive*: `StrideTable::new` walks the whole modulus
 /// on one CPU thread (8.6e6 steps at base 52). Rebuilt per field, that walk
@@ -2533,8 +2529,8 @@ pub struct NiceonlyPlan {
     /// for the cross-end residue filter; a 2-word dummy when `cross` is off.
     low_masks: cubecl::server::Handle,
     cross: bool,
-    /// Plane-compact the filter's survivors before checking them
-    /// (`NICE_CUBECL_COMPACT=0` opts out; requires `cross`).
+    /// Plane-compact the filter's survivors before checking them (requires
+    /// `cross` and a device with plane ops).
     compact: bool,
     /// Use the plane-scoped compaction queue instead of the cube-scoped one
     /// (default on under `wgpu<spirv>` and `cuda`; `NICE_CUBECL_PLANE_COMPACT=0|1`
@@ -2565,10 +2561,9 @@ impl NiceonlyPlan {
         let stride_m = table.modulus as u32;
         let stride_r = u32::try_from(table.valid_residues.len())
             .with_context(|| format!("residue count overflows u32 for base {base}"))?;
-        // Cross-end residue filter: on by default wherever the low-mask
-        // table exists (base <= 64); NICE_CUBECL_CROSS=0 opts out for A/B.
-        let cross = !table.low_digit_masks.is_empty()
-            && std::env::var("NICE_CUBECL_CROSS").map_or(true, |v| v != "0");
+        // Cross-end residue filter: wherever the low-mask table exists
+        // (base <= 64).
+        let cross = !table.low_digit_masks.is_empty();
         // Compaction needs plane scan/reduce ops; adapters without them
         // (some older wgpu targets) fall back to the naive skip.
         let plane_ok = client
@@ -2576,8 +2571,7 @@ impl NiceonlyPlan {
             .features
             .plane
             .contains(cubecl::ir::features::Plane::Ops);
-        let compact =
-            cross && plane_ok && std::env::var("NICE_CUBECL_COMPACT").map_or(true, |v| v != "0");
+        let compact = cross && plane_ok;
         let plane_sync = client
             .properties()
             .features
@@ -2884,8 +2878,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
         // enough for the mean to be a good summary, because the MSD recursion
         // bounds range length by the floor.
         let mean_len = lens.iter().map(|&l| u64::from(l)).sum::<u64>() / lens.len().max(1) as u64;
-        // NICE_CUBECL_LANES pins the tiling for A/B measurement, the same
-        // shape of knob as NICE_VULKAN_LANES on the hand backend.
+        // NICE_CUBECL_LANES pins the tiling for A/B measurement.
         let lane_shift = self
             .lane_shift_override
             .or_else(|| {
@@ -3003,9 +2996,7 @@ mod tests {
         ));
     }
 
-    /// CPU/CubeCL parity on the detailed path — the same bases and ranges as
-    /// `vulkan_matches_cpu_detailed`, so results are directly comparable.
-    /// Runs on lavapipe:
+    /// CPU/CubeCL parity on the detailed path. Runs on lavapipe:
     ///
     /// ```text
     /// VK_ICD_FILENAMES=.../lvp_icd.json \
@@ -3179,21 +3170,21 @@ mod tests {
     }
 
     /// CPU/CubeCL parity on the niceonly path, over the same range with the
-    /// same stride table — the same bases and rationale as
-    /// `vulkan_matches_cpu_niceonly`. The GPU checks a *superset* of the CPU's
+    /// same stride table. The GPU checks a *superset* of the CPU's
     /// candidates (its MSD floor is coarser), so the nice-number sets must
     /// still be identical.
     /// Throughput of the continuous pipeline on a fixed run of fields on
     /// the default wgpu device, so two configurations can be compared on
-    /// identical work. Env as in production (`NICE_GPU_FIELDS_IN_FLIGHT`,
-    /// `NICE_GPU_MSD_FLOOR`); `NICE_TEST_FIELDS` (required: it is also the
-    /// opt-in, since the parity workflow runs this module's ignored tests on
-    /// lavapipe) fields of 1e13 in base 54 from the Anvil region.
+    /// identical work. Fields are queued `FIELDS_IN_FLIGHT` deep as in
+    /// production, and `NICE_GPU_MSD_FLOOR` applies as there;
+    /// `NICE_TEST_FIELDS` (required: it is also the opt-in, since the parity
+    /// workflow runs this module's ignored tests on lavapipe) fields of 1e13
+    /// in base 54 from the Anvil region.
     #[test]
     #[ignore = "requires a wgpu device; prints throughput"]
     #[allow(clippy::cast_precision_loss)]
     fn pipeline_throughput_fixed_fields() {
-        use crate::gpu_niceonly::{fields_in_flight, msd_floor_in_use};
+        use crate::gpu_niceonly::{FIELDS_IN_FLIGHT, msd_floor_in_use};
         use crate::gpu_route::{NiceonlyStarted, begin_niceonly};
         // The parity workflow runs every ignored test in this module on a
         // software rasterizer; a throughput run there is hours of nothing.
@@ -3214,7 +3205,7 @@ mod tests {
         if let NiceonlyStarted::Queued(ticket) = begin_niceonly(&ctx, &warm, base).unwrap() {
             ctx.finish(ticket).unwrap();
         }
-        let lookahead = fields_in_flight().saturating_sub(1);
+        let lookahead = FIELDS_IN_FLIGHT.saturating_sub(1);
         let t = std::time::Instant::now();
         let mut queued = std::collections::VecDeque::new();
         let mut found = 0usize;
@@ -3233,7 +3224,7 @@ mod tests {
         let secs = t.elapsed().as_secs_f64();
         eprintln!(
             "THROUGHPUT fields_in_flight={} floor_now={} fields={n} secs={secs:.2} rate={:.3e} n/s found={found}",
-            fields_in_flight(),
+            FIELDS_IN_FLIGHT,
             msd_floor_in_use(),
             (n as f64) * (size as f64) / secs
         );
