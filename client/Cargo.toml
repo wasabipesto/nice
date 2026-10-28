@@ -21,11 +21,6 @@ cuda = ["nice_common/cuda", "dep:cudarc"]
 # dlopens its driver at runtime — and that is the contract: a feature that
 # needs an SDK to compile does not belong in the umbrella.
 gpu = ["cuda", "cubecl", "cubecl-cuda"]
-# Experimental: the hand-written WGSL backend. Not part of the `gpu`
-# umbrella — every platform it serves is covered by `cubecl`, which beats it
-# in detailed mode on all vendors measured. Kept for opt-in builds while its
-# fate (promote or remove) is decided.
-vulkan = ["nice_common/vulkan"]
 cubecl = ["nice_common/cubecl"]
 # Must also enable this crate's own cubecl gate: feature cfgs do not
 # propagate upward from nice_common.
