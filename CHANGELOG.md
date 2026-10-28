@@ -7,7 +7,8 @@
 - Size the overlap join's working memory to the GPU, up to 4 GiB instead of 1 GiB, so a production field at bases 60-64 runs as one slice instead of five to seven.
 - Strengthen the overlap join's prefix certificate: at the first position where an interval's powers differ, the digit's range of possible values can rule the interval out or fix one more digit. Fewer candidates reach the later stages on the CPU and the GPU.
 - Pin the Rust toolchain to 1.99.0, so a new stable release can't fail CI on unchanged code; Dependabot proposes each new release as its own PR.
-- Pair an explicit `--gpu-backend cuda` with the overlap join in nice-only mode, as `auto` already does.
+- Pair an explicit `--gpu-backend cuda` with the overlap join in nice-only mode.
+- Make nice-only `auto` on NVIDIA run on `CubeCL`'s CUDA runtime alone, as detailed already does; hand-CUDA stays available with `--gpu-backend cuda`.
 - Remove the experimental hand-written Vulkan backend (`--gpu-backend vulkan`, first contributed by [Janzert](https://github.com/Janzert) in #96), which the `cubecl` backend now supersedes on every device it served.
 - Remove the `NICE_GPU_FIELDS_IN_FLIGHT` and `NICE_GPU_BATCHES_IN_FLIGHT` environment variables; the GPU nice-only pipeline keeps its defaults of 2 fields and 16 batches in flight.
 - Remove the `NICE_CUDA_CROSS`, `NICE_CUDA_COMPACT`, `NICE_CUBECL_CROSS` and `NICE_CUBECL_COMPACT` environment variables, as v3.4.1 announced; the cross-end filter and its compaction now always run where they apply.
