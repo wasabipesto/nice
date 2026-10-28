@@ -1,2 +1,6 @@
+# Pinned so a new stable's lints can't turn CI red on unchanged code.
+# Dependabot (rust-toolchain ecosystem) proposes each new release as a PR.
+# CI reads `channel` from here; see .github/workflows/rust-build-test.yml.
 [toolchain]
-channel = "stable"
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

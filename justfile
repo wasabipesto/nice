@@ -67,11 +67,8 @@ build:
 lint:
     cargo fmt --all --check
     cargo clippy -p "*" --all-targets -- -D warnings
-    # The GPU/vulkan/spirv code only exists under these features, so lint it too.
-    cargo clippy -p "*" --all-targets --features nice_client/gpu,nice_client/vulkan,nice_client/cubecl-spirv -- -D warnings
-    # vulkan on its own: the one combination where the GPU match in the
-    # client has a single (unreachable) arm. It regressed once (E0282).
-    cargo clippy -p "*" --all-targets --features nice_client/vulkan -- -D warnings
+    # The GPU/spirv code only exists under these features, so lint it too.
+    cargo clippy -p "*" --all-targets --features nice_client/gpu,nice_client/cubecl-spirv -- -D warnings
 
 # Build all packages, run all tests, and then run the client
 test:
@@ -80,9 +77,6 @@ test:
     cargo build -p "*" --features nice_client/gpu
     # What the -gpu docker image ships.
     cargo build -p "*" --features nice_client/gpu,nice_client/cubecl-spirv
-    cargo build -p "*" --features nice_client/vulkan
-    # One binary carrying both backends; neither library is needed to build.
-    cargo build -p "*" --features nice_client/gpu,nice_client/vulkan
     # cargo build -p "*" -r
     # just wasm-build
     RUST_LOG="trace" cargo test -p "*" --no-fail-fast
@@ -105,7 +99,7 @@ client-gpu *args:
 # Run the all-backend GPU client with given options
 client-gpu-all *args:
     cargo run -r --bin nice_client \
-        --features nice_client/gpu,nice_client/cubecl-spirv,nice_client/vulkan \
+        --features nice_client/gpu,nice_client/cubecl-spirv \
         -- {{ args }}
 
 # Run benchmark

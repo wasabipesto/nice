@@ -40,7 +40,7 @@ use crate::gpu_config::{
     MAX_GPU_DIGIT_MASK_BASE, affine_params, chunk_constants, gpu_supports_base, prefilter_params,
 };
 use crate::gpu_niceonly::{
-    DeviceResult, NiceonlyPipeline, NiceonlyStats, PendingField, RangeSink, batches_in_flight,
+    BATCHES_IN_FLIGHT, DeviceResult, NiceonlyPipeline, NiceonlyStats, PendingField, RangeSink,
 };
 use crate::gpu_route::{FieldTicket, NiceonlyGpu};
 use crate::{
@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// The MSD/descriptor pipeline these two constants belong to now lives in
-/// [`crate::gpu_niceonly`], which the Vulkan backend shares. Re-exported so the
+/// [`crate::gpu_niceonly`], which the `CubeCL` backend shares. Re-exported so the
 /// CUDA path's public surface is unchanged.
 pub use crate::gpu_niceonly::{GPU_LSD_K, PROCESSING_CHUNK_SIZE};
 
@@ -295,16 +295,11 @@ fn niceonly_defines(base: u32) -> Result<(Vec<String>, stride_filter::StrideTabl
     } else {
         debug!("modular prefilter disabled for base {base}");
     }
-    // Cross-end residue filter (and its warp compaction): on by default
-    // wherever the low-mask table exists (base <= 64); NICE_CUDA_CROSS=0 /
-    // NICE_CUDA_COMPACT=0 disable them for A/B measurement.
-    let cross = !table.low_digit_masks.is_empty()
-        && std::env::var("NICE_CUDA_CROSS").map_or(true, |v| v != "0");
-    if cross {
+    // Cross-end residue filter, with its warp compaction: wherever the
+    // low-mask table exists (base <= 64).
+    if !table.low_digit_masks.is_empty() {
         defines.push("CROSS_FILTER".to_string());
-        if std::env::var("NICE_CUDA_COMPACT").map_or(true, |v| v != "0") {
-            defines.push("COMPACT".to_string());
-        }
+        defines.push("COMPACT".to_string());
         // Affine middle-digit filter on the cross survivors (NICE_CUDA_AFFINE=0
         // disables it for A/B measurement).
         if let Some(aff) = affine_params(base, GPU_LSD_K)
@@ -392,8 +387,7 @@ impl NiceonlyGpu for CudaContext {
 /// NVIDIA nice-only with the overlap join: hand-CUDA's stride pipeline, and
 /// `CubeCL`'s CUDA runtime for the join, which hand-CUDA does not have yet.
 /// Each field's ticket says which of the two holds it. The client uses this
-/// under `--gpu-backend auto`; an explicit `cuda` keeps every field on
-/// hand-CUDA.
+/// for nice-only under `--gpu-backend auto` and `cuda` alike.
 #[cfg(feature = "cubecl-cuda")]
 pub struct CudaWithJoin {
     pub cuda: CudaContext,
@@ -576,7 +570,7 @@ impl RangeSink for CudaNiceonlySink {
             open.start = Some(record_timing_event(&stream)?);
         }
         let nice_capacity = NICE_OUT_CAPACITY as u32;
-        let max_inflight = batches_in_flight();
+        let max_inflight = BATCHES_IN_FLIGHT;
         for ((batch_offsets, batch_lens), batch_masks) in offsets
             .chunks(RANGES_PER_LAUNCH)
             .zip(lens.chunks(RANGES_PER_LAUNCH))
@@ -849,14 +843,15 @@ mod tests {
     /// Throughput of the continuous pipeline on a fixed run of fields, so two
     /// configurations can be compared on identical work (production claims
     /// hand every run different regions, whose MSD character varies 2x).
-    /// Env: `NICE_GPU_FIELDS_IN_FLIGHT`, `NICE_GPU_MSD_FLOOR` as in
-    /// production; `NICE_TEST_FIELDS` (required: it is also the opt-in) fields
-    /// of 1e13 in base 54 from the region the Anvil runs covered.
+    /// Fields are queued `FIELDS_IN_FLIGHT` deep and `NICE_GPU_MSD_FLOOR`
+    /// applies, as in production; `NICE_TEST_FIELDS` (required: it is also
+    /// the opt-in) fields of 1e13 in base 54 from the region the Anvil runs
+    /// covered.
     #[test]
     #[ignore = "requires an NVIDIA device; prints throughput"]
     #[allow(clippy::cast_precision_loss)]
     fn pipeline_throughput_fixed_fields() {
-        use crate::gpu_niceonly::{fields_in_flight, msd_floor_in_use};
+        use crate::gpu_niceonly::{FIELDS_IN_FLIGHT, msd_floor_in_use};
         use crate::gpu_route::{NiceonlyStarted, begin_niceonly};
         // The parity workflow runs every ignored test in this module on a
         // software rasterizer; a throughput run there is hours of nothing.
@@ -882,7 +877,7 @@ mod tests {
                 "device busy time missing from the pipeline stats: {stats:?}"
             );
         }
-        let lookahead = fields_in_flight().saturating_sub(1);
+        let lookahead = FIELDS_IN_FLIGHT.saturating_sub(1);
         let t = Instant::now();
         let mut queued = std::collections::VecDeque::new();
         let mut found = 0usize;
@@ -901,7 +896,7 @@ mod tests {
         let secs = t.elapsed().as_secs_f64();
         eprintln!(
             "THROUGHPUT fields_in_flight={} floor_now={} fields={n} secs={secs:.2} rate={:.3e} n/s found={found}",
-            fields_in_flight(),
+            FIELDS_IN_FLIGHT,
             msd_floor_in_use(),
             (n as f64) * (size as f64) / secs
         );
@@ -1553,11 +1548,14 @@ mod tests {
                 "b{base}"
             );
             assert!(defines.iter().any(|d| d == "CROSS_FILTER"), "b{base}");
+            assert!(defines.iter().any(|d| d == "COMPACT"), "b{base}");
         }
-        // No low-mask table above 64, so no cross filter and no affine filter.
+        // No low-mask table above 64, so no cross filter, no compaction and
+        // no affine filter.
         for base in [68u32, 70] {
             let (defines, _) = niceonly_defines(base).unwrap();
             assert!(!defines.iter().any(|d| d == "CROSS_FILTER"), "b{base}");
+            assert!(!defines.iter().any(|d| d == "COMPACT"), "b{base}");
             assert!(!defines.iter().any(|d| d == "AFFINE"), "b{base}");
         }
     }
@@ -1603,8 +1601,10 @@ mod tests {
                 compile_kernel_ptx(&defines).unwrap_or_else(|e| {
                     panic!("niceonly kernel failed to compile for b{base}: {e:?}")
                 });
-                // Also cover the variants the env toggles can produce:
-                // cross without compaction, and neither.
+                // Also cover the kernel's other variants: cross without
+                // compaction (no longer selected, but still in the source),
+                // without the affine filter (NICE_CUDA_AFFINE=0), and
+                // neither, as bases above 64 compile it.
                 if defines.iter().any(|d| d == "CROSS_FILTER") {
                     let no_compact: Vec<String> = defines
                         .iter()
