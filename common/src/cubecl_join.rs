@@ -2515,6 +2515,14 @@ mod tests {
         (client, name)
     }
 
+    /// The device's limits within the ceiling the client starts it at
+    /// ([`JoinCeiling::for_device`]): the limits every client field is
+    /// planned within, so the tests' production-size layouts are the ones a
+    /// client would run.
+    fn device_limits<R: Runtime>(client: &ComputeClient<R>, name: &str) -> JoinLimits {
+        JoinCeiling::for_device(name).cap(limits_of(client))
+    }
+
     /// A layout for `slots` partitions per launch whose lists hold every
     /// survivor of a production batch (a base-57 partition has 1.5-2.7e6
     /// join survivors), since the tests compare whole lists: the device's
@@ -2584,7 +2592,7 @@ mod tests {
     /// Hits, join survivors and prefilter survivors must come out exactly as
     /// the reference has them.
     fn check_tight_layouts<R: Runtime>(client: &ComputeClient<R>, name: &str) {
-        let lim = limits_of(client);
+        let lim = device_limits(client, name);
         for &(b, s, e, t, k, p) in WINDOWS {
             let jp = JoinParams { t, k, p };
             let fs = FieldSetup::new(b, s, e, jp).expect("field setup");
@@ -2642,7 +2650,7 @@ mod tests {
     fn check_all<R: Runtime>(client: &ComputeClient<R>, name: &str) {
         let jp = JoinParams { t: 2, k: 1, p: 0 };
         let band = FieldSize::new(47, 100);
-        let field = JoinField::prepare(10, &band, jp, limits_of(client))
+        let field = JoinField::prepare(10, &band, jp, device_limits(client, name))
             .expect("field setup")
             .expect("base 10 fits any device");
         let (hits, _) = run_field(client, &field, &JoinCeiling::default()).expect("join run");
@@ -2678,7 +2686,7 @@ mod tests {
     /// reference's.
     fn check_production_shape<R: Runtime>(client: &ComputeClient<R>, name: &str) {
         let range = FieldSize::new(FRONTIER_57, FRONTIER_57 + 100_000_000_000_000);
-        let lim = limits_of(client);
+        let lim = device_limits(client, name);
         let field = crate::join_plan::plan_join(57, &range, lim).expect("a join field");
         let fs = &field.fs;
         let parts = [0u32, 1_000, 3_248];
@@ -2745,7 +2753,7 @@ mod tests {
     /// fails the field instead of reporting it empty.
     fn check_refused_layouts<R: Runtime>(client: &ComputeClient<R>, name: &str) {
         let refuse_above = |bytes: usize| REFUSE_ABOVE.with(|r| r.set(bytes));
-        let lim = limits_of(client);
+        let lim = device_limits(client, name);
         let mut tried = 0;
         for &(b, s, e, t, k, p) in WINDOWS {
             let (jp, range) = (JoinParams { t, k, p }, FieldSize::new(s, e));
@@ -2797,7 +2805,7 @@ mod tests {
     /// A field run slice by slice (here cut into about three) finds what it
     /// finds whole: the same hits, join survivors and prefilter survivors.
     fn check_slices<R: Runtime>(client: &ComputeClient<R>, name: &str) {
-        let lim = limits_of(client);
+        let lim = device_limits(client, name);
         let mut sliced_any = 0;
         for &(b, s, e, t, k, p) in WINDOWS {
             let (jp, range) = (JoinParams { t, k, p }, FieldSize::new(s, e));
@@ -2845,7 +2853,7 @@ mod tests {
         // Planned and run within the ceiling the client starts this device
         // at, as `join_sample` below is.
         let ceiling = JoinCeiling::for_device(&name);
-        let lim = ceiling.cap(limits_of(&client));
+        let lim = device_limits(&client, &name);
         let field = crate::join_plan::plan_join(57, &range, lim).expect("a join field");
         println!(
             "{name}: limits {lim:?}; {} slice(s); plan {:?}; re-run {:?}",
