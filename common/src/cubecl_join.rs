@@ -141,7 +141,10 @@ mod kernels {
     /// join kernel reads them), and each surviving entry's two
     /// key-position digits are stepped through every key value d incrementally
     /// (+s2, +s3 mod b); the entry's index goes onto the (slot, d, c) list for
-    /// every d where they are distinct and new. List layout per slot:
+    /// every d where they are distinct and new. Every digit is also tested
+    /// against the field's certificate `fc_lo | fc_hi << 32`, which every
+    /// top's mask contains: an entry that meets it would fail every AND.
+    /// List layout per slot:
     /// `slot*b*nbp + b*seg[c] + d*len(c) + i`; counts at `(slot*b + d)*m1 + c`.
     #[cube(launch_unchecked)]
     pub fn bucket_kernel(
@@ -155,6 +158,8 @@ mod kernels {
         counts: &mut Array<u32>,
         ran: &mut Array<Atomic<u32>>,
         nbp: u32,
+        fc_lo: u32,
+        fc_hi: u32,
         #[comptime] base: u32,
         #[comptime] f0: u32,
         #[comptime] pp: u32,
@@ -163,6 +168,7 @@ mod kernels {
         #[comptime] key_at_zero: bool,
     ) {
         let m1 = comptime!(base - 1);
+        let fc = (u64::cast_from(fc_hi) << 32u64) | u64::cast_from(fc_lo);
         let nkeys = comptime!(if key_level { base } else { 1 });
         let s_cnt = SharedMemory::<Atomic<u32>>::new(64usize);
         let c = CUBE_POS_X;
@@ -228,7 +234,7 @@ mod kernels {
                 let g2 = sq[j as usize];
                 let g3 = cu[j as usize];
                 let bb = (1u64 << u64::cast_from(g2)) | (1u64 << u64::cast_from(g3));
-                if g2 == g3 || (m & bb) != 0u64 {
+                if g2 == g3 || ((m | fc) & bb) != 0u64 {
                     ok = false;
                 }
                 m |= bb;
@@ -236,6 +242,9 @@ mod kernels {
             if !ok {
                 m = DEAD_MASK;
             }
+            // What the key digit must miss: the entry's digits and the
+            // field's.
+            let mf = m | fc;
             let idx = slot * nbp + i;
             ext_m[(2u32 * idx) as usize] = u32::cast_from(m);
             ext_m[(2u32 * idx + 1u32) as usize] = u32::cast_from(m >> 32u64);
@@ -259,7 +268,7 @@ mod kernels {
                             a3 = (a2 * dk) % base;
                         }
                         let bb = (1u64 << u64::cast_from(a2)) | (1u64 << u64::cast_from(a3));
-                        if a2 != a3 && (m & bb) == 0u64 {
+                        if a2 != a3 && (mf & bb) == 0u64 {
                             let at = s_cnt[dk as usize].fetch_add(1u32);
                             lists[(lbase + dk * clen + at) as usize] = i;
                         }
@@ -1335,6 +1344,8 @@ pub(crate) struct JoinDevice<R: Runtime> {
     wide: bool,
     w_f0: u32,
     nbp: u32,
+    /// The field's certificate (`FieldSetup::fc`), low and high words.
+    fc: [u32; 2],
     max_slots: usize,
     /// The layout's bytes, and its largest buffer (for errors).
     bytes: usize,
@@ -1493,6 +1504,10 @@ impl<R: Runtime> JoinDevice<R> {
             wide,
             w_f0: u32::try_from(fs.w)?,
             nbp: u32::try_from(nbp)?,
+            fc: {
+                let w = u32_words(u128::from(fs.fc));
+                [w[0], w[1]]
+            },
             max_slots,
             bytes: plan.bytes,
             largest: (max_slots * fp.largest_per_slot())
@@ -1678,6 +1693,8 @@ impl<R: Runtime> JoinDevice<R> {
                 ),
                 ArrayArg::from_raw_parts(ran.clone(), nran),
                 self.nbp,
+                self.fc[0],
+                self.fc[1],
                 self.b,
                 self.f0,
                 self.pp,
@@ -2910,9 +2927,12 @@ mod tests {
     /// uncounted as a join survivor); with the stage flushed per chunk that
     /// is about 2e-5 of the survivors here (7.6k of 323M on 32 partitions),
     /// where flushing per wave sent two thirds (11x the full checks).
+    /// `NICE_TEST_JOIN_DENSE_FIELD=base:start:size` runs another field (of
+    /// its first slice) instead.
     #[test]
     #[cfg(feature = "cubecl-cuda")]
     #[ignore = "requires an NVIDIA device; opt-in, NICE_TEST_JOIN_DENSE=partitions"]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn cubecl_cuda_join_matches_the_cpu_join_on_a_dense_field() {
         let Ok(n) = std::env::var("NICE_TEST_JOIN_DENSE") else {
             eprintln!("skipping: set NICE_TEST_JOIN_DENSE to a partition count");
@@ -2923,10 +2943,21 @@ mod tests {
         let CubeclContext::Cuda { client, .. } = ctx else {
             unreachable!("new_cuda is CUDA")
         };
-        let dense = crate::join_plan::tests::DENSE_58;
-        let range = FieldSize::new(dense, dense + 1_000_000_000_000_000);
+        let (b, dense, size) = std::env::var("NICE_TEST_JOIN_DENSE_FIELD").map_or(
+            (58, crate::join_plan::tests::DENSE_58, 1_000_000_000_000_000),
+            |v| {
+                let x: Vec<&str> = v.split(':').map(str::trim).collect();
+                (
+                    x[0].parse().expect("NICE_TEST_JOIN_DENSE_FIELD: a base"),
+                    x[1].parse().expect("NICE_TEST_JOIN_DENSE_FIELD: a start"),
+                    x[2].parse::<f64>()
+                        .expect("NICE_TEST_JOIN_DENSE_FIELD: a size") as u128,
+                )
+            },
+        );
+        let range = FieldSize::new(dense, dense + size);
         let field =
-            crate::join_plan::plan_join(58, &range, limits_of(&client)).expect("a join field");
+            crate::join_plan::plan_join(b, &range, limits_of(&client)).expect("a join field");
         let total = u32::try_from(field.fs.nparts).unwrap();
         let parts: Vec<u32> = (0..n).map(|i| i * total / n.max(1)).collect();
         let t0 = Instant::now();
@@ -2934,7 +2965,7 @@ mod tests {
             run_slices(&client, &field, 1, &parts, &JoinCeiling::default()).expect("device run");
         let gpu_secs = t0.elapsed().as_secs_f64();
         let cpu =
-            crate::cpu_join::CpuJoin::new(58, &field.slices[0], field.fs.jp).expect("cpu setup");
+            crate::cpu_join::CpuJoin::new(b, &field.slices[0], field.fs.jp).expect("cpu setup");
         let mut sc = crate::cpu_join::Scratch::default();
         let mut want = crate::cpu_join::PartitionResult::default();
         for &v in &parts {
@@ -2943,8 +2974,8 @@ mod tests {
         want.hits.sort_unstable();
         let got: Vec<u128> = hits.iter().map(|h| h.number).collect();
         println!(
-            "b58 dense 1e15, {n} partitions: {} slice(s), {} per launch (fewest {}), {} re-run; \
-             survivors {} checked {} on the device in {gpu_secs:.2}s",
+            "b{b} [{dense}, +{size}), {n} partitions: {} slice(s), {} per launch (fewest {}), \
+             {} re-run; survivors {} checked {} on the device in {gpu_secs:.2}s",
             field.slices.len(),
             st.slots,
             st.min_slots,
@@ -3130,7 +3161,11 @@ mod tests {
     /// at bases 60 and 64.
     const THROUGHPUT_STARTS: &[(u32, u128)] = &[
         (57, FRONTIER_57),
+        // EXPERIMENTS item 18's b58 GPU field.
+        (58, 130_525_216_587_923_470_200),
         (60, 1_573_714_731_429_953_349_518),
+        // `PLAN_FIELDS`' b62 start.
+        (62, 7_997_740_455_941_656_911_841),
         (64, 41_242_006_262_957_161_709_568),
     ];
 
@@ -3144,7 +3179,15 @@ mod tests {
     /// (partitions per launch, MiB), re-runs, survivor counts and the
     /// device's memory. `NICE_TEST_JOIN_COMPARE=1` also runs every field
     /// through the stride pipeline and asserts the same nice numbers.
-    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    /// `NICE_TEST_JOIN_SIZE` sets the field size (default 1e14; the warm-up
+    /// field stays at most 1e14), and `NICE_TEST_JOIN_STARTS=b:start,...`
+    /// overrides the table's starts.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
     fn join_throughput(ctx: &CubeclContext) {
         use crate::cubecl_backend::memory_usage;
         use crate::gpu_niceonly::FIELDS_IN_FLIGHT;
@@ -3159,14 +3202,30 @@ mod tests {
             .map(|b| b.trim().parse().expect("NICE_TEST_JOIN_BASES: bases"))
             .collect();
         let compare = std::env::var("NICE_TEST_JOIN_COMPARE").is_ok();
-        let size = 100_000_000_000_000u128;
+        let size: u128 = std::env::var("NICE_TEST_JOIN_SIZE").map_or(100_000_000_000_000, |v| {
+            v.parse::<f64>().expect("NICE_TEST_JOIN_SIZE: a field size") as u128
+        });
+        let overrides: Vec<(u32, u128)> = std::env::var("NICE_TEST_JOIN_STARTS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|x| !x.trim().is_empty())
+            .map(|x| {
+                let (b, s) = x.split_once(':').expect("NICE_TEST_JOIN_STARTS: b:start");
+                (
+                    b.trim().parse().expect("a base"),
+                    s.trim().replace('_', "").parse().expect("a start"),
+                )
+            })
+            .collect();
+        let warm_size = size.min(100_000_000_000_000);
         let mib = |b: u64| b >> 20;
         for base in bases {
-            let &(_, start) = THROUGHPUT_STARTS
+            let &(_, start) = overrides
                 .iter()
+                .chain(THROUGHPUT_STARTS)
                 .find(|&&(b, _)| b == base)
-                .expect("a base with throughput fields (57, 60, 64)");
-            let warm = FieldSize::new(start - size, start);
+                .expect("a base with throughput fields (57, 58, 60, 62, 64)");
+            let warm = FieldSize::new(start - warm_size, start);
             run_routed(ctx, base, &warm);
             let fields: Vec<FieldSize> = (0..n)
                 .map(|i| FieldSize::new(start + i * size, start + (i + 1) * size))

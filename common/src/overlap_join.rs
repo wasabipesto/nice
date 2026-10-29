@@ -39,11 +39,22 @@
 //! the AND of the two masks is zero. Nothing else is assumed: this is the
 //! client's own MSD, LSD, residue and cross-end reasoning, enumerated as a
 //! join.
+//!
+//! The bottom side also drops what the field itself rules out. The field's
+//! own certificate, `cert(s, e − 1, k)` ([`FieldSetup::fc`]), is a set of
+//! digits that every nice `n` of the field has at positions `≥ k`, and a
+//! residue's digits sit below `k`. So a residue whose mask meets it, or that
+//! a partition or key digit extends by one of its digits, is part of no nice
+//! `n`, and is never listed. Every top certifies a sub-interval of the field,
+//! so its mask contains the field's and those residues would have failed
+//! every AND anyway: the join's survivors are the same with the prune or
+//! without it. A slice prunes by its own certificate, from the unpruned
+//! list.
 
 use crate::FieldSize;
 use crate::client_process::get_is_nice;
 use anyhow::{Result, anyhow, ensure};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// Smallest base the join is used for. Below this the stride pipeline is as
@@ -956,12 +967,25 @@ pub struct FieldSetup {
     pub phi: u128,
     /// Top layer at depth `t − p`.
     pub tlay: Vec<(u128, u64)>,
+    /// The field's certificate, `cert(s, e − 1, k)`: the output digits at
+    /// positions `>= k` that every nice `n` of `[s, e)` has (the digits
+    /// every `n` shares, and those the closure forces). Every top's
+    /// interval lies in the field, so every top's mask contains it, and a
+    /// bottom that meets it fails every AND of the field: the bottom side
+    /// drops those (in `bpre` here, and at every digit the partitions add).
+    /// `0` when the field's certificate fails (a repeated digit): then every
+    /// top's fails too and the top layer is empty.
+    pub fc: u64,
     /// `bpre`: residues mod `b^f0` whose `2·f0` low output digits are
-    /// distinct, sorted by digit-sum class mod `b − 1`; `seg[c]..seg[c + 1]`
-    /// is class `c`.
+    /// distinct and miss `fc`, sorted by digit-sum class mod `b − 1`;
+    /// `seg[c]..seg[c + 1]` is class `c`.
     pub bp_r: Vec<u32>,
     pub bp_m: Vec<u64>,
     pub seg: Vec<u32>,
+    /// `bpre` before the prune by `fc`, in the same order, which slices
+    /// ([`Self::sub_range`]) prune by their own certificate. Its length
+    /// sizes the device buffers, so the layout does not depend on the prune.
+    pub bp_all: Arc<(Vec<u32>, Vec<u64>)>,
     /// The prefilter tests the output digits below `k2` (1 or 2 more than
     /// the bottom list's `k`).
     pub k2: u32,
@@ -994,25 +1018,20 @@ impl FieldSetup {
         let f0 = l - t;
         let o = t + k - l;
         let w = base.powu(f0);
-        let (tlay, full_floor) = Self::top_side(&base, jp, w, s, e);
+        let (tlay, full_floor, fc) = Self::top_side(&base, jp, w, s, e);
         let mut bpre: Vec<(u64, u64)> = Vec::new();
         base.bot_dfs(0, 0, 0, f0, f0, 0, 0, &mut bpre);
         ensure!(!bpre.is_empty(), "empty bottom list");
         let m1 = b - 1;
         bpre.sort_unstable_by_key(|&(r, _)| (r % u64::from(m1), r));
-        let mut seg = vec![0u32; m1 as usize + 1];
-        for &(r, _) in &bpre {
-            seg[usize::try_from(r % u64::from(m1))? + 1] += 1;
-        }
-        for c in 0..m1 as usize {
-            seg[c + 1] += seg[c];
-        }
         // Residues below b^f0 < 2^32 (`JoinParams::supported`).
-        let bp_r = bpre
+        let all_r: Vec<u32> = bpre
             .iter()
             .map(|&(r, _)| u32::try_from(r))
             .collect::<Result<_, _>>()?;
-        let bp_m = bpre.iter().map(|&(_, m)| m).collect();
+        let all_m: Vec<u64> = bpre.iter().map(|&(_, m)| m).collect();
+        let bp_all = Arc::new((all_r, all_m));
+        let (bp_r, bp_m, seg) = Self::prune_bottoms(&bp_all, m1, fc)?;
         let keyspace = base.powu(o - pp);
         // The prefilter tests digits k..k2 too; it needs both powers to have
         // at least k2 digits and P mod b^(k2 - f0) to fit u32.
@@ -1044,17 +1063,69 @@ impl FieldSetup {
             plo: s / w,
             phi: (e - 1) / w,
             tlay,
+            fc,
             bp_r,
             bp_m,
             seg,
+            bp_all,
             secs: t0.elapsed().as_secs_f64(),
             base,
         })
     }
 
+    /// `bpre` (`all`, sorted by class) without the residues whose mask
+    /// meets `fc`, and its class offsets. If every residue meets it, the
+    /// range has no nice number; the device stage needs a non-empty list,
+    /// so then nothing is pruned (the AND still rejects every pair).
+    ///
+    /// # Errors
+    /// If `all` is empty.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn prune_bottoms(
+        all: &(Vec<u32>, Vec<u64>),
+        m1: u32,
+        fc: u64,
+    ) -> Result<(Vec<u32>, Vec<u64>, Vec<u32>)> {
+        let (all_r, all_m) = all;
+        let (mut bp_r, mut bp_m) = (
+            Vec::with_capacity(all_r.len()),
+            Vec::with_capacity(all_r.len()),
+        );
+        let mut seg = vec![0u32; m1 as usize + 1];
+        for (&r, &m) in all_r.iter().zip(all_m) {
+            if m & fc != 0 {
+                continue;
+            }
+            bp_r.push(r);
+            bp_m.push(m);
+            seg[(r % m1) as usize + 1] += 1;
+        }
+        if bp_r.is_empty() && fc != 0 {
+            return Self::prune_bottoms(all, m1, 0);
+        }
+        ensure!(!bp_r.is_empty(), "empty bottom list");
+        for c in 0..m1 as usize {
+            seg[c + 1] += seg[c];
+        }
+        log::debug!(
+            "overlap join: field certificate of {} digits keeps {} of {} bottom prefixes",
+            fc.count_ones(),
+            bp_r.len(),
+            all_r.len()
+        );
+        Ok((bp_r, bp_m, seg))
+    }
+
     /// The field's top side over `[s, e)`: its top layer at depth `t − p`,
-    /// and the certificate floor of its full-width blocks.
-    fn top_side(base: &Base, jp: JoinParams, w: u128, s: u128, e: u128) -> (Vec<(u128, u64)>, u32) {
+    /// the certificate floor of its full-width blocks, and the field's own
+    /// certificate (see [`Self::fc`]).
+    fn top_side(
+        base: &Base,
+        jp: JoinParams,
+        w: u128,
+        s: u128,
+        e: u128,
+    ) -> (Vec<(u128, u64)>, u32, u64) {
         let tlay = base.top_layer(s, e - 1, jp.t - jp.p, jp.k);
         let first_full = s.div_ceil(w);
         let full_floor = if first_full * w + w - 1 < e {
@@ -1062,12 +1133,18 @@ impl FieldSetup {
         } else {
             0
         };
-        (tlay, full_floor)
+        // A failed field certificate fails every top's (they certify
+        // sub-intervals, a superset of the field's digits): no tops, and
+        // nothing to prune by.
+        let fc = base.cert(s, e - 1, jp.k);
+        debug_assert!(fc.is_some() || tlay.is_empty());
+        (tlay, full_floor, fc.unwrap_or(0))
     }
 
     /// The same setup for `[s, e)`, another range with the same digit
     /// lengths (a slice of the field, see [`join_slices`]): the bottom side
-    /// is reused, only the top side is built again.
+    /// is reused, pruned by the range's own certificate, and the top side is
+    /// built again.
     ///
     /// # Errors
     /// An empty range, or one whose digit lengths differ from this field's.
@@ -1081,7 +1158,8 @@ impl FieldSetup {
             self.s,
             self.e
         );
-        let (tlay, full_floor) = Self::top_side(&self.base, self.jp, self.w, s, e);
+        let (tlay, full_floor, fc) = Self::top_side(&self.base, self.jp, self.w, s, e);
+        let (bp_r, bp_m, seg) = Self::prune_bottoms(&self.bp_all, self.m1, fc)?;
         Ok(Self {
             base: self.base.clone(),
             b: self.b,
@@ -1097,9 +1175,11 @@ impl FieldSetup {
             plo: s / self.w,
             phi: (e - 1) / self.w,
             tlay,
-            bp_r: self.bp_r.clone(),
-            bp_m: self.bp_m.clone(),
-            seg: self.seg.clone(),
+            fc,
+            bp_r,
+            bp_m,
+            seg,
+            bp_all: Arc::clone(&self.bp_all),
             k2: self.k2,
             full_floor,
             secs: t0.elapsed().as_secs_f64(),

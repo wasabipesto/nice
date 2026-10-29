@@ -457,7 +457,8 @@ impl CpuJoin {
     /// The bottom list extended by the partition's fixed digits: the
     /// positions from `f0` up to `k − 2` (`k − 1` holds the key digit, or
     /// the partition's last digit, which [`Self::list`] adds). Residues
-    /// whose digits repeat are dropped here, once for every key.
+    /// whose digits repeat, or meet the field's certificate (which every
+    /// top's mask contains), are dropped here, once for every key.
     // Narrowed: b^f0 and the list's length (at most b^f0) are below 2^32,
     // r below b^(k-1) < 2^40, and every column below M <= 2^18.
     #[allow(clippy::cast_possible_truncation)]
@@ -470,6 +471,7 @@ impl CpuJoin {
             add += u128::from(self.partition_digit(v, i)) * fs.base.powu(f0 + i);
         }
         let below_f0 = fs.base.powu(f0) as u64;
+        let fc = fs.fc;
         ext.clear();
         for c in 0..fs.m1 as usize {
             ext.seg.push(ext.idx.len() as u32);
@@ -487,7 +489,7 @@ impl CpuJoin {
                     x2 /= b;
                     x3 /= b;
                     let bits = (1u64 << g2) | (1u64 << g3);
-                    if g2 == g3 || mask & bits != 0 {
+                    if g2 == g3 || (mask | fc) & bits != 0 {
                         mask = DEAD;
                         break;
                     }
@@ -573,6 +575,7 @@ impl CpuJoin {
         masks.clear();
         info.clear();
         offs.clear();
+        let fc = self.fs.fc;
         for c in 0..self.fs.m1 as usize {
             offs.push(masks.len() as u32);
             for row in ext.seg[c]..ext.seg[c + 1] {
@@ -581,7 +584,7 @@ impl CpuJoin {
                 let (a3, g3) = self.sb.divrem_small(ext.t3[i]);
                 let bits = (1u64 << g2) | (1u64 << g3);
                 let mask = ext.mask[i];
-                if g2 == g3 || mask & bits != 0 {
+                if g2 == g3 || (mask | fc) & bits != 0 {
                     continue;
                 }
                 masks.push(mask | bits);
@@ -1039,6 +1042,88 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Partition `v`'s bottom lists, every key digit in order (as
+    /// [`CpuJoin::run`] makes them): `(key, class, bpre residue, mask,
+    /// carries)` per listed bottom.
+    fn listed(join: &CpuJoin, v: u32, ext: &mut Ext) -> Vec<(u32, usize, u32, u64, u32)> {
+        let keys: Vec<u32> = if join.fs.key_level {
+            (0..join.keyspace).collect()
+        } else {
+            vec![join.partition_digit(v, join.fs.jp.p - 1)]
+        };
+        let (mut masks, mut info, mut offs) = (Vec::new(), Vec::new(), Vec::new());
+        join.extend(v, ext);
+        let mut out = Vec::new();
+        for d in keys {
+            join.list(d, ext, &mut masks, &mut info, &mut offs);
+            for c in 0..join.fs.m1 as usize {
+                for i in offs[c] as usize..offs[c + 1] as usize {
+                    let r0 = join.fs.bp_r[ext.idx[info[i].row as usize] as usize];
+                    out.push((d, c, r0, masks[i], info[i].carries));
+                }
+            }
+        }
+        out
+    }
+
+    /// The field prune drops exactly the bottoms that meet the field's
+    /// certificate: on every production field, `bpre` and the bottom lists
+    /// of sampled partitions (every key digit) equal the unpruned ones
+    /// filtered by it. Prints the counts before and after.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn the_field_prune_drops_exactly_the_bottoms_that_meet_the_certificate() {
+        for &(b, s, size) in PLAN_FIELDS {
+            let range = FieldSize::new(s, s + size);
+            let jp = join_params_for(b, &range).expect("a join field");
+            let join = CpuJoin::new(b, &range, jp).expect("field setup");
+            let fc = join.fs.fc;
+            assert_eq!(Some(fc), join.fs.base.cert(s, s + size - 1, jp.k));
+            let mut raw = CpuJoin::new(b, &range, jp).expect("field setup");
+            raw.fs.fc = 0;
+            (raw.fs.bp_r, raw.fs.bp_m, raw.fs.seg) =
+                FieldSetup::prune_bottoms(&raw.fs.bp_all, raw.fs.m1, 0).expect("bpre");
+            assert_eq!(raw.fs.bp_r, raw.fs.bp_all.0, "b{b}: fc = 0 prunes nothing");
+            let every = u64::MAX >> (64 - b);
+            assert_eq!(
+                FieldSetup::prune_bottoms(&raw.fs.bp_all, raw.fs.m1, every).expect("bpre"),
+                (raw.fs.bp_r.clone(), raw.fs.bp_m.clone(), raw.fs.seg.clone()),
+                "b{b}: a certificate that meets every residue prunes nothing"
+            );
+            let class = |seg: &[u32], i: usize| seg.partition_point(|&x| x as usize <= i) - 1;
+            let pre = |fs: &FieldSetup| -> Vec<(usize, u32, u64)> {
+                (0..fs.bp_r.len())
+                    .map(|i| (class(&fs.seg, i), fs.bp_r[i], fs.bp_m[i]))
+                    .collect()
+            };
+            let mut want = pre(&raw.fs);
+            want.retain(|&(_, _, m)| m & fc == 0);
+            assert_eq!(pre(&join.fs), want, "b{b}: bpre");
+            let live = live_partitions(&join.fs);
+            let (mut ext, mut ext_raw) = (Ext::default(), Ext::default());
+            let (mut before, mut after, mut nparts) = (0, 0, 0);
+            for v in live.iter().copied().step_by(live.len().div_ceil(2)) {
+                let got = listed(&join, v, &mut ext);
+                let mut want = listed(&raw, v, &mut ext_raw);
+                before += want.len();
+                want.retain(|&(_, _, _, m, _)| m & fc == 0);
+                assert_eq!(got, want, "b{b} partition {v}: bottom lists");
+                after += got.len();
+                nparts += 1;
+            }
+            eprintln!(
+                "b{b} [{s}, +{size}) {jp:?}: field certificate {} digits; bpre {} -> {}; \
+                 listed bottoms per partition (all keys) {} -> {} ({:.1}% pruned)",
+                fc.count_ones(),
+                raw.fs.bp_r.len(),
+                join.fs.bp_r.len(),
+                before / nparts,
+                after / nparts,
+                100.0 * (1.0 - after as f64 / before as f64)
+            );
+        }
     }
 
     #[test]

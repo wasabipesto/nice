@@ -189,7 +189,9 @@ impl Footprint {
     /// every buffer is affine in it.
     pub(crate) fn with_prefixes(fs: &FieldSetup, ntl: usize, nice_cap: u32) -> Self {
         let b = fs.b as usize;
-        let nbp = fs.bp_r.len();
+        // The bottom list before the field prune: a slice's pruned list is
+        // never longer, so the layout fits every slice of the field.
+        let nbp = fs.bp_all.0.len();
         let ntl = ntl.max(1);
         let nroots = fs.base.roots.len();
         let nkeys = if fs.key_level { b } else { 1 };
