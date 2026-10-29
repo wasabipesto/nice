@@ -71,13 +71,13 @@ pub const SURV_SH_CAP: u32 = 1024;
 pub const SURV_FLUSH: u32 = 512;
 /// Sentinel mask of an extended entry that failed its fixed positions.
 pub const DEAD_MASK: u64 = 0xFFFF_FFFF_FFFF_FFFF;
-/// Bottom entries each thread holds in registers in [`join_kernel`], per
-/// base. Six win from base 62 up (+6-9% per field at base 62 and +14-16% at
-/// base 64 on an RTX 3080, RTX 4090, A100 and RX 9070 XT) and lose 7-11% at
-/// bases 58-60, which keep four.
-fn entries_per_thread(base: u32) -> u32 {
-    if base >= 62 { 6 } else { 4 }
-}
+/// Bottom entries each thread holds in registers in [`join_kernel`]: a wave
+/// covers `ENTRIES_PER_THREAD · JOIN_WG` = 512 entries of a bucket. Since
+/// the field prune (`FieldSetup::fc`) a bucket holds 3-4x fewer entries,
+/// about 280-420 on fields of 1e16 at bases 58-64 and fewer at 1e14, so
+/// waves of 1,024 or 1,536 entries (4 below base 62 and 6 from it before)
+/// ran mostly empty lanes. Two are the fastest at every base measured.
+const ENTRIES_PER_THREAD: u32 = 2;
 /// Cubes for the prefilter and check kernels (grid-stride loops).
 const CHECK_CUBES: u32 = 1024;
 /// How deep the halving of an overflowing partition's top layer may go: a
@@ -1730,7 +1730,7 @@ impl<R: Runtime> JoinDevice<R> {
                 self.b,
                 self.key_level,
                 self.key_level && self.k == 1,
-                entries_per_thread(self.b),
+                ENTRIES_PER_THREAD,
                 self.f0,
                 self.k2,
                 self.walk_sync,
