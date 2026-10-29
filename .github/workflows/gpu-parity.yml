@@ -69,9 +69,8 @@ jobs:
     metal:
         name: cubecl (Metal) on macOS
         runs-on: macos-latest
-        # A healthy run takes 9-16 minutes, build included. The MSL step has
-        # occasionally hung with three tests stalled at once, and without a
-        # limit it holds a macOS runner for GitHub's 6-hour maximum.
+        # A healthy run takes 9-16 minutes, build included. Without a limit, a
+        # hung run holds a macOS runner for GitHub's 6-hour maximum.
         timeout-minutes: 30
         steps:
             - uses: actions/checkout@v6
@@ -79,12 +78,18 @@ jobs:
             - name: Run device parity tests
               # cubecl goes through wgpu -> Metal on the runner's
               # paravirtualized Apple GPU.
+              #
+              # One test at a time: each join test sizes its working memory
+              # for the whole device, as a client's single join thread does
+              # (up to 3.5 GiB on this runner since #206). Run in parallel,
+              # three of them outgrow the VM's ~7 GB of shared memory and
+              # stall together.
               run: |
-                  cargo test --release --features cubecl -p nice_common -- --ignored --nocapture
+                  cargo test --release --features cubecl -p nice_common -- --ignored --nocapture --test-threads=1
 
             - name: Run device parity tests (CubeCL direct MSL compiler)
               # cubecl-metal is the direct compiler a Mac can actually use.
               # cubecl-spirv can't engage here (wgpu picks Metal), which is
               # why the Linux job tests spirv and this one tests msl.
               run: |
-                  cargo test --release --features cubecl-metal -p nice_common -- --ignored --nocapture cubecl_
+                  cargo test --release --features cubecl-metal -p nice_common -- --ignored --nocapture --test-threads=1 cubecl_
