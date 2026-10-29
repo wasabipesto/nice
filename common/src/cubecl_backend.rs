@@ -1594,7 +1594,7 @@ impl CubeclContext {
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
             join_pipeline: Mutex::new(None),
-            join_ceiling: Arc::default(),
+            join_ceiling: Arc::new(JoinCeiling::for_device(device_name)),
         })
     }
 
@@ -1637,7 +1637,7 @@ impl CubeclContext {
             niceonly_plans: Arc::new(Mutex::new(HashMap::new())),
             niceonly_pipeline: Mutex::new(None),
             join_pipeline: Mutex::new(None),
-            join_ceiling: Arc::default(),
+            join_ceiling: Arc::new(JoinCeiling::for_device(device_name)),
         })
     }
 

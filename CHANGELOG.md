@@ -5,6 +5,7 @@
 - Update the leaderboard and activity chart caches from each run's new submissions instead of re-reading every submission every hour (migration `2026-10-15_incremental_search_caches.sql`).
 - Speed up the overlap join at bases 62 and up by giving each GPU thread six bottom entries instead of four.
 - Size the overlap join's working memory to the GPU, up to 4 GiB instead of 1 GiB, so a production field at bases 60-64 runs as one slice instead of five to seven.
+- Start the overlap join within 512 MiB layouts on the paravirtual GPU of macOS virtual machines, which can hang on larger ones instead of refusing them.
 - Strengthen the overlap join's prefix certificate: at the first position where an interval's powers differ, the digit's range of possible values can rule the interval out or fix one more digit. Fewer candidates reach the later stages on the CPU and the GPU.
 - Speed up the CPU overlap join: an AVX-512 scan where the CPU has it, and a top certificate built from one endpoint's digits instead of both, with half the 256-bit divisions.
 - Pin the Rust toolchain to 1.99.0, so a new stable release can't fail CI on unchanged code; Dependabot proposes each new release as its own PR.

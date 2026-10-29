@@ -2842,7 +2842,10 @@ mod tests {
         let cpu = crate::cpu_join::CpuJoin::for_field(57, &range).expect("a join field");
         let want = cpu.run_partition(1_000, &mut crate::cpu_join::Scratch::default());
         let (client, name) = client();
-        let lim = limits_of(&client);
+        // Planned and run within the ceiling the client starts this device
+        // at, as `join_sample` below is.
+        let ceiling = JoinCeiling::for_device(&name);
+        let lim = ceiling.cap(limits_of(&client));
         let field = crate::join_plan::plan_join(57, &range, lim).expect("a join field");
         println!(
             "{name}: limits {lim:?}; {} slice(s); plan {:?}; re-run {:?}",
@@ -2850,11 +2853,13 @@ mod tests {
             field.plan,
             field.retry
         );
-        let ceiling = JoinCeiling::default();
         let (_, prod) =
             run_slices(&client, &field, 1, &[1_000], &ceiling).expect("production layout");
-        let four =
-            JoinField::with_plans(field.fs.clone(), test_plan(&field.fs, lim, 4), field.retry);
+        let four = JoinField::with_plans(
+            field.fs.clone(),
+            test_plan(&field.fs, limits_of(&client), 4),
+            field.retry,
+        );
         let (_, test) =
             run_slices(&client, &four, 1, &[1_000], &JoinCeiling::default()).expect("test layout");
         println!(

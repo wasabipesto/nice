@@ -124,7 +124,9 @@ fn list_bound(lim: JoinLimits) -> u32 {
 /// a 3.5 GiB buffer limit and runs a 626 MiB layout, but drops every
 /// dispatch of a 697 MiB one without an error. A device's planning (through
 /// its limits) and its join's worker share one ceiling, so every later
-/// field is planned within it.
+/// field is planned within it. A device that hangs on a layout instead of
+/// dropping it teaches the ceiling nothing, so such a device starts below
+/// it ([`Self::for_device`]).
 #[derive(Debug)]
 pub struct JoinCeiling(AtomicUsize);
 
@@ -134,7 +136,26 @@ impl Default for JoinCeiling {
     }
 }
 
+/// Where [`JoinCeiling::for_device`] starts the paravirtual Metal device
+/// of macOS virtual machines: below the 626 MiB it is known to run.
+const PARAVIRTUAL_CEILING: usize = 512 << 20;
+
 impl JoinCeiling {
+    /// The ceiling a device starts at, by its name: none, except on the
+    /// paravirtual Metal device of macOS virtual machines (the macOS CI
+    /// runner's). Above about 1 GiB its command buffers mostly never
+    /// complete, and wgpu waits on them without a timeout, so the join
+    /// would hang before it could learn a ceiling from a dropped layout.
+    #[must_use]
+    pub fn for_device(device_name: &str) -> Self {
+        let name = device_name.to_lowercase();
+        if name.contains("apple") && name.contains("paravirtual") {
+            Self(AtomicUsize::new(PARAVIRTUAL_CEILING))
+        } else {
+            Self::default()
+        }
+    }
+
     /// `lim` with neither its budget nor its largest buffer above the
     /// ceiling.
     pub(crate) fn cap(&self, lim: JoinLimits) -> JoinLimits {
@@ -548,6 +569,24 @@ pub(crate) mod tests {
                 SURV_CAP
             };
             assert_eq!(list_bound(lim), bound, "buffer {buffer}");
+        }
+    }
+
+    /// Only the paravirtual Metal device of macOS virtual machines starts
+    /// below its limits; its 3.5 GiB buffer limit plans within 512 MiB.
+    #[test]
+    fn only_the_paravirtual_device_starts_with_a_ceiling() {
+        let vm = JoinCeiling::for_device("Apple Paravirtual device (Metal, wgpu<wgsl>)");
+        assert_eq!(vm.get(), PARAVIRTUAL_CEILING);
+        let lim = vm.cap(JoinLimits::for_buffer(3_758_096_384));
+        assert_eq!((lim.max_binding, lim.budget), (512 << 20, 512 << 20));
+        for name in [
+            "Apple M4 (Metal, wgpu<wgsl>)",
+            "NVIDIA GeForce RTX 4090",
+            "AMD Radeon RX 9070 XT (RADV GFX1201) (Vulkan, wgpu<spirv>)",
+            "llvmpipe (LLVM 19.1.7, 256 bits) (Vulkan, wgpu<wgsl>)",
+        ] {
+            assert_eq!(JoinCeiling::for_device(name).get(), usize::MAX, "{name}");
         }
     }
 
