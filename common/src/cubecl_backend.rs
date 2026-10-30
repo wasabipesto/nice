@@ -2055,7 +2055,9 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
         range.size()
     );
 
-    // Near misses.
+    // Near misses. The kernel bumps the count for every near-miss but writes
+    // a record only below the capacity, so a count within the capacity is
+    // exactly the number of records written, in slots 0..count.
     let bytes = client
         .read_async(vec![miss_count_handle.clone()])
         .await
@@ -2066,12 +2068,29 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
         miss_total <= NEAR_MISS_CAPACITY,
         "near-miss buffer overflow: {miss_total} > {NEAR_MISS_CAPACITY}"
     );
-    let bytes = client
-        .read_async(vec![miss_data_handle])
-        .await
-        .map_err(|e| anyhow::anyhow!("miss data read failed: {e:?}"))?
-        .remove(0);
-    let words = u32::from_bytes(&bytes);
+    // Read back only those records, and nothing when there are none (the
+    // usual case at the live bases). The whole buffer is 20 MB, which costs
+    // a device-to-host copy of about 1.7 ms per field over PCIe 3 whatever
+    // the count.
+    let record_bytes = MISS_STRIDE as usize * core::mem::size_of::<u32>();
+    let miss_bytes = if miss_total == 0 {
+        None
+    } else {
+        let unused = ((NEAR_MISS_CAPACITY - miss_total) * record_bytes) as u64;
+        Some(
+            client
+                .read_async(vec![miss_data_handle.offset_end(unused)])
+                .await
+                .map_err(|e| anyhow::anyhow!("miss data read failed: {e:?}"))?
+                .remove(0),
+        )
+    };
+    let words: &[u32] = miss_bytes.as_ref().map_or(&[], |b| u32::from_bytes(b));
+    ensure!(
+        words.len() == miss_total * MISS_STRIDE as usize,
+        "near-miss read returned {} words for {miss_total} records",
+        words.len()
+    );
     let mut nice_numbers: Vec<NiceNumberSimple> = (0..miss_total)
         .map(|i| {
             let o = i * MISS_STRIDE as usize;
@@ -3029,6 +3048,55 @@ mod tests {
             );
             println!("base {base}: {count} candidates match the CPU exactly");
         }
+    }
+
+    /// The whole range of every base from 10 to `max_base` that has one,
+    /// through `ctx` and through the CPU. These are the windows with
+    /// near-misses (the larger bases' windows above have none), so they check
+    /// that the readback returns every record the kernel wrote, from a buffer
+    /// far larger than the count. Returns the number of near-misses compared.
+    fn small_bases_match_cpu(ctx: &CubeclContext, max_base: u32) -> usize {
+        let mut misses = 0;
+        for base in 10..=max_base {
+            let Some(range) = crate::base_range::get_base_range_u128(base).unwrap() else {
+                continue;
+            };
+            let gpu = process_range_detailed_cubecl(ctx, &range, base).expect("cubecl run");
+            let cpu = process_range_detailed(&range, base);
+            assert_eq!(
+                gpu.distribution, cpu.distribution,
+                "base {base}: distribution mismatch"
+            );
+            assert_eq!(
+                gpu.nice_numbers, cpu.nice_numbers,
+                "base {base}: near-miss mismatch"
+            );
+            misses += cpu.nice_numbers.len();
+        }
+        misses
+    }
+
+    /// Every near-miss comes back: bases 10 to 24 in full, 2.24 million
+    /// numbers.
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn cubecl_reads_back_every_near_miss() {
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        let misses = small_bases_match_cpu(&ctx, 24);
+        assert!(misses > 0, "no near-misses compared");
+        println!("bases 10-24 in full: {misses} near-misses match the CPU exactly");
+    }
+
+    /// As [`cubecl_reads_back_every_near_miss`] through the native CUDA
+    /// runtime, up to base 28 (76 million numbers).
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_reads_back_every_near_miss() {
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        let misses = small_bases_match_cpu(&ctx, 28);
+        assert!(misses > 0, "no near-misses compared");
+        println!("bases 10-28 in full: {misses} near-misses match the CPU exactly (CUDA runtime)");
     }
 
     /// CPU/CubeCL parity through the native HIP runtime, on real AMD silicon.
