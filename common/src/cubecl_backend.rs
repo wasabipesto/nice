@@ -2011,8 +2011,8 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
         // run in microseconds. This one is a persistent grid-stride kernel over
         // a whole `CUBECL_BATCH_SIZE`, ~0.12 s per dispatch at base 50 on an
         // AMD 860M, so without this flush a single submission holds the *whole
-        // field*: `DETAILED_SEARCH_MAX_FIELD_SIZE` is 20 batches, which is
-        // 2.4 s at base 50 and 6.3 s at base 80. Measured on Linux/RADV,
+        // field*: `DETAILED_SEARCH_MAX_FIELD_SIZE` is 200 batches, which is
+        // 24 s at base 50 and 63 s at base 80. Measured on Linux/RADV,
         // amdgpu resets a gfx job at ~2 s ("ring gfx_0.0.0 timeout ... device
         // wedged") and the device is lost for the rest of the process; Windows
         // has the same 2 s TDR, and only survives because the GPUs it was
@@ -3502,9 +3502,9 @@ mod tests {
     /// long before that — ~2 s on Linux/RADV, the same 2 s TDR on Windows.
     ///
     /// 40 batches is deliberately over that cap so the test also covers the
-    /// aggregated path, but it is not the interesting size: a real field is
-    /// `DETAILED_SEARCH_MAX_FIELD_SIZE` = 20 batches, under the cap and still
-    /// over the watchdog at every base past ~46.
+    /// aggregated path. A real field is longer still
+    /// (`DETAILED_SEARCH_MAX_FIELD_SIZE` = 200 batches), and a fifth of one
+    /// is over the watchdog at every base past ~46.
     ///
     /// Skipped on software rasterizers: CI runs the ignored tests on lavapipe,
     /// where 2e9 candidates would take hours and no watchdog is involved.
