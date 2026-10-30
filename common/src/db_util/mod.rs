@@ -36,7 +36,7 @@ pub type PgPooledConnection = PooledConnection<ConnectionManager<PgConnection>>;
 ///
 /// Reads:
 /// - `DATABASE_URL` (required)
-/// - `DATABASE_POOL_SIZE` (optional, defaults to 10)
+/// - `DATABASE_POOL_SIZE` (optional, defaults to 30)
 /// - `DATABASE_POOL_TIMEOUT_SECS` (optional, defaults to 5)
 ///
 /// The checkout timeout is deliberately short: r2d2's default of 30 seconds
@@ -52,7 +52,7 @@ pub fn get_database_pool() -> PgPool {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(10);
+        .unwrap_or(30);
 
     let timeout_secs: u64 = env::var("DATABASE_POOL_TIMEOUT_SECS")
         .ok()
