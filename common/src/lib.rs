@@ -16,6 +16,7 @@ pub mod cubecl_join;
 pub mod cubecl_web;
 #[cfg(feature = "database")]
 pub mod db_util;
+pub mod detailed_fd;
 pub mod distribution_stats;
 pub mod estimator;
 pub mod fixed_width;
