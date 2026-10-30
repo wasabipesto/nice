@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Speed up GPU detailed mode at bases 10-64 by stepping each GPU thread through a run of consecutive numbers with digit-array additions, instead of dividing every square and cube down to digits.
 - Speed up GPU detailed mode by copying back only the near-misses a field found, instead of the whole 20 MB buffer after every field.
 - Speed up the overlap join by dropping, before they are paired with any prefix, the bottom residues whose digits clash with the ones every number of the field shares: more than half of them at bases 58-64.
 - Update the leaderboard and activity chart caches from each run's new submissions instead of re-reading every submission every hour (migration `2026-10-15_incremental_search_caches.sql`).

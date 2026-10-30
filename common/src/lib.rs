@@ -12,6 +12,7 @@ pub mod client_process_cuda;
 pub mod consensus;
 pub mod cpu_join;
 pub mod cubecl_backend;
+pub mod cubecl_detailed_fd;
 pub mod cubecl_join;
 pub mod cubecl_web;
 #[cfg(feature = "database")]
