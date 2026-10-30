@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Speed up GPU detailed mode by copying back only the near-misses a field found, instead of the whole 20 MB buffer after every field.
 - Speed up the overlap join by dropping, before they are paired with any prefix, the bottom residues whose digits clash with the ones every number of the field shares: more than half of them at bases 58-64.
 - Update the leaderboard and activity chart caches from each run's new submissions instead of re-reading every submission every hour (migration `2026-10-15_incremental_search_caches.sql`).
 - Raise the largest detailed field from 1e9 to 1e10 numbers, so detailed mode continues at base 52 (base 51 has no range) once base 50's fields are done.
