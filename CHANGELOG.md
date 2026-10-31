@@ -5,6 +5,7 @@
 - Keep the overlap join's GPU top certificates clear of a constant division that Apple's Metal compiler miscompiles (the cause of #225's seed errors on an M4); on Apple GPUs it would make them wrong at bases 49-55. Bases 57-64 are not affected.
 - Speed up GPU detailed mode at bases 10-64 by stepping each GPU thread through a run of consecutive numbers with digit-array additions, instead of dividing every square and cube down to digits.
 - Speed up detailed searches on the CPU at bases 40-64 by updating the digits of each number's square and cube with additions from the previous number's, instead of dividing them out of every number.
+- Keep the GPU nice-only prefilter at bases 40 and below clear of a constant division that Apple's Metal compiler miscompiles, as a precaution: it is exact on an Apple M4 today.
 - Speed up GPU detailed mode by copying back only the near-misses a field found, instead of the whole 20 MB buffer after every field.
 - Speed up the browser client's CPU detailed mode with the same finite-difference digit arrays as the native client.
 - Speed up the overlap join by dropping, before they are paired with any prefix, the bottom residues whose digits clash with the ones every number of the field shares: more than half of them at bases 58-64.
