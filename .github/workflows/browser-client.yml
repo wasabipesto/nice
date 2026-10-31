@@ -17,9 +17,14 @@
 #                      checking claim_id's type and that a near miss above
 #                      2^53 survives as exact digits, without touching the
 #                      live server
+#   GPU/CPU parity   — web/search/parity.html runs process_chunk_gpu and
+#                      process_chunk_wasm over 13 windows (bases 10-80, run
+#                      lengths 1-1e5, a near miss above 2^53) and requires
+#                      byte-identical results; about 11 s on SwiftShader
 #
 # Not covered: real GPU hardware. WebGPU on a physical adapter is validated
-# manually, with the harness's --hw mode (see wasm-client/e2e/e2e.mjs).
+# manually, with the harness's --hw mode (see wasm-client/e2e/e2e.mjs), which
+# also requires a real GPU adapter and can run the full parity window list.
 name: Browser Client
 
 on:

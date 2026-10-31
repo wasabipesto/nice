@@ -14,6 +14,11 @@
 #                          feature can't engage.
 #   cubecl-metal         — Metal on the macOS arm64 runner (the direct MSL
 #                          compiler; the one a Mac can actually use).
+#
+# Apple's GPU compiler miscompiles a constant division of a half-width shift,
+# which the macOS runner's paravirtual GPU does not reproduce. The lavapipe
+# job therefore also lints the WGSL of the kernels for that pattern
+# (scripts/wgsl-lint.py).
 name: GPU Device Parity
 
 on:
@@ -55,6 +60,36 @@ jobs:
                   test -n "$VK_ICD_FILENAMES" || { echo "no lavapipe ICD found"; exit 1; }
                   vulkaninfo --summary | grep -A3 deviceName || true
                   cargo test --release --features cubecl -p nice_common -- --ignored --nocapture
+
+            - name: Lint the kernels' WGSL for Apple's half-shift division
+              # Apple's GPU compiler gets a division or remainder by a constant
+              # that is not a power of two wrong when the dividend is a right
+              # shift by half the word (x >> 16, or a u64's high word), and no
+              # runner here has that compiler. wgsl_dump_for_lint compiles the
+              # browser kernel, the native detailed kernels and the stride and
+              # join kernels at a few bases, CubeCL logs their WGSL, and the
+              # script fails on the pattern; its header says what it cannot
+              # see. Reuses the test binary the step above built.
+              run: |
+                  export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)"
+                  export CUBECL_DEBUG_LOG="$RUNNER_TEMP/wgsl.log"
+                  cargo test --release --features cubecl -p nice_common --lib -- \
+                      --ignored --exact cubecl_backend::tests::wgsl_dump_for_lint --nocapture
+                  python3 scripts/wgsl-lint.py "$CUBECL_DEBUG_LOG" \
+                      --require DetailedKernelU32@40 --require DetailedKernelU32@50 \
+                      --require DetailedFdKernel@23 --require DetailedFdKernel@40 \
+                      --require DetailedFdKernel@50 --require DetailedFdKernel@62 \
+                      --require DetailedKernel@80 --require NiceonlyKernel@40 \
+                      --require BucketKernel@57 --require JoinKernel@57 \
+                      --require TopKernel@57 --require CheckKernel@57
+
+            - name: Keep the WGSL the lint read
+              if: failure()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: wgsl-lavapipe
+                  path: ${{ runner.temp }}/wgsl.log
+                  if-no-files-found: ignore
 
             - name: Run device parity tests (CubeCL direct SPIR-V compiler)
               # The `-gpu` docker image is built with cubecl-spirv, so its
