@@ -8,8 +8,9 @@ use nice_common::client_api_async::{
     Client, get_field_from_server_async, get_validation_data_from_server_async,
     submit_field_to_server_async,
 };
-use nice_common::client_process::{process_range_detailed, process_range_niceonly};
+use nice_common::client_process::process_range_niceonly;
 use nice_common::cpu_join::{CpuJoin, PartitionResult, Scratch, slices_for};
+use nice_common::detailed_fd::process_range_detailed_fd;
 use nice_common::overlap_join::{JoinParams, JoinTelemetry, StrideReason, join_verdict};
 use nice_common::progress::FieldProgress;
 use nice_common::stride_filter;
@@ -842,7 +843,7 @@ fn process_field_sync(
             .par_iter()
             .map(|chunk| {
                 let result = match mode {
-                    SearchMode::Detailed => process_range_detailed(chunk, claim_data.base),
+                    SearchMode::Detailed => process_range_detailed_fd(chunk, claim_data.base),
                     SearchMode::Niceonly => {
                         let stride_table = stride_table_opt
                             .as_ref()

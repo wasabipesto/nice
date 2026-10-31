@@ -28,6 +28,7 @@
 )]
 
 use crate::client_process::process_range_detailed;
+use crate::cubecl_detailed_fd::{FD_RUN_LEN, detailed_fd_kernel, fd_plan};
 use crate::cubecl_join::{JoinPipeline, limits_of, run_slices};
 use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
@@ -76,6 +77,11 @@ const NEAR_MISS_CAPACITY: usize = 1 << 20;
 /// Comptime parameters make `CubeCL` specialize one kernel per base, exactly
 /// as the WGSL generator bakes literals: every division below is by a
 /// comptime constant, and every limb loop unrolls to straight-line code.
+///
+/// Inside the legal range of every base up to
+/// [`crate::cubecl_detailed_fd::FD_MAX_BASE`], [`detailed_impl`] runs the
+/// finite-difference kernel instead; this one serves the bases above and
+/// any candidates outside a base's range.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn detailed_kernel(
@@ -1841,6 +1847,47 @@ pub async fn process_range_detailed_cubecl_async(
     range: &FieldSize,
     base: u32,
 ) -> Result<FieldResults> {
+    process_range_detailed_cubecl_kernel(ctx, range, base, DetailedKernel::for_base(base)).await
+}
+
+/// Which kernel the detailed path runs on candidates inside a base's legal
+/// range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailedKernel {
+    /// The per-number kernel: production's choice for the bases
+    /// [`fd_plan`] has no plan for (above [`crate::cubecl_detailed_fd::FD_MAX_BASE`]),
+    /// and the reference the finite-difference kernel is tested against.
+    Division,
+    /// [`crate::cubecl_detailed_fd`] with `run_len` candidates per thread and
+    /// at most `batch` (no more than [`CUBECL_BATCH_SIZE`]) per dispatch.
+    FiniteDifference { run_len: u32, batch: u128 },
+}
+
+impl DetailedKernel {
+    /// The finite-difference kernel at its production settings.
+    pub(crate) const DEFAULT: Self = Self::FiniteDifference {
+        run_len: FD_RUN_LEN,
+        batch: CUBECL_BATCH_SIZE,
+    };
+
+    /// What production runs for `base`: [`Self::DEFAULT`] where [`fd_plan`]
+    /// has a plan, the per-number kernel elsewhere.
+    pub(crate) fn for_base(base: u32) -> Self {
+        if fd_plan(base).is_some() {
+            Self::DEFAULT
+        } else {
+            Self::Division
+        }
+    }
+}
+
+/// As [`process_range_detailed_cubecl_async`] with the kernel chosen.
+pub(crate) async fn process_range_detailed_cubecl_kernel(
+    ctx: &CubeclContext,
+    range: &FieldSize,
+    base: u32,
+    kernel: DetailedKernel,
+) -> Result<FieldResults> {
     if !gpu_supports_base(base) {
         warn!("base {base} not supported on GPU, falling back to CPU for this field");
         return Ok(process_range_detailed(range, base));
@@ -1848,15 +1895,15 @@ pub async fn process_range_detailed_cubecl_async(
 
     match ctx {
         CubeclContext::Wgpu { client, .. } => {
-            detailed_impl(client, range, base, wide_chunk_for(client)).await
+            detailed_impl(client, range, base, wide_chunk_for(client), kernel).await
         }
         #[cfg(feature = "cubecl-cuda")]
         CubeclContext::Cuda { client, .. } => {
-            detailed_impl(client, range, base, wide_chunk_for(client)).await
+            detailed_impl(client, range, base, wide_chunk_for(client), kernel).await
         }
         #[cfg(feature = "cubecl-hip")]
         CubeclContext::Hip { client, .. } => {
-            detailed_impl(client, range, base, wide_chunk_for(client)).await
+            detailed_impl(client, range, base, wide_chunk_for(client), kernel).await
         }
     }
 }
@@ -1933,11 +1980,21 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
     range: &FieldSize,
     base: u32,
     wide_chunk: bool,
+    kernel: DetailedKernel,
 ) -> Result<FieldResults> {
     /// Batches launched between blocking histogram drains; the overflow
     /// bound is checked below.
     const DRAIN_INTERVAL: usize = 64;
     const _: () = assert!((DRAIN_INTERVAL as u128) * CUBECL_BATCH_SIZE < u32::MAX as u128);
+
+    let (plan, run_len, batch_size) = match kernel {
+        DetailedKernel::FiniteDifference { run_len, batch } => (fd_plan(base), run_len, batch),
+        DetailedKernel::Division => (None, FD_RUN_LEN, CUBECL_BATCH_SIZE),
+    };
+    ensure!(
+        run_len > 0 && (1..=CUBECL_BATCH_SIZE).contains(&batch_size),
+        "detailed run length {run_len} or batch {batch_size} out of range"
+    );
 
     let start_time = Instant::now();
     let limbs = n_limbs(base).with_context(|| format!("base {base} has no u128 range"))?;
@@ -1968,21 +2025,20 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
     // Ticks on submission: without a per-batch sync there is nothing cheap
     // to wait on here, so the bar runs ahead of the device by however many
     // batches the runtime queues. It still shows the field is moving.
-    let progress = crate::progress::FieldProgress::begin(range, CUBECL_BATCH_SIZE);
+    let progress = crate::progress::FieldProgress::begin(range, batch_size);
 
-    for batch in range.chunks(CUBECL_BATCH_SIZE) {
-        let start = batch.start();
-        let count = batch.size() as u64;
+    // The per-number kernel over [start, end), at most one batch.
+    let launch_division = |hist: &cubecl::server::Handle, start: u128, end: u128| {
+        let count = (end - start) as u64;
         let cubes = u32::try_from(count.div_ceil(u64::from(WORKGROUP_SIZE)))
             .unwrap_or(MAX_CUBES)
             .clamp(1, MAX_CUBES);
-
         unsafe {
             detailed_kernel::launch_unchecked::<R>(
                 client,
                 CubeCount::Static(cubes, 1, 1),
                 CubeDim::new_1d(WORKGROUP_SIZE),
-                ArrayArg::from_raw_parts(hist_handle.clone(), hist_bins),
+                ArrayArg::from_raw_parts(hist.clone(), hist_bins),
                 ArrayArg::from_raw_parts(miss_count_handle.clone(), 1),
                 ArrayArg::from_raw_parts(
                     miss_data_handle.clone(),
@@ -2002,6 +2058,61 @@ async fn detailed_impl<R: cubecl::prelude::Runtime>(
                 cutoff,
                 wide_chunk,
             );
+        }
+    };
+
+    for batch in range.chunks(batch_size) {
+        // The finite-difference kernel takes the part of the batch inside its
+        // plan's interval (all of it, for a field in the base's legal range);
+        // the per-number kernel takes anything outside.
+        let (a, z) = (batch.start(), batch.end());
+        let (lo, hi) = plan.map_or((z, z), |p| {
+            let lo = a.max(p.reg_lo).min(z);
+            (lo, z.min(p.reg_hi).max(lo))
+        });
+        if let Some(p) = plan.filter(|_| hi > lo) {
+            let count = (hi - lo) as u64;
+            let runs = count.div_ceil(u64::from(run_len));
+            let cubes = u32::try_from(runs.div_ceil(u64::from(WORKGROUP_SIZE)))
+                .unwrap_or(MAX_CUBES)
+                .clamp(1, MAX_CUBES);
+            unsafe {
+                detailed_fd_kernel::launch_unchecked::<R>(
+                    client,
+                    CubeCount::Static(cubes, 1, 1),
+                    CubeDim::new_1d(WORKGROUP_SIZE),
+                    ArrayArg::from_raw_parts(hist_handle.clone(), hist_bins),
+                    ArrayArg::from_raw_parts(miss_count_handle.clone(), 1),
+                    ArrayArg::from_raw_parts(
+                        miss_data_handle.clone(),
+                        NEAR_MISS_CAPACITY * MISS_STRIDE as usize,
+                    ),
+                    lo as u32,
+                    (lo >> 32) as u32,
+                    (lo >> 64) as u32,
+                    (lo >> 96) as u32,
+                    count as u32,
+                    (count >> 32) as u32,
+                    run_len,
+                    NEAR_MISS_CAPACITY as u32,
+                    base,
+                    limbs,
+                    chunk_digits,
+                    chunk_div,
+                    wide_chunk,
+                    cutoff,
+                    p.ls,
+                    p.lc,
+                    p.lds,
+                    p.ldc,
+                    p.lddc,
+                );
+            }
+        }
+        for (start, end) in [(a, lo), (hi, z)] {
+            if end > start {
+                launch_division(&hist_handle, start, end);
+            }
         }
 
         // Submit this batch on its own, because a GPU driver kills a
