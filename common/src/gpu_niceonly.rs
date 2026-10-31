@@ -311,10 +311,14 @@ const FLOOR_WAIT_THRESHOLD: f64 = 0.15;
 /// Anvil it ratcheted to the bypass and stayed there.
 ///
 /// `NICE_GPU_MSD_FLOOR` pins the floor and disables steering (floor sweeps).
+///
+/// Every pipeline in the process shares one controller, handed to it at
+/// start; tests can hand their pipelines a pinned controller of their own.
 pub struct FloorController {
     /// The floor as `f64` bits; workers read it per block, lock-free.
     floor_bits: AtomicU64,
-    /// No steering: pinned by the environment for the whole process.
+    /// No steering: pinned by the environment for the whole process, or a
+    /// test's own fixed floor.
     pinned: AtomicBool,
     state: Mutex<FloorState>,
 }
@@ -394,23 +398,23 @@ impl FloorController {
     }
 }
 
-static FLOOR: OnceLock<FloorController> = OnceLock::new();
+static FLOOR: OnceLock<Arc<FloorController>> = OnceLock::new();
 
 /// The process-wide floor controller, initialised on first use: pinned by
 /// `NICE_GPU_MSD_FLOOR` if set, otherwise steering from [`MSD_FLOOR_SEED`].
-fn floor_controller() -> &'static FloorController {
+fn floor_controller() -> &'static Arc<FloorController> {
     FLOOR.get_or_init(|| {
         if let Ok(v) = std::env::var("NICE_GPU_MSD_FLOOR") {
             match v.parse::<f64>() {
                 Ok(f) if f >= 1.0 => {
                     debug!("GPU MSD floor fixed at {f:.0} via NICE_GPU_MSD_FLOOR");
-                    return FloorController::new(f, true);
+                    return Arc::new(FloorController::new(f, true));
                 }
                 _ => warn!("ignoring invalid NICE_GPU_MSD_FLOOR '{v}'; steering the floor"),
             }
         }
         debug!("GPU MSD floor: steered, seed {MSD_FLOOR_SEED:.0}");
-        FloorController::new(MSD_FLOOR_SEED, false)
+        Arc::new(FloorController::new(MSD_FLOOR_SEED, false))
     })
 }
 
@@ -772,6 +776,9 @@ struct Shared {
     /// Set when the pipeline is dropped; workers exit at their next look.
     closed: AtomicBool,
     workers: usize,
+    /// Where the workers read the floor and the dispatcher reports waits:
+    /// the process-wide [`floor_controller`] outside tests.
+    controller: Arc<FloorController>,
 }
 
 struct FieldQueueState {
@@ -818,7 +825,7 @@ fn msd_worker(shared: &Shared, tx: &SyncSender<Msg>, error: &Mutex<Option<anyhow
             // whole field's worth of "device behind" pile up unobserved and
             // slam the floor to its minimum for the next one. Every floor is
             // sound, so mixing them within a field only changes the work.
-            let floor = floor_controller().floor();
+            let floor = shared.controller.floor();
             match descriptors_for_block(block, work.base, floor, work.range.start()) {
                 Ok((offsets, lens, masks)) => {
                     if batch.feed(work.seq, &offsets, &lens, &masks, tx).is_err() {
@@ -880,7 +887,7 @@ pub struct FieldReady<P> {
 struct Dispatcher<'a, S: RangeSink> {
     sink: &'a mut S,
     rx: &'a Receiver<Msg>,
-    controller: &'static FloorController,
+    controller: &'a FloorController,
     /// Fields opened on the sink, with what has been launched for them.
     open: HashMap<u64, OpenField>,
     buf_offsets: Vec<u64>,
@@ -944,7 +951,7 @@ impl<S: RangeSink> Dispatcher<'_, S> {
                     OpenField {
                         pushed_at: Instant::now(),
                         range,
-                        floor: floor_controller().floor(),
+                        floor: self.controller.floor(),
                         first_launch: None,
                         num_ranges: 0,
                         valid_numbers: 0,
@@ -1035,11 +1042,15 @@ impl<S: RangeSink> Dispatcher<'_, S> {
     }
 }
 
-fn new_dispatcher<'a, S: RangeSink>(sink: &'a mut S, rx: &'a Receiver<Msg>) -> Dispatcher<'a, S> {
+fn new_dispatcher<'a, S: RangeSink>(
+    sink: &'a mut S,
+    rx: &'a Receiver<Msg>,
+    controller: &'a FloorController,
+) -> Dispatcher<'a, S> {
     Dispatcher {
         sink,
         rx,
-        controller: floor_controller(),
+        controller,
         open: HashMap::new(),
         buf_offsets: Vec::new(),
         buf_lens: Vec::new(),
@@ -1049,7 +1060,7 @@ fn new_dispatcher<'a, S: RangeSink>(sink: &'a mut S, rx: &'a Receiver<Msg>) -> D
     }
 }
 
-fn new_shared(workers: usize) -> Shared {
+fn new_shared(workers: usize, controller: Arc<FloorController>) -> Shared {
     Shared {
         fields: Mutex::new(FieldQueueState {
             open: HashMap::new(),
@@ -1057,6 +1068,7 @@ fn new_shared(workers: usize) -> Shared {
         field_added: Condvar::new(),
         closed: AtomicBool::new(false),
         workers,
+        controller,
     }
 }
 
@@ -1147,7 +1159,19 @@ pub fn run_range_pipeline<S: RangeSink>(
     range: &FieldSize,
     base: u32,
 ) -> Result<(NiceonlyStats, Vec<NiceNumberSimple>)> {
-    let shared = new_shared(worker_count());
+    run_range_pipeline_with(backend, sink, range, base, floor_controller().clone())
+}
+
+/// [`run_range_pipeline`] steered by `controller` instead of the process-wide
+/// [`floor_controller`].
+fn run_range_pipeline_with<S: RangeSink>(
+    backend: &str,
+    sink: &mut S,
+    range: &FieldSize,
+    base: u32,
+    controller: Arc<FloorController>,
+) -> Result<(NiceonlyStats, Vec<NiceNumberSimple>)> {
+    let shared = new_shared(worker_count(), controller);
     let (tx, rx) = sync_channel::<Msg>(PIPELINE_DEPTH);
     let worker_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     push_field(&shared, &tx, 0, base, range)?;
@@ -1162,7 +1186,7 @@ pub fn run_range_pipeline<S: RangeSink>(
             scope.spawn(move || msd_worker(shared, &tx, worker_error));
         }
         drop(tx);
-        let mut d = new_dispatcher(sink, &rx);
+        let mut d = new_dispatcher(sink, &rx, &shared.controller);
         let mut ready = None;
         while let Some(msg) = d.recv() {
             if let Some(r) = d.handle(msg) {
@@ -1208,10 +1232,20 @@ impl<P: PendingField + Send + 'static> NiceonlyPipeline<P> {
     /// Start the workers and the dispatch thread over `sink`.
     pub fn start<S: RangeSink<Pending = P> + Send + 'static>(
         backend: &'static str,
+        sink: S,
+    ) -> Self {
+        Self::start_with(backend, sink, floor_controller().clone())
+    }
+
+    /// [`Self::start`] steered by `controller` instead of the process-wide
+    /// [`floor_controller`].
+    fn start_with<S: RangeSink<Pending = P> + Send + 'static>(
+        backend: &'static str,
         mut sink: S,
+        controller: Arc<FloorController>,
     ) -> Self {
         let workers = worker_count();
-        let shared = Arc::new(new_shared(workers));
+        let shared = Arc::new(new_shared(workers, controller));
         let (tx, rx) = sync_channel::<Msg>(PIPELINE_DEPTH);
         let (results_tx, results) = sync_channel::<FieldReady<P>>(FIELDS_IN_FLIGHT + 1);
         let worker_error = Arc::new(Mutex::new(None));
@@ -1224,8 +1258,9 @@ impl<P: PendingField + Send + 'static> NiceonlyPipeline<P> {
                 msd_worker(&shared, &tx, &worker_error);
             }));
         }
+        let controller = shared.controller.clone();
         threads.push(std::thread::spawn(move || {
-            let mut d = new_dispatcher(&mut sink, &rx);
+            let mut d = new_dispatcher(&mut sink, &rx, &controller);
             while let Some(msg) = d.recv() {
                 if let Some(ready) = d.handle(msg)
                     && results_tx.send(ready).is_err()
@@ -1649,6 +1684,18 @@ mod tests {
         }
     }
 
+    /// The floor [`mixed_windows`] picks its windows at, which the
+    /// pipeline-equality test also pins both of its forms to.
+    const TEST_FLOOR: u128 = 4000;
+
+    /// A floor controller of the caller's own, pinned at `floor`, so that
+    /// neither the process-wide one's steering nor the other tests feeding it
+    /// can move the floor under a test.
+    #[allow(clippy::cast_precision_loss)]
+    fn fixed_floor(floor: u128) -> Arc<FloorController> {
+        Arc::new(FloorController::new(floor as f64, true))
+    }
+
     /// Windows of base 40 that both keep and reject, for the pipeline tests.
     fn mixed_windows(n: usize) -> Vec<FieldSize> {
         let base = 40;
@@ -1664,7 +1711,7 @@ mod tests {
                     .chunks(PROCESSING_CHUNK_SIZE)
                     .into_iter()
                     .map(|c| {
-                        descriptors_for_chunk(c, base, 4000, f.start())
+                        descriptors_for_chunk(c, base, TEST_FLOOR, f.start())
                             .unwrap()
                             .0
                             .len()
@@ -1679,13 +1726,29 @@ mod tests {
     /// The threaded pipeline returns fields in push order, each with exactly
     /// the descriptors the one-field form produces for it, keeps the sink's
     /// open/launch/close protocol, and lets several fields be open at once.
+    ///
+    /// Both forms run at the same fixed floor, [`TEST_FLOOR`], each on a
+    /// pinned controller of its own. The floor decides where the MSD
+    /// recursion stops and so where descriptors are cut, and the process-wide
+    /// controller moves it: a mock device never blocks a launch, so the
+    /// dispatcher's only waits are on the MSD workers, which the controller
+    /// reads as a starved device and answers by raising the floor at the end
+    /// of an adjustment interval. Alone, this test is over long before the
+    /// first one ends; alongside the other tests sharing that controller, or
+    /// on a loaded host, a step can land between or during its two runs, and
+    /// the two forms then cut the same numbers at different boundaries (seen
+    /// in CI as ranges of 250 000 against 500 000 after a step from 250 000
+    /// to 270 856). The floor is an input to the MSD work, not to how the
+    /// pipeline batches, orders and closes it, so equality at one fixed floor
+    /// is the property under test.
     #[test]
     fn threaded_pipeline_matches_the_one_field_form_field_by_field() {
         let base = 40;
         let fields = mixed_windows(3);
         assert_eq!(fields.len(), 3, "need three mixed windows in base 40");
         let device = Arc::new(Mutex::new(MockDevice::default()));
-        let mut pipeline = NiceonlyPipeline::start("test", MockSink(device.clone()));
+        let mut pipeline =
+            NiceonlyPipeline::start_with("test", MockSink(device.clone()), fixed_floor(TEST_FLOOR));
 
         // Two open at once, like the client runs it.
         let t0 = pipeline.push(base, &fields[0]).unwrap();
@@ -1712,7 +1775,10 @@ mod tests {
         for (seq, (field, stats)) in fields.iter().zip([stats0, stats1, stats2]).enumerate() {
             let seq = seq as u64;
             let mut sink = Recorder::default();
-            let (ref_stats, _) = run_range_pipeline("test", &mut sink, field, base).unwrap();
+            let (ref_stats, _) =
+                run_range_pipeline_with("test", &mut sink, field, base, fixed_floor(TEST_FLOOR))
+                    .unwrap();
+            assert_eq!((stats.floor, ref_stats.floor), (TEST_FLOOR, TEST_FLOOR));
             let mut expected: Vec<(u64, u32, u64)> = sink
                 .batches
                 .iter()
@@ -1725,6 +1791,7 @@ mod tests {
                 })
                 .collect();
             expected.sort_unstable();
+            assert!(!expected.is_empty(), "field {seq}: nothing to compare");
             let mut got = d.ranges.get(&seq).cloned().unwrap_or_default();
             got.sort_unstable();
             assert_eq!(
