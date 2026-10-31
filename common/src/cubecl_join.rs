@@ -565,7 +565,8 @@ mod kernels {
 
     /// One power's share of the top certificate, the device form of
     /// `Base::cert`'s inner loop: x and y are the power of the interval's two
-    /// endpoints (`nl` u32 limbs, destroyed), `sp` its digit count. Positions
+    /// endpoints (`2·nl` 16-bit limbs, one to a u32, destroyed; `nl` is the
+    /// width in u32 words), `sp` its digit count. Positions
     /// >= c0 = max(cap, ndig(y - x)) are scanned least significant first in
     /// lockstep; a position where the digits differ resets the run, so what
     /// is left at the top is exactly the digits `cert` certifies (from the top
@@ -574,6 +575,23 @@ mod kernels {
     /// `out_dom` the digits of x and y at the topmost disagreement at or
     /// above c0, which bound every n's digit there (`Base::cert`), or (1, 0)
     /// if there is none.
+    ///
+    /// The limbs are 16-bit so that no constant division here divides a
+    /// bare half-width right shift. Each pass's long division by `chunk_div`
+    /// starts with the remainder 0, and the loops are unrolled, so with u32
+    /// limbs split in 16-bit halves the first dividend of every pass was
+    /// exactly `x[top] >> 16`, and in pass 0 `x[top]` was the high half of a
+    /// u64 product sum. Apple's GPU compiler (M4, macOS 26.3, through naga's
+    /// MSL) miscompiles `naga_div(x >> 16u, K)`, `(x >> 16u) % K` and
+    /// `uint(ulong p >> 32) / K` for a constant K that is not a power of
+    /// two. The detailed FD seed of #225 came out wrong at b49, b50 and
+    /// b52-55 from the same division, and so would the tops' certificates
+    /// wherever the top word of n² or n³ is not zero (b45-55 of the join's
+    /// bases; it is zero at b40-44 and b57-64). Here the first step of each
+    /// pass divides the top two limbs as one u32: in pass 0 that is the u32
+    /// sum `t` whose halves the schoolbook in `top_kernel` stored there,
+    /// later the previous quotient. It is the same long division, with one
+    /// division fewer.
     #[cube]
     fn cert_power(
         x: &mut Array<u32>,
@@ -590,13 +608,14 @@ mod kernels {
         #[comptime] chunk_digits: u32,
         #[comptime] chunk_div: u32,
     ) -> u64 {
-        // d = y - x (y >= x)
+        let nh = comptime!(2 * nl);
+        // d = y - x (y >= x), over u32 words packed from the limb pairs.
         let mut d = Array::<u32>::new(nl as usize);
         let mut borrow = 0u32;
         #[unroll]
         for j in 0..nl {
-            let yj = y[j as usize];
-            let xj = x[j as usize];
+            let yj = y[comptime!(2 * j) as usize] | (y[comptime!(2 * j + 1) as usize] << 16u32);
+            let xj = x[comptime!(2 * j) as usize] | (x[comptime!(2 * j + 1) as usize] << 16u32);
             let t = yj - xj - borrow;
             let mut nb = 0u32;
             if yj < xj || (yj == xj && borrow != 0u32) {
@@ -647,27 +666,30 @@ mod kernels {
         let passes = comptime!(sp.div_ceil(chunk_digits));
         #[unroll]
         for pass in 0..passes {
-            let mut rx = 0u32;
-            let mut ry = 0u32;
+            // The top two limbs as one u32 (see above), then one limb a step.
+            let top = comptime!(nh - 1);
+            let next = comptime!(nh - 2);
+            let cx = (x[top as usize] << 16u32) | x[next as usize];
+            let qx = cx / chunk_div;
+            let mut rx = cx - qx * chunk_div;
+            x[top as usize] = qx >> 16u32;
+            x[next as usize] = qx & 0xFFFFu32;
+            let cy = (y[top as usize] << 16u32) | y[next as usize];
+            let qy = cy / chunk_div;
+            let mut ry = cy - qy * chunk_div;
+            y[top as usize] = qy >> 16u32;
+            y[next as usize] = qy & 0xFFFFu32;
             #[unroll]
-            for jj in 0..nl {
-                let j = comptime!(nl - 1 - jj);
-                let vx = x[j as usize];
-                let c1 = (rx << 16u32) | (vx >> 16u32);
+            for jj in 2..nh {
+                let j = comptime!(nh - 1 - jj);
+                let c1 = (rx << 16u32) | x[j as usize];
                 let q1 = c1 / chunk_div;
-                let r1 = c1 - q1 * chunk_div;
-                let c2 = (r1 << 16u32) | (vx & 0xFFFFu32);
-                let q2 = c2 / chunk_div;
-                rx = c2 - q2 * chunk_div;
-                x[j as usize] = (q1 << 16u32) | q2;
-                let vy = y[j as usize];
-                let e1 = (ry << 16u32) | (vy >> 16u32);
+                rx = c1 - q1 * chunk_div;
+                x[j as usize] = q1;
+                let e1 = (ry << 16u32) | y[j as usize];
                 let s1 = e1 / chunk_div;
-                let t1 = e1 - s1 * chunk_div;
-                let e2 = (t1 << 16u32) | (vy & 0xFFFFu32);
-                let s2 = e2 / chunk_div;
-                ry = e2 - s2 * chunk_div;
-                y[j as usize] = (s1 << 16u32) | s2;
+                ry = e1 - s1 * chunk_div;
+                y[j as usize] = s1;
             }
             #[unroll]
             for q in 0..chunk_digits {
@@ -757,6 +779,9 @@ mod kernels {
         let m1 = comptime!(base - 1);
         let nl2 = comptime!(2 * limbs);
         let nl3 = comptime!(3 * limbs);
+        let nh = comptime!(2 * limbs);
+        let nh2 = comptime!(4 * limbs);
+        let nh3 = comptime!(6 * limbs);
         let i = ABSOLUTE_POS_X;
         let slot = CUBE_POS_Y;
         if i < ntlay {
@@ -835,62 +860,66 @@ mod kernels {
                         e[j as usize] = fb[comptime!(3 + j) as usize];
                     }
                 }
-                // Powers: a2 = a^2, e2 = e^2 (2L limbs), a3, e3 (3L limbs).
-                let mut a2 = Array::<u32>::new(nl2 as usize);
-                let mut e2 = Array::<u32>::new(nl2 as usize);
+                // Powers in 16-bit limbs, one to a u32, by schoolbook in u32
+                // (`cert_power` says why): a2 = a^2, e2 = e^2 (4L limbs), a3,
+                // e3 (6L limbs). A limb product plus two values below 2^16 is
+                // at most 2^32 - 1.
+                let mut ah = Array::<u32>::new(nh as usize);
+                let mut eh = Array::<u32>::new(nh as usize);
                 #[unroll]
-                for j in 0..nl2 {
+                for j in 0..limbs {
+                    ah[comptime!(2 * j) as usize] = a[j as usize] & 0xFFFFu32;
+                    ah[comptime!(2 * j + 1) as usize] = a[j as usize] >> 16u32;
+                    eh[comptime!(2 * j) as usize] = e[j as usize] & 0xFFFFu32;
+                    eh[comptime!(2 * j + 1) as usize] = e[j as usize] >> 16u32;
+                }
+                let mut a2 = Array::<u32>::new(nh2 as usize);
+                let mut e2 = Array::<u32>::new(nh2 as usize);
+                #[unroll]
+                for j in 0..nh2 {
                     a2[j as usize] = 0u32;
                     e2[j as usize] = 0u32;
                 }
                 #[unroll]
-                for i1 in 0..limbs {
-                    let mut ca = 0u64;
-                    let mut ce = 0u64;
+                for i1 in 0..nh {
+                    let mut ca = 0u32;
+                    let mut ce = 0u32;
                     #[unroll]
-                    for j in 0..limbs {
+                    for j in 0..nh {
                         let kk = comptime!(i1 + j);
-                        let ta = u64::cast_from(a[i1 as usize]) * u64::cast_from(a[j as usize])
-                            + u64::cast_from(a2[kk as usize])
-                            + ca;
-                        a2[kk as usize] = u32::cast_from(ta);
-                        ca = ta >> 32u64;
-                        let te = u64::cast_from(e[i1 as usize]) * u64::cast_from(e[j as usize])
-                            + u64::cast_from(e2[kk as usize])
-                            + ce;
-                        e2[kk as usize] = u32::cast_from(te);
-                        ce = te >> 32u64;
+                        let ta = ah[i1 as usize] * ah[j as usize] + a2[kk as usize] + ca;
+                        a2[kk as usize] = ta & 0xFFFFu32;
+                        ca = ta >> 16u32;
+                        let te = eh[i1 as usize] * eh[j as usize] + e2[kk as usize] + ce;
+                        e2[kk as usize] = te & 0xFFFFu32;
+                        ce = te >> 16u32;
                     }
-                    a2[comptime!(i1 + limbs) as usize] = u32::cast_from(ca);
-                    e2[comptime!(i1 + limbs) as usize] = u32::cast_from(ce);
+                    a2[comptime!(i1 + nh) as usize] = ca;
+                    e2[comptime!(i1 + nh) as usize] = ce;
                 }
-                let mut a3 = Array::<u32>::new(nl3 as usize);
-                let mut e3 = Array::<u32>::new(nl3 as usize);
+                let mut a3 = Array::<u32>::new(nh3 as usize);
+                let mut e3 = Array::<u32>::new(nh3 as usize);
                 #[unroll]
-                for j in 0..nl3 {
+                for j in 0..nh3 {
                     a3[j as usize] = 0u32;
                     e3[j as usize] = 0u32;
                 }
                 #[unroll]
-                for i1 in 0..nl2 {
-                    let mut ca = 0u64;
-                    let mut ce = 0u64;
+                for i1 in 0..nh2 {
+                    let mut ca = 0u32;
+                    let mut ce = 0u32;
                     #[unroll]
-                    for j in 0..limbs {
+                    for j in 0..nh {
                         let kk = comptime!(i1 + j);
-                        let ta = u64::cast_from(a2[i1 as usize]) * u64::cast_from(a[j as usize])
-                            + u64::cast_from(a3[kk as usize])
-                            + ca;
-                        a3[kk as usize] = u32::cast_from(ta);
-                        ca = ta >> 32u64;
-                        let te = u64::cast_from(e2[i1 as usize]) * u64::cast_from(e[j as usize])
-                            + u64::cast_from(e3[kk as usize])
-                            + ce;
-                        e3[kk as usize] = u32::cast_from(te);
-                        ce = te >> 32u64;
+                        let ta = a2[i1 as usize] * ah[j as usize] + a3[kk as usize] + ca;
+                        a3[kk as usize] = ta & 0xFFFFu32;
+                        ca = ta >> 16u32;
+                        let te = e2[i1 as usize] * eh[j as usize] + e3[kk as usize] + ce;
+                        e3[kk as usize] = te & 0xFFFFu32;
+                        ce = te >> 16u32;
                     }
-                    a3[comptime!(i1 + limbs) as usize] = u32::cast_from(ca);
-                    e3[comptime!(i1 + limbs) as usize] = u32::cast_from(ce);
+                    a3[comptime!(i1 + nh) as usize] = ca;
+                    e3[comptime!(i1 + nh) as usize] = ce;
                 }
                 let mut c0a = Array::<u32>::new(1usize);
                 let mut dupa = Array::<u32>::new(1usize);
