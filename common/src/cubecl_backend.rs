@@ -3481,7 +3481,7 @@ mod tests {
                 .unwrap()
                 .range_start
         };
-        for base in [40u32, 50] {
+        for base in [40u32, 50, 80] {
             let s = start(base);
             crate::cubecl_web::process_range_detailed_web(
                 &ctx,

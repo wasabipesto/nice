@@ -76,7 +76,8 @@ jobs:
                   cargo test --release --features cubecl -p nice_common --lib -- \
                       --ignored --exact cubecl_backend::tests::wgsl_dump_for_lint --nocapture
                   python3 scripts/wgsl-lint.py "$CUBECL_DEBUG_LOG" \
-                      --require DetailedKernelU32@40 --require DetailedKernelU32@50 \
+                      --require DetailedKernelU32@80 --require DetailedFdKernelU32@40 \
+                      --require DetailedFdKernelU32@50 \
                       --require DetailedFdKernel@23 --require DetailedFdKernel@40 \
                       --require DetailedFdKernel@50 --require DetailedFdKernel@62 \
                       --require DetailedKernel@80 --require NiceonlyKernel@40 \
