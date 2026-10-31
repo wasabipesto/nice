@@ -4,7 +4,7 @@
 //! project that finds "nice numbers" (square-cube pandigitals).
 
 use nice_common::FieldSize;
-use nice_common::client_process::process_range_detailed;
+use nice_common::detailed_fd::process_range_detailed_fd;
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
@@ -35,7 +35,10 @@ pub fn build_sha() -> String {
     nice_common::BUILD_SHA.to_string()
 }
 
-/// Process a chunk of numbers and return nice numbers and distribution updates
+/// Process a chunk of numbers and return nice numbers and distribution updates.
+///
+/// Goes through the same CPU detailed dispatch as the native client: finite
+/// differences at the bases that have them, the division loop elsewhere.
 #[wasm_bindgen]
 pub fn process_chunk_wasm(range_start_str: &str, range_end_str: &str, base: u32) -> String {
     console_error_panic_hook::set_once();
@@ -46,7 +49,7 @@ pub fn process_chunk_wasm(range_start_str: &str, range_end_str: &str, base: u32)
     let range = FieldSize::new(range_start, range_end);
 
     // Pass off to common for processing
-    let result = process_range_detailed(&range, base);
+    let result = process_range_detailed_fd(&range, base);
 
     // Send results back to worker
     serde_json::to_string(&result).unwrap()
