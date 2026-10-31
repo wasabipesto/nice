@@ -3460,6 +3460,54 @@ mod tests {
         }
     }
 
+    /// Compiles each shader `scripts/wgsl-lint.py` checks, once: the browser
+    /// kernel, the native detailed kernels (finite-difference and
+    /// per-number), the stride pipeline's nice-only kernel with its low-digit
+    /// prefilter, and the overlap join's kernels on a production field.
+    /// `CubeCL` writes their WGSL to the file `CUBECL_DEBUG_LOG` names, which
+    /// CI then lints; without that variable this does nothing. Results are
+    /// left to the parity tests.
+    #[test]
+    #[ignore = "requires a wgpu device; dumps shaders when CUBECL_DEBUG_LOG is set"]
+    fn wgsl_dump_for_lint() {
+        if std::env::var_os("CUBECL_DEBUG_LOG").is_none() {
+            println!("CUBECL_DEBUG_LOG is not set; no shaders to dump");
+            return;
+        }
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        let start = |base: u32| {
+            crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap()
+                .range_start
+        };
+        for base in [40u32, 50] {
+            let s = start(base);
+            crate::cubecl_web::process_range_detailed_web(
+                &ctx,
+                &FieldSize::new(s, s + 10_000),
+                base,
+            )
+            .expect("browser kernel");
+        }
+        // Finite differences at 23-62 (with the per-number kernel where a
+        // window leaves the plan's interval), the per-number kernel at 80.
+        for base in [23u32, 40, 50, 62, 80] {
+            let s = start(base);
+            process_range_detailed_cubecl(&ctx, &FieldSize::new(s, s + 10_000), base)
+                .expect("detailed kernel");
+        }
+        // Below the join's minimum field size, so the stride pipeline takes
+        // it, with the prefilter on (bases up to 40).
+        let s = start(40);
+        process_niceonly(&ctx, &FieldSize::new(s, s + 1_000_000_000), 40).expect("stride kernel");
+        let frontier = crate::overlap_join::test_fields::FRONTIER_57;
+        let field = FieldSize::new(frontier, frontier + 100_000_000_000_000);
+        ctx.join_sample(57, &field, &[1_000])
+            .expect("device run")
+            .expect("a join field");
+    }
+
     /// The known solution, through the niceonly path: the whole pipeline (MSD
     /// filter, descriptors, on-device residue reconstruction, prefilter) has
     /// to line up for 69 to come back.

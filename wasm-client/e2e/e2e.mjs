@@ -1,12 +1,31 @@
 // End-to-end test of the browser client: serves web/search, drives the real
 // page in headless Chromium, and runs the offline benchmark on the CPU
 // backend and (when WebGPU is available — SwiftShader supplies it in CI
-// containers) on the GPU backend, asserting both complete and agree.
+// containers) on the GPU backend, asserting both complete and agree. Then
+// the parity step (parity.html) compares the GPU kernel with the CPU path
+// window by window, byte for byte.
 //
 // Run via ./run.sh (docker + playwright image) or directly with playwright
-// installed: node e2e.mjs [--skip-gpu]
+// installed: node e2e.mjs [options]
+//
+//   --skip-gpu / --skip-cpu   leave out one backend
+//   --hw                      the platform's real adapter, no GPU flags; the
+//                             adapter must be a GPU (see the adapter check)
+//   --expect-vendor V         with --hw: the adapter's vendor must be V
+//                             (e.g. apple, amd, nvidia, intel)
+//   --min-rate R              with --hw: the warm 2e8-number base-40 GPU call
+//                             must beat R numbers/s (default 1e8)
+//   --chromium-arg FLAG       pass FLAG to Chromium (repeatable); for
+//                             experiments only, never advice for users
+//   --firefox                 Firefox instead of Chromium
+//   --parity ci|hw|off        parity windows: the CI subset (default), the
+//                             full hardware list, or none
+//   --parity-random N         add N pseudo-random 1e6 windows per base 10-64
+//   --parity-only             only the adapter check and the parity step
+//   --parity-out FILE         write every parity record as JSON lines
+//   --parity-timeout-secs S   give up on a window after S seconds (300)
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, firefox } from "playwright";
@@ -58,6 +77,23 @@ console.log(`serving ${root} at ${url}`);
 // That is the only mode that can report a meaningful rate, and the only one
 // that proves the stack works on hardware someone actually has.
 const hardware = process.argv.includes("--hw");
+
+// `--name value` or `--name=value`.
+function option(name, fallback) {
+    const argv = process.argv;
+    const i = argv.indexOf(`--${name}`);
+    if (i >= 0 && i + 1 < argv.length) return argv[i + 1];
+    const eq = argv.find((a) => a.startsWith(`--${name}=`));
+    return eq === undefined ? fallback : eq.slice(name.length + 3);
+}
+// Extra Chromium flags, repeatable; the value is taken verbatim, since
+// Chromium's own flags start with "--" too. For experiments on a machine
+// whose adapter does not show up headless. `--hw` adds no flags of its own,
+// because users launch their browsers without any, so a run that needed one
+// says nothing about what users get.
+const chromiumArgs = process.argv.flatMap((a, i, argv) =>
+    a === "--chromium-arg" ? [argv[i + 1]] : a.startsWith("--chromium-arg=") ? [a.slice(15)] : [],
+);
 // `channel: "chromium"` matters in hardware mode: Playwright's default
 // headless binary is chrome-headless-shell, which ships without GPU support
 // at all, so it reports no adapter on a perfectly good GPU. The full
@@ -85,17 +121,18 @@ const browser = useFirefox
           headless: true,
           ...(hardware ? { channel: "chromium" } : {}),
           args: hardware
-              ? []
+              ? chromiumArgs
               : [
                     "--enable-unsafe-webgpu",
                     "--use-webgpu-adapter=swiftshader",
                     "--enable-features=Vulkan",
+                    ...chromiumArgs,
                 ],
       });
 console.log(
-    `browser: ${useFirefox ? "firefox" : "chromium"}, adapter: ${
+    `browser: ${useFirefox ? "firefox" : "chromium"} ${browser.version()}, adapter: ${
         hardware || useFirefox ? "real" : "pinned software"
-    }`,
+    }${chromiumArgs.length ? `, extra flags: ${chromiumArgs.join(" ")}` : ""}`,
 );
 
 // Drive one full offline-benchmark run on the given backend and return the
@@ -166,12 +203,181 @@ async function runBackend(backend) {
 }
 
 const skipGpu = process.argv.includes("--skip-gpu");
+// Only the adapter check and the parity step: a hardware run of the full
+// window list does not need the page's benchmarks again.
+const parityOnly = process.argv.includes("--parity-only");
 // `--skip-cpu` is for hardware benchmarking: the two backends want very
 // different field sizes to measure cleanly (the GPU needs a big one to
 // amortise kernel-compile warmup, which the CPU pool would then grind
 // through for minutes), so each is timed on its own run.
-const skipCpu = process.argv.includes("--skip-cpu");
+const skipCpu = parityOnly || process.argv.includes("--skip-cpu");
 let failed = false;
+
+// ---------------------------------------------------------------------------
+// The WebGPU adapter, and the parity step. Both run in parity.html, a test
+// page next to the client's (see web/search/parity.js), which exposes its
+// functions to the harness as window.parity.
+// ---------------------------------------------------------------------------
+
+async function openParityPage() {
+    const page = await browser.newPage();
+    page.on("pageerror", (e) => console.log(`[parity] pageerror: ${e.message}`));
+    page.on("console", (m) => {
+        if (m.type() === "error") console.log(`[parity] page error: ${m.text()}`);
+    });
+    await page.goto(`${url}parity.html`);
+    await page.waitForFunction(() => window.parityReady || window.parityError, undefined, {
+        timeout: 120000,
+    });
+    const error = await page.evaluate(() => window.parityError);
+    if (error) throw new Error(`parity.html did not load: ${error}`);
+    return page;
+}
+
+// What the adapter must look like. `--hw` must get a real GPU: no adapter,
+// the browser's fallback adapter, a software rasterizer's name, the wrong
+// vendor or a slow warm call all fail the run. The rate check is the one
+// that does not trust the browser's strings: SwiftShader runs about 1e6
+// numbers/s here and a GPU 1e8 or more. CI's pinned adapter must be the
+// software one, so the run never depends on the host's GPU drivers.
+const MIN_HW_RATE = Number(option("min-rate", 1e8));
+const expectVendor = option("expect-vendor");
+let adapter = null;
+
+async function adapterCheck() {
+    const page = await openParityPage();
+    const { rec, line, software } = await page.evaluate(async () => {
+        const rec = await window.parity.adapter();
+        return {
+            rec,
+            line: window.parity.describeAdapter(rec),
+            software: rec.adapter ? window.parity.isSoftwareAdapter(rec) : null,
+        };
+    });
+    adapter = rec;
+    console.log(`adapter: ${line}`);
+    console.log(`build: ${rec.client_version} ${rec.build_sha}; ${rec.gpu_build_info}`);
+    const problems = [];
+    const usable = rec.adapter && !rec.gpu_init_error;
+    if (rec.adapter && rec.gpu_init_error) problems.push(`gpu_init() failed: ${rec.gpu_init_error}`);
+    if (hardware) {
+        if (!rec.adapter) problems.push("no WebGPU adapter");
+        if (software) problems.push("the adapter is the fallback adapter or a software rasterizer");
+        if (expectVendor && rec.vendor !== expectVendor) {
+            problems.push(`vendor ${JSON.stringify(rec.vendor)}, expected ${JSON.stringify(expectVendor)}`);
+        }
+        if (usable) {
+            const r = await page.evaluate(() => window.parity.timeGpu(window.parity.b40RateWindow()));
+            console.log(
+                `b40 ${r.size} numbers: first call ${r.first_secs.toFixed(3)} s, ` +
+                    `warm call ${r.warm_secs.toFixed(3)} s = ${r.rate.toExponential(3)} numbers/s`,
+            );
+            rec.rate_check = r;
+            if (!(r.rate > MIN_HW_RATE)) {
+                problems.push(`warm b40 rate ${r.rate.toExponential(3)} is not above ${MIN_HW_RATE.toExponential(0)}`);
+            }
+        }
+    } else if (!useFirefox && rec.adapter && !software) {
+        problems.push("the pinned SwiftShader adapter did not take; a real GPU answered");
+    }
+    await page.close();
+    if (problems.length) {
+        console.log(`ADAPTER CHECK FAILED: ${problems.join("; ")}`);
+        failed = true;
+    } else if (rec.adapter) {
+        console.log(`adapter check passed (${hardware ? "hardware" : useFirefox ? "not asserted" : "software, as pinned"})`);
+    } else {
+        console.log("no WebGPU adapter offered: the GPU steps will be skipped");
+    }
+}
+
+function withTimeout(promise, ms, what) {
+    let timer;
+    return Promise.race([
+        promise.finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${what}: no result after ${ms / 1000} s`)), ms);
+        }),
+    ]);
+}
+
+// GPU against CPU, one window at a time, raw JSON compared byte for byte
+// (in the page; see compareWindow in web/search/parity.js). A window that
+// hangs is a failure, and the run carries on in a fresh page.
+async function parityStep(subset) {
+    const random = Number(option("parity-random", 0));
+    const timeoutMs = Number(option("parity-timeout-secs", 300)) * 1000;
+    const prepare = (p) => p.evaluate(({ subset, random }) => window.parity.prepare(subset, { random }), { subset, random });
+    let page = await openParityPage();
+    const list = await prepare(page);
+    const records = [];
+    let numbers = 0n;
+    let nearMisses = 0;
+    const t0 = Date.now();
+    for (let i = 0; i < list.length; i++) {
+        let rec;
+        try {
+            rec = await withTimeout(
+                page.evaluate((i) => window.parity.compare(i), i),
+                timeoutMs,
+                list[i].key,
+            );
+        } catch (err) {
+            rec = { ...list[i], ok: false, problems: [String(err)], near_misses: [] };
+            await page.close().catch(() => {});
+            page = await openParityPage();
+            await prepare(page);
+        }
+        records.push(rec);
+        numbers += BigInt(rec.end) - BigInt(rec.start);
+        nearMisses += rec.near_misses.length;
+        const secs = (x) => (x == null ? "    -" : x.toFixed(3));
+        console.log(
+            `${rec.ok ? "same" : "FAIL"} ${rec.key.padEnd(34)} b${String(rec.base).padEnd(3)} ` +
+                `n=${(BigInt(rec.end) - BigInt(rec.start)).toString().padStart(9)} ` +
+                `near=${String(rec.near_misses.length).padStart(2)} ` +
+                `gpu=${secs(rec.gpu_secs)}s cpu=${secs(rec.cpu_secs)}s`,
+        );
+        if (!rec.ok) {
+            console.log(`  window [${rec.start}, ${rec.end}) at base ${rec.base}`);
+            for (const p of rec.problems) console.log(`  ${p}`);
+            for (const d of (rec.differences ?? []).slice(1, 10)) console.log(`    also ${d}`);
+        }
+    }
+    await page.close();
+    const bad = records.filter((r) => !r.ok);
+    const wall = (Date.now() - t0) / 1000;
+    const where = `${adapter.vendor ?? "?"}/${adapter.architecture ?? "?"}${adapter.fallback ? " (fallback)" : ""}`;
+    const summary =
+        `parity (${subset}): ${records.length} windows, ${numbers} numbers, ${nearMisses} near misses, ` +
+        `${bad.length} failed, ${wall.toFixed(1)} s on ${where}`;
+    const out = option("parity-out");
+    if (out) {
+        const lines = [
+            { kind: "adapter", ...adapter },
+            ...records.map((r) => ({ kind: "window", ...r })),
+            { kind: "summary", subset, windows: records.length, numbers: String(numbers), near_misses: nearMisses, failed: bad.length, wall_secs: wall },
+        ];
+        await writeFile(out, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    }
+    if (bad.length) {
+        console.log(`PARITY FAILED: ${summary}`);
+        for (const r of bad) console.log(`  ${r.key} [${r.start}, ${r.end}) base ${r.base}: ${r.problems[0]}`);
+        failed = true;
+    } else {
+        console.log(`GPU and CPU agree on every window: ${summary}`);
+    }
+}
+
+const parityMode = option("parity", "ci");
+if (!["ci", "hw", "off"].includes(parityMode)) {
+    console.log(`--parity ${parityMode}: expected ci, hw or off`);
+    process.exit(2);
+}
+if (!skipGpu) {
+    console.log("=== WebGPU adapter ===");
+    await adapterCheck();
+}
 
 let cpu = { skipped: "--skip-cpu" };
 if (!skipCpu) {
@@ -190,8 +396,8 @@ if (!skipCpu) {
     }
 }
 
-let gpu = { skipped: "--skip-gpu" };
-if (!skipGpu) {
+let gpu = { skipped: parityOnly ? "--parity-only" : "--skip-gpu" };
+if (!skipGpu && !parityOnly) {
     console.log("=== GPU backend ===");
     gpu = await runBackend("gpu");
     if (gpu.skipped) {
@@ -338,11 +544,12 @@ async function submitShape(backend) {
     return { submissions, claimsAtCapture, wasmFetches, sessionState };
 }
 
-if (!failed) {
+const submitBackends = ["cpu", "gpu"].filter(
+    (b) => !(b === "cpu" && skipCpu) && !(b === "gpu" && (skipGpu || parityOnly)),
+);
+if (!failed && submitBackends.length) {
     console.log("=== submit payload shape ===");
-    const backends = ["cpu", "gpu"].filter(
-        (b) => !(b === "cpu" && skipCpu) && !(b === "gpu" && skipGpu),
-    );
+    const backends = submitBackends;
     for (const backend of backends) {
         const { submissions, claimsAtCapture, wasmFetches, sessionState, skipped } =
             await submitShape(backend);
@@ -567,6 +774,18 @@ if (!failed && !skipCpu) {
                 `${uploaded.data.scenarios.length} scenarios uploaded ` +
                 `(platform browser, ${uploaded.data.client_version})`,
         );
+    }
+}
+
+if (!skipGpu && parityMode !== "off") {
+    console.log(`=== GPU/CPU parity (${parityMode}) ===`);
+    if (!adapter?.adapter || adapter.gpu_init_error) {
+        // Loud, not a silent pass: nothing was compared.
+        console.log(
+            `PARITY SKIPPED: no usable WebGPU adapter (${adapter?.gpu_init_error ?? adapter?.error ?? "none offered"})`,
+        );
+    } else {
+        await parityStep(parityMode);
     }
 }
 

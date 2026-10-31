@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run the browser E2E in the playwright container (no host browser needed).
 # SwiftShader supplies a software WebGPU adapter, so the GPU path is tested
-# end to end without GPU hardware. Usage: ./run.sh [--skip-gpu]
+# end to end without GPU hardware. Usage: ./run.sh [e2e.mjs options], for
+# example --skip-gpu or --parity-only (see the top of e2e.mjs).
 set -euo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
