@@ -1,32 +1,44 @@
 # Changelog
 
-## Unreleased
+## Nice v3.4.7
 
-- Speed up GPU detailed mode in the browser at bases 10-64 by stepping each GPU thread through a run of consecutive numbers with digit-array additions, as the native client does, in 32-bit arithmetic.
-- Move the finite-difference seed of GPU detailed mode into one function that uses no 64-bit integers, so the coming browser kernel can share it. An internal change: results and speed are unchanged.
-- Keep the overlap join's GPU top certificates clear of a constant division that Apple's Metal compiler miscompiles (the cause of #225's seed errors on an M4); on Apple GPUs it would make them wrong at bases 49-55. Bases 57-64 are not affected.
-- Speed up GPU detailed mode at bases 10-64 by stepping each GPU thread through a run of consecutive numbers with digit-array additions, instead of dividing every square and cube down to digits.
-- Speed up detailed searches on the CPU at bases 40-64 by updating the digits of each number's square and cube with additions from the previous number's, instead of dividing them out of every number.
-- Keep the GPU nice-only prefilter at bases 40 and below clear of a constant division that Apple's Metal compiler miscompiles, as a precaution: it is exact on an Apple M4 today.
-- Speed up GPU detailed mode by copying back only the near-misses a field found, instead of the whole 20 MB buffer after every field.
-- Speed up the browser client's CPU detailed mode with the same finite-difference digit arrays as the native client.
-- Speed up the overlap join by dropping, before they are paired with any prefix, the bottom residues whose digits clash with the ones every number of the field shares: more than half of them at bases 58-64.
-- Update the leaderboard and activity chart caches from each run's new submissions instead of re-reading every submission every hour (migration `2026-10-15_incremental_search_caches.sql`).
-- Raise the largest detailed field from 1e9 to 1e10 numbers, so detailed mode continues at base 52 (base 51 has no range) once base 50's fields are done.
-- Serve detailed `Next` claims from a cursor past the last batch handed out, instead of re-reading the frontier chunk (about 700k fields at base 50) on every refill; wait for a refill in flight instead of piling direct claims onto it; and lock claimed fields so that a slow claim cannot hold up `/submit`.
-- Speed up the overlap join on the GPU by giving each thread two bottom entries instead of four (six from base 62), which fits the pruned bottom lists.
-- Size the overlap join's working memory to the GPU, up to 4 GiB instead of 1 GiB, so a production field at bases 60-64 runs as one slice instead of five to seven.
-- Start the overlap join within 512 MiB layouts on the paravirtual GPU of macOS virtual machines, which can hang on larger ones instead of refusing them.
-- Strengthen the overlap join's prefix certificate: at the first position where an interval's powers differ, the digit's range of possible values can rule the interval out or fix one more digit. Fewer candidates reach the later stages on the CPU and the GPU.
-- Speed up the CPU overlap join: an AVX-512 scan where the CPU has it, and a top certificate built from one endpoint's digits instead of both, with half the 256-bit divisions.
-- Pin the Rust toolchain to 1.99.0, so a new stable release can't fail CI on unchanged code; Dependabot proposes each new release as its own PR.
-- Pair an explicit `--gpu-backend cuda` with the overlap join in nice-only mode.
-- Make nice-only `auto` on NVIDIA run on `CubeCL`'s CUDA runtime alone, as detailed already does; hand-CUDA stays available with `--gpu-backend cuda`.
-- Remove the experimental hand-written Vulkan backend (`--gpu-backend vulkan`, first contributed by [Janzert](https://github.com/Janzert) in #96), which the `cubecl` backend now supersedes on every device it served.
-- Remove the `NICE_GPU_FIELDS_IN_FLIGHT` and `NICE_GPU_BATCHES_IN_FLIGHT` environment variables; the GPU nice-only pipeline keeps its defaults of 2 fields and 16 batches in flight.
-- Remove the `NICE_CUDA_CROSS`, `NICE_CUDA_COMPACT`, `NICE_CUBECL_CROSS` and `NICE_CUBECL_COMPACT` environment variables, as v3.4.1 announced; the cross-end filter and its compaction now always run where they apply.
-- Make the fleet require the GPU image's CUDA version on every offer search (`min_cuda_version`, default 12.8), even when a config's `offer_query` asks for less.
-- Use the GPU runs' progress bar on CPU runs too, with log lines printed above it and every finished field logged, even when stderr is not a terminal.
+Performance gains, combined about +30-50% for nice-only and 700-1000% for detailed:
+
+- Speed up the detailed mode by updating the digits of each number's square and cube with additions from the previous number's instead of dividing them out of each one independently ([#221](https://github.com/wasabipesto/nice/pull/221)). On GPU, this is implemented by stepping each thread through a run of consecutive numbers with digit-array additions ([#225](https://github.com/wasabipesto/nice/pull/225), [#230](https://github.com/wasabipesto/nice/pull/230)). Also included in the browser client ([#231](https://github.com/wasabipesto/nice/pull/231), [#233](https://github.com/wasabipesto/nice/pull/233)).
+- Speed up GPU detailed mode by copying back only the near-misses found, instead of the whole 20 MB buffer after every field ([#224](https://github.com/wasabipesto/nice/pull/224)).
+- Speed up the nice-only overlap join by dropping, before they are paired with any prefix, the bottom residues whose digits clash with the ones every number of the field shares ([#215](https://github.com/wasabipesto/nice/pull/215)).
+- Speed up the GPU overlap join by tuning the number of entries per thread: two entries for bases up to 60 and six from 62+ ([#216](https://github.com/wasabipesto/nice/pull/216)).
+- Speed up the CPU overlap join with an AVX-512 scan (where the CPU has it) and a top certificate built from one endpoint's digits instead of both, with half the 256-bit divisions ([#204](https://github.com/wasabipesto/nice/pull/204)).
+- Size the overlap join's working memory to the available memory on the GPU (between 1-4 GiB) so a production-sized field at bases 60-64 can run as a single slice instead of 5+ ([#206](https://github.com/wasabipesto/nice/pull/206)).
+- Reduce the number of survivors after the overlap join's prefix certificate filtering. At the first position where an interval's powers differ, the digit's range of possible values can rule the interval out or fix one more digit ([#203](https://github.com/wasabipesto/nice/pull/203)).
+
+Remove some experimental and development-only code:
+
+- Remove the `NICE_CUDA_CROSS`, `NICE_CUDA_COMPACT`, `NICE_CUBECL_CROSS` and `NICE_CUBECL_COMPACT` environment variables; the cross-end filter and its compaction now always run where they apply ([#191](https://github.com/wasabipesto/nice/pull/191)).
+- Remove the `NICE_GPU_FIELDS_IN_FLIGHT` and `NICE_GPU_BATCHES_IN_FLIGHT` environment variables; the GPU nice-only pipeline keeps its defaults of 2 fields and 16 batches in flight ([#192](https://github.com/wasabipesto/nice/pull/192)).
+- Remove the experimental hand-written Vulkan backend, which was unmaintained is now superseded entirely by the `cubecl` backend ([#193](https://github.com/wasabipesto/nice/pull/193)).
+
+Address some Apple-specific correctness and runtime issues:
+
+- Keep the overlap join's GPU top certificates clear of a constant division that Apple's Metal compiler potentially miscompiles ([#228](https://github.com/wasabipesto/nice/pull/228)). Bases 57-64 are not affected.
+- Keep the GPU nice-only prefilter at bases 40 and below clear of a constant division that Apple's Metal compiler potentially miscompiles, as a precaution ([#229](https://github.com/wasabipesto/nice/pull/229)).
+- Start the overlap join within 512 MiB layouts on the paravirtual GPU of macOS virtual machines, which hangs on larger ones instead of refusing them ([#218](https://github.com/wasabipesto/nice/pull/218)).
+
+Smooth out some API server latency: 
+
+- Update the leaderboard and activity chart caches from each run's new submissions instead of re-reading every submission every hour ([#201](https://github.com/wasabipesto/nice/pull/201)).
+- Use a server-side cursor to refill the `Next` queue instead of re-reading the frontier chunk ([#226](https://github.com/wasabipesto/nice/pull/226)).
+- Wait for a refill in flight instead of piling direct claims onto it ([#226](https://github.com/wasabipesto/nice/pull/226)).
+- Lock claimed fields so that a slow claim cannot hold up `/submit` ([#226](https://github.com/wasabipesto/nice/pull/226)).
+
+Miscellaneous:
+
+- Raise the largest detailed field permitted by the server from 1e9 to 1e10 numbers wide so detailed mode can continue at base 52 once base 50's fields are done ([#223](https://github.com/wasabipesto/nice/pull/223)).
+- Use the GPU-style progress bar on CPU also, with consistent log lines for claim and submit actions and the progress bar pinned to the bottom of the terminal ([#202](https://github.com/wasabipesto/nice/pull/202)).
+- Drop the priority of the hand-written `cuda` option in the `--gpu-backed auto niceonly` list; you can still select it manually with `--gpu-backend cuda` ([#207](https://github.com/wasabipesto/nice/pull/207)).
+- Utilize the nice-only overlap join from CubeCL's path when `--gpu-backend cuda` is selected manually ([#190](https://github.com/wasabipesto/nice/pull/190)).
+- Make the fleet require the GPU image's CUDA version on every offer search (`min_cuda_version`, default 12.8), even when a config's `offer_query` asks for less ([#187](https://github.com/wasabipesto/nice/pull/187)).
+- Bump dependencies ([#195](https://github.com/wasabipesto/nice/pull/195), [#196](https://github.com/wasabipesto/nice/pull/196), [#197](https://github.com/wasabipesto/nice/pull/197), [#211](https://github.com/wasabipesto/nice/pull/211), [#212](https://github.com/wasabipesto/nice/pull/212), [#213](https://github.com/wasabipesto/nice/pull/213), [#214](https://github.com/wasabipesto/nice/pull/214), [#219](https://github.com/wasabipesto/nice/pull/219), [#220](https://github.com/wasabipesto/nice/pull/220))
 
 ## Nice v3.4.6
 
