@@ -409,38 +409,60 @@ pub(crate) fn candidate_check(
     // multiplies stay in u32 (`x^k mod b^p == (x mod b^p)^k mod b^p`).
     if has_prefilter {
         if ok {
-            // v = n's u32 limbs; a[r] = successive `mod pre_chunk_div`
-            // chunks peeled off by the same split16 step the digit scan
-            // uses.
-            let mut v = Array::<u32>::new(limbs as usize);
+            // v = n's 16-bit limbs, one to a u32; a[r] = successive
+            // `mod pre_chunk_div` chunks, peeled off by long division.
+            //
+            // No constant division here divides a bare half-width right shift
+            // or the high half of a u64. Apple's GPU compiler (M4, macOS 26.3,
+            // through naga's MSL) miscompiles `naga_div(x >> 16u, K)`,
+            // `(x >> 16u) % K` and `uint(ulong p >> 32) / K` for a constant K
+            // that is not a power of two. The split16 form this replaces (u32
+            // limbs in 16-bit halves, unrolled) started each pass from a
+            // remainder of 0, so its first dividend was exactly `v[top] >> 16`,
+            // at two limbs `u32(n_lo >> 32) >> 16`. A multiply-subtract form
+            // of it failed the probe test on an M4; a paired `/` and `%`
+            // passed there, for no known reason. Here each pass starts with
+            // the top two limbs, hi·2^16 + lo = hi·Q·K + (hi·R + lo) for
+            // 2^16 = Q·K + R, so the quotient is hi·Q + (hi·R + lo) / K and
+            // the dividend is a sum. Dividing the pair as one u32 instead
+            // would divide `u32(n_lo >> 32)` in the first pass at two limbs.
+            // In later passes the pair is the previous quotient, and every
+            // other dividend is `rem << 16 | limb`.
+            let nh = comptime!(2 * limbs);
+            let top = comptime!(nh - 1);
+            let next = comptime!(nh - 2);
+            let pre_q = comptime!(0x1_0000u32 / pre_chunk_div);
+            let pre_r = comptime!(0x1_0000u32 % pre_chunk_div);
+            let mut v = Array::<u32>::new(nh as usize);
             #[unroll]
             for i in 0..limbs {
                 let shift = comptime!(((i & 1) * 32) as u64);
-                if comptime!(i < 2) {
-                    v[i as usize] = u32::cast_from(n_lo >> shift);
+                let w = if comptime!(i < 2) {
+                    u32::cast_from(n_lo >> shift)
                 } else {
-                    v[i as usize] = u32::cast_from(n_hi >> shift);
-                }
+                    u32::cast_from(n_hi >> shift)
+                };
+                v[comptime!(2 * i) as usize] = w & 0xFFFFu32;
+                v[comptime!(2 * i + 1) as usize] = w >> 16u32;
             }
             let mut a = Array::<u32>::new(pre_limbs as usize);
             #[unroll]
             for rr in 0..pre_limbs {
-                let mut rem = 0u32;
+                // hi·R + lo <= (2^16 - 1)·K < 2^32.
+                let hi = v[top as usize];
+                let t = hi * pre_r + v[next as usize];
+                let qt = t / pre_chunk_div;
+                let mut rem = t - qt * pre_chunk_div;
+                let q = hi * pre_q + qt;
+                v[top as usize] = q >> 16u32;
+                v[next as usize] = q & 0xFFFFu32;
                 #[unroll]
-                for i in 0..limbs {
-                    let idx = comptime!(limbs - 1 - i);
-                    let vi = v[idx as usize];
-                    // Plain paired `%` here, unlike the digit scan: the
-                    // mul-sub form of these four prefilter sites
-                    // miscompiles under naga's MSL backend (survivors
-                    // diverge from the host mirror on Apple GPUs, caught
-                    // by the probe test), and the prefilter runs once per
-                    // candidate so the pairing costs nothing measurable.
-                    let c1 = (rem << 16u32) | (vi >> 16u32);
-                    let q1 = c1 / pre_chunk_div;
-                    let c2 = ((c1 % pre_chunk_div) << 16u32) | (vi & 0xFFFFu32);
-                    rem = c2 % pre_chunk_div;
-                    v[idx as usize] = (q1 << 16u32) | (c2 / pre_chunk_div);
+                for jj in 2..nh {
+                    let j = comptime!(nh - 1 - jj);
+                    let c = (rem << 16u32) | v[j as usize];
+                    let qj = c / pre_chunk_div;
+                    rem = c - qj * pre_chunk_div;
+                    v[j as usize] = qj;
                 }
                 a[rr as usize] = rem;
             }
