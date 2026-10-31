@@ -735,8 +735,9 @@ pub fn process_range_detailed_cuda(
     }
     let mut nice_numbers = Vec::with_capacity(miss_count);
     if miss_count > 0 {
-        let out = ctx.stream.clone_dtoh(&d_miss_out)?;
-        let uniques = ctx.stream.clone_dtoh(&d_miss_uniques)?;
+        // Only the records written: the buffers hold NEAR_MISS_CAPACITY.
+        let out = ctx.stream.clone_dtoh(&d_miss_out.slice(..2 * miss_count))?;
+        let uniques = ctx.stream.clone_dtoh(&d_miss_uniques.slice(..miss_count))?;
         for i in 0..miss_count {
             nice_numbers.push(NiceNumberSimple {
                 number: combine_u64(out[2 * i], out[2 * i + 1]),
@@ -1685,6 +1686,36 @@ mod tests {
                 "near-miss mismatch at base {base}"
             );
         }
+    }
+
+    /// The whole range of every base from 10 to 24 that has one (2.24
+    /// million numbers): the windows with near-misses, so the readback of
+    /// just the records written is compared in full.
+    #[test_log::test]
+    #[ignore = "requires GPU"]
+    fn gpu_reads_back_every_near_miss() {
+        let Some(ctx) = try_init_cuda() else {
+            println!("GPU not available, skipping test");
+            return;
+        };
+        let mut misses = 0;
+        for base in 10..=24 {
+            let Some(range) = crate::base_range::get_base_range_u128(base).unwrap() else {
+                continue;
+            };
+            let cpu = process_range_detailed(&range, base);
+            let gpu = process_range_detailed_cuda(&ctx, &range, base).expect("GPU failed");
+            assert_eq!(
+                cpu.distribution, gpu.distribution,
+                "distribution mismatch at base {base}"
+            );
+            assert_eq!(
+                cpu.nice_numbers, gpu.nice_numbers,
+                "near-miss mismatch at base {base}"
+            );
+            misses += cpu.nice_numbers.len();
+        }
+        assert!(misses > 0, "no near-misses compared");
     }
 
     #[test_log::test]

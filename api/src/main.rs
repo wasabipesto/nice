@@ -236,15 +236,19 @@ fn claim_helper(
         && let Some(queued_field) = queue.claim_detailed_next(&mut conn, max_check_level)
     {
         queued_field
+    } else if claim_strategy == FieldClaimStrategy::Next {
+        // A `Next` queue still empty after waiting for its refill: claim directly,
+        // from the queue's cursor where it has one.
+        tracing::warn!(
+            max_check_level,
+            "Detailed-next queue exhausted, falling back to direct database claim"
+        );
+        queue
+            .claim_detailed_next_direct(&mut conn, max_check_level)
+            .map_err(|e| internal_error(format!("Database error while claiming a field: {e}")))?
+            .ok_or_else(no_claimable_field)?
     } else {
-        // `Random`, or a `Next` queue that is empty while its refill is in flight:
-        // claim directly from the database.
-        if claim_strategy == FieldClaimStrategy::Next {
-            tracing::warn!(
-                max_check_level,
-                "Detailed-next queue exhausted, falling back to direct database claim"
-            );
-        }
+        // `Random`: claim directly from the database.
         let maximum_timestamp = Utc::now() - TimeDelta::hours(CLAIM_DURATION_HOURS);
         try_claim_field(
             &mut conn,

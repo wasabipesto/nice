@@ -48,9 +48,8 @@ pub const CLAIM_DURATION_HOURS: i64 = 1;
 pub const CLIENT_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 /// Detailed runners will never get a field larger than this.
-/// Currently set to 1e9, which corresponds to base 50 and takes about a minute
-/// to process on modern runners.
-pub const DETAILED_SEARCH_MAX_FIELD_SIZE: u128 = 1_000_000_000;
+/// Currently set to 1e10, which corresponds to base 52.
+pub const DETAILED_SEARCH_MAX_FIELD_SIZE: u128 = 10_000_000_000;
 
 /// Each possible search mode the server and client supports.
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]

@@ -3,8 +3,11 @@
 ## Unreleased
 
 - Speed up detailed searches on the CPU at bases 40-64 by updating the digits of each number's square and cube with additions from the previous number's, instead of dividing them out of every number.
+- Speed up GPU detailed mode by copying back only the near-misses a field found, instead of the whole 20 MB buffer after every field.
 - Speed up the overlap join by dropping, before they are paired with any prefix, the bottom residues whose digits clash with the ones every number of the field shares: more than half of them at bases 58-64.
 - Update the leaderboard and activity chart caches from each run's new submissions instead of re-reading every submission every hour (migration `2026-10-15_incremental_search_caches.sql`).
+- Raise the largest detailed field from 1e9 to 1e10 numbers, so detailed mode continues at base 52 (base 51 has no range) once base 50's fields are done.
+- Serve detailed `Next` claims from a cursor past the last batch handed out, instead of re-reading the frontier chunk (about 700k fields at base 50) on every refill; wait for a refill in flight instead of piling direct claims onto it; and lock claimed fields so that a slow claim cannot hold up `/submit`.
 - Speed up the overlap join on the GPU by giving each thread two bottom entries instead of four (six from base 62), which fits the pruned bottom lists.
 - Size the overlap join's working memory to the GPU, up to 4 GiB instead of 1 GiB, so a production field at bases 60-64 runs as one slice instead of five to seven.
 - Start the overlap join within 512 MiB layouts on the paravirtual GPU of macOS virtual machines, which can hang on larger ones instead of refusing them.

@@ -497,8 +497,19 @@ mod kernels {
                         // no more on larger fields, since a chunk is the same
                         // size); that overflow takes the same unfiltered
                         // path, which costs only its full checks.
+                        //
+                        // Every thread reads the count before any appends the
+                        // next chunk's survivors (the second barrier): a plane
+                        // that read it after a faster plane's appends could
+                        // decide alone to flush, and from then on the cube's
+                        // barriers would pair up at different call sites. The
+                        // lone plane's flush sums plane totals and writes at a
+                        // list offset no one reserved for it, which costs full
+                        // checks of stale list entries and can overwrite ones
+                        // another flush reserved.
                         sync_cube();
                         let sc = s_cnt[0].load();
+                        sync_cube();
                         if sc >= SURV_FLUSH {
                             flush_survivors(
                                 &s_t,

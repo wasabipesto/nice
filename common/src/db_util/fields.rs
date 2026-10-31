@@ -331,12 +331,20 @@ fn eligible_chunk_cte(check_level_predicate: &str) -> String {
 /// scoping to it changes nothing about which field `Next` returns, only what the planner
 /// has to read to find it (measured in production: 1,547ms → 32ms, generic plan).
 ///
-/// Trusting `minimum_cl` is sound because it shares a writer with the thing it
-/// summarizes: field `check_level`s are advanced only by the `jobs` binary, which
-/// recomputes chunk `minimum_cl` in the same run. Between runs the frontier cannot move.
-/// Within a run's window a stale `minimum_cl` errs low, which is the safe direction —
-/// the `EXISTS` finds nothing in a finished chunk and the CTE steps past it, same as a
-/// saturated chunk.
+/// Trusting `minimum_cl` is sound even though it goes stale. Only the `jobs` binary
+/// writes it, but `/submit` raises a field's `check_level` as soon as its result
+/// arrives, so between runs the frontier moves and `minimum_cl` lags behind it. A lag
+/// only ever errs low, which is the safe direction: the `EXISTS` finds nothing in a
+/// finished chunk and the CTE steps past it, same as a saturated chunk.
+///
+/// What it costs is the chunk scan. Every field of the frontier chunk (about 711k at
+/// base 50, against the 30k this was first measured on) is read through
+/// `idx_fields_chunk_id`, once by the `EXISTS` and once by the candidate search, and
+/// `Next` consumes a chunk from its low end, so the finished prefix read past grows as
+/// the chunk is worked: one batch late in a chunk read 1M rows and 65k buffers from
+/// disk in 1.1 s alone, and took tens of seconds under concurrent load. The API's
+/// queue therefore runs this only to rewind, and serves from a cursor in between
+/// ([`bulk_claim_next_fields_from`]).
 ///
 /// Parameters: `$1` = maximum claim timestamp, `$2` = maximum check level,
 /// `$3` = maximum range size.
@@ -379,7 +387,10 @@ pub fn try_claim_field(
     let maximum_size_clone = maximum_size.clone();
 
     // Use a single-statement "claim" with row locking to avoid thundering herd / lock contention.
-    // `FOR UPDATE SKIP LOCKED` ensures concurrent claimers don't block on the same "next" row.
+    // `SKIP LOCKED` ensures concurrent claimers don't block on the same "next" row. The lock is
+    // `FOR NO KEY UPDATE`, the mode the `UPDATE` of `last_claim_time` takes anyway: unlike
+    // `FOR UPDATE` it does not conflict with the `FOR KEY SHARE` a submission's foreign key
+    // takes on its field, so a slow claim never holds up `/submit`.
     let check_level_predicate = check_level_predicate(maximum_check_level);
     let claimable = claimable_predicate("");
 
@@ -397,8 +408,9 @@ pub fn try_claim_field(
             // unscoped form walks the primary key from id 1 and filters every completed
             // field below the frontier — measured at 1.55s and ~1.6GB of buffer reads
             // per claim in production. Scope it to the frontier chunk instead via
-            // `frontier_chunk_cte`, which reads only that chunk's fields: 32ms measured,
-            // same row returned.
+            // `frontier_chunk_cte`, which reads only that chunk's fields: 32ms measured
+            // on 30k-field chunks, same row returned (but see `frontier_chunk_cte` for
+            // what that read costs on production's 700k-field chunks).
             let query = if maximum_check_level == 0 {
                 format!(
                     "WITH candidate AS (
@@ -408,7 +420,7 @@ pub fn try_claim_field(
                           AND {check_level_predicate}
                           AND range_size <= $3
                         ORDER BY id ASC
-                        FOR UPDATE SKIP LOCKED
+                        FOR NO KEY UPDATE SKIP LOCKED
                         LIMIT 1
                     )
                     UPDATE fields f
@@ -425,7 +437,7 @@ pub fn try_claim_field(
                 // chunk join as a filter — reintroducing the full 1.3s scan this scoping
                 // exists to avoid. Leading with `chunk_id` makes the primary key unable
                 // to produce the ordering, so the planner reads the chunk via
-                // `idx_fields_chunk_id` and top-1 sorts its ~30k rows. Verified against
+                // `idx_fields_chunk_id` and top-1 sorts its rows. Verified against
                 // production under `force_generic_plan`, which is what diesel's prepared
                 // statements get.
                 let frontier_chunk = frontier_chunk_cte(check_level_predicate);
@@ -439,7 +451,7 @@ pub fn try_claim_field(
                           AND f.{check_level_predicate}
                           AND f.range_size <= $3
                         ORDER BY f.chunk_id, f.id ASC
-                        FOR UPDATE SKIP LOCKED
+                        FOR NO KEY UPDATE SKIP LOCKED
                         LIMIT 1
                     )
                     UPDATE fields f
@@ -470,7 +482,7 @@ pub fn try_claim_field(
             // This avoids `ORDER BY RANDOM()`, which requires assigning random values and sorting
             // over the eligible set.
             //
-            // Note: Postgres does not allow `FOR UPDATE` with UNION/INTERSECT/EXCEPT, so the
+            // Note: Postgres does not allow row locking with UNION/INTERSECT/EXCEPT, so the
             // wraparound is implemented as a second query if the pivot query finds no rows.
             let query_from_pivot = format!(
                 "WITH candidate AS (
@@ -481,7 +493,7 @@ pub fn try_claim_field(
                       AND {check_level_predicate}
                       AND range_size <= $3
                     ORDER BY id ASC
-                    FOR UPDATE SKIP LOCKED
+                    FOR NO KEY UPDATE SKIP LOCKED
                     LIMIT 1
                 )
                 UPDATE fields f
@@ -499,7 +511,7 @@ pub fn try_claim_field(
                       AND {check_level_predicate}
                       AND range_size <= $3
                     ORDER BY id ASC
-                    FOR UPDATE SKIP LOCKED
+                    FOR NO KEY UPDATE SKIP LOCKED
                     LIMIT 1
                 )
                 UPDATE fields f
@@ -621,7 +633,7 @@ pub fn try_claim_field(
                       AND {check_level_predicate}
                       AND range_size <= $3
                     ORDER BY id ASC
-                    FOR UPDATE SKIP LOCKED
+                    FOR NO KEY UPDATE SKIP LOCKED
                     LIMIT 1
                 )
                 UPDATE fields f
@@ -655,7 +667,7 @@ pub fn try_claim_field(
                       AND {check_level_predicate}
                       AND range_size <= $3
                     ORDER BY id ASC
-                    FOR UPDATE SKIP LOCKED
+                    FOR NO KEY UPDATE SKIP LOCKED
                     LIMIT 1
                 )
                 UPDATE fields f
@@ -709,7 +721,7 @@ pub fn bulk_claim_fields(
               AND {check_level_predicate}
               AND range_size <= $3
             ORDER BY id ASC
-            FOR UPDATE SKIP LOCKED
+            FOR NO KEY UPDATE SKIP LOCKED
             LIMIT $4
         )
         UPDATE fields f
@@ -775,7 +787,7 @@ pub fn bulk_claim_thin_fields(
               AND f.{check_level_predicate}
               AND f.range_size <= $3
             ORDER BY f.chunk_id, f.id ASC
-            FOR UPDATE SKIP LOCKED
+            FOR NO KEY UPDATE SKIP LOCKED
             LIMIT $5
         )
         UPDATE fields f
@@ -852,7 +864,7 @@ pub fn bulk_claim_next_fields(
               AND f.{check_level_predicate}
               AND f.range_size <= $3
             ORDER BY f.chunk_id, f.id ASC
-            FOR UPDATE SKIP LOCKED
+            FOR NO KEY UPDATE SKIP LOCKED
             LIMIT $4
         )
         UPDATE fields f
@@ -872,6 +884,77 @@ pub fn bulk_claim_next_fields(
 
     // `UPDATE ... FROM` does not promise to return rows in the CTE's order, and
     // the queue hands them out front to back, so restore frontier order here.
+    results.sort_by_key(|f| f.id);
+    results.into_iter().map(private_to_public).collect()
+}
+
+/// [`bulk_claim_next_fields`] from a cursor: the lowest-id claimable fields at or
+/// below `maximum_check_level` with ids in `[from_id, from_id + window)`, in id order.
+///
+/// This reads the primary key forward from `from_id` and stops at `count` rows, so with
+/// `from_id` at the frontier (just past the last batch handed out) it reads about
+/// `count` rows instead of the whole frontier chunk. It does not see claimable fields
+/// below `from_id`, such as those whose claims expired, so its caller rewinds to
+/// [`bulk_claim_next_fields`] periodically. `window` bounds the read when nothing past
+/// the cursor is claimable (the end of the searchable range, or fields above
+/// `maximum_size`): an empty result means "rewind", not "no work". Unlike the
+/// chunk-scoped query a batch may cross into the next chunk, in the same order.
+///
+/// Parameters: `$1` = maximum claim timestamp, `$2` = maximum check level,
+/// `$3` = maximum range size, `$4` = count, `$5` = `from_id`, `$6` = end of window.
+pub fn bulk_claim_next_fields_from(
+    conn: &mut PgConnection,
+    count: usize,
+    maximum_timestamp: DateTime<Utc>,
+    maximum_check_level: u8,
+    maximum_size: u128,
+    from_id: u128,
+    window: u128,
+) -> Result<Vec<FieldRecord>> {
+    use diesel::sql_query;
+    use diesel::sql_types::{BigInt, Integer, Numeric, Timestamptz};
+
+    if maximum_check_level == 0 {
+        return Err(anyhow!(
+            "bulk_claim_next_fields_from is for detailed claims (check level >= 1); use bulk_claim_fields for niceonly"
+        ));
+    }
+    let maximum_check_level = conversions::u8_to_i32(maximum_check_level)?;
+    let maximum_size = conversions::u128_to_bigdec(maximum_size)?;
+    let count_i64 = i64::try_from(count).map_err(|e| anyhow!("{e}"))?;
+    let from = i64::try_from(from_id).map_err(|e| anyhow!("{e}"))?;
+    let until = i64::try_from(from_id.saturating_add(window)).unwrap_or(i64::MAX);
+    let claimable = claimable_predicate("");
+
+    let query = format!(
+        "WITH candidates AS (
+            SELECT id
+            FROM fields
+            WHERE id >= $5 AND id < $6
+              AND {claimable}
+              AND check_level <= $2
+              AND range_size <= $3
+            ORDER BY id ASC
+            FOR NO KEY UPDATE SKIP LOCKED
+            LIMIT $4
+        )
+        UPDATE fields f
+        SET last_claim_time = NOW()
+        FROM candidates
+        WHERE f.id = candidates.id
+        RETURNING f.*;"
+    );
+
+    let mut results = sql_query(query)
+        .bind::<Timestamptz, _>(maximum_timestamp)
+        .bind::<Integer, _>(maximum_check_level)
+        .bind::<Numeric, _>(maximum_size)
+        .bind::<BigInt, _>(count_i64)
+        .bind::<BigInt, _>(from)
+        .bind::<BigInt, _>(until)
+        .load::<FieldPrivate>(conn)
+        .map_err(|e| anyhow!("{e}"))?;
+
     results.sort_by_key(|f| f.id);
     results.into_iter().map(private_to_public).collect()
 }

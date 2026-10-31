@@ -31,7 +31,8 @@ use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::sql_query;
 use nice_common::db_util::fields::{
-    bulk_claim_fields, bulk_claim_next_fields, bulk_claim_thin_fields, try_claim_field,
+    bulk_claim_fields, bulk_claim_next_fields, bulk_claim_next_fields_from, bulk_claim_thin_fields,
+    try_claim_field,
 };
 use nice_common::{FieldClaimStrategy, FieldRecord};
 
@@ -538,6 +539,93 @@ fn bulk_next_rejects_the_niceonly_level(conn: &mut PgConnection) {
     assert!(bulk_claim_next_fields(conn, 3, claim_cutoff(), 0, FIELD_SIZE).is_err());
 }
 
+/// Stamp `ids` as claimed `hours_ago` hours ago (0 = a live claim).
+fn claim_ids(conn: &mut PgConnection, ids: &[i64], hours_ago: i64) {
+    let list = ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    sql_query(format!(
+        "UPDATE fields SET last_claim_time = NOW() - interval '{hours_ago} hours' WHERE id IN ({list})"
+    ))
+    .execute(conn)
+    .expect("claim ids");
+}
+
+fn from_cursor(
+    conn: &mut PgConnection,
+    count: usize,
+    level: u8,
+    from: u128,
+    window: u128,
+) -> Vec<u128> {
+    ids_of(
+        &bulk_claim_next_fields_from(conn, count, claim_cutoff(), level, FIELD_SIZE, from, window)
+            .expect("cursor claim should execute"),
+    )
+}
+
+/// The cursor claim reads forward from its cursor in id order, and a batch may run on
+/// into the next chunk.
+fn bulk_next_from_reads_forward_from_the_cursor(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    assert_eq!(from_cursor(conn, 4, 1, 5, 100), vec![5, 6, 7, 8]);
+    assert_eq!(
+        from_cursor(conn, 4, 1, 9, 100),
+        vec![9, 10, 11, 12],
+        "a batch from the cursor crosses into chunk 2"
+    );
+}
+
+/// Live claims and completed fields past the cursor are skipped, as in the
+/// chunk-scoped query.
+fn bulk_next_from_skips_claimed_and_completed(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    claim_ids(conn, &[5, 6], 0);
+    complete_chunk(conn, 2);
+    assert_eq!(from_cursor(conn, 5, 1, 4, 100), vec![4, 7, 8, 9, 10]);
+    assert_eq!(
+        from_cursor(conn, 3, 1, 11, 100),
+        vec![21, 22, 23],
+        "completed chunk 2 is read past"
+    );
+}
+
+/// Nothing below the cursor is returned, not even an expired claim: that is what the
+/// queue's rewind is for.
+fn bulk_next_from_does_not_look_below_the_cursor(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    claim_ids(conn, &[1, 3, 4, 5, 6, 7, 8, 9], 0);
+    claim_ids(conn, &[2], 2);
+    assert_eq!(from_cursor(conn, 2, 1, 10, 100), vec![10, 11]);
+    assert_eq!(
+        ids_of(&bulk_claim_next_fields(conn, 1, claim_cutoff(), 1, FIELD_SIZE).expect("rewind")),
+        vec![2],
+        "the full search finds the expired claim below the cursor"
+    );
+}
+
+/// The window bounds the read: a count larger than the window returns only the
+/// window, and a window past the last field returns nothing (the rewind signal).
+fn bulk_next_from_stays_in_its_window(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    assert_eq!(from_cursor(conn, 10, 1, 25, 3), vec![25, 26, 27]);
+    assert!(from_cursor(conn, 10, 1, 31, 100).is_empty());
+}
+
+/// Rechecks (level 2) include completed fields; the frontier level does not.
+fn bulk_next_from_recheck_includes_completed(conn: &mut PgConnection) {
+    reset_fixture(conn);
+    complete_chunk(conn, 1);
+    assert_eq!(from_cursor(conn, 2, 2, 1, 100), vec![1, 2]);
+    assert_eq!(from_cursor(conn, 2, 1, 3, 100), vec![11, 12]);
+    assert!(
+        bulk_claim_next_fields_from(conn, 1, claim_cutoff(), 0, FIELD_SIZE, 1, 100).is_err(),
+        "nice-only claims have their own query"
+    );
+}
+
 /// A claim must not be handed to two clients at once — the property the removed
 /// `maximum_timestamp = Utc::now()` fallback violated.
 fn claims_are_not_duplicated(conn: &mut PgConnection) {
@@ -608,6 +696,11 @@ fn claim_queries_against_postgres() {
     bulk_next_reclaims_expired_fields(&mut conn);
     bulk_next_recheck_claims_completed_work(&mut conn);
     bulk_next_rejects_the_niceonly_level(&mut conn);
+    bulk_next_from_reads_forward_from_the_cursor(&mut conn);
+    bulk_next_from_skips_claimed_and_completed(&mut conn);
+    bulk_next_from_does_not_look_below_the_cursor(&mut conn);
+    bulk_next_from_stays_in_its_window(&mut conn);
+    bulk_next_from_recheck_includes_completed(&mut conn);
     try_claim_thin_advances_past_saturated_chunk(&mut conn);
     try_claim_thin_finds_the_last_free_field(&mut conn);
     try_claim_thin_returns_none_when_everything_is_claimed(&mut conn);
