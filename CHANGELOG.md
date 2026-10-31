@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep the overlap join's GPU top certificates clear of a constant division that Apple's Metal compiler miscompiles (the cause of #225's seed errors on an M4); on Apple GPUs it would make them wrong at bases 49-55. Bases 57-64 are not affected.
 - Speed up GPU detailed mode by copying back only the near-misses a field found, instead of the whole 20 MB buffer after every field.
 - Speed up the overlap join by dropping, before they are paired with any prefix, the bottom residues whose digits clash with the ones every number of the field shares: more than half of them at bases 58-64.
 - Update the leaderboard and activity chart caches from each run's new submissions instead of re-reading every submission every hour (migration `2026-10-15_incremental_search_caches.sql`).
