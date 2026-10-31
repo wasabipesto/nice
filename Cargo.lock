@@ -2843,6 +2843,7 @@ dependencies = [
 name = "nice_api"
 version = "3.4.7-dev"
 dependencies = [
+ "anyhow",
  "chrono",
  "diesel",
  "nice_common",
