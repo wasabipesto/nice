@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Speed up GPU detailed mode in the browser at bases 10-64 by stepping each GPU thread through a run of consecutive numbers with digit-array additions, as the native client does, in 32-bit arithmetic.
 - Move the finite-difference seed of GPU detailed mode into one function that uses no 64-bit integers, so the coming browser kernel can share it. An internal change: results and speed are unchanged.
 - Keep the overlap join's GPU top certificates clear of a constant division that Apple's Metal compiler miscompiles (the cause of #225's seed errors on an M4); on Apple GPUs it would make them wrong at bases 49-55. Bases 57-64 are not affected.
 - Speed up GPU detailed mode at bases 10-64 by stepping each GPU thread through a run of consecutive numbers with digit-array additions, instead of dividing every square and cube down to digits.

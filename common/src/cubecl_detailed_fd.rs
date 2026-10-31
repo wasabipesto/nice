@@ -888,7 +888,7 @@ pub fn fd_plan(base: u32) -> Option<FdPlan> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::client_process::process_range_detailed;
     use crate::cubecl_backend::{
@@ -923,7 +923,7 @@ mod tests {
     }
 
     /// `process_range_detailed` over scoped threads, merged.
-    fn cpu_detailed_parallel(range: &FieldSize, base: u32) -> FieldResults {
+    pub(crate) fn cpu_detailed_parallel(range: &FieldSize, base: u32) -> FieldResults {
         let threads =
             std::thread::available_parallelism().map_or(8, std::num::NonZero::get) as u128;
         let step = range.size().div_ceil(threads).max(1);
@@ -1009,7 +1009,7 @@ mod tests {
     /// splits between the two kernels), eight seeded random ones, and one
     /// centred on every point inside the range where an addend gains a
     /// digit.
-    fn windows(base: u32, width: u128) -> Vec<(FieldSize, String)> {
+    pub(crate) fn windows(base: u32, width: u128) -> Vec<(FieldSize, String)> {
         let legal = crate::base_range::get_base_range_u128(base)
             .unwrap()
             .unwrap();
@@ -1157,8 +1157,9 @@ mod tests {
 
     /// Words of one [`fd_seed_probe_kernel`] record: S at 0, C at 7, dS at
     /// 17, dC at 21, ddC at 28 (the widest arrays, at b64, fill them).
-    const SEED_STRIDE: u32 = 32;
-    const SEED_FIELDS: [(&str, u32); 5] = [("S", 0), ("C", 7), ("dS", 17), ("dC", 21), ("ddC", 28)];
+    pub(crate) const SEED_STRIDE: u32 = 32;
+    pub(crate) const SEED_FIELDS: [(&str, u32); 5] =
+        [("S", 0), ("C", 7), ("dS", 17), ("dC", 21), ("ddC", 28)];
 
     /// [`fd_seed`] for `count` consecutive n from `start`, one n per thread,
     /// its five digit arrays written out as a [`SEED_STRIDE`]-word record.
@@ -1249,7 +1250,7 @@ mod tests {
     }
 
     /// The record [`fd_seed_probe_kernel`] should write for `n`.
-    fn seed_expected(n: u128, base: u32, p: &FdPlan) -> Vec<u32> {
+    pub(crate) fn seed_expected(n: u128, base: u32, p: &FdPlan) -> Vec<u32> {
         let mut rec = vec![0u32; SEED_STRIDE as usize];
         let nn = Natural::from(n);
         let sq = &nn * &nn;

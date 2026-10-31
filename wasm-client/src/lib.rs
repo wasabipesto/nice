@@ -117,7 +117,10 @@ pub fn nicemark_score(rates_json: &str, gpu: bool) -> Result<Option<f64>, JsValu
 // ============================================================================
 
 use nice_common::cubecl_backend::CubeclContext;
-use nice_common::cubecl_web::process_range_detailed_web_async;
+use nice_common::cubecl_web::{
+    CUBECL_WEB_BATCH_SIZE, WebKernel, fd_seed_probe_web_async, process_range_detailed_web_async,
+    process_range_detailed_web_kernel,
+};
 
 /// Try to bring up WebGPU. Returns the adapter's name (for the backend
 /// dropdown) or throws if no adapter is available — the caller treats a
@@ -134,8 +137,9 @@ pub async fn gpu_init() -> Result<String, JsValue> {
     Ok(ctx.device_name())
 }
 
-/// Process a chunk on the GPU with the u32-only WebGPU kernel. Same JSON
-/// result shape as [`process_chunk_wasm`], so the merging JS is shared.
+/// Process a chunk on the GPU with the u32-only WebGPU kernels (finite
+/// differences at bases up to 64). Same JSON result shape as
+/// [`process_chunk_wasm`], so the merging JS is shared.
 #[wasm_bindgen]
 pub async fn process_chunk_gpu(
     range_start_str: &str,
@@ -158,15 +162,79 @@ pub async fn process_chunk_gpu(
     serde_json::to_string(&result).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Test hook: [`process_chunk_gpu`] with the run shape chosen. `run_len` 0
+/// runs the per-number kernel on every candidate; otherwise the
+/// finite-difference kernel takes the plan's interval with `run_len`
+/// candidates per thread and at most `batch` per dispatch (0 for the
+/// production batch). For the browser parity and tuning harness only.
+#[doc(hidden)]
+#[wasm_bindgen]
+pub async fn process_chunk_gpu_shape(
+    range_start_str: &str,
+    range_end_str: &str,
+    base: u32,
+    run_len: u32,
+    batch: u32,
+) -> Result<String, JsValue> {
+    let range_start = u128::from_str(range_start_str)
+        .map_err(|e| JsValue::from_str(&format!("bad range_start: {e}")))?;
+    let range_end = u128::from_str(range_end_str)
+        .map_err(|e| JsValue::from_str(&format!("bad range_end: {e}")))?;
+    let range = FieldSize::new(range_start, range_end);
+    let kernel = if run_len == 0 {
+        WebKernel::Division
+    } else {
+        WebKernel::FiniteDifference {
+            run_len,
+            batch: if batch == 0 {
+                CUBECL_WEB_BATCH_SIZE
+            } else {
+                u128::from(batch)
+            },
+        }
+    };
+    let ctx = CubeclContext::new_default_async()
+        .await
+        .map_err(|e| JsValue::from_str(&format!("WebGPU unavailable: {e:#}")))?;
+    let result = process_range_detailed_web_kernel(&ctx, &range, base, kernel)
+        .await
+        .map_err(|e| JsValue::from_str(&format!("GPU processing failed: {e:#}")))?;
+    serde_json::to_string(&result).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Test hook: the GPU finite-difference seed for `count` consecutive n from
+/// `start` at `base`, as JSON: the record layout (`stride` words per n,
+/// `offsets` of S, C, dS, dC and ddC) and the flat `words`, each holding
+/// four base-`base` digits, least significant first. Words past an array's
+/// top are 0. For the browser parity harness only.
+#[doc(hidden)]
+#[wasm_bindgen]
+pub async fn fd_seed_probe_gpu(start_str: &str, count: u32, base: u32) -> Result<String, JsValue> {
+    let start =
+        u128::from_str(start_str).map_err(|e| JsValue::from_str(&format!("bad start: {e}")))?;
+    let ctx = CubeclContext::new_default_async()
+        .await
+        .map_err(|e| JsValue::from_str(&format!("WebGPU unavailable: {e:#}")))?;
+    let words = fd_seed_probe_web_async(&ctx, base, start, count)
+        .await
+        .map_err(|e| JsValue::from_str(&format!("seed probe failed: {e:#}")))?;
+    Ok(serde_json::json!({
+        "stride": nice_common::cubecl_web::FD_SEED_STRIDE,
+        "offsets": nice_common::cubecl_web::FD_SEED_OFFSETS,
+        "words": words,
+    })
+    .to_string())
+}
+
 /// Sizes the GPU path actually compiled with, for field diagnosis. The page
 /// logs this at startup: a browser caches the wasm aggressively, and without
 /// it a console paste cannot tell a fixed build from a stale one.
 #[wasm_bindgen]
 pub fn gpu_build_info() -> String {
     format!(
-        "{{\"near_miss_capacity\":{},\"batch_size\":{},\"miss_buffer_bytes\":{}}}",
+        "{{\"near_miss_capacity\":{},\"batch_size\":{},\"miss_buffer_bytes\":{},\"detailed_kernel\":\"fd\"}}",
         nice_common::cubecl_web::near_miss_capacity(),
-        nice_common::cubecl_web::CUBECL_WEB_BATCH_SIZE,
+        CUBECL_WEB_BATCH_SIZE,
         nice_common::cubecl_web::near_miss_capacity() * 5 * 4,
     )
 }
