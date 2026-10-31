@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Speed up detailed searches on the CPU at bases 40-64 by updating the digits of each number's square and cube with additions from the previous number's, instead of dividing them out of every number.
 - Speed up GPU detailed mode by copying back only the near-misses a field found, instead of the whole 20 MB buffer after every field.
 - Speed up the overlap join by dropping, before they are paired with any prefix, the bottom residues whose digits clash with the ones every number of the field shares: more than half of them at bases 58-64.
 - Update the leaderboard and activity chart caches from each run's new submissions instead of re-reading every submission every hour (migration `2026-10-15_incremental_search_caches.sql`).
