@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Nice Numbers - Browser GPU parity</title>
+        <link
+            rel="icon"
+            href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✨</text></svg>"
+        />
+        <!-- A maintainer's test page, not part of the client: it checks the
+             WebGPU kernel against the CPU path in whatever browser opens it.
+             The end-to-end harness (wasm-client/e2e/e2e.mjs) drives the same
+             page through window.parity. -->
+        <style>
+            body {
+                font-family: system-ui, sans-serif;
+                margin: 1.5rem auto;
+                max-width: 64rem;
+                padding: 0 1rem;
+                line-height: 1.45;
+            }
+            code,
+            pre,
+            td.mono {
+                font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
+                font-size: 0.85rem;
+            }
+            fieldset {
+                border: 1px solid #ccc;
+                border-radius: 6px;
+                margin: 1rem 0;
+            }
+            dl {
+                display: grid;
+                grid-template-columns: max-content 1fr;
+                gap: 0.15rem 1rem;
+                margin: 0;
+            }
+            dt {
+                color: #555;
+            }
+            dd {
+                margin: 0;
+                font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
+                font-size: 0.85rem;
+                word-break: break-all;
+            }
+            #verdict {
+                font-size: 1.4rem;
+                font-weight: 600;
+                margin: 1rem 0 0.5rem;
+            }
+            .pass {
+                color: #1a7f37;
+            }
+            .fail {
+                color: #c62828;
+            }
+            table {
+                border-collapse: collapse;
+                width: 100%;
+            }
+            th,
+            td {
+                text-align: left;
+                padding: 0.15rem 0.5rem;
+                border-bottom: 1px solid #eee;
+            }
+            td.num {
+                text-align: right;
+                font-variant-numeric: tabular-nums;
+            }
+            tr.bad {
+                background: #fdecea;
+            }
+            pre {
+                white-space: pre-wrap;
+                word-break: break-all;
+                background: #fafafa;
+                padding: 0.5rem;
+                margin: 0.25rem 0;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>Browser GPU parity</h1>
+        <p>
+            Runs the WebGPU kernel (<code>process_chunk_gpu</code>) and the CPU path
+            (<code>process_chunk_wasm</code>) over the same windows and compares the
+            two results byte for byte. Any difference means this browser's shader
+            compiler or this GPU's driver computed something wrong. Both paths run on
+            this page's main thread, so the page can stall for a moment on each window.
+        </p>
+
+        <fieldset>
+            <legend>Run</legend>
+            <label>
+                Windows
+                <select id="subset">
+                    <option value="ci">CI subset: 13 windows, 1.1e6 numbers</option>
+                    <option value="hw" selected>Full list: about 200 windows, every base 10-64</option>
+                </select>
+            </label>
+            <label>
+                plus
+                <input id="random" type="number" min="0" max="100" value="0" style="width: 4em" />
+                pseudo-random 1e6 windows per base
+            </label>
+            <br />
+            <label>
+                <input id="rate" type="checkbox" />
+                Time a warm 2e8-number base-40 GPU call first (seconds on a GPU, many
+                minutes on a software adapter)
+            </label>
+            <br />
+            <button id="start" disabled>Loading...</button>
+            <button id="stop" disabled>Stop</button>
+            <button id="copy" disabled>Copy report (JSON)</button>
+        </fieldset>
+
+        <h2>Adapter</h2>
+        <dl id="adapter"><dt>status</dt><dd>checking...</dd></dl>
+
+        <div id="verdict"></div>
+        <div id="progress"></div>
+        <div id="failures"></div>
+        <h2>Windows</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>window</th>
+                    <th>numbers</th>
+                    <th>near misses</th>
+                    <th>GPU s</th>
+                    <th>CPU s</th>
+                    <th>result</th>
+                </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+        </table>
+
+        <script type="module">
+            import * as P from "./parity.js";
+
+            const $ = (id) => document.getElementById(id);
+            const params = new URLSearchParams(location.search);
+            if (params.get("subset")) $("subset").value = params.get("subset");
+            if (params.get("random")) $("random").value = params.get("random");
+
+            let wasm;
+            try {
+                wasm = await P.loadWasm();
+            } catch (e) {
+                // Usually a page served without the wasm build next to it
+                // (pkg/, from `just wasm-build`).
+                $("verdict").className = "fail";
+                $("verdict").textContent = `Could not load the wasm client: ${e}`;
+                window.parityError = String(e);
+                throw e;
+            }
+            const adapterPromise = P.adapterRecord(wasm);
+
+            // The harness's handle on this page: it builds the same window
+            // list in-page and runs one window per call, so it can time each
+            // out and carry on in a fresh page.
+            window.parity = {
+                ...P,
+                wasm,
+                windows: [],
+                adapter: () => adapterPromise,
+                prepare(subset, opts = {}) {
+                    P.checkRangesAgainstPlan(wasm);
+                    this.windows = P.windowsFor(subset, {
+                        randomPerBase: Number(opts.random ?? 0),
+                    });
+                    return this.windows.map((w) => ({
+                        set: w.set,
+                        key: w.key,
+                        base: w.base,
+                        start: w.start.toString(),
+                        end: w.end.toString(),
+                    }));
+                },
+                compare(i) {
+                    return P.compareWindow(wasm, this.windows[i]);
+                },
+                timeGpu(opts) {
+                    return P.timeGpu(wasm, opts);
+                },
+                b40RateWindow() {
+                    const plan = JSON.parse(wasm.benchmark_plan());
+                    const s = plan.scenarios.find((x) => x.key === "b40_detailed");
+                    return { base: s.base, start: s.start, size: s.window_gpu };
+                },
+            };
+
+            const adapter = await adapterPromise;
+            const report = { adapter, page: location.href, records: [] };
+            const shown = {
+                vendor: adapter.vendor,
+                architecture: adapter.architecture,
+                device: adapter.device,
+                description: adapter.description,
+                fallback: adapter.fallback,
+                "gpu_init()": adapter.gpu_init_name ?? adapter.gpu_init_error,
+                software: adapter.adapter ? P.isSoftwareAdapter(adapter) : undefined,
+                build: `${adapter.client_version} ${adapter.build_sha}`,
+                "user agent": adapter.user_agent,
+            };
+            $("adapter").replaceChildren(
+                ...(adapter.adapter
+                    ? Object.entries(shown).flatMap(([k, v]) => {
+                          const dt = document.createElement("dt");
+                          const dd = document.createElement("dd");
+                          dt.textContent = k;
+                          dd.textContent = v === undefined ? "(not reported)" : JSON.stringify(v);
+                          return [dt, dd];
+                      })
+                    : [
+                          Object.assign(document.createElement("dt"), { textContent: "status" }),
+                          Object.assign(document.createElement("dd"), {
+                              textContent: P.describeAdapter(adapter),
+                          }),
+                      ]),
+            );
+
+            let stop = false;
+            const fmt = (x) => (x == null ? "" : x.toFixed(3));
+
+            function addRow(rec, i) {
+                const tr = document.createElement("tr");
+                if (!rec.ok) tr.className = "bad";
+                const cells = [
+                    [String(i), "num"],
+                    [rec.key, "mono"],
+                    [Number(rec.numbers).toLocaleString(), "num"],
+                    [String(rec.near_misses.length), "num"],
+                    [fmt(rec.gpu_secs), "num"],
+                    [fmt(rec.cpu_secs), "num"],
+                    [rec.ok ? "same" : "DIFFERENT", rec.ok ? "pass" : "fail"],
+                ];
+                for (const [text, cls] of cells) {
+                    const td = document.createElement("td");
+                    td.textContent = text;
+                    td.className = cls;
+                    tr.append(td);
+                }
+                $("rows").append(tr);
+                if (!rec.ok) {
+                    const div = document.createElement("div");
+                    const h = document.createElement("h3");
+                    h.className = "fail";
+                    h.textContent = `${rec.key}: [${rec.start}, ${rec.end}) at base ${rec.base}`;
+                    const pre = document.createElement("pre");
+                    pre.textContent = [
+                        ...rec.problems,
+                        ...(rec.differences ?? []).map((d) => `  ${d}`),
+                        rec.gpu_json ? `gpu: ${rec.gpu_json}` : "",
+                        rec.cpu_json ? `cpu: ${rec.cpu_json}` : "",
+                    ]
+                        .filter(Boolean)
+                        .join("\n");
+                    div.append(h, pre);
+                    $("failures").append(div);
+                }
+            }
+
+            async function run() {
+                $("start").disabled = true;
+                $("stop").disabled = false;
+                $("copy").disabled = true;
+                $("rows").replaceChildren();
+                $("failures").replaceChildren();
+                $("verdict").textContent = "";
+                stop = false;
+                report.records = [];
+                report.rate = undefined;
+                try {
+                    if ($("rate").checked) {
+                        $("progress").textContent = "Timing a warm 2e8-number base-40 call...";
+                        report.rate = await P.timeGpu(wasm, window.parity.b40RateWindow());
+                    }
+                    const list = window.parity.prepare($("subset").value, {
+                        random: $("random").value,
+                    });
+                    const summary = await P.runParity(wasm, window.parity.windows, {
+                        shouldStop: () => stop,
+                        onWindow: (rec, i) => {
+                            report.records.push(rec);
+                            addRow(rec, i);
+                            const failed = report.records.filter((r) => !r.ok).length;
+                            $("progress").textContent =
+                                `${i + 1} / ${list.length} windows, ${failed} failed` +
+                                (report.rate
+                                    ? `; warm b40 GPU rate ${report.rate.rate.toExponential(3)} numbers/s`
+                                    : "");
+                        },
+                    });
+                    report.summary = { ...summary, subset: $("subset").value, stopped: stop };
+                    const ok = summary.failed === 0 && !stop && summary.windows === list.length;
+                    $("verdict").className = ok ? "pass" : "fail";
+                    $("verdict").textContent = ok
+                        ? `PASS: ${summary.windows} windows, ${Number(summary.numbers).toLocaleString()} numbers, ${summary.near_misses} near misses, identical on GPU and CPU (${summary.wall_secs.toFixed(1)} s)`
+                        : stop
+                          ? `STOPPED after ${summary.windows} windows (${summary.failed} failed)`
+                          : `FAIL: ${summary.failed} of ${summary.windows} windows differ or failed (details above the table)`;
+                } catch (e) {
+                    $("verdict").className = "fail";
+                    $("verdict").textContent = `ERROR: ${e}`;
+                    report.error = String(e);
+                }
+                $("start").disabled = !adapter.adapter;
+                $("stop").disabled = true;
+                $("copy").disabled = false;
+            }
+
+            $("start").textContent = "Run";
+            $("start").disabled = !adapter.adapter || !!adapter.gpu_init_error;
+            if ($("start").disabled) {
+                $("verdict").className = "fail";
+                $("verdict").textContent = `Nothing to compare: ${P.describeAdapter(adapter)}`;
+            }
+            $("start").onclick = run;
+            $("stop").onclick = () => {
+                stop = true;
+            };
+            $("copy").onclick = async () => {
+                const text = JSON.stringify(report, null, 2);
+                try {
+                    await navigator.clipboard.writeText(text);
+                    $("copy").textContent = "Copied";
+                } catch {
+                    // Clipboard refused (no user activation, or a browser
+                    // policy): show it for copying by hand instead.
+                    const pre = document.createElement("pre");
+                    pre.textContent = text;
+                    document.body.append(pre);
+                }
+            };
+            window.parityReady = true;
+            if (params.get("run") === "1" && !$("start").disabled) run();
+        </script>
+    </body>
+</html>
