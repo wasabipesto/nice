@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Speed up the GPU overlap join's top certificates by turning only the low endpoint's powers into digits and deciding the high endpoint's from a carry test, as the CPU join does since [#204](https://github.com/wasabipesto/nice/pull/204).
 
 ## Nice v3.4.7
 

@@ -11,9 +11,10 @@
 //! in batches:
 //!
 //! 1. [`top_kernel`], [`top_scan_kernel`], [`top_fill_kernel`]: certify each
-//!    top `P = P0·b^p + v` of the slot's partition `v` (96-bit endpoint
-//!    powers in `u32` limbs, both endpoints' digits scanned in lockstep), and
-//!    bucket it by (key digit, digit-sum class) once per root.
+//!    top `P = P0·b^p + v` of the slot's partition `v` (96-bit endpoints,
+//!    their powers in 16-bit limbs; the low endpoint's digits and a carry
+//!    test, as `Base::cert`), and bucket it by (key digit, digit-sum class)
+//!    once per root.
 //! 2. [`bucket_kernel`]: extend every `bpre` entry by `v`'s digits with exact
 //!    digit arithmetic mod `b^k`, and list it under every key digit whose two
 //!    output digits are distinct and new.
@@ -563,18 +564,49 @@ mod kernels {
         cube_done(ran, 4u32);
     }
 
+    /// 16-bit limbs of `k^e`, least significant first: the host-side
+    /// constants `cert_power` multiplies by.
+    // Every limb is masked to 16 bits.
+    #[allow(clippy::cast_possible_truncation)]
+    fn pow_limbs16(k: u32, e: u32) -> Vec<u32> {
+        let mut v = vec![1u32];
+        for _ in 0..e {
+            let mut c = 0u64;
+            for l in &mut v {
+                let t = u64::from(*l) * u64::from(k) + c;
+                *l = (t & 0xFFFF) as u32;
+                c = t >> 16;
+            }
+            while c != 0 {
+                v.push((c & 0xFFFF) as u32);
+                c >>= 16;
+            }
+        }
+        v
+    }
+
     /// One power's share of the top certificate, the device form of
     /// `Base::cert`'s inner loop: x and y are the power of the interval's two
-    /// endpoints (`2·nl` 16-bit limbs, one to a u32, destroyed; `nl` is the
-    /// width in u32 words), `sp` its digit count. Positions
-    /// >= c0 = max(cap, ndig(y - x)) are scanned least significant first in
-    /// lockstep; a position where the digits differ resets the run, so what
-    /// is left at the top is exactly the digits `cert` certifies (from the top
-    /// down to the first disagreement), with `dup` set if two of them repeat.
-    /// Returns the run mask; `c0` and `dup` via the out-arrays, and in
-    /// `out_dom` the digits of x and y at the topmost disagreement at or
-    /// above c0, which bound every n's digit there (`Base::cert`), or (1, 0)
-    /// if there is none.
+    /// endpoints (`2·nl` 16-bit limbs, one to a u32; x is destroyed, y only
+    /// read; `nl` is the width in u32 words), `sp` its digit count. Returns
+    /// the mask of the digits `cert` certifies, the ones common to x and y
+    /// at positions >= c0 = max(cap, ndig(y - x)) from the top down to their
+    /// first disagreement; `c0`, and `dup` set if two of those digits
+    /// repeat, via the out-arrays; and in `out_dom` the digits of x and y at
+    /// that topmost disagreement, which bound every n's digit there
+    /// (`Base::cert`), or (1, 0) if there is none.
+    ///
+    /// Only x's digits are divided out, as in `Base::cert`: y - x < b^c0,
+    /// so floor(y / b^c0) is floor(x / b^c0) or one more, and it is one more
+    /// exactly when (x mod b^c0) + (y - x) >= b^c0. If not, every digit from
+    /// c0 up is common. If so, the two differ on x's run of (b - 1)s from c0
+    /// up and on the digit d above it, which is d + 1 in y, and agree above
+    /// that. The scan runs least significant first, so it keeps both
+    /// answers (every digit from c0 up; the digits above the first that is
+    /// not b - 1) and the remainder test picks one at the end. x mod b^c0
+    /// is put together in 16-bit limbs from the digits below c0, which the
+    /// scan divides out anyway: each pass adds its chunk's digits below c0,
+    /// times B^pass (B = `chunk_div`, whose powers' limbs are constants).
     ///
     /// The limbs are 16-bit so that no constant division here divides a
     /// bare half-width right shift. Each pass's long division by `chunk_div`
@@ -589,13 +621,13 @@ mod kernels {
     /// wherever the top word of n² or n³ is not zero (b45-55 of the join's
     /// bases; it is zero at b40-44 and b57-64). Here the first step of each
     /// pass divides the top two limbs as one u32: in pass 0 that is the u32
-    /// sum `t` whose halves the schoolbook in `top_kernel` stored there,
+    /// sum `t` whose halves the schoolbook in `powers16` stored there,
     /// later the previous quotient. It is the same long division, with one
     /// division fewer.
     #[cube]
-    fn cert_power(
+    pub(super) fn cert_power(
         x: &mut Array<u32>,
-        y: &mut Array<u32>,
+        y: &Array<u32>,
         pw: &Array<u32>,
         out_c0: &mut Array<u32>,
         out_dup: &mut Array<u32>,
@@ -659,10 +691,21 @@ mod kernels {
         if c0 < cap {
             c0 = cap.runtime();
         }
+        // x mod b^c0, in 16-bit limbs.
+        let mut rem = Array::<u32>::new(nh as usize);
+        #[unroll]
+        for j in 0..nh {
+            rem[j as usize] = 0u32;
+        }
+        // Every digit from c0 up (`run`, `dup`); and the digits above x's
+        // run of (b - 1)s from c0 up (`runc`, `dupc`), with the digit `dlo`
+        // that ends that run.
         let mut run = 0u64;
         let mut dup = 0u32;
-        let mut dlo = 1u32;
-        let mut dhi = 0u32;
+        let mut runc = 0u64;
+        let mut dupc = 0u32;
+        let mut in_run = true;
+        let mut dlo = 0u32;
         let passes = comptime!(sp.div_ceil(chunk_digits));
         #[unroll]
         for pass in 0..passes {
@@ -674,11 +717,6 @@ mod kernels {
             let mut rx = cx - qx * chunk_div;
             x[top as usize] = qx >> 16u32;
             x[next as usize] = qx & 0xFFFFu32;
-            let cy = (y[top as usize] << 16u32) | y[next as usize];
-            let qy = cy / chunk_div;
-            let mut ry = cy - qy * chunk_div;
-            y[top as usize] = qy >> 16u32;
-            y[next as usize] = qy & 0xFFFFu32;
             #[unroll]
             for jj in 2..nh {
                 let j = comptime!(nh - 1 - jj);
@@ -686,40 +724,113 @@ mod kernels {
                 let q1 = c1 / chunk_div;
                 rx = c1 - q1 * chunk_div;
                 x[j as usize] = q1;
-                let e1 = (ry << 16u32) | y[j as usize];
-                let s1 = e1 / chunk_div;
-                ry = e1 - s1 * chunk_div;
-                y[j as usize] = s1;
             }
+            // The chunk's digits below c0, as a value below B.
+            let mut low = 0u32;
             #[unroll]
             for q in 0..chunk_digits {
                 let pos = comptime!(pass * chunk_digits + q);
                 let dx = rx % base;
                 rx /= base;
-                let dy = ry % base;
-                ry /= base;
                 if comptime!(pos < sp) {
                     if pos >= c0 {
-                        if dx == dy {
-                            let bit = 1u64 << u64::cast_from(dx);
-                            if (run & bit) != 0u64 {
-                                dup = 1u32;
-                            }
-                            run |= bit;
-                        } else {
-                            run = 0u64;
-                            dup = 0u32;
-                            dlo = dx;
-                            dhi = dy;
+                        let bit = 1u64 << u64::cast_from(dx);
+                        if (run & bit) != 0u64 {
+                            dup = 1u32;
                         }
+                        run |= bit;
+                        if in_run {
+                            if dx != comptime!(base - 1) {
+                                in_run = false;
+                                dlo = dx;
+                            }
+                        } else {
+                            if (runc & bit) != 0u64 {
+                                dupc = 1u32;
+                            }
+                            runc |= bit;
+                        }
+                    } else {
+                        low += dx * comptime!(base.pow(q));
                     }
                 }
             }
+            // rem += low · B^pass. The sum is x mod b^min(c0, start + cd),
+            // below B^(pass + 1), and B^pass fits x's limbs (start < sp).
+            let start = comptime!(pass * chunk_digits);
+            if start < c0 {
+                let len = comptime!((pow_limbs16(chunk_div, pass).len() as u32).min(nh));
+                let topk = comptime!((pow_limbs16(chunk_div, pass + 1).len() as u32).min(nh));
+                let mut c = 0u32;
+                #[unroll]
+                for i in 0..len {
+                    let t = low * comptime!(pow_limbs16(chunk_div, pass)[i as usize])
+                        + rem[i as usize]
+                        + c;
+                    rem[i as usize] = t & 0xFFFFu32;
+                    c = t >> 16u32;
+                }
+                #[unroll]
+                for i in len..topk {
+                    let t = rem[i as usize] + c;
+                    rem[i as usize] = t & 0xFFFFu32;
+                    c = t >> 16u32;
+                }
+            }
+        }
+        // floor(y / b^c0) is one more than floor(x / b^c0) iff
+        // (x mod b^c0) + (y - x) >= b^c0. The sum is below 2·b^c0 <= 2x, so
+        // it can carry out of nl words, and is then above b^c0.
+        let mut one_more = false;
+        if c0 < sp {
+            let mut s = Array::<u32>::new(nl as usize);
+            let mut carry = 0u32;
+            #[unroll]
+            for j in 0..nl {
+                let rj =
+                    rem[comptime!(2 * j) as usize] | (rem[comptime!(2 * j + 1) as usize] << 16u32);
+                let t = rj + d[j as usize];
+                let t2 = t + carry;
+                let mut nc = 0u32;
+                if t < rj || t2 < t {
+                    nc = 1u32;
+                }
+                s[j as usize] = t2;
+                carry = nc;
+            }
+            let mut ge = true;
+            let mut eq = true;
+            #[unroll]
+            for jj in 0..nl3 {
+                let j = comptime!(nl3 - 1 - jj);
+                let pj = pw[(c0 * nl3 + j) as usize];
+                let mut sj = 0u32;
+                if comptime!(j < nl) {
+                    sj = s[j as usize];
+                }
+                if eq {
+                    if sj < pj {
+                        ge = false;
+                        eq = false;
+                    } else if sj > pj {
+                        eq = false;
+                    }
+                }
+            }
+            one_more = carry != 0u32 || ge;
+        }
+        let mut dom_lo = 1u32;
+        let mut dom_hi = 0u32;
+        if one_more {
+            run = runc;
+            dup = dupc;
+            dom_lo = dlo;
+            dom_hi = dlo + 1u32;
         }
         out_c0[0] = c0;
         out_dup[0] = dup;
-        out_dom[0] = dlo;
-        out_dom[1] = dhi;
+        out_dom[0] = dom_lo;
+        out_dom[1] = dom_hi;
         run
     }
 
@@ -736,6 +847,188 @@ mod kernels {
             }
         }
         m
+    }
+
+    /// a² and e² (4L limbs) and a³ and e³ (6L limbs) of a and e (`limbs` =
+    /// L u32 words each), in 16-bit limbs one to a u32, by schoolbook in
+    /// u32 (`cert_power` says why). A limb product plus two values below
+    /// 2^16 is at most 2^32 - 1.
+    #[cube]
+    pub(super) fn powers16(
+        a: &Array<u32>,
+        e: &Array<u32>,
+        a2: &mut Array<u32>,
+        e2: &mut Array<u32>,
+        a3: &mut Array<u32>,
+        e3: &mut Array<u32>,
+        #[comptime] limbs: u32,
+    ) {
+        let nh = comptime!(2 * limbs);
+        let nh2 = comptime!(4 * limbs);
+        let nh3 = comptime!(6 * limbs);
+        let mut ah = Array::<u32>::new(nh as usize);
+        let mut eh = Array::<u32>::new(nh as usize);
+        #[unroll]
+        for j in 0..limbs {
+            ah[comptime!(2 * j) as usize] = a[j as usize] & 0xFFFFu32;
+            ah[comptime!(2 * j + 1) as usize] = a[j as usize] >> 16u32;
+            eh[comptime!(2 * j) as usize] = e[j as usize] & 0xFFFFu32;
+            eh[comptime!(2 * j + 1) as usize] = e[j as usize] >> 16u32;
+        }
+        #[unroll]
+        for j in 0..nh2 {
+            a2[j as usize] = 0u32;
+            e2[j as usize] = 0u32;
+        }
+        #[unroll]
+        for i1 in 0..nh {
+            let mut ca = 0u32;
+            let mut ce = 0u32;
+            #[unroll]
+            for j in 0..nh {
+                let kk = comptime!(i1 + j);
+                let ta = ah[i1 as usize] * ah[j as usize] + a2[kk as usize] + ca;
+                a2[kk as usize] = ta & 0xFFFFu32;
+                ca = ta >> 16u32;
+                let te = eh[i1 as usize] * eh[j as usize] + e2[kk as usize] + ce;
+                e2[kk as usize] = te & 0xFFFFu32;
+                ce = te >> 16u32;
+            }
+            a2[comptime!(i1 + nh) as usize] = ca;
+            e2[comptime!(i1 + nh) as usize] = ce;
+        }
+        #[unroll]
+        for j in 0..nh3 {
+            a3[j as usize] = 0u32;
+            e3[j as usize] = 0u32;
+        }
+        #[unroll]
+        for i1 in 0..nh2 {
+            let mut ca = 0u32;
+            let mut ce = 0u32;
+            #[unroll]
+            for j in 0..nh {
+                let kk = comptime!(i1 + j);
+                let ta = a2[i1 as usize] * ah[j as usize] + a3[kk as usize] + ca;
+                a3[kk as usize] = ta & 0xFFFFu32;
+                ca = ta >> 16u32;
+                let te = e2[i1 as usize] * eh[j as usize] + e3[kk as usize] + ce;
+                e3[kk as usize] = te & 0xFFFFu32;
+                ce = te >> 16u32;
+            }
+            a3[comptime!(i1 + nh) as usize] = ca;
+            e3[comptime!(i1 + nh) as usize] = ce;
+        }
+    }
+
+    /// The top certificate of [a, e] (`limbs` u32 words each), the device
+    /// form of `Base::cert`: returns its mask, and in `res` whether the
+    /// interval is kept (1) or not (0) and the square's and the cube's c0
+    /// (the terms of `Base::cert_floor`).
+    #[cube]
+    pub(super) fn top_cert(
+        a: &Array<u32>,
+        e: &Array<u32>,
+        pw: &Array<u32>,
+        res: &mut Array<u32>,
+        #[comptime] base: u32,
+        #[comptime] limbs: u32,
+        #[comptime] cap: u32,
+        #[comptime] s2: u32,
+        #[comptime] s3: u32,
+        #[comptime] chunk_digits: u32,
+        #[comptime] chunk_div: u32,
+    ) -> u64 {
+        let nl2 = comptime!(2 * limbs);
+        let nl3 = comptime!(3 * limbs);
+        let nh2 = comptime!(4 * limbs);
+        let nh3 = comptime!(6 * limbs);
+        let mut a2 = Array::<u32>::new(nh2 as usize);
+        let mut e2 = Array::<u32>::new(nh2 as usize);
+        let mut a3 = Array::<u32>::new(nh3 as usize);
+        let mut e3 = Array::<u32>::new(nh3 as usize);
+        powers16(a, e, &mut a2, &mut e2, &mut a3, &mut e3, limbs);
+        let mut c0a = Array::<u32>::new(1usize);
+        let mut dupa = Array::<u32>::new(1usize);
+        let mut c0b = Array::<u32>::new(1usize);
+        let mut dupb = Array::<u32>::new(1usize);
+        let mut doma = Array::<u32>::new(2usize);
+        let mut domb = Array::<u32>::new(2usize);
+        let msq = cert_power(
+            &mut a2,
+            &e2,
+            pw,
+            &mut c0a,
+            &mut dupa,
+            &mut doma,
+            nl2,
+            nl3,
+            s2,
+            cap,
+            base,
+            chunk_digits,
+            chunk_div,
+        );
+        let mcu = cert_power(
+            &mut a3,
+            &e3,
+            pw,
+            &mut c0b,
+            &mut dupb,
+            &mut domb,
+            nl3,
+            nl3,
+            s3,
+            cap,
+            base,
+            chunk_digits,
+            chunk_div,
+        );
+        let mut mask = msq | mcu;
+        let mut keep = dupa[0] == 0u32 && dupb[0] == 0u32 && (msq & mcu) == 0u64;
+        // `close_certificate` over the two powers' first-disagreement
+        // intervals: an interval with no free digit rejects, and one with a
+        // single free digit forces it. Forcing the cube's digit can only
+        // shrink the square's free set, so one recheck of the square reaches
+        // the same fixed point.
+        let d0 = dom_mask(doma[0], doma[1]);
+        let d1 = dom_mask(domb[0], domb[1]);
+        let mut f0 = false;
+        let mut f1 = false;
+        if keep && d0 != 0u64 {
+            let fr = d0 & !mask;
+            if fr == 0u64 {
+                keep = false;
+            } else if (fr & (fr - 1u64)) == 0u64 {
+                mask |= fr;
+                f0 = true;
+            }
+        }
+        if keep && d1 != 0u64 {
+            let fr = d1 & !mask;
+            if fr == 0u64 {
+                keep = false;
+            } else if (fr & (fr - 1u64)) == 0u64 {
+                mask |= fr;
+                f1 = true;
+            }
+        }
+        if keep && d0 != 0u64 && !f0 && f1 {
+            let fr = d0 & !mask;
+            if fr == 0u64 {
+                keep = false;
+            } else if (fr & (fr - 1u64)) == 0u64 {
+                mask |= fr;
+            }
+        }
+        let mut kept = 0u32;
+        if keep {
+            kept = 1u32;
+        }
+        res[0] = kept;
+        res[1] = c0a[0];
+        res[2] = c0b[0];
+        mask
     }
 
     /// Stage 0a: certify every top prefix of every slot's partition. Grid: x
@@ -777,11 +1070,6 @@ mod kernels {
         #[comptime] nb: u32,
     ) {
         let m1 = comptime!(base - 1);
-        let nl2 = comptime!(2 * limbs);
-        let nl3 = comptime!(3 * limbs);
-        let nh = comptime!(2 * limbs);
-        let nh2 = comptime!(4 * limbs);
-        let nh3 = comptime!(6 * limbs);
         let i = ABSOLUTE_POS_X;
         let slot = CUBE_POS_Y;
         if i < ntlay {
@@ -860,144 +1148,24 @@ mod kernels {
                         e[j as usize] = fb[comptime!(3 + j) as usize];
                     }
                 }
-                // Powers in 16-bit limbs, one to a u32, by schoolbook in u32
-                // (`cert_power` says why): a2 = a^2, e2 = e^2 (4L limbs), a3,
-                // e3 (6L limbs). A limb product plus two values below 2^16 is
-                // at most 2^32 - 1.
-                let mut ah = Array::<u32>::new(nh as usize);
-                let mut eh = Array::<u32>::new(nh as usize);
-                #[unroll]
-                for j in 0..limbs {
-                    ah[comptime!(2 * j) as usize] = a[j as usize] & 0xFFFFu32;
-                    ah[comptime!(2 * j + 1) as usize] = a[j as usize] >> 16u32;
-                    eh[comptime!(2 * j) as usize] = e[j as usize] & 0xFFFFu32;
-                    eh[comptime!(2 * j + 1) as usize] = e[j as usize] >> 16u32;
-                }
-                let mut a2 = Array::<u32>::new(nh2 as usize);
-                let mut e2 = Array::<u32>::new(nh2 as usize);
-                #[unroll]
-                for j in 0..nh2 {
-                    a2[j as usize] = 0u32;
-                    e2[j as usize] = 0u32;
-                }
-                #[unroll]
-                for i1 in 0..nh {
-                    let mut ca = 0u32;
-                    let mut ce = 0u32;
-                    #[unroll]
-                    for j in 0..nh {
-                        let kk = comptime!(i1 + j);
-                        let ta = ah[i1 as usize] * ah[j as usize] + a2[kk as usize] + ca;
-                        a2[kk as usize] = ta & 0xFFFFu32;
-                        ca = ta >> 16u32;
-                        let te = eh[i1 as usize] * eh[j as usize] + e2[kk as usize] + ce;
-                        e2[kk as usize] = te & 0xFFFFu32;
-                        ce = te >> 16u32;
-                    }
-                    a2[comptime!(i1 + nh) as usize] = ca;
-                    e2[comptime!(i1 + nh) as usize] = ce;
-                }
-                let mut a3 = Array::<u32>::new(nh3 as usize);
-                let mut e3 = Array::<u32>::new(nh3 as usize);
-                #[unroll]
-                for j in 0..nh3 {
-                    a3[j as usize] = 0u32;
-                    e3[j as usize] = 0u32;
-                }
-                #[unroll]
-                for i1 in 0..nh2 {
-                    let mut ca = 0u32;
-                    let mut ce = 0u32;
-                    #[unroll]
-                    for j in 0..nh {
-                        let kk = comptime!(i1 + j);
-                        let ta = a2[i1 as usize] * ah[j as usize] + a3[kk as usize] + ca;
-                        a3[kk as usize] = ta & 0xFFFFu32;
-                        ca = ta >> 16u32;
-                        let te = e2[i1 as usize] * eh[j as usize] + e3[kk as usize] + ce;
-                        e3[kk as usize] = te & 0xFFFFu32;
-                        ce = te >> 16u32;
-                    }
-                    a3[comptime!(i1 + nh) as usize] = ca;
-                    e3[comptime!(i1 + nh) as usize] = ce;
-                }
-                let mut c0a = Array::<u32>::new(1usize);
-                let mut dupa = Array::<u32>::new(1usize);
-                let mut c0b = Array::<u32>::new(1usize);
-                let mut dupb = Array::<u32>::new(1usize);
-                let mut doma = Array::<u32>::new(2usize);
-                let mut domb = Array::<u32>::new(2usize);
-                let msq = cert_power(
-                    &mut a2,
-                    &mut e2,
+                let mut res = Array::<u32>::new(3usize);
+                let mask = top_cert(
+                    &a,
+                    &e,
                     pw,
-                    &mut c0a,
-                    &mut dupa,
-                    &mut doma,
-                    nl2,
-                    nl3,
+                    &mut res,
+                    base,
+                    limbs,
+                    cap,
                     s2,
-                    cap,
-                    base,
-                    chunk_digits,
-                    chunk_div,
-                );
-                let mcu = cert_power(
-                    &mut a3,
-                    &mut e3,
-                    pw,
-                    &mut c0b,
-                    &mut dupb,
-                    &mut domb,
-                    nl3,
-                    nl3,
                     s3,
-                    cap,
-                    base,
                     chunk_digits,
                     chunk_div,
                 );
-                let mut mask = msq | mcu;
-                let mut keep = dupa[0] == 0u32 && dupb[0] == 0u32 && (msq & mcu) == 0u64;
-                // `close_certificate` over the two powers' first-disagreement
-                // intervals: an interval with no free digit rejects, and one
-                // with a single free digit forces it. Forcing the cube's
-                // digit can only shrink the square's free set, so one
-                // recheck of the square reaches the same fixed point.
-                let d0 = dom_mask(doma[0], doma[1]);
-                let d1 = dom_mask(domb[0], domb[1]);
-                let mut f0 = false;
-                let mut f1 = false;
-                if keep && d0 != 0u64 {
-                    let fr = d0 & !mask;
-                    if fr == 0u64 {
-                        keep = false;
-                    } else if (fr & (fr - 1u64)) == 0u64 {
-                        mask |= fr;
-                        f0 = true;
-                    }
-                }
-                if keep && d1 != 0u64 {
-                    let fr = d1 & !mask;
-                    if fr == 0u64 {
-                        keep = false;
-                    } else if (fr & (fr - 1u64)) == 0u64 {
-                        mask |= fr;
-                        f1 = true;
-                    }
-                }
-                if keep && d0 != 0u64 && !f0 && f1 {
-                    let fr = d0 & !mask;
-                    if fr == 0u64 {
-                        keep = false;
-                    } else if (fr & (fr - 1u64)) == 0u64 {
-                        mask |= fr;
-                    }
-                }
-                if keep {
-                    let mut floor = c0a[0];
-                    if c0b[0] < floor {
-                        floor = c0b[0];
+                if res[0] != 0u32 {
+                    let mut floor = res[1];
+                    if res[2] < floor {
+                        floor = res[2];
                     }
                     // Same seed rule as the host: an unclipped block uses the
                     // field bound (a lower bound of its exact floor).
@@ -3374,5 +3542,571 @@ mod tests {
     #[ignore = "requires an NVIDIA device; prints throughput"]
     fn cubecl_cuda_join_throughput_fixed_fields() {
         join_throughput(&CubeclContext::new_cuda(0).expect("CubeCL CUDA init"));
+    }
+
+    // ---------------------------------------------------------------------
+    // The top certificate: the remainder form against the lockstep scan it
+    // replaced and against the CPU's `Base::cert`.
+    // ---------------------------------------------------------------------
+
+    /// The device side of the certificate test, under `kernels`' lint
+    /// allowances (ported integer arithmetic, comptime-unrolled loops).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_lossless,
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::similar_names,
+        clippy::many_single_char_names,
+        clippy::collapsible_if,
+        clippy::needless_range_loop,
+        clippy::trivially_copy_pass_by_ref,
+        clippy::collapsible_else_if,
+        clippy::manual_midpoint
+    )]
+    mod cert_kernels {
+        use super::super::kernels::{cert_power, powers16, top_cert};
+        use cubecl::prelude::*;
+
+        /// `kernels::cert_power` as it was before it divided out only x's
+        /// digits: both endpoints' powers turned into digits in lockstep, least
+        /// significant first, where a position whose digits differ resets the
+        /// run. The reference the remainder form must reproduce exactly.
+        #[cube]
+        fn cert_power_lockstep(
+            x: &mut Array<u32>,
+            y: &mut Array<u32>,
+            pw: &Array<u32>,
+            out_c0: &mut Array<u32>,
+            out_dup: &mut Array<u32>,
+            out_dom: &mut Array<u32>,
+            #[comptime] nl: u32,
+            #[comptime] nl3: u32,
+            #[comptime] sp: u32,
+            #[comptime] cap: u32,
+            #[comptime] base: u32,
+            #[comptime] chunk_digits: u32,
+            #[comptime] chunk_div: u32,
+        ) -> u64 {
+            let nh = comptime!(2 * nl);
+            // d = y - x (y >= x), over u32 words packed from the limb pairs.
+            let mut d = Array::<u32>::new(nl as usize);
+            let mut borrow = 0u32;
+            #[unroll]
+            for j in 0..nl {
+                let yj = y[comptime!(2 * j) as usize] | (y[comptime!(2 * j + 1) as usize] << 16u32);
+                let xj = x[comptime!(2 * j) as usize] | (x[comptime!(2 * j + 1) as usize] << 16u32);
+                let t = yj - xj - borrow;
+                let mut nb = 0u32;
+                if yj < xj || (yj == xj && borrow != 0u32) {
+                    nb = 1u32;
+                }
+                d[j as usize] = t;
+                borrow = nb;
+            }
+            // ndig(d): smallest i with b^i > d, binary search over the power table.
+            let mut lo = 0u32;
+            let mut hi = sp.runtime();
+            while lo < hi {
+                let mid = (lo + hi) >> 1u32;
+                // d < b^mid ?
+                let mut lt = false;
+                let mut eq = true;
+                #[unroll]
+                for jj in 0..nl3 {
+                    let j = comptime!(nl3 - 1 - jj);
+                    let pj = pw[(mid * nl3 + j) as usize];
+                    let mut dj = 0u32;
+                    if comptime!(j < nl) {
+                        dj = d[j as usize];
+                    }
+                    if eq {
+                        if dj < pj {
+                            lt = true;
+                            eq = false;
+                        } else if dj > pj {
+                            eq = false;
+                        }
+                    }
+                }
+                if lt {
+                    hi = mid;
+                } else {
+                    lo = mid + 1u32;
+                }
+            }
+            let mut c0 = lo;
+            if c0 < cap {
+                c0 = cap.runtime();
+            }
+            let mut run = 0u64;
+            let mut dup = 0u32;
+            let mut dlo = 1u32;
+            let mut dhi = 0u32;
+            let passes = comptime!(sp.div_ceil(chunk_digits));
+            #[unroll]
+            for pass in 0..passes {
+                // The top two limbs as one u32 (see above), then one limb a step.
+                let top = comptime!(nh - 1);
+                let next = comptime!(nh - 2);
+                let cx = (x[top as usize] << 16u32) | x[next as usize];
+                let qx = cx / chunk_div;
+                let mut rx = cx - qx * chunk_div;
+                x[top as usize] = qx >> 16u32;
+                x[next as usize] = qx & 0xFFFFu32;
+                let cy = (y[top as usize] << 16u32) | y[next as usize];
+                let qy = cy / chunk_div;
+                let mut ry = cy - qy * chunk_div;
+                y[top as usize] = qy >> 16u32;
+                y[next as usize] = qy & 0xFFFFu32;
+                #[unroll]
+                for jj in 2..nh {
+                    let j = comptime!(nh - 1 - jj);
+                    let c1 = (rx << 16u32) | x[j as usize];
+                    let q1 = c1 / chunk_div;
+                    rx = c1 - q1 * chunk_div;
+                    x[j as usize] = q1;
+                    let e1 = (ry << 16u32) | y[j as usize];
+                    let s1 = e1 / chunk_div;
+                    ry = e1 - s1 * chunk_div;
+                    y[j as usize] = s1;
+                }
+                #[unroll]
+                for q in 0..chunk_digits {
+                    let pos = comptime!(pass * chunk_digits + q);
+                    let dx = rx % base;
+                    rx /= base;
+                    let dy = ry % base;
+                    ry /= base;
+                    if comptime!(pos < sp) {
+                        if pos >= c0 {
+                            if dx == dy {
+                                let bit = 1u64 << u64::cast_from(dx);
+                                if (run & bit) != 0u64 {
+                                    dup = 1u32;
+                                }
+                                run |= bit;
+                            } else {
+                                run = 0u64;
+                                dup = 0u32;
+                                dlo = dx;
+                                dhi = dy;
+                            }
+                        }
+                    }
+                }
+            }
+            out_c0[0] = c0;
+            out_dup[0] = dup;
+            out_dom[0] = dlo;
+            out_dom[1] = dhi;
+            run
+        }
+
+        /// Words per interval in [`cert_test_kernel`]'s output: for the square
+        /// and then the cube, `cert_power`'s (run lo, run hi, dup, dom lo, dom
+        /// hi, c0) at 0 and 6 and `cert_power_lockstep`'s at 12 and 18; then
+        /// `top_cert`'s (kept, mask lo, mask hi, c0 of the square, of the cube)
+        /// at 24.
+        pub(super) const CERT_OUT: u32 = 32;
+
+        /// Writes one power's certificate state at `o` (see [`CERT_OUT`]).
+        #[cube]
+        fn put_power(
+            out: &mut Array<u32>,
+            o: u32,
+            run: u64,
+            c0: &Array<u32>,
+            dup: &Array<u32>,
+            dom: &Array<u32>,
+        ) {
+            out[o as usize] = u32::cast_from(run);
+            out[(o + 1u32) as usize] = u32::cast_from(run >> 32u64);
+            out[(o + 2u32) as usize] = dup[0];
+            out[(o + 3u32) as usize] = dom[0];
+            out[(o + 4u32) as usize] = dom[1];
+            out[(o + 5u32) as usize] = c0[0];
+        }
+
+        /// Per interval `[a, e]` (`limbs` u32 words each, a then e, in `iv`):
+        /// both powers' certificates by `cert_power` and by
+        /// `cert_power_lockstep`, and `top_cert`'s, written as [`CERT_OUT`]
+        /// says.
+        #[cube(launch_unchecked)]
+        pub(super) fn cert_test_kernel(
+            iv: &Array<u32>,
+            pw: &Array<u32>,
+            out: &mut Array<u32>,
+            n: u32,
+            #[comptime] base: u32,
+            #[comptime] limbs: u32,
+            #[comptime] cap: u32,
+            #[comptime] s2: u32,
+            #[comptime] s3: u32,
+            #[comptime] chunk_digits: u32,
+            #[comptime] chunk_div: u32,
+        ) {
+            let i = ABSOLUTE_POS_X;
+            if i < n {
+                let nl2 = comptime!(2 * limbs);
+                let nl3 = comptime!(3 * limbs);
+                let nh2 = comptime!(4 * limbs);
+                let nh3 = comptime!(6 * limbs);
+                let mut a = Array::<u32>::new(limbs as usize);
+                let mut e = Array::<u32>::new(limbs as usize);
+                #[unroll]
+                for j in 0..limbs {
+                    a[j as usize] = iv[(2u32 * limbs * i + j) as usize];
+                    e[j as usize] = iv[(2u32 * limbs * i + limbs + j) as usize];
+                }
+                let mut a2 = Array::<u32>::new(nh2 as usize);
+                let mut e2 = Array::<u32>::new(nh2 as usize);
+                let mut a3 = Array::<u32>::new(nh3 as usize);
+                let mut e3 = Array::<u32>::new(nh3 as usize);
+                powers16(&a, &e, &mut a2, &mut e2, &mut a3, &mut e3, limbs);
+                let mut x2 = Array::<u32>::new(nh2 as usize);
+                let mut y2 = Array::<u32>::new(nh2 as usize);
+                let mut x3 = Array::<u32>::new(nh3 as usize);
+                let mut y3 = Array::<u32>::new(nh3 as usize);
+                #[unroll]
+                for j in 0..nh2 {
+                    x2[j as usize] = a2[j as usize];
+                    y2[j as usize] = e2[j as usize];
+                }
+                #[unroll]
+                for j in 0..nh3 {
+                    x3[j as usize] = a3[j as usize];
+                    y3[j as usize] = e3[j as usize];
+                }
+                let o = i * CERT_OUT;
+                let mut c0 = Array::<u32>::new(1usize);
+                let mut dup = Array::<u32>::new(1usize);
+                let mut dom = Array::<u32>::new(2usize);
+                let m = cert_power(
+                    &mut a2,
+                    &e2,
+                    pw,
+                    &mut c0,
+                    &mut dup,
+                    &mut dom,
+                    nl2,
+                    nl3,
+                    s2,
+                    cap,
+                    base,
+                    chunk_digits,
+                    chunk_div,
+                );
+                put_power(out, o, m, &c0, &dup, &dom);
+                let m = cert_power(
+                    &mut a3,
+                    &e3,
+                    pw,
+                    &mut c0,
+                    &mut dup,
+                    &mut dom,
+                    nl3,
+                    nl3,
+                    s3,
+                    cap,
+                    base,
+                    chunk_digits,
+                    chunk_div,
+                );
+                put_power(out, o + 6u32, m, &c0, &dup, &dom);
+                let m = cert_power_lockstep(
+                    &mut x2,
+                    &mut y2,
+                    pw,
+                    &mut c0,
+                    &mut dup,
+                    &mut dom,
+                    nl2,
+                    nl3,
+                    s2,
+                    cap,
+                    base,
+                    chunk_digits,
+                    chunk_div,
+                );
+                put_power(out, o + 12u32, m, &c0, &dup, &dom);
+                let m = cert_power_lockstep(
+                    &mut x3,
+                    &mut y3,
+                    pw,
+                    &mut c0,
+                    &mut dup,
+                    &mut dom,
+                    nl3,
+                    nl3,
+                    s3,
+                    cap,
+                    base,
+                    chunk_digits,
+                    chunk_div,
+                );
+                put_power(out, o + 18u32, m, &c0, &dup, &dom);
+                let mut res = Array::<u32>::new(3usize);
+                let mask = top_cert(
+                    &a,
+                    &e,
+                    pw,
+                    &mut res,
+                    base,
+                    limbs,
+                    cap,
+                    s2,
+                    s3,
+                    chunk_digits,
+                    chunk_div,
+                );
+                out[(o + 24u32) as usize] = res[0];
+                out[(o + 25u32) as usize] = u32::cast_from(mask);
+                out[(o + 26u32) as usize] = u32::cast_from(mask >> 32u64);
+                out[(o + 27u32) as usize] = res[1];
+                out[(o + 28u32) as usize] = res[2];
+            }
+        }
+    }
+
+    use cert_kernels::{CERT_OUT, cert_test_kernel};
+
+    /// A splitmix64 stream for the interval generators.
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// Below `n` (> 0), near enough uniform for a test.
+        fn below(&mut self, n: u128) -> u128 {
+            ((u128::from(self.next()) << 64) | u128::from(self.next())) % n
+        }
+    }
+
+    /// What one group of intervals exercised.
+    #[derive(Default)]
+    struct CertTally {
+        intervals: u64,
+        kept: u64,
+        /// Powers whose shifted endpoints differ by one (the carry case).
+        carried: u64,
+        /// Powers with a digit at or above c0 (c0 below the digit count).
+        scanned: u64,
+    }
+
+    /// Runs `iv` (one comptime shape: base, `limbs`, `cap` and the digit
+    /// counts of `base`) through [`cert_test_kernel`] with the production
+    /// chunk constants, and asserts per interval that `cert_power` equals
+    /// `cert_power_lockstep` on both powers, word for word, and that
+    /// `top_cert` equals `Base::cert` and its c0 terms `Base::cert_floor`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn check_cert_group<R: Runtime>(
+        client: &ComputeClient<R>,
+        base: &crate::overlap_join::Base,
+        limbs: u32,
+        cap: u32,
+        iv: &[(u128, u128)],
+        tally: &mut CertTally,
+    ) {
+        if iv.is_empty() {
+            return;
+        }
+        let b = base.b;
+        let nl3 = 3 * limbs as usize;
+        let mut pw = Vec::with_capacity((base.s3 as usize + 1) * nl3);
+        for i in 0..=base.s3 {
+            let mut words: Vec<u32> = base
+                .poww_words(i)
+                .iter()
+                .flat_map(|&w| [w as u32, (w >> 32) as u32])
+                .collect();
+            words.resize(nl3.max(8), 0);
+            assert!(
+                words[nl3..].iter().all(|&x| x == 0),
+                "b{b}: b^{i} does not fit {nl3} words"
+            );
+            pw.extend_from_slice(&words[..nl3]);
+        }
+        let mut words = Vec::with_capacity(iv.len() * 2 * limbs as usize);
+        for &(a, e) in iv {
+            assert!(
+                e >> (32 * limbs) == 0,
+                "b{b}: [{a}, {e}] exceeds {limbs} words"
+            );
+            for x in [a, e] {
+                words.extend((0..limbs).map(|j| (x >> (32 * j)) as u32));
+            }
+        }
+        let n = u32::try_from(iv.len()).expect("a test-sized group");
+        let (cd, cdiv) = chunk_constants_u16(b);
+        let out = client.empty(iv.len() * CERT_OUT as usize * 4);
+        let iv_h = client.create(cubecl::bytes::Bytes::from_elems(words.clone()));
+        let pw_h = client.create(cubecl::bytes::Bytes::from_elems(pw.clone()));
+        unsafe {
+            cert_test_kernel::launch_unchecked::<R>(
+                client,
+                CubeCount::Static(n.div_ceil(JOIN_WG), 1, 1),
+                CubeDim::new_1d(JOIN_WG),
+                ArrayArg::from_raw_parts(iv_h, words.len()),
+                ArrayArg::from_raw_parts(pw_h, pw.len()),
+                ArrayArg::from_raw_parts(out.clone(), iv.len() * CERT_OUT as usize),
+                n,
+                b,
+                limbs,
+                cap,
+                base.s2,
+                base.s3,
+                cd,
+                cdiv,
+            );
+        }
+        let bytes = client.read_one(out).expect("read the certificates");
+        let got = u32::from_bytes(&bytes);
+        for (i, &(a, e)) in iv.iter().enumerate() {
+            let o = &got[i * CERT_OUT as usize..(i + 1) * CERT_OUT as usize];
+            let at = format!("b{b} [{a}, {e}] cap {cap}");
+            assert_eq!(o[0..6], o[12..18], "{at}: the square's certificate differs");
+            assert_eq!(o[6..12], o[18..24], "{at}: the cube's certificate differs");
+            let mask = u64::from(o[25]) | (u64::from(o[26]) << 32);
+            let want = base.cert(a, e, cap);
+            assert_eq!(
+                (o[24] == 1).then_some(mask),
+                want,
+                "{at}: against Base::cert"
+            );
+            assert_eq!(
+                o[27].min(o[28]),
+                base.cert_floor(a, e, cap),
+                "{at}: against Base::cert_floor"
+            );
+            tally.intervals += 1;
+            tally.kept += u64::from(want.is_some());
+            for (p, sp) in [(&o[0..6], base.s2), (&o[6..12], base.s3)] {
+                tally.carried += u64::from(p[3] < p[4]);
+                tally.scanned += u64::from(p[5] < sp);
+            }
+        }
+    }
+
+    /// The top certificate from the low endpoint's digits and a remainder
+    /// (`kernels::cert_power`) equals the lockstep scan of both endpoints'
+    /// digits it replaced, power by power and word for word (the mask, the
+    /// repeat flag, the digit interval at the first disagreement, c0), and
+    /// `top_cert` equals the CPU's `Base::cert` and `cert_floor`: on
+    /// partition-extended tops of production-shaped fields at bases 58-64,
+    /// and on arbitrary intervals and caps at smaller bases, in groups that
+    /// share a kernel shape (where c0 is often the cap). More with
+    /// `NICE_TEST_CERT_SAMPLES` per field and base (default 20,000).
+    #[allow(clippy::cast_possible_truncation)]
+    fn check_certificates<R: Runtime>(client: &ComputeClient<R>, name: &str) {
+        use crate::overlap_join::{Base, join_params_for};
+        let per: u64 = std::env::var("NICE_TEST_CERT_SAMPLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        let mut tally = CertTally::default();
+        for (b, s0, size) in [
+            (58, 183_859_216_587_923_470_200, 1_000_000_000_000_000),
+            (60, 795_599_612_114_824_200_908, 10_000_000_000_000_000),
+            (62, 12_255_736_762_397_899_821_056, 10_000_000_000_000_000),
+            (64, 72_806_461_862_957_161_709_568, 10_000_000_000_000_000),
+        ] {
+            let range = FieldSize::new(s0, s0 + size);
+            let jp = join_params_for(b, &range).expect("a join field");
+            let fs = FieldSetup::new(b, s0, s0 + size, jp).expect("field setup");
+            let limbs = crate::gpu_config::n_limbs(b).expect("a base range");
+            let mut rng = SplitMix(u64::from(b) * 0x51ED_2701);
+            let mut iv = Vec::new();
+            for _ in 0..per {
+                let (p0, _) = fs.tlay[rng.below(fs.tlay.len() as u128) as usize];
+                let p = p0 * fs.nparts + rng.below(fs.nparts);
+                if p < fs.plo || p > fs.phi {
+                    continue;
+                }
+                let lo = p * fs.w;
+                iv.push((lo.max(fs.s), (lo + fs.w - 1).min(fs.e - 1)));
+            }
+            check_cert_group(client, &fs.base, limbs, jp.k, &iv, &mut tally);
+        }
+        for b in [10u32, 12, 20, 30, 40, 47, 50, 57] {
+            let mut rng = SplitMix(u64::from(b) * 0x2545_F491);
+            for _ in 0..4 {
+                // n of about `half` + 1 digits, any cap below 6, widths up
+                // to 2^40 or n's own: the intervals whose powers keep their
+                // digit counts and share the first one's.
+                let mut half = 2 + u32::try_from(rng.below(14)).unwrap();
+                let cap = u32::try_from(rng.below(6)).unwrap();
+                // `Base` takes n below 2^85.
+                while 4 * u128::from(b).pow(half) >= 1 << 85 {
+                    half -= 1;
+                }
+                let start = u128::from(b).pow(half);
+                let bits = 128 - start.leading_zeros();
+                let mut iv = Vec::new();
+                let mut shape: Option<(Base, u32)> = None;
+                for _ in 0..per / 16 {
+                    let a = start + rng.below(start * 3);
+                    let shift = rng.below(u128::from(bits.min(40)));
+                    let e = a + rng.below(1 << shift);
+                    let Some(base) = Base::try_new(b, a, e) else {
+                        continue;
+                    };
+                    // The fewest words that hold e and the power table.
+                    let words = (128 - e.leading_zeros()).div_ceil(32).max(1);
+                    let top: Vec<u32> = base
+                        .poww_words(base.s3)
+                        .iter()
+                        .flat_map(|&w| [w as u32, (w >> 32) as u32])
+                        .collect();
+                    let limbs =
+                        (words..=3).find(|&l| top.iter().skip(3 * l as usize).all(|&x| x == 0));
+                    let Some(limbs) = limbs else { continue };
+                    match &shape {
+                        None => shape = Some((base, limbs)),
+                        Some((s, l)) if (s.s2, s.s3, *l) != (base.s2, base.s3, limbs) => continue,
+                        Some(_) => {}
+                    }
+                    iv.push((a, e));
+                }
+                if let Some((base, limbs)) = shape {
+                    check_cert_group(client, &base, limbs, cap, &iv, &mut tally);
+                }
+            }
+        }
+        println!(
+            "{name}: {} intervals, {} kept; {} of the powers scanned above c0, {} of them \
+             with the carry",
+            tally.intervals, tally.kept, tally.scanned, tally.carried
+        );
+        assert!(
+            tally.kept > per && tally.carried > per,
+            "the kept case or the carry is barely tested"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn top_certificates_match_the_lockstep_scan_and_the_cpu() {
+        let (client, name) = client();
+        check_certificates(&client, &name);
+    }
+
+    /// The same on `CubeCL`'s CUDA runtime.
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_top_certificates_match_the_lockstep_scan_and_the_cpu() {
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        let name = ctx.device_name();
+        let CubeclContext::Cuda { client, .. } = ctx else {
+            unreachable!("new_cuda is CUDA")
+        };
+        check_certificates(&client, &name);
     }
 }
