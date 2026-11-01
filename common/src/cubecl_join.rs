@@ -19,12 +19,14 @@
 //!    output digits are distinct and new.
 //! 3. [`join_kernel`]: one cube per bucket; the bucket's tops in shared
 //!    memory, `ept` entries per thread in registers, a branch-free AND over
-//!    32 tops at a time, survivors staged in shared memory. As a stage is
-//!    flushed the whole cube applies the middle-digit prefilter
-//!    (`mid_pass`): digits `0..k+2` of `n²` and `n³` from `n`'s low `k + 2`
-//!    digits must be distinct, and disjoint from the top certificate when it
-//!    provably sits above them. It keeps about 6% at bases 57-64, and only
-//!    those are written out. (Dan's design ran the prefilter as a separate
+//!    32 tops at a time. Each pair that passes it goes through the
+//!    middle-digit prefilter as the walk over the AND's bits reaches it:
+//!    digits `k..k2` of `n²` and `n³` must be distinct, new, and disjoint
+//!    from the top certificate when it provably sits above them. It is
+//!    affine in the top's digits there (as on the CPU, `cpu_join`), so the
+//!    entry's part is formed once per wave and the top's once per chunk. It
+//!    keeps about 6% at bases 57-64, and only those are staged in shared
+//!    memory and written out. (Dan's design ran the prefilter as a separate
 //!    pass over a full survivor list, which was never small.)
 //! 4. [`check_kernel`]: the client's own `candidate_check`.
 //!
@@ -65,7 +67,8 @@ const _: () = assert!(NICEONLY_STRIDE as usize * 4 == NICE_RECORD_BYTES);
 pub const JOIN_WG: u32 = 256;
 /// Tops held in shared memory per pass over a bucket's entries.
 pub const TOP_CAP: u32 = 256;
-/// Survivors staged in shared memory before a flush to the global list.
+/// Prefilter survivors staged in shared memory before a flush to the global
+/// list.
 pub const SURV_SH_CAP: u32 = 1024;
 /// Staged-survivor level that triggers a flush at the next barrier.
 pub const SURV_FLUSH: u32 = 512;
@@ -137,7 +140,7 @@ mod kernels {
 
     /// Step 1+ (v3): extension fused with bucketization. One cube per
     /// (class c, slot): its bpre segment is extended by the slot's partition
-    /// digits (the extended entries are written to `ext_m`/`ext_pk`, where the
+    /// digits (the extended entries are written to `ext_m`/`ext_q`, where the
     /// join kernel reads them), and each surviving entry's two
     /// key-position digits are stepped through every key value d incrementally
     /// (+s2, +s3 mod b); the entry's index goes onto the (slot, d, c) list for
@@ -146,6 +149,18 @@ mod kernels {
     /// top's mask contains: an entry that meets it would fail every AND.
     /// List layout per slot:
     /// `slot*b*nbp + b*seg[c] + d*len(c) + i`; counts at `(slot*b + d)*m1 + c`.
+    ///
+    /// The digit columns run to `k2`, past the entry's `k` digits, for the
+    /// prefilter's terms in `ext_q` (two words per entry; see
+    /// [`join_kernel`]). With `mid = k2 - k`, `M = b^(mid + 1)` (at most
+    /// `64^3 = 2^18`) and `R'` the entry with key digit 0:
+    /// - key level: `⌊R'²/b^(k-1)⌋ mod M | c3 << 18` and
+    ///   `⌊R'³/b^(k-1)⌋ mod M | (c3 >> 14) << 18`, `c3 = 3R'² mod M`: the
+    ///   key digit's output digits and the prefilter's carries for every key
+    ///   digit (`cpu_join`'s `Ext`);
+    /// - otherwise (`R'` is the whole entry R): `⌊R²/b^k⌋ | ⌊R³/b^k⌋ << 16`
+    ///   and `2R | 3R² << 16`, each mod `b^mid` (with `R mod b^mid` for `2R`
+    ///   when `k < mid`).
     #[cube(launch_unchecked)]
     pub fn bucket_kernel(
         bp_r: &Array<u32>,
@@ -153,7 +168,7 @@ mod kernels {
         seg: &Array<u32>,
         vs: &Array<u32>,
         ext_m: &mut Array<u32>,
-        ext_pk: &mut Array<u32>,
+        ext_q: &mut Array<u32>,
         lists: &mut Array<u32>,
         counts: &mut Array<u32>,
         ran: &mut Array<Atomic<u32>>,
@@ -164,10 +179,14 @@ mod kernels {
         #[comptime] f0: u32,
         #[comptime] pp: u32,
         #[comptime] k: u32,
+        #[comptime] k2: u32,
         #[comptime] key_level: bool,
         #[comptime] key_at_zero: bool,
     ) {
         let m1 = comptime!(base - 1);
+        let mid = comptime!(k2 - k);
+        let bm = comptime!(base.pow(k2 - k));
+        let big_m = comptime!(base.pow(k2 - k + 1));
         let fc = (u64::cast_from(fc_hi) << 32u64) | u64::cast_from(fc_lo);
         let nkeys = comptime!(if key_level { base } else { 1 });
         let s_cnt = SharedMemory::<Atomic<u32>>::new(64usize);
@@ -187,7 +206,7 @@ mod kernels {
             let r0 = bp_r[i as usize];
             let mut m = (u64::cast_from(bp_m[(2u32 * i + 1u32) as usize]) << 32u64)
                 | u64::cast_from(bp_m[(2u32 * i) as usize]);
-            let mut d = Array::<u32>::new(k as usize);
+            let mut d = Array::<u32>::new(k2 as usize);
             let mut x = r0;
             #[unroll]
             for j in 0..f0 {
@@ -201,13 +220,13 @@ mod kernels {
                 y /= base;
             }
             #[unroll]
-            for j in comptime!(f0 + pp)..k {
+            for j in comptime!(f0 + pp)..k2 {
                 d[j as usize] = 0u32;
             }
-            let mut sq = Array::<u32>::new(k as usize);
+            let mut sq = Array::<u32>::new(k2 as usize);
             let mut carry = 0u32;
             #[unroll]
-            for pos in 0..k {
+            for pos in 0..k2 {
                 let mut col = carry;
                 #[unroll]
                 for i2 in 0..comptime!(pos + 1) {
@@ -216,10 +235,10 @@ mod kernels {
                 sq[pos as usize] = col % base;
                 carry = col / base;
             }
-            let mut cu = Array::<u32>::new(k as usize);
+            let mut cu = Array::<u32>::new(k2 as usize);
             carry = 0u32;
             #[unroll]
-            for pos in 0..k {
+            for pos in 0..k2 {
                 let mut col = carry;
                 #[unroll]
                 for i2 in 0..comptime!(pos + 1) {
@@ -249,12 +268,53 @@ mod kernels {
             ext_m[(2u32 * idx) as usize] = u32::cast_from(m);
             ext_m[(2u32 * idx + 1u32) as usize] = u32::cast_from(m >> 32u64);
             if key_level {
+                // Digits k-1..k2 of R'^2 and R'^3 as numbers, and R'^2 mod M
+                // from its low digits (k2 >= mid + 1 of them).
+                let mut q2 = 0u32;
+                let mut q3 = 0u32;
+                #[unroll]
+                for jj in 0..comptime!(mid + 1) {
+                    let j = comptime!(k2 - 1 - jj);
+                    q2 = q2 * base + sq[j as usize];
+                    q3 = q3 * base + cu[j as usize];
+                }
+                let mut lo2 = 0u32;
+                #[unroll]
+                for jj in 0..comptime!(mid + 1) {
+                    lo2 = lo2 * base + sq[comptime!(mid - jj) as usize];
+                }
+                let c3 = (3u32 * lo2) % big_m;
+                ext_q[(2u32 * idx) as usize] = q2 | ((c3 & 0x3FFFu32) << 18u32);
+                ext_q[(2u32 * idx + 1u32) as usize] = q3 | ((c3 >> 14u32) << 18u32);
+            } else {
+                // Digits k..k2 of R^2 and R^3 as numbers, and R mod b^mid.
+                let mut a2 = 0u32;
+                let mut a3 = 0u32;
+                #[unroll]
+                for jj in 0..mid {
+                    let j = comptime!(k2 - 1 - jj);
+                    a2 = a2 * base + sq[j as usize];
+                    a3 = a3 * base + cu[j as usize];
+                }
+                let mut rho = 0u32;
+                #[unroll]
+                for jj in 0..mid {
+                    rho = rho * base + d[comptime!(mid - 1 - jj) as usize];
+                }
+                let p3 = (3u32 * ((rho * rho) % bm)) % bm;
+                let mut p2 = (2u32 * rho) % bm;
+                if comptime!(k < mid) {
+                    p2 = rho;
+                }
+                ext_q[(2u32 * idx) as usize] = a2 | (a3 << 16u32);
+                ext_q[(2u32 * idx + 1u32) as usize] = p2 | (p3 << 16u32);
+            }
+            if key_level {
                 let u2 = sq[comptime!(k - 1) as usize];
                 let u3 = cu[comptime!(k - 1) as usize];
                 let d0 = d[0];
                 let s2 = (2u32 * d0) % base;
                 let s3 = (3u32 * ((d0 * d0) % base)) % base;
-                ext_pk[idx as usize] = u2 | (u3 << 8u32) | (s2 << 16u32) | (s3 << 24u32);
                 if ok {
                     // Key digit dk: (u2 + dk s2, u3 + dk s3) mod b, stepped.
                     let mut g2 = u2;
@@ -301,13 +361,30 @@ mod kernels {
 
     /// Step 2 (v3): one cube per work item over the dense (slot, d, c) list
     /// built by [`bucket_kernel`]; `ept` entries per thread per wave, every
-    /// thread runs every wave (uniform), survivors staged and flushed through
-    /// the prefilter whenever the stage is half full, checked after every 32
-    /// tops.
+    /// thread runs every wave (uniform). A branch-free AND over 32 tops at a
+    /// time gives each entry a bitmask of the tops it passes, and each lane
+    /// walks its set bits. A pair inside the top's range is a join survivor
+    /// (counted in `and_count`) and goes through the middle-digit prefilter
+    /// there and then ([`walk_pf`]); only the pairs that pass it, about 6% at
+    /// bases 57-64, are staged in shared memory, and the stage goes to the
+    /// list once it is half full, checked after every 32 tops.
+    ///
+    /// The prefilter tests n's output digits at positions `k..k2` (`mid =
+    /// k2 - k` of them). With `n = R + D·b^k` (`R` the entry's `k` digits,
+    /// `D` the top's next `mid`), they are the digits of
+    /// `(⌊R²/b^k⌋ + 2R·D) mod b^mid` and `(⌊R³/b^k⌋ + 3R²·D) mod b^mid`, as
+    /// in `cpu_join`'s prefilter (plus terms in `b^k` that vanish unless
+    /// `k < mid`, which only small test shapes have). So the work splits by
+    /// what it depends on: the wave load forms each entry's part once per
+    /// 256 tops (`ac`: the two carries; `pc`: `2R | 3R² << 16`), the top
+    /// chunk load the top's (`t_dm`: `D | seed << 16`), and a pair costs two
+    /// multiply-adds mod `b^mid` and the digit tests, about 50 instructions.
+    /// Rebuilding all `k2` digit columns of n² and n³ for every pair instead,
+    /// as this kernel used to when it flushed the stage, was about 290.
     #[cube(launch_unchecked)]
     pub fn join_kernel(
         ext_m: &Array<u32>,
-        ext_pk: &Array<u32>,
+        ext_q: &Array<u32>,
         bp_r: &Array<u32>,
         seg: &Array<u32>,
         lists: &Array<u32>,
@@ -319,32 +396,59 @@ mod kernels {
         surv: &mut Array<u32>,
         surv_count: &mut Array<Atomic<u32>>,
         top_x: &Array<u32>,
-        staged: &mut Array<Atomic<u32>>,
+        and_count: &mut Array<Atomic<u32>>,
         ran: &mut Array<Atomic<u32>>,
         nwork: u32,
         nbp: u32,
         surv_cap: u32,
         #[comptime] base: u32,
         #[comptime] key_level: bool,
-        #[comptime] key_at_zero: bool,
         #[comptime] ept: u32,
         #[comptime] f0: u32,
+        #[comptime] k: u32,
         #[comptime] k2: u32,
         #[comptime] walk_sync: bool,
     ) {
         let m1 = comptime!(base - 1);
         let nkeys = comptime!(if key_level { base } else { 1 });
         let wave = comptime!(ept * JOIN_WG);
-        let mut plane_tot = SharedMemory::<u32>::new(comptime!(JOIN_WG as usize));
+        let mid = comptime!(k2 - k);
+        let bm = comptime!(base.pow(k2 - k));
+        // M = b^(mid + 1): the key digit's output digit and the carries above.
+        let big_m = comptime!(base.pow(k2 - k + 1));
+        // n's digits k..k2 from the top's P mod b^(k2 - f0).
+        let dm_div = comptime!(base.pow(k - f0));
+        // b^(k-1) and b^(2(k-1)) mod M, and b^(k-1) mod b^mid: the key digit's
+        // terms beyond the affine ones (`cpu_join`'s e1, e2 and kb). All zero
+        // at k >= mid + 2, the production shape's k = 6 among them.
+        let e1 = comptime!(if k < mid + 2 { base.pow(k - 1) } else { 0 });
+        let e2 = comptime!(if 2 * k < mid + 3 {
+            base.pow(2 * k - 2)
+        } else {
+            0
+        });
+        let kb = comptime!(if k <= mid { base.pow(k - 1) } else { 0 });
+        // R' mod M (R' the entry with key digit 0, so R = R' + d·b^(k-1)) is
+        // r0 mod M when the bottom list's f0 digits reach M (the production
+        // shape: f0 = 3 = mid + 1); otherwise it takes the slot's partition
+        // digits below M too, which every top's P mod b^(k2 - f0) begins with.
+        let v_digits = comptime!(if key_level && f0 <= mid {
+            (k - 1 - f0).min(mid + 1 - f0)
+        } else {
+            0
+        });
         let mut t_lo = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_hi = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_rlo = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_rhi = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_id = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
+        let mut t_dm = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut s_t = SharedMemory::<u32>::new(comptime!(SURV_SH_CAP as usize));
         let mut s_r = SharedMemory::<u32>::new(comptime!(SURV_SH_CAP as usize));
         let mut s_cnt = SharedMemory::<Atomic<u32>>::new(1usize);
         let mut s_base = SharedMemory::<u32>::new(1usize);
+        // This thread's join survivors (pairs that pass the AND in range).
+        let mut nand = 0u32;
 
         if UNIT_POS_X == 0u32 {
             s_cnt[0].store(0u32);
@@ -364,6 +468,14 @@ mod kernels {
             let ne = counts[((slot * nkeys + dkey) * m1 + cls) as usize];
             let lbase = slot * base * nbp + base * cs + dkey * clen;
             let ebase = slot * nbp;
+            let mut v_part = 0u32;
+            if comptime!(v_digits > 0) {
+                if ts < te {
+                    let t0 = tl[ts as usize];
+                    v_part = (top_x[(2u32 * t0) as usize] % comptime!(base.pow(v_digits)))
+                        * comptime!(base.pow(f0));
+                }
+            }
 
             let mut tc = ts;
             while tc < te {
@@ -378,6 +490,9 @@ mod kernels {
                     t_rlo[UNIT_POS_X as usize] = top_r[(2u32 * t) as usize];
                     t_rhi[UNIT_POS_X as usize] = top_r[(2u32 * t + 1u32) as usize];
                     t_id[UNIT_POS_X as usize] = t;
+                    // D (below b^mid <= 2^12) and the seed flag.
+                    t_dm[UNIT_POS_X as usize] = (top_x[(2u32 * t) as usize] / dm_div)
+                        | (top_x[(2u32 * t + 1u32) as usize] << 16u32);
                 }
                 sync_cube();
 
@@ -389,6 +504,9 @@ mod kernels {
                     // Per-slot validity: an empty slot must never pass, whatever
                     // the top's mask (a top may certify nothing at small t).
                     let mut vv = Array::<u32>::new(ept as usize);
+                    // The entry's part of the prefilter (see above).
+                    let mut ac = Array::<u32>::new(ept as usize);
+                    let mut pc = Array::<u32>::new(ept as usize);
                     #[unroll]
                     for j in 0..ept {
                         let sl = ws + UNIT_POS_X + comptime!(j * JOIN_WG);
@@ -396,28 +514,68 @@ mod kernels {
                         mhi[j as usize] = 0xFFFF_FFFFu32;
                         rr[j as usize] = 0u32;
                         vv[j as usize] = 0u32;
+                        ac[j as usize] = 0u32;
+                        pc[j as usize] = 0u32;
                         if sl < ne {
                             vv[j as usize] = 0xFFFF_FFFFu32;
                             let e = lists[(lbase + sl) as usize];
                             let gi = ebase + e;
+                            let r0 = bp_r[e as usize];
                             let mut m = (u64::cast_from(ext_m[(2u32 * gi + 1u32) as usize])
                                 << 32u64)
                                 | u64::cast_from(ext_m[(2u32 * gi) as usize]);
+                            let q0 = ext_q[(2u32 * gi) as usize];
+                            let q1 = ext_q[(2u32 * gi + 1u32) as usize];
                             if key_level {
-                                let pk = ext_pk[gi as usize];
-                                let mut g2 =
-                                    ((pk & 255u32) + dkey * ((pk >> 16u32) & 255u32)) % base;
-                                let mut g3 =
-                                    (((pk >> 8u32) & 255u32) + dkey * (pk >> 24u32)) % base;
-                                if key_at_zero {
-                                    g2 = (dkey * dkey) % base;
-                                    g3 = (g2 * dkey) % base;
+                                // t2, t3 = ⌊R²/b^(k-1)⌋, ⌊R³/b^(k-1)⌋ mod M for
+                                // this key digit: q + d·c (+ d²·e1, ...) from
+                                // the bucket kernel's terms at d = 0 (`cpu_join`'s
+                                // `advance`). The low digit is the key digit's
+                                // output digit, the two above the carries.
+                                let mut sigma = r0;
+                                if comptime!(v_digits > 0) {
+                                    sigma += v_part;
                                 }
+                                if comptime!(f0 > mid + 1) {
+                                    sigma = r0 % big_m;
+                                }
+                                let c3 = (q0 >> 18u32) | ((q1 >> 18u32) << 14u32);
+                                let mut t2 = (q0 & 0x3FFFFu32) + dkey * (2u32 * sigma);
+                                let mut t3 = (q1 & 0x3FFFFu32) + dkey * c3;
+                                if comptime!(e1 != 0) {
+                                    let dd = dkey * dkey;
+                                    t2 += (dd % comptime!(big_m / e1.max(1))) * e1;
+                                    let c3b = ((3u32 * sigma) % comptime!(big_m / e1.max(1))) * e1;
+                                    t3 += (dd * c3b) % big_m;
+                                    if comptime!(e2 != 0) {
+                                        t3 += ((dd * dkey) % comptime!(big_m / e2.max(1))) * e2;
+                                    }
+                                }
+                                t2 %= big_m;
+                                t3 %= big_m;
+                                let g2 = t2 % base;
+                                let g3 = t3 % base;
                                 m |= (1u64 << u64::cast_from(g2)) | (1u64 << u64::cast_from(g3));
+                                ac[j as usize] = (t2 / base) | ((t3 / base) << 16u32);
+                                // 2R and 3R² mod b^mid (R mod b^mid itself
+                                // when k < mid).
+                                let mut rho = sigma % bm;
+                                if comptime!(kb != 0) {
+                                    rho = (rho + dkey * kb) % bm;
+                                }
+                                let p3 = (3u32 * ((rho * rho) % bm)) % bm;
+                                let mut p2 = (2u32 * rho) % bm;
+                                if comptime!(k < mid) {
+                                    p2 = rho;
+                                }
+                                pc[j as usize] = p2 | (p3 << 16u32);
+                            } else {
+                                ac[j as usize] = q0;
+                                pc[j as usize] = q1;
                             }
                             mlo[j as usize] = u32::cast_from(m);
                             mhi[j as usize] = u32::cast_from(m >> 32u64);
-                            rr[j as usize] = bp_r[e as usize];
+                            rr[j as usize] = r0;
                         }
                     }
                     // Branch-free AND over a chunk of up to 32 tops into a pass
@@ -467,15 +625,29 @@ mod kernels {
                                     let jt2 = jc + x.trailing_zeros();
                                     x &= x - 1u32;
                                     if r0 >= t_rlo[jt2 as usize] && r0 < t_rhi[jt2 as usize] {
-                                        let at = s_cnt[0].fetch_add(1u32);
-                                        if at < SURV_SH_CAP {
-                                            s_t[at as usize] = t_id[jt2 as usize];
-                                            s_r[at as usize] = r0;
-                                        } else {
-                                            let g = surv_count[0].fetch_add(1u32);
-                                            if g < surv_cap {
-                                                surv[(2u32 * g) as usize] = t_id[jt2 as usize];
-                                                surv[(2u32 * g + 1u32) as usize] = r0;
+                                        nand += 1u32;
+                                        if walk_pf(
+                                            ac[j as usize],
+                                            pc[j as usize],
+                                            t_dm[jt2 as usize],
+                                            mlo[j as usize],
+                                            mhi[j as usize],
+                                            t_lo[jt2 as usize],
+                                            t_hi[jt2 as usize],
+                                            base,
+                                            k,
+                                            k2,
+                                        ) {
+                                            let at = s_cnt[0].fetch_add(1u32);
+                                            if at < SURV_SH_CAP {
+                                                s_t[at as usize] = t_id[jt2 as usize];
+                                                s_r[at as usize] = r0;
+                                            } else {
+                                                let g = surv_count[0].fetch_add(1u32);
+                                                if g < surv_cap {
+                                                    surv[(2u32 * g) as usize] = t_id[jt2 as usize];
+                                                    surv[(2u32 * g + 1u32) as usize] = r0;
+                                                }
                                             }
                                         }
                                     }
@@ -485,28 +657,23 @@ mod kernels {
                                 }
                             }
                         }
-                        // Flush the stage once it is half full, after every
-                        // chunk of 32 tops. Once a wave pairs its 1,024
-                        // entries with a full 256 tops (buckets that dense
-                        // come with fields of about 1e15 and up), checking
-                        // only at the wave's end let the stage overrun, and
-                        // its overflow went to the list unfiltered: 11x the
-                        // full checks on a base-58 field of 1e15, and lists
-                        // that overflowed. A chunk can still overrun the
-                        // half left (about 2e-5 of the survivors there, and
-                        // no more on larger fields, since a chunk is the same
-                        // size); that overflow takes the same unfiltered
-                        // path, which costs only its full checks.
+                        // Write the stage out once it is half full, after
+                        // every chunk of 32 tops. A chunk that adds more than
+                        // the half left (it can add up to 32 x 512 pairs, and
+                        // adds about 40 on the densest production fields)
+                        // writes its overflow to the list directly, above:
+                        // those pairs passed the prefilter too, so the list
+                        // holds the same entries either way.
                         //
                         // Every thread reads the count before any appends the
                         // next chunk's survivors (the second barrier): a plane
                         // that read it after a faster plane's appends could
                         // decide alone to flush, and from then on the cube's
                         // barriers would pair up at different call sites. The
-                        // lone plane's flush sums plane totals and writes at a
-                        // list offset no one reserved for it, which costs full
-                        // checks of stale list entries and can overwrite ones
-                        // another flush reserved.
+                        // lone plane's flush writes at a list offset no one
+                        // reserved for it, which costs full checks of stale
+                        // list entries and can overwrite ones another flush
+                        // reserved.
                         sync_cube();
                         let sc = s_cnt[0].load();
                         sync_cube();
@@ -516,17 +683,10 @@ mod kernels {
                                 &s_r,
                                 &mut s_cnt,
                                 &mut s_base,
-                                &mut plane_tot,
-                                top_m,
-                                top_x,
                                 surv,
                                 surv_count,
-                                staged,
                                 surv_cap,
                                 sc,
-                                base,
-                                f0,
-                                k2,
                             );
                             sync_cube();
                         }
@@ -547,18 +707,16 @@ mod kernels {
                 &s_r,
                 &mut s_cnt,
                 &mut s_base,
-                &mut plane_tot,
-                top_m,
-                top_x,
                 surv,
                 surv_count,
-                staged,
                 surv_cap,
                 sc,
-                base,
-                f0,
-                k2,
             );
+        }
+        // One atomic per plane for the join survivors.
+        let planes_and = plane_sum(nand);
+        if UNIT_POS_PLANE == 0u32 {
+            and_count[0].fetch_add(planes_and);
         }
         cube_done(ran, 4u32);
     }
@@ -1124,76 +1282,75 @@ mod kernels {
         cube_done(ran, 2u32);
     }
 
-    /// The middle-digit test for one survivor `(top t, r0)`: digits `0..k2` of
-    /// n² and n³ from n's low `k2` digits (`r0` and the top's `P mod b^(k2-f0)`)
-    /// must be distinct, and disjoint from the top's certificate when its seed
-    /// flag says every certified position is `>= k2`.
+    /// The middle-digit prefilter of one join survivor, in [`join_kernel`]'s
+    /// walk: n's output digits at positions `k..k2` of n² and n³ must be
+    /// distinct, and miss the bottom's (`mlo | mhi << 32`, positions `0..k`,
+    /// distinct by construction) and the top's certificate (`tlo | thi <<
+    /// 32`) when its seed flag says every certified position is `>= k2`.
+    /// `ac` = `⌊R²/b^k⌋ | ⌊R³/b^k⌋ << 16` and `pc` = `2R | 3R² << 16` (each
+    /// mod `b^mid`; `R mod b^mid` for `2R` when `k < mid`) are the entry's,
+    /// `dmv` = `D | seed << 16` the top's. The same test as
+    /// `cpu_join::CpuJoin::prefilter`, which has the derivation.
+    ///
+    /// Every division here divides a sum or a remainder, never a bare
+    /// half-width shift (see [`cert_power`] for why that matters).
     #[cube]
-    fn mid_pass(
-        t: u32,
-        r0: u32,
-        top_m: &Array<u32>,
-        top_x: &Array<u32>,
+    fn walk_pf(
+        ac: u32,
+        pc: u32,
+        dmv: u32,
+        mlo: u32,
+        mhi: u32,
+        tlo: u32,
+        thi: u32,
         #[comptime] base: u32,
-        #[comptime] f0: u32,
+        #[comptime] k: u32,
         #[comptime] k2: u32,
     ) -> bool {
-        let pm = top_x[(2u32 * t) as usize];
-        let mut m = 0u64;
-        if top_x[(2u32 * t + 1u32) as usize] != 0u32 {
-            m = (u64::cast_from(top_m[(2u32 * t + 1u32) as usize]) << 32u64)
-                | u64::cast_from(top_m[(2u32 * t) as usize]);
+        let bm = comptime!(base.pow(k2 - k));
+        // b^k and b^2k mod b^mid: zero unless k < mid.
+        let bk = comptime!(if k < k2 - k { base.pow(k) } else { 0 });
+        let b2k = comptime!(if 2 * k < k2 - k { base.pow(2 * k) } else { 0 });
+        let dm = dmv & 0xFFFFu32;
+        let mut seen = (u64::cast_from(mhi) << 32u64) | u64::cast_from(mlo);
+        if (dmv >> 16u32) != 0u32 {
+            seen |= (u64::cast_from(thi) << 32u64) | u64::cast_from(tlo);
         }
-        let mut d = Array::<u32>::new(k2 as usize);
-        let mut x = r0;
-        #[unroll]
-        for j in 0..f0 {
-            d[j as usize] = x % base;
-            x /= base;
+        let mut x2 = (ac & 0xFFFFu32) + (pc & 0xFFFFu32) * dm;
+        let mut x3 = (ac >> 16u32) + (pc >> 16u32) * dm;
+        if comptime!(bk != 0) {
+            // pc's low half is R mod b^mid here, so x2 holds R·D of 2R·D.
+            // The rest: R·D, D²·b^k; 3R·D²·b^k and D³·b^2k (`prefilter_any`).
+            let rho = pc & 0xFFFFu32;
+            let d2 = (dm * dm) % bm;
+            x2 += rho * dm + d2 * bk;
+            x3 += ((3u32 * rho * d2) % bm) * bk + ((d2 * dm) % bm) * b2k;
         }
-        let mut y = pm;
-        #[unroll]
-        for j in f0..k2 {
-            d[j as usize] = y % base;
-            y /= base;
-        }
-        let mut sq = Array::<u32>::new(k2 as usize);
-        let mut carry = 0u32;
-        #[unroll]
-        for pos in 0..k2 {
-            let mut col = carry;
-            #[unroll]
-            for i2 in 0..comptime!(pos + 1) {
-                col += d[i2 as usize] * d[comptime!(pos - i2) as usize];
-            }
-            sq[pos as usize] = col % base;
-            carry = col / base;
-        }
+        x2 %= bm;
+        x3 %= bm;
         let mut ok = true;
-        carry = 0u32;
-        #[unroll]
-        for pos in 0..k2 {
-            let mut col = carry;
-            #[unroll]
-            for i2 in 0..comptime!(pos + 1) {
-                col += sq[i2 as usize] * d[comptime!(pos - i2) as usize];
-            }
-            let g3 = col % base;
-            carry = col / base;
-            let g2 = sq[pos as usize];
-            let bb = (1u64 << u64::cast_from(g2)) | (1u64 << u64::cast_from(g3));
-            if g2 == g3 || (m & bb) != 0u64 {
+        if comptime!(k2 - k == 2) {
+            let g2 = x2 % base;
+            let g3 = x3 % base;
+            let h2 = x2 / base;
+            let h3 = x3 / base;
+            let at_k = (1u64 << u64::cast_from(g2)) | (1u64 << u64::cast_from(g3));
+            let at_k1 = (1u64 << u64::cast_from(h2)) | (1u64 << u64::cast_from(h3));
+            if g2 == g3 || h2 == h3 || (seen & at_k) != 0u64 || ((seen | at_k) & at_k1) != 0u64 {
                 ok = false;
             }
-            m |= bb;
+        } else {
+            let at_k = (1u64 << u64::cast_from(x2)) | (1u64 << u64::cast_from(x3));
+            if x2 == x3 || (seen & at_k) != 0u64 {
+                ok = false;
+            }
         }
         ok
     }
 
-    /// Flush the shared survivor stage through the middle-digit prefilter:
-    /// the whole cube tests the staged survivors and only those that pass go
-    /// to `out`, compacted per plane with one atomic per round. `staged`
-    /// counts every survivor staged (statistics). Must be called by the whole
+    /// Write the shared survivor stage to the list. Every staged pair passed
+    /// the prefilter in the walk, so one atomic reserves the stage's place
+    /// in `out` and the cube copies it there. Must be called by the whole
     /// cube at a point where no thread is still appending (after a barrier);
     /// `sc` is the stage count read after that barrier.
     #[cube]
@@ -1202,69 +1359,28 @@ mod kernels {
         s_r: &SharedMemory<u32>,
         s_cnt: &mut SharedMemory<Atomic<u32>>,
         s_base: &mut SharedMemory<u32>,
-        plane_tot: &mut SharedMemory<u32>,
-        top_m: &Array<u32>,
-        top_x: &Array<u32>,
         out: &mut Array<u32>,
         out_count: &mut Array<Atomic<u32>>,
-        staged: &mut Array<Atomic<u32>>,
         out_cap: u32,
         sc: u32,
-        #[comptime] base: u32,
-        #[comptime] f0: u32,
-        #[comptime] k2: u32,
     ) {
         let mut n = sc;
         if n > SURV_SH_CAP {
-            n = SURV_SH_CAP; // the rest went straight to `out`, untested
+            n = SURV_SH_CAP; // the rest went to `out` from the walk
         }
         if UNIT_POS_X == 0u32 {
-            staged[0].fetch_add(n);
+            s_base[0] = out_count[0].fetch_add(n);
         }
-        let my_plane = UNIT_POS_X / PLANE_DIM;
-        let num_planes = CUBE_DIM_X / PLANE_DIM;
-        let mut rb = 0u32;
-        while rb < n {
-            let i = rb + UNIT_POS_X;
-            let mut pass = 0u32;
-            let mut t = 0u32;
-            let mut r0 = 0u32;
-            if i < n {
-                t = s_t[i as usize];
-                r0 = s_r[i as usize];
-                if mid_pass(t, r0, top_m, top_x, base, f0, k2) {
-                    pass = 1u32;
-                }
+        sync_cube();
+        let at = s_base[0];
+        let mut i = UNIT_POS_X;
+        while i < n {
+            let g = at + i;
+            if g < out_cap {
+                out[(2u32 * g) as usize] = s_t[i as usize];
+                out[(2u32 * g + 1u32) as usize] = s_r[i as usize];
             }
-            let idx = plane_exclusive_sum(pass);
-            let tot = plane_sum(pass);
-            if UNIT_POS_PLANE == 0u32 {
-                plane_tot[my_plane as usize] = tot;
-            }
-            sync_cube();
-            let mut off = 0u32;
-            let mut all = 0u32;
-            let mut p = 0u32;
-            while p < num_planes {
-                let tp = plane_tot[p as usize];
-                if p < my_plane {
-                    off += tp;
-                }
-                all += tp;
-                p += 1u32;
-            }
-            if UNIT_POS_X == 0u32 && all > 0u32 {
-                s_base[0] = out_count[0].fetch_add(all);
-            }
-            sync_cube();
-            if pass != 0u32 {
-                let g = s_base[0] + off + idx;
-                if g < out_cap {
-                    out[(2u32 * g) as usize] = t;
-                    out[(2u32 * g + 1u32) as usize] = r0;
-                }
-            }
-            rb += CUBE_DIM_X;
+            i += CUBE_DIM_X;
         }
         sync_cube();
         if UNIT_POS_X == 0u32 {
@@ -1394,7 +1510,8 @@ pub(crate) struct JoinDevice<R: Runtime> {
     bp_m: Handle,
     seg: Handle,
     ext_m: Handle,
-    ext_pk: Handle,
+    /// The prefilter's terms per extended entry (see [`bucket_kernel`]).
+    ext_q: Handle,
     lists: Handle,
     counts: Handle,
     nkeys: u32,
@@ -1429,7 +1546,8 @@ pub(crate) struct JoinDevice<R: Runtime> {
 }
 
 /// What a launched batch leaves behind to be read later: its two counts,
-/// the pairs that passed the join's AND and the prefilter's survivors.
+/// the pairs that passed the join's AND (in range) and the prefilter's
+/// survivors.
 pub(crate) struct BatchRec {
     pub survivors: Handle,
     pub checked: Handle,
@@ -1454,6 +1572,14 @@ impl<R: Runtime> JoinDevice<R> {
             chunk_constants_u16(fs.b)
         };
         let nbp = fs.bp_r.len();
+        // The prefilter's terms pack values below M = b^(k2 - k + 1) into
+        // 18 bits (`bucket_kernel`).
+        ensure!(
+            u64::from(fs.b).pow(fs.k2 - fs.jp.k + 1) <= 1 << 18,
+            "base {} with a prefilter depth of {}: its terms exceed 18 bits",
+            fs.b,
+            fs.k2 - fs.jp.k
+        );
         let bp_m_words: Vec<u32> = fs
             .bp_m
             .iter()
@@ -1557,7 +1683,7 @@ impl<R: Runtime> JoinDevice<R> {
             bp_m: client.create(cubecl::bytes::Bytes::from_elems(bp_m_words)),
             seg: client.create(cubecl::bytes::Bytes::from_elems(fs.seg.clone())),
             ext_m: client.empty(max_slots * fp.ext_m),
-            ext_pk: client.empty(max_slots * fp.ext_pk),
+            ext_q: client.empty(max_slots * fp.ext_q),
             lists: client.empty(max_slots * fp.lists),
             counts: client.empty(max_slots * fp.counts),
             nkeys,
@@ -1624,7 +1750,8 @@ impl<R: Runtime> JoinDevice<R> {
         let top_count = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; nslots]));
         let bucket_cnt = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; nslots * nb]));
         // The join kernel counts its survivors and writes only those that
-        // pass the prefilter to the list, which it counts too.
+        // pass the prefilter to the list, which it counts too. Both counts
+        // are exact: every survivor is counted and prefiltered in the walk.
         let survivors = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
         let checked = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
         // Every kernel counts its cubes as they finish, against the cubes
@@ -1725,7 +1852,7 @@ impl<R: Runtime> JoinDevice<R> {
                 ArrayArg::from_raw_parts(self.seg.clone(), self.b as usize),
                 ArrayArg::from_raw_parts(vs_h, nslots),
                 ArrayArg::from_raw_parts(self.ext_m.clone(), 2 * nbp * max_slots),
-                ArrayArg::from_raw_parts(self.ext_pk.clone(), (nbp * max_slots).max(1)),
+                ArrayArg::from_raw_parts(self.ext_q.clone(), 2 * nbp.max(1) * max_slots),
                 ArrayArg::from_raw_parts(self.lists.clone(), nbp * max_slots * self.b as usize),
                 ArrayArg::from_raw_parts(
                     self.counts.clone(),
@@ -1739,6 +1866,7 @@ impl<R: Runtime> JoinDevice<R> {
                 self.f0,
                 self.pp,
                 self.k,
+                self.k2,
                 self.key_level,
                 self.key_level && self.k == 1,
             );
@@ -1747,7 +1875,7 @@ impl<R: Runtime> JoinDevice<R> {
                 CubeCount::Static(join_cubes, 1, 1),
                 CubeDim::new_1d(JOIN_WG),
                 ArrayArg::from_raw_parts(self.ext_m.clone(), 2 * nbp * max_slots),
-                ArrayArg::from_raw_parts(self.ext_pk.clone(), (nbp * max_slots).max(1)),
+                ArrayArg::from_raw_parts(self.ext_q.clone(), 2 * nbp.max(1) * max_slots),
                 ArrayArg::from_raw_parts(self.bp_r.clone(), nbp),
                 ArrayArg::from_raw_parts(self.seg.clone(), self.b as usize),
                 ArrayArg::from_raw_parts(self.lists.clone(), nbp * max_slots * self.b as usize),
@@ -1769,9 +1897,9 @@ impl<R: Runtime> JoinDevice<R> {
                 self.list_cap,
                 self.b,
                 self.key_level,
-                self.key_level && self.k == 1,
                 ENTRIES_PER_THREAD,
                 self.f0,
+                self.k,
                 self.k2,
                 self.walk_sync,
             );
@@ -1949,13 +2077,12 @@ pub(crate) struct JoinFieldStats {
     pub slots: usize,
     pub min_slots: usize,
     pub bytes: usize,
-    /// Pairs that passed the join's AND, and the prefilter's survivors
-    /// (what the full check read). Both depend only on the field and the
-    /// parameters, not on the device or the layout, unless a wave overflows
-    /// the join kernel's shared stage: then the overflow goes to the list
-    /// unprefiltered and uncounted. No production field has done so (the
-    /// counts matched a separate prefilter pass on ten production fields),
-    /// and the full check is exact either way.
+    /// Pairs that passed the join's AND inside their top's range, and of
+    /// those the prefilter's survivors (what the full check read). Both
+    /// depend only on the field and the parameters, not on the device or the
+    /// layout: the join kernel counts and prefilters every pair in its walk,
+    /// before the shared stage, so a chunk that overruns the stage sends the
+    /// list only prefiltered pairs too.
     pub survivors: u64,
     pub checked: u64,
     /// Partitions of batches that overflowed their list and ran again, in a
@@ -2974,12 +3101,11 @@ mod tests {
     }
 
     /// A field with dense buckets (base 58, 1e15), on `NICE_TEST_JOIN_DENSE`
-    /// partitions spread over it: the hits must equal the CPU join's, and
-    /// the survivor counts nearly so. A chunk that overruns the stage's
-    /// headroom still sends its overflow to the list unfiltered (and
-    /// uncounted as a join survivor); with the stage flushed per chunk that
-    /// is about 2e-5 of the survivors here (7.6k of 323M on 32 partitions),
-    /// where flushing per wave sent two thirds (11x the full checks).
+    /// partitions spread over it: the hits and both survivor counts must
+    /// equal the CPU join's. This is the field where the join kernel's
+    /// shared stage overran most (when it held unprefiltered survivors,
+    /// about 2e-5 of them here); a chunk that overruns it now writes only
+    /// prefiltered survivors to the list, so the counts stay exact.
     /// `NICE_TEST_JOIN_DENSE_FIELD=base:start:size` runs another field (of
     /// its first slice) instead.
     #[test]
@@ -3037,24 +3163,10 @@ mod tests {
             st.checked
         );
         assert_eq!(got, want.hits, "hits differ");
-        // Each survivor that overran the stage is missing from the join's
-        // count and went to the list unfiltered: at most one more checked.
-        assert!(
-            st.survivors <= want.survivors,
-            "more join survivors than the CPU join"
-        );
-        let spilled = want.survivors - st.survivors;
-        #[allow(clippy::cast_precision_loss)]
-        let share = spilled as f64 / want.survivors.max(1) as f64;
-        println!("  {spilled} survivors overran the stage ({share:.1e} of them)");
-        assert!(
-            share <= 1e-4,
-            "{spilled} of {} survivors overran the stage",
-            want.survivors
-        );
-        assert!(
-            st.checked >= want.checked && st.checked - want.checked <= spilled,
-            "prefilter survivors differ beyond the overrun"
+        assert_eq!(
+            (st.survivors, st.checked),
+            (want.survivors, want.checked),
+            "join or prefilter survivors differ from the CPU join's"
         );
     }
 
