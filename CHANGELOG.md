@@ -6,6 +6,7 @@
 - Let the `Next` queue's cursor read past longer finished stretches before falling back to a full frontier search ([#238](https://github.com/wasabipesto/nice/pull/238)).
 - Speed up the GPU overlap join by running its middle-digit prefilter on each pair as the join finds it, in the cheaper form the CPU join uses, so that only the few pairs that pass are staged and written out ([#236](https://github.com/wasabipesto/nice/pull/236)).
 - Speed up the GPU overlap join's top certificates by turning only the low endpoint's powers into digits and deciding the high endpoint's from a carry test, as the CPU join does since [#204](https://github.com/wasabipesto/nice/pull/204) ([#235](https://github.com/wasabipesto/nice/pull/235)).
+- Speed up the GPU overlap join's top certificates by skipping the limbs of their long division that are known to be zero, computing the difference of the endpoints' powers from the endpoints' difference, and taking its digit count from its bit length instead of a search ([#237](https://github.com/wasabipesto/nice/pull/237)).
 
 ## Nice v3.4.7
 
