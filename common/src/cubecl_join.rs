@@ -725,39 +725,44 @@ mod kernels {
                 rx = c1 - q1 * chunk_div;
                 x[j as usize] = q1;
             }
-            // The chunk's digits below c0, as a value below B.
-            let mut low = 0u32;
-            #[unroll]
-            for q in 0..chunk_digits {
-                let pos = comptime!(pass * chunk_digits + q);
-                let dx = rx % base;
-                rx /= base;
-                if comptime!(pos < sp) {
-                    if pos >= c0 {
-                        let bit = 1u64 << u64::cast_from(dx);
-                        if (run & bit) != 0u64 {
-                            dup = 1u32;
-                        }
+            // The chunk's digits below c0, as a value below B: the chunk
+            // itself if it lies below c0 (and below sp; the last chunk can
+            // reach past sp, so it always takes the digit path). Otherwise
+            // its digits one at a time, with selects rather than branches:
+            // CubeCL's SPIR-V compiler recurses once per basic block, on a
+            // thread with a 2 MiB stack.
+            let start = comptime!(pass * chunk_digits);
+            let digit_path = comptime!(if start + chunk_digits > sp {
+                u32::MAX
+            } else {
+                start + chunk_digits
+            });
+            let mut low = rx;
+            if c0 < digit_path {
+                low = 0u32;
+                #[unroll]
+                for q in 0..chunk_digits {
+                    let pos = comptime!(start + q);
+                    let dx = rx % base;
+                    rx /= base;
+                    if comptime!(pos < sp) {
+                        let above = c0 <= pos;
+                        let bit = select(above, 1u64 << u64::cast_from(dx), 0u64);
+                        dup |= select((run & bit) != 0u64, 1u32, 0u32);
                         run |= bit;
-                        if in_run {
-                            if dx != comptime!(base - 1) {
-                                in_run = false;
-                                dlo = dx;
-                            }
-                        } else {
-                            if (runc & bit) != 0u64 {
-                                dupc = 1u32;
-                            }
-                            runc |= bit;
-                        }
-                    } else {
-                        low += dx * comptime!(base.pow(q));
+                        // Above the end of x's run of (b - 1)s.
+                        let cbit = select(in_run, 0u64, bit);
+                        dupc |= select((runc & cbit) != 0u64, 1u32, 0u32);
+                        runc |= cbit;
+                        let ends = above && in_run && dx != comptime!(base - 1);
+                        dlo = select(ends, dx, dlo);
+                        in_run = in_run && !ends;
+                        low += select(above, 0u32, dx * comptime!(base.pow(q)));
                     }
                 }
             }
             // rem += low · B^pass. The sum is x mod b^min(c0, start + cd),
             // below B^(pass + 1), and B^pass fits x's limbs (start < sp).
-            let start = comptime!(pass * chunk_digits);
             if start < c0 {
                 let len = comptime!((pow_limbs16(chunk_div, pass).len() as u32).min(nh));
                 let topk = comptime!((pow_limbs16(chunk_div, pass + 1).len() as u32).min(nh));
@@ -3728,10 +3733,14 @@ mod tests {
             out[(o + 5u32) as usize] = c0[0];
         }
 
-        /// Per interval `[a, e]` (`limbs` u32 words each, a then e, in `iv`):
-        /// both powers' certificates by `cert_power` and by
-        /// `cert_power_lockstep`, and `top_cert`'s, written as [`CERT_OUT`]
-        /// says.
+        /// Per interval `[a, e]` (`limbs` u32 words each, a then e, in `iv`),
+        /// one `part` of the output [`CERT_OUT`] describes: 0, both powers'
+        /// certificates by `cert_power`; 1, by `cert_power_lockstep`; 2,
+        /// `top_cert`'s. One part per kernel: `CubeCL`'s SPIR-V compiler
+        /// recurses once per basic block, and one kernel holding all three
+        /// (six power scans) overflowed the 2 MiB stack of the thread that
+        /// compiles it at the 3-word shapes of b47 and b50. A part is about
+        /// the size of a top kernel.
         #[cube(launch_unchecked)]
         pub(super) fn cert_test_kernel(
             iv: &Array<u32>,
@@ -3745,6 +3754,7 @@ mod tests {
             #[comptime] s3: u32,
             #[comptime] chunk_digits: u32,
             #[comptime] chunk_div: u32,
+            #[comptime] part: u32,
         ) {
             let i = ABSOLUTE_POS_X;
             if i < n {
@@ -3759,112 +3769,104 @@ mod tests {
                     a[j as usize] = iv[(2u32 * limbs * i + j) as usize];
                     e[j as usize] = iv[(2u32 * limbs * i + limbs + j) as usize];
                 }
-                let mut a2 = Array::<u32>::new(nh2 as usize);
-                let mut e2 = Array::<u32>::new(nh2 as usize);
-                let mut a3 = Array::<u32>::new(nh3 as usize);
-                let mut e3 = Array::<u32>::new(nh3 as usize);
-                powers16(&a, &e, &mut a2, &mut e2, &mut a3, &mut e3, limbs);
-                let mut x2 = Array::<u32>::new(nh2 as usize);
-                let mut y2 = Array::<u32>::new(nh2 as usize);
-                let mut x3 = Array::<u32>::new(nh3 as usize);
-                let mut y3 = Array::<u32>::new(nh3 as usize);
-                #[unroll]
-                for j in 0..nh2 {
-                    x2[j as usize] = a2[j as usize];
-                    y2[j as usize] = e2[j as usize];
-                }
-                #[unroll]
-                for j in 0..nh3 {
-                    x3[j as usize] = a3[j as usize];
-                    y3[j as usize] = e3[j as usize];
-                }
                 let o = i * CERT_OUT;
-                let mut c0 = Array::<u32>::new(1usize);
-                let mut dup = Array::<u32>::new(1usize);
-                let mut dom = Array::<u32>::new(2usize);
-                let m = cert_power(
-                    &mut a2,
-                    &e2,
-                    pw,
-                    &mut c0,
-                    &mut dup,
-                    &mut dom,
-                    nl2,
-                    nl3,
-                    s2,
-                    cap,
-                    base,
-                    chunk_digits,
-                    chunk_div,
-                );
-                put_power(out, o, m, &c0, &dup, &dom);
-                let m = cert_power(
-                    &mut a3,
-                    &e3,
-                    pw,
-                    &mut c0,
-                    &mut dup,
-                    &mut dom,
-                    nl3,
-                    nl3,
-                    s3,
-                    cap,
-                    base,
-                    chunk_digits,
-                    chunk_div,
-                );
-                put_power(out, o + 6u32, m, &c0, &dup, &dom);
-                let m = cert_power_lockstep(
-                    &mut x2,
-                    &mut y2,
-                    pw,
-                    &mut c0,
-                    &mut dup,
-                    &mut dom,
-                    nl2,
-                    nl3,
-                    s2,
-                    cap,
-                    base,
-                    chunk_digits,
-                    chunk_div,
-                );
-                put_power(out, o + 12u32, m, &c0, &dup, &dom);
-                let m = cert_power_lockstep(
-                    &mut x3,
-                    &mut y3,
-                    pw,
-                    &mut c0,
-                    &mut dup,
-                    &mut dom,
-                    nl3,
-                    nl3,
-                    s3,
-                    cap,
-                    base,
-                    chunk_digits,
-                    chunk_div,
-                );
-                put_power(out, o + 18u32, m, &c0, &dup, &dom);
-                let mut res = Array::<u32>::new(3usize);
-                let mask = top_cert(
-                    &a,
-                    &e,
-                    pw,
-                    &mut res,
-                    base,
-                    limbs,
-                    cap,
-                    s2,
-                    s3,
-                    chunk_digits,
-                    chunk_div,
-                );
-                out[(o + 24u32) as usize] = res[0];
-                out[(o + 25u32) as usize] = u32::cast_from(mask);
-                out[(o + 26u32) as usize] = u32::cast_from(mask >> 32u64);
-                out[(o + 27u32) as usize] = res[1];
-                out[(o + 28u32) as usize] = res[2];
+                if comptime!(part == 2) {
+                    let mut res = Array::<u32>::new(3usize);
+                    let mask = top_cert(
+                        &a,
+                        &e,
+                        pw,
+                        &mut res,
+                        base,
+                        limbs,
+                        cap,
+                        s2,
+                        s3,
+                        chunk_digits,
+                        chunk_div,
+                    );
+                    out[(o + 24u32) as usize] = res[0];
+                    out[(o + 25u32) as usize] = u32::cast_from(mask);
+                    out[(o + 26u32) as usize] = u32::cast_from(mask >> 32u64);
+                    out[(o + 27u32) as usize] = res[1];
+                    out[(o + 28u32) as usize] = res[2];
+                } else {
+                    let mut a2 = Array::<u32>::new(nh2 as usize);
+                    let mut e2 = Array::<u32>::new(nh2 as usize);
+                    let mut a3 = Array::<u32>::new(nh3 as usize);
+                    let mut e3 = Array::<u32>::new(nh3 as usize);
+                    powers16(&a, &e, &mut a2, &mut e2, &mut a3, &mut e3, limbs);
+                    let mut c0 = Array::<u32>::new(1usize);
+                    let mut dup = Array::<u32>::new(1usize);
+                    let mut dom = Array::<u32>::new(2usize);
+                    if comptime!(part == 0) {
+                        let m = cert_power(
+                            &mut a2,
+                            &e2,
+                            pw,
+                            &mut c0,
+                            &mut dup,
+                            &mut dom,
+                            nl2,
+                            nl3,
+                            s2,
+                            cap,
+                            base,
+                            chunk_digits,
+                            chunk_div,
+                        );
+                        put_power(out, o, m, &c0, &dup, &dom);
+                        let m = cert_power(
+                            &mut a3,
+                            &e3,
+                            pw,
+                            &mut c0,
+                            &mut dup,
+                            &mut dom,
+                            nl3,
+                            nl3,
+                            s3,
+                            cap,
+                            base,
+                            chunk_digits,
+                            chunk_div,
+                        );
+                        put_power(out, o + 6u32, m, &c0, &dup, &dom);
+                    } else {
+                        let m = cert_power_lockstep(
+                            &mut a2,
+                            &mut e2,
+                            pw,
+                            &mut c0,
+                            &mut dup,
+                            &mut dom,
+                            nl2,
+                            nl3,
+                            s2,
+                            cap,
+                            base,
+                            chunk_digits,
+                            chunk_div,
+                        );
+                        put_power(out, o + 12u32, m, &c0, &dup, &dom);
+                        let m = cert_power_lockstep(
+                            &mut a3,
+                            &mut e3,
+                            pw,
+                            &mut c0,
+                            &mut dup,
+                            &mut dom,
+                            nl3,
+                            nl3,
+                            s3,
+                            cap,
+                            base,
+                            chunk_digits,
+                            chunk_div,
+                        );
+                        put_power(out, o + 18u32, m, &c0, &dup, &dom);
+                    }
+                }
             }
         }
     }
@@ -3948,23 +3950,26 @@ mod tests {
         let out = client.empty(iv.len() * CERT_OUT as usize * 4);
         let iv_h = client.create(cubecl::bytes::Bytes::from_elems(words.clone()));
         let pw_h = client.create(cubecl::bytes::Bytes::from_elems(pw.clone()));
-        unsafe {
-            cert_test_kernel::launch_unchecked::<R>(
-                client,
-                CubeCount::Static(n.div_ceil(JOIN_WG), 1, 1),
-                CubeDim::new_1d(JOIN_WG),
-                ArrayArg::from_raw_parts(iv_h, words.len()),
-                ArrayArg::from_raw_parts(pw_h, pw.len()),
-                ArrayArg::from_raw_parts(out.clone(), iv.len() * CERT_OUT as usize),
-                n,
-                b,
-                limbs,
-                cap,
-                base.s2,
-                base.s3,
-                cd,
-                cdiv,
-            );
+        for part in 0..3 {
+            unsafe {
+                cert_test_kernel::launch_unchecked::<R>(
+                    client,
+                    CubeCount::Static(n.div_ceil(JOIN_WG), 1, 1),
+                    CubeDim::new_1d(JOIN_WG),
+                    ArrayArg::from_raw_parts(iv_h.clone(), words.len()),
+                    ArrayArg::from_raw_parts(pw_h.clone(), pw.len()),
+                    ArrayArg::from_raw_parts(out.clone(), iv.len() * CERT_OUT as usize),
+                    n,
+                    b,
+                    limbs,
+                    cap,
+                    base.s2,
+                    base.s3,
+                    cd,
+                    cdiv,
+                    part,
+                );
+            }
         }
         let bytes = client.read_one(out).expect("read the certificates");
         let got = u32::from_bytes(&bytes);
