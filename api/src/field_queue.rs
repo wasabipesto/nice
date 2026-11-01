@@ -41,9 +41,15 @@ const NEXT_REFILL_AMOUNT: usize = 100;
 const REFILL_WAIT: Duration = Duration::from_secs(2);
 
 /// Ids past a `Next` queue's cursor that one refill reads at most
-/// (`bulk_claim_next_fields_from`): enough for a batch at the frontier, small
-/// enough that an empty stretch costs a bounded read before the rewind.
-const NEXT_CURSOR_WINDOW: u128 = 100_000;
+/// (`bulk_claim_next_fields_from`) before giving up and rewinding.
+///
+/// The read stops at the batch's last field, so the window only costs anything
+/// across a stretch with nothing claimable, and the frontier has those: earlier
+/// sweeps left finished runs of 150k-350k fields at the low end of base 50's
+/// chunks. At 100k the cursor could not cross one, so each one forced a rewind,
+/// the full frontier search the cursor exists to avoid. A million ids spans a whole
+/// production chunk (711k fields at base 50) and stays a bounded primary-key read.
+const NEXT_CURSOR_WINDOW: u128 = 1_000_000;
 
 /// How often a `Next` queue rewinds to the full frontier search, which also
 /// finds claimable fields below its cursor (claims that expired unsubmitted).
@@ -216,7 +222,7 @@ impl NextCursor {
     /// already is. It never moves back: a rewind mostly returns fields below
     /// the frontier whose claims expired, and starting the next refill there
     /// would read forward through the last hour's live claims (about 100k
-    /// fields at fleet rates), overrun the window and rewind again every time.
+    /// fields at fleet rates) on every refill.
     fn advance_past(&self, fields: &[FieldRecord]) {
         if let Some(id) = fields.iter().map(|f| f.field_id).max() {
             let next = u64::try_from(id + 1).unwrap_or(u64::MAX);
@@ -733,6 +739,68 @@ mod tests {
         assert_eq!(direct.field_id, 2 * NEXT_REFILL_AMOUNT as u128 + 1);
     }
 
+    /// One locked field pins the frontier: it still reads as claimable, so the
+    /// frontier search picks its chunk, skips the row and returns nothing, even
+    /// with claimable chunks behind it. The pool's `statement_timeout` bounds how
+    /// long that lasts by cancelling the statement holding the lock.
+    fn a_statement_timeout_releases_a_pinned_frontier(url: &str) {
+        #[derive(QueryableByName)]
+        struct Setting {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            statement_timeout: String,
+        }
+
+        let pool: PgPool = diesel::r2d2::Pool::builder()
+            .max_size(2)
+            .connection_timeout(Duration::from_secs(3))
+            .connection_customizer(Box::new(nice_common::db_util::StatementTimeout(1)))
+            .build(ConnectionManager::new(url))
+            .expect("build test pool");
+        let mut conn = pool.get().unwrap();
+        reset_fixture(&mut conn);
+        sql_query("UPDATE fields SET check_level = 2 WHERE chunk_id = 1 AND id <> 7")
+            .execute(&mut conn)
+            .expect("finish chunk 1 but one field");
+
+        let setting = sql_query("SHOW statement_timeout")
+            .get_result::<Setting>(&mut conn)
+            .expect("show statement_timeout");
+        assert_eq!(setting.statement_timeout, "1s");
+
+        // A claim statement stalled after taking its row lock.
+        let holder = std::thread::spawn({
+            let pool = pool.clone();
+            move || {
+                sql_query(
+                    "WITH l AS (SELECT id FROM fields WHERE id = 7 FOR NO KEY UPDATE)
+                     SELECT pg_sleep(10) FROM l",
+                )
+                .execute(&mut pool.get().unwrap())
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let pinned = bulk_claim_next_fields(
+            &mut conn,
+            NEXT_REFILL_AMOUNT,
+            FieldQueue::claim_cutoff(),
+            1,
+            DETAILED_SEARCH_MAX_FIELD_SIZE,
+        )
+        .expect("claim while pinned");
+        assert!(pinned.is_empty(), "the locked field pins chunk 1");
+
+        let held = holder.join().unwrap();
+        assert!(
+            held.is_err_and(|e| e.to_string().contains("statement timeout")),
+            "the stalled statement is cancelled"
+        );
+        let queue = FieldQueue::new(pool.clone());
+        let field = queue
+            .claim_detailed_next(&mut conn, 1)
+            .expect("the frontier moves once the lock is gone");
+        assert_eq!(field.field_id, 7);
+    }
+
     #[test]
     fn field_queue_against_postgres() {
         let Ok(url) = std::env::var("NICE_TEST_DATABASE_URL") else {
@@ -746,6 +814,7 @@ mod tests {
         next_queues_serve_the_frontier_in_order(&url);
         queues_drain_and_refill_sequentially(&url);
         next_queue_serves_from_its_cursor(&url);
+        a_statement_timeout_releases_a_pinned_frontier(&url);
     }
 
     fn record(id: u128) -> FieldRecord {
