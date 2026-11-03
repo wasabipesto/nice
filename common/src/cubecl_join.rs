@@ -20,7 +20,9 @@
 //!    output digits are distinct and new.
 //! 3. [`join_kernel`]: one cube per bucket; the bucket's tops in shared
 //!    memory, `ept` entries per thread in registers, a branch-free AND over
-//!    32 tops at a time. Each pair that passes it goes through the
+//!    32 tops at a time, formed from a digit-major copy of the tops' masks
+//!    (one OR per digit of the entry) for large batches of tops. Each pair
+//!    that passes it goes through the
 //!    middle-digit prefilter as the walk over the AND's bits reaches it:
 //!    digits `k..k2` of `n²` and `n³` must be distinct, new, and disjoint
 //!    from the top certificate when it provably sits above them. It is
@@ -68,6 +70,21 @@ const _: () = assert!(NICEONLY_STRIDE as usize * 4 == NICE_RECORD_BYTES);
 pub const JOIN_WG: u32 = 256;
 /// Tops held in shared memory per pass over a bucket's entries.
 pub const TOP_CAP: u32 = 256;
+/// Top batches of at least this many tops get [`join_kernel`]'s transposed
+/// AND; smaller ones test each entry against each top, which is cheaper than
+/// the digit-major copy on a few tops (the fastest of 128, 192 and 256 on
+/// fields of 1e14-1e17 at bases 58-64).
+pub const TRANSPOSE_MIN: u32 = 192;
+/// Chunks of 32 tops whose pass masks the transposed AND forms per pass over
+/// an entry's digits: 4 accumulators per entry slot (8 loaded more words
+/// than a partial batch needs and more registers; 1 re-walks the digits per
+/// chunk).
+const AND_GROUP: u32 = 4;
+// The transposed copy maps thread u to chunk u / 32 of the batch, and the
+// groups tile the batch's chunks.
+const _: () = assert!(
+    JOIN_WG == TOP_CAP && TOP_CAP.is_multiple_of(32 * AND_GROUP) && TRANSPOSE_MIN <= TOP_CAP
+);
 /// Prefilter survivors staged in shared memory before a flush to the global
 /// list.
 pub const SURV_SH_CAP: u32 = 1024;
@@ -118,14 +135,15 @@ pub use kernels::{
     clippy::unreadable_literal,
     // Shared memory is passed by reference, the comptime `if` must stay
     // separate from the runtime one, and the integer helpers clippy suggests
-    // (midpoint, is_power_of_two) are not cube intrinsics.
+    // (midpoint, is_power_of_two, is_multiple_of) are not cube intrinsics.
     clippy::trivially_copy_pass_by_ref,
     clippy::collapsible_else_if,
     clippy::manual_midpoint,
-    clippy::manual_is_power_of_two
+    clippy::manual_is_power_of_two,
+    clippy::manual_is_multiple_of
 )]
 mod kernels {
-    use super::{DEAD_MASK, JOIN_WG, SURV_FLUSH, SURV_SH_CAP, TOP_CAP};
+    use super::{AND_GROUP, DEAD_MASK, JOIN_WG, SURV_FLUSH, SURV_SH_CAP, TOP_CAP, TRANSPOSE_MIN};
     use crate::cubecl_backend::candidate_check;
     use cubecl::prelude::*;
 
@@ -364,7 +382,19 @@ mod kernels {
     /// built by [`bucket_kernel`]; `ept` entries per thread per wave, every
     /// thread runs every wave (uniform). A branch-free AND over 32 tops at a
     /// time gives each entry a bitmask of the tops it passes, and each lane
-    /// walks its set bits. A pair inside the top's range is a join survivor
+    /// walks its set bits.
+    ///
+    /// A pair passes the AND iff the entry's and the top's digit masks are
+    /// disjoint, i.e. iff no digit of the entry is a digit of the top. So for
+    /// a batch of at least [`TRANSPOSE_MIN`] tops the kernel first transposes
+    /// the tops' masks into `t_tr`, one word per (chunk of 32 tops, digit)
+    /// with bit i set iff the chunk's top i has the digit, and an entry's
+    /// pass mask for a chunk is the complement of the OR of the words of its
+    /// digits: about 12 OR-loads per entry per chunk (the entry's 2k digits)
+    /// instead of 32 two-word tests, done for `AND_GROUP` chunks per pass
+    /// over the digits. Smaller batches test each top.
+    ///
+    /// A pair inside the top's range is a join survivor
     /// (counted in `and_count`) and goes through the middle-digit prefilter
     /// there and then ([`walk_pf`]); only the pairs that pass it, about 6% at
     /// bases 57-64, are staged in shared memory, and the stage goes to the
@@ -444,6 +474,9 @@ mod kernels {
         let mut t_rhi = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_id = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_dm = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
+        // The batch's masks digit-major: bit i of `t_tr[c·64 + d]` is set iff
+        // top 32c + i has digit d.
+        let mut t_tr = SharedMemory::<u32>::new(comptime!((TOP_CAP / 32 * 64) as usize));
         let mut s_t = SharedMemory::<u32>::new(comptime!(SURV_SH_CAP as usize));
         let mut s_r = SharedMemory::<u32>::new(comptime!(SURV_SH_CAP as usize));
         let mut s_cnt = SharedMemory::<Atomic<u32>>::new(1usize);
@@ -494,6 +527,35 @@ mod kernels {
                     // D (below b^mid <= 2^12) and the seed flag.
                     t_dm[UNIT_POS_X as usize] = (top_x[(2u32 * t) as usize] / dm_div)
                         | (top_x[(2u32 * t + 1u32) as usize] << 16u32);
+                }
+                sync_cube();
+                if nt >= TRANSPOSE_MIN {
+                    // Thread u writes chunk u / 32's words for digits u % 32
+                    // and u % 32 + 32, over the chunk's 32 tops unrolled (the
+                    // loads pipeline); bits past the batch's last top are
+                    // clear, and chunks past it are zero.
+                    let cc = UNIT_POS_X / 32u32;
+                    let dl = UNIT_POS_X % 32u32;
+                    let t0 = cc * 32u32;
+                    let mut w0 = 0u32;
+                    let mut w1 = 0u32;
+                    if t0 < nt {
+                        #[unroll]
+                        for i in 0..32u32 {
+                            let lo = t_lo[(t0 + i) as usize];
+                            let hi = t_hi[(t0 + i) as usize];
+                            w0 |= ((lo >> dl) & 1u32) << i;
+                            w1 |= ((hi >> dl) & 1u32) << i;
+                        }
+                        let n = nt - t0;
+                        if n < 32u32 {
+                            let vm = (1u32 << n) - 1u32;
+                            w0 &= vm;
+                            w1 &= vm;
+                        }
+                    }
+                    t_tr[(cc * 64u32 + dl) as usize] = w0;
+                    t_tr[(cc * 64u32 + 32u32 + dl) as usize] = w1;
                 }
                 sync_cube();
 
@@ -583,6 +645,10 @@ mod kernels {
                     // bitmask per entry, then only the (rare) set bits are
                     // walked: the survivor path diverges once per chunk, not
                     // once per top.
+                    // The transposed AND's ORs of the next AND_GROUP chunks,
+                    // per entry slot (chunk-major).
+                    let ag = comptime!(AND_GROUP);
+                    let mut acc = Array::<u32>::new(comptime!((ag * ept) as usize));
                     let mut jc = 0u32;
                     while jc < nt {
                         let mut cend = jc + 32u32;
@@ -590,22 +656,69 @@ mod kernels {
                             cend = nt;
                         }
                         let mut pm = Array::<u32>::new(ept as usize);
-                        #[unroll]
-                        for j in 0..ept {
-                            pm[j as usize] = 0u32;
-                        }
-                        let mut jt = jc;
-                        let mut bit = 1u32;
-                        while jt < cend {
-                            let tlo = t_lo[jt as usize];
-                            let thi = t_hi[jt as usize];
+                        if nt >= TRANSPOSE_MIN {
+                            let cb = jc / 32u32;
+                            if cb % ag == 0u32 {
+                                #[unroll]
+                                for i in 0..comptime!(ag * ept) {
+                                    acc[i as usize] = 0u32;
+                                }
+                                let ab = cb * 64u32;
+                                #[unroll]
+                                for j in 0..ept {
+                                    // The entry's digits, low word first; an
+                                    // empty slot (vv = 0) has none.
+                                    let mut x = mlo[j as usize] & vv[j as usize];
+                                    let mut y = mhi[j as usize] & vv[j as usize];
+                                    while (x | y) != 0u32 {
+                                        let lo = x != 0u32;
+                                        let v = select(lo, x, y);
+                                        // v != 0: its lowest set bit.
+                                        let d =
+                                            (v.find_first_set() - 1u32) + select(lo, 0u32, 32u32);
+                                        let v1 = v & (v - 1u32);
+                                        x = select(lo, v1, x);
+                                        y = select(lo, y, v1);
+                                        let a = ab + d;
+                                        #[unroll]
+                                        for c in 0..ag {
+                                            acc[comptime!(c * ept + j) as usize] |=
+                                                t_tr[(a + comptime!(c * 64)) as usize];
+                                        }
+                                    }
+                                }
+                            }
+                            // Pass: no digit of the entry in the top, and a
+                            // top of the batch.
+                            let nb = cend - jc;
+                            let cm =
+                                select(nb >= 32u32, 0xFFFF_FFFFu32, (1u32 << (nb & 31u32)) - 1u32);
                             #[unroll]
                             for j in 0..ept {
-                                let z = (mlo[j as usize] & tlo) | (mhi[j as usize] & thi);
-                                pm[j as usize] |= select(z == 0u32, bit, 0u32);
+                                pm[j as usize] = (acc[j as usize] ^ cm) & cm;
                             }
-                            bit <<= 1u32;
-                            jt += 1u32;
+                            #[unroll]
+                            for i in 0..comptime!((ag - 1) * ept) {
+                                acc[i as usize] = acc[comptime!(i + ept) as usize];
+                            }
+                        } else {
+                            #[unroll]
+                            for j in 0..ept {
+                                pm[j as usize] = 0u32;
+                            }
+                            let mut jt = jc;
+                            let mut bit = 1u32;
+                            while jt < cend {
+                                let tlo = t_lo[jt as usize];
+                                let thi = t_hi[jt as usize];
+                                #[unroll]
+                                for j in 0..ept {
+                                    let z = (mlo[j as usize] & tlo) | (mhi[j as usize] & thi);
+                                    pm[j as usize] |= select(z == 0u32, bit, 0u32);
+                                }
+                                bit <<= 1u32;
+                                jt += 1u32;
+                            }
                         }
                         // Each lane walks its set bits, one per round while any
                         // lane of the plane has one left. With an exit that
