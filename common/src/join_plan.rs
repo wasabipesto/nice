@@ -184,7 +184,8 @@ impl JoinCeiling {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Footprint {
     pub(crate) ext_m: usize,
-    pub(crate) ext_pk: usize,
+    /// The join's prefilter terms, two words per extended entry.
+    pub(crate) ext_q: usize,
     pub(crate) lists: usize,
     pub(crate) counts: usize,
     /// Each of `top_p`, `top_m`, `top_r` and `top_x`.
@@ -230,7 +231,7 @@ impl Footprint {
         ];
         Self {
             ext_m: nbp * 8,
-            ext_pk: nbp.max(1) * 4,
+            ext_q: nbp.max(1) * 8,
             lists: nbp * b * 4,
             counts: nkeys * (b - 1) * 4,
             top: ntl * 8,
@@ -246,7 +247,7 @@ impl Footprint {
 
     pub(crate) fn per_slot(&self) -> usize {
         self.ext_m
-            + self.ext_pk
+            + self.ext_q
             + self.lists
             + self.counts
             + 4 * self.top
@@ -261,7 +262,7 @@ impl Footprint {
     pub(crate) fn largest_per_slot(&self) -> usize {
         [
             self.ext_m,
-            self.ext_pk,
+            self.ext_q,
             self.lists,
             self.counts,
             self.top,
