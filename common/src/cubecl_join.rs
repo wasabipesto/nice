@@ -416,9 +416,15 @@ mod kernels {
     ///
     /// A pair inside the top's range is a join survivor
     /// (counted in `and_count`) and goes through the middle-digit prefilter
-    /// there and then ([`walk_pf`]); only the pairs that pass it, about 6% at
-    /// bases 57-64, are staged in shared memory, and the stage goes to the
-    /// list once it is half full, checked after every 32 tops.
+    /// there and then ([`walk_pf_lean`], or [`walk_pf`] for small test
+    /// shapes); only the pairs that pass it, about 6% at bases 57-64, are
+    /// staged in shared memory, and the stage goes to the list once it is
+    /// half full, checked after every 32 tops. The range test is done per
+    /// chunk, not per pair: only a clipped top (a block at the field's ends,
+    /// whose range is not the whole `[0, w)`) can reject a residue, so the
+    /// batch load marks the clipped tops in a word per chunk (`s_cw`), and a
+    /// chunk with one clears their out-of-range pass bits before the walk.
+    /// Every bit walked is then a join survivor, counted by popcount.
     ///
     /// The prefilter tests n's output digits at positions `k..k2` (`mid =
     /// k2 - k` of them). With `n = R + D·b^k` (`R` the entry's `k` digits,
@@ -427,11 +433,25 @@ mod kernels {
     /// in `cpu_join`'s prefilter (plus terms in `b^k` that vanish unless
     /// `k < mid`, which only small test shapes have). So the work splits by
     /// what it depends on: the wave load forms each entry's part once per
-    /// 256 tops (`ac`: the two carries; `pc`: `2R | 3R² << 16`), the top
-    /// chunk load the top's (`t_dm`: `D | seed << 16`), and a pair costs two
-    /// multiply-adds mod `b^mid` and the digit tests, about 50 instructions.
-    /// Rebuilding all `k2` digit columns of n² and n³ for every pair instead,
-    /// as this kernel used to when it flushed the stage, was about 290.
+    /// 256 tops, the batch load the top's, and a pair costs two
+    /// multiply-adds and the digit tests. At `mid = 2` (every production
+    /// shape) the reduction mod `b²` and the two digits come from
+    /// fixed-point arithmetic ([`walk_pf_lean`]): the entry holds `A·C` and
+    /// `P` for each power (`A` the carry, `P` = `2R` or `3R²`, `C =
+    /// ceil(2^32/b²)`), the top `ceil(D·2^32/b²)` (`t_dm`) and its
+    /// certificate gated by its seed flag (`t_glo`, `t_ghi`), and a pair
+    /// costs about 25 instructions. Elsewhere `ac`/`pc` pack the carries and
+    /// `2R | 3R² << 16`, `t_dm` is `D | seed << 16`, and [`walk_pf`] reduces
+    /// by division. Rebuilding all `k2` digit columns of n² and n³ for every
+    /// pair instead, as this kernel used to when it flushed the stage, was
+    /// about 290.
+    ///
+    /// The digit masks are held bit-reversed in this kernel when the lean
+    /// prefilter runs (`lean`: digit d at bit 63 - d), entries' and tops'
+    /// alike, and so `t_tr`: the AND is the same disjointness test under any
+    /// labelling of the bits, and the prefilter reads digit g as the sign bit
+    /// of `hi32(seen << g)`. The global buffers (`ext_m`, `top_rec`) and every
+    /// other kernel keep digit d at bit d.
     #[cube(launch_unchecked)]
     pub fn join_kernel(
         ext_m: &Array<u32>,
@@ -450,6 +470,7 @@ mod kernels {
         nwork: u32,
         nbp: u32,
         surv_cap: u32,
+        w_f0: u32,
         #[comptime] base: u32,
         #[comptime] key_level: bool,
         #[comptime] ept: u32,
@@ -486,14 +507,29 @@ mod kernels {
         } else {
             0
         });
+        // The fixed-point prefilter ([`walk_pf_lean`]) at mid = 2, k >= 2:
+        // C = ceil(2^32/b²), and 2^32 = Q·b² + R.
+        let lean = comptime!(mid == 2 && k >= 2);
+        let fx_c = comptime!(fx_consts(base).0);
+        let fx_q = comptime!(fx_consts(base).1);
+        let fx_r = comptime!(fx_consts(base).2);
+        let bsq = comptime!(base * base);
         let mut t_lo = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_hi = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_rlo = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_rhi = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_id = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
         let mut t_dm = SharedMemory::<u32>::new(comptime!(TOP_CAP as usize));
+        // The tops' certificates where their seed flag is set, else 0.
+        let mut t_glo =
+            SharedMemory::<u32>::new(comptime!(if lean { TOP_CAP as usize } else { 1 }));
+        let mut t_ghi =
+            SharedMemory::<u32>::new(comptime!(if lean { TOP_CAP as usize } else { 1 }));
+        // Per chunk of 32 tops: bit i set iff top i is clipped.
+        let s_cw = SharedMemory::<Atomic<u32>>::new(comptime!((TOP_CAP / 32) as usize));
         // The batch's masks digit-major: bit i of `t_tr[c·64 + d]` is set iff
-        // top 32c + i has digit d.
+        // top 32c + i has the digit at mask bit d (digit d, or digit 63 - d
+        // where `lean` holds the masks bit-reversed, see the doc above).
         let mut t_tr = SharedMemory::<u32>::new(comptime!((TOP_CAP / 32 * 64) as usize));
         let mut s_t = SharedMemory::<u32>::new(comptime!(SURV_SH_CAP as usize));
         let mut s_r = SharedMemory::<u32>::new(comptime!(SURV_SH_CAP as usize));
@@ -504,6 +540,9 @@ mod kernels {
 
         if UNIT_POS_X == 0u32 {
             s_cnt[0].store(0u32);
+        }
+        if UNIT_POS_X < comptime!(TOP_CAP / 32) {
+            s_cw[UNIT_POS_X as usize].store(0u32);
         }
         sync_cube();
 
@@ -540,14 +579,35 @@ mod kernels {
                     let t = tl[(tc + UNIT_POS_X) as usize];
                     // Words 2-7 of the top's record ([`TOP_REC_WORDS`]).
                     let r8 = TOP_REC_WORDS * t;
-                    t_lo[UNIT_POS_X as usize] = top_rec[(r8 + 2u32) as usize];
-                    t_hi[UNIT_POS_X as usize] = top_rec[(r8 + 3u32) as usize];
-                    t_rlo[UNIT_POS_X as usize] = top_rec[(r8 + 4u32) as usize];
-                    t_rhi[UNIT_POS_X as usize] = top_rec[(r8 + 5u32) as usize];
+                    let mut lo = top_rec[(r8 + 2u32) as usize];
+                    let mut hi = top_rec[(r8 + 3u32) as usize];
+                    if comptime!(lean) {
+                        let l0 = lo;
+                        lo = hi.reverse_bits();
+                        hi = l0.reverse_bits();
+                    }
+                    t_lo[UNIT_POS_X as usize] = lo;
+                    t_hi[UNIT_POS_X as usize] = hi;
+                    let rlo = top_rec[(r8 + 4u32) as usize];
+                    let rhi = top_rec[(r8 + 5u32) as usize];
+                    t_rlo[UNIT_POS_X as usize] = rlo;
+                    t_rhi[UNIT_POS_X as usize] = rhi;
+                    if rlo != 0u32 || rhi != w_f0 {
+                        s_cw[(UNIT_POS_X / 32u32) as usize].fetch_or(1u32 << (UNIT_POS_X % 32u32));
+                    }
                     t_id[UNIT_POS_X as usize] = t;
                     // D (below b^mid <= 2^12) and the seed flag.
-                    t_dm[UNIT_POS_X as usize] = (top_rec[(r8 + 6u32) as usize] / dm_div)
-                        | (top_rec[(r8 + 7u32) as usize] << 16u32);
+                    let dm = top_rec[(r8 + 6u32) as usize] / dm_div;
+                    let seed = top_rec[(r8 + 7u32) as usize];
+                    if comptime!(lean) {
+                        // ceil(D·2^32/b²) = D·Q + ceil(D·R/b²).
+                        t_dm[UNIT_POS_X as usize] =
+                            dm * fx_q + (dm * fx_r + comptime!(bsq - 1)) / bsq;
+                        t_glo[UNIT_POS_X as usize] = select(seed != 0u32, lo, 0u32);
+                        t_ghi[UNIT_POS_X as usize] = select(seed != 0u32, hi, 0u32);
+                    } else {
+                        t_dm[UNIT_POS_X as usize] = dm | (seed << 16u32);
+                    }
                 }
                 sync_cube();
                 if nt >= TRANSPOSE_MIN {
@@ -591,6 +651,9 @@ mod kernels {
                     // The entry's part of the prefilter (see above).
                     let mut ac = Array::<u32>::new(ept as usize);
                     let mut pc = Array::<u32>::new(ept as usize);
+                    // Lean: `ac`/`pc` the n² terms (A·C, P), `ac3`/`pc3` n³'s.
+                    let mut ac3 = Array::<u32>::new(ept as usize);
+                    let mut pc3 = Array::<u32>::new(ept as usize);
                     #[unroll]
                     for j in 0..ept {
                         let sl = ws + UNIT_POS_X + comptime!(j * JOIN_WG);
@@ -600,6 +663,8 @@ mod kernels {
                         vv[j as usize] = 0u32;
                         ac[j as usize] = 0u32;
                         pc[j as usize] = 0u32;
+                        ac3[j as usize] = 0u32;
+                        pc3[j as usize] = 0u32;
                         if sl < ne {
                             vv[j as usize] = 0xFFFF_FFFFu32;
                             let e = lists[(lbase + sl) as usize];
@@ -640,7 +705,12 @@ mod kernels {
                                 let g2 = t2 % base;
                                 let g3 = t3 % base;
                                 m |= (1u64 << u64::cast_from(g2)) | (1u64 << u64::cast_from(g3));
-                                ac[j as usize] = (t2 / base) | ((t3 / base) << 16u32);
+                                if comptime!(lean) {
+                                    ac[j as usize] = (t2 / base) * fx_c;
+                                    ac3[j as usize] = (t3 / base) * fx_c;
+                                } else {
+                                    ac[j as usize] = (t2 / base) | ((t3 / base) << 16u32);
+                                }
                                 // 2R and 3R² mod b^mid (R mod b^mid itself
                                 // when k < mid).
                                 let mut rho = sigma % bm;
@@ -652,13 +722,28 @@ mod kernels {
                                 if comptime!(k < mid) {
                                     p2 = rho;
                                 }
-                                pc[j as usize] = p2 | (p3 << 16u32);
+                                if comptime!(lean) {
+                                    pc[j as usize] = p2;
+                                    pc3[j as usize] = p3;
+                                } else {
+                                    pc[j as usize] = p2 | (p3 << 16u32);
+                                }
+                            } else if comptime!(lean) {
+                                ac[j as usize] = (q0 & 0xFFFFu32) * fx_c;
+                                ac3[j as usize] = (q0 >> 16u32) * fx_c;
+                                pc[j as usize] = q1 & 0xFFFFu32;
+                                pc3[j as usize] = q1 >> 16u32;
                             } else {
                                 ac[j as usize] = q0;
                                 pc[j as usize] = q1;
                             }
-                            mlo[j as usize] = u32::cast_from(m);
-                            mhi[j as usize] = u32::cast_from(m >> 32u64);
+                            if comptime!(lean) {
+                                mlo[j as usize] = u32::cast_from(m >> 32u64).reverse_bits();
+                                mhi[j as usize] = u32::cast_from(m).reverse_bits();
+                            } else {
+                                mlo[j as usize] = u32::cast_from(m);
+                                mhi[j as usize] = u32::cast_from(m >> 32u64);
+                            }
                             rr[j as usize] = r0;
                         }
                     }
@@ -741,6 +826,31 @@ mod kernels {
                                 jt += 1u32;
                             }
                         }
+                        // The range test, on the chunk's clipped tops only
+                        // (none but in a field's edge blocks): their pass
+                        // bits for residues outside the range are cleared,
+                        // so every bit walked is a join survivor.
+                        let cw = s_cw[(jc / 32u32) as usize].load();
+                        if cw != 0u32 {
+                            #[unroll]
+                            for j in 0..ept {
+                                let r0 = rr[j as usize];
+                                let mut y = pm[j as usize] & vv[j as usize] & cw;
+                                while y != 0u32 {
+                                    let i = y.trailing_zeros();
+                                    y &= y - 1u32;
+                                    if r0 < t_rlo[(jc + i) as usize]
+                                        || r0 >= t_rhi[(jc + i) as usize]
+                                    {
+                                        pm[j as usize] ^= 1u32 << i;
+                                    }
+                                }
+                            }
+                        }
+                        #[unroll]
+                        for j in 0..ept {
+                            nand += (pm[j as usize] & vv[j as usize]).count_ones();
+                        }
                         // Each lane walks its set bits, one per round while any
                         // lane of the plane has one left. With an exit that
                         // diverged per lane, CUDA's independent thread
@@ -759,9 +869,21 @@ mod kernels {
                                 if x != 0u32 {
                                     let jt2 = jc + x.trailing_zeros();
                                     x &= x - 1u32;
-                                    if r0 >= t_rlo[jt2 as usize] && r0 < t_rhi[jt2 as usize] {
-                                        nand += 1u32;
-                                        if walk_pf(
+                                    let pass = if comptime!(lean) {
+                                        walk_pf_lean(
+                                            ac[j as usize],
+                                            ac3[j as usize],
+                                            pc[j as usize],
+                                            pc3[j as usize],
+                                            t_dm[jt2 as usize],
+                                            mlo[j as usize],
+                                            mhi[j as usize],
+                                            t_glo[jt2 as usize],
+                                            t_ghi[jt2 as usize],
+                                            base,
+                                        )
+                                    } else {
+                                        walk_pf(
                                             ac[j as usize],
                                             pc[j as usize],
                                             t_dm[jt2 as usize],
@@ -772,17 +894,18 @@ mod kernels {
                                             base,
                                             k,
                                             k2,
-                                        ) {
-                                            let at = s_cnt[0].fetch_add(1u32);
-                                            if at < SURV_SH_CAP {
-                                                s_t[at as usize] = t_id[jt2 as usize];
-                                                s_r[at as usize] = r0;
-                                            } else {
-                                                let g = surv_count[0].fetch_add(1u32);
-                                                if g < surv_cap {
-                                                    surv[(2u32 * g) as usize] = t_id[jt2 as usize];
-                                                    surv[(2u32 * g + 1u32) as usize] = r0;
-                                                }
+                                        )
+                                    };
+                                    if pass {
+                                        let at = s_cnt[0].fetch_add(1u32);
+                                        if at < SURV_SH_CAP {
+                                            s_t[at as usize] = t_id[jt2 as usize];
+                                            s_r[at as usize] = r0;
+                                        } else {
+                                            let g = surv_count[0].fetch_add(1u32);
+                                            if g < surv_cap {
+                                                surv[(2u32 * g) as usize] = t_id[jt2 as usize];
+                                                surv[(2u32 * g + 1u32) as usize] = r0;
                                             }
                                         }
                                     }
@@ -828,6 +951,12 @@ mod kernels {
                         jc += 32u32;
                     }
                     ws += wave;
+                }
+                // Every thread is past its last read of the clip words (each
+                // chunk ends with barriers), and the next batch sets them
+                // after the barrier below.
+                if UNIT_POS_X < comptime!(TOP_CAP / 32) {
+                    s_cw[UNIT_POS_X as usize].store(0u32);
                 }
                 tc += TOP_CAP;
                 sync_cube();
@@ -2708,6 +2837,68 @@ mod kernels {
         ok
     }
 
+    /// The constants of [`walk_pf_lean`] at base b: `C = ceil(2^32/b²)`, and
+    /// `Q`, `R` with `2^32 = Q·b² + R`.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(super) fn fx_consts(base: u32) -> (u32, u32, u32) {
+        let b2 = u64::from(base * base);
+        (
+            (1u64 << 32).div_ceil(b2) as u32,
+            ((1u64 << 32) / b2) as u32,
+            ((1u64 << 32) % b2) as u32,
+        )
+    }
+
+    /// [`walk_pf`] at mid = 2 (k >= 2) without a division: `x mod b²` as a
+    /// 32-bit fraction of b², `F = (ah + p·dh) mod 2^32` with `ah = A·C`,
+    /// `C = ceil(2^32/b²)` (the entry's) and `dh = ceil(D·2^32/b²)` (the
+    /// top's); then `F·b² = (x mod b²)·2^32 + Δ` with `Δ = A·(C·b² − 2^32) +
+    /// P·(dh·b² − D·2^32) < 2b⁴ <= 2^25`, so the high words of `F·b` and of
+    /// `(F·b mod 2^32)·b` are the two digits of `x mod b²` exactly. The masks
+    /// are bit-reversed (digit d at bit 63 - d), so digit g is in `seen` iff
+    /// bit 63 of `seen << g` is set: four shifts and a sign test, and six
+    /// compares for the digits' distinctness. `tlo`/`thi` are the top's
+    /// certificate if its seed flag is set, else 0.
+    #[cube]
+    fn walk_pf_lean(
+        ah2: u32,
+        ah3: u32,
+        p2: u32,
+        p3: u32,
+        dh: u32,
+        mlo: u32,
+        mhi: u32,
+        tlo: u32,
+        thi: u32,
+        #[comptime] base: u32,
+    ) -> bool {
+        let f2 = ah2 + p2 * dh;
+        let f3 = ah3 + p3 * dh;
+        let h2 = u32::mul_hi(f2, base);
+        let g2 = u32::mul_hi(f2 * base, base);
+        let h3 = u32::mul_hi(f3, base);
+        let g3 = u32::mul_hi(f3 * base, base);
+        let seen = (u64::cast_from(mhi | thi) << 32u64) | u64::cast_from(mlo | tlo);
+        let hit = u32::cast_from((seen << u64::cast_from(g2)) >> 32u64)
+            | u32::cast_from((seen << u64::cast_from(g3)) >> 32u64)
+            | u32::cast_from((seen << u64::cast_from(h2)) >> 32u64)
+            | u32::cast_from((seen << u64::cast_from(h3)) >> 32u64);
+        let mut ok = true;
+        // Keep the sign test last in the chain: placed first, NVVM compiled it
+        // to a select and a byte extension in front of the compares.
+        if g2 == g3
+            || h2 == h3
+            || g2 == h2
+            || g2 == h3
+            || g3 == h2
+            || g3 == h3
+            || i32::cast_from(hit) < 0i32
+        {
+            ok = false;
+        }
+        ok
+    }
+
     /// Write the shared survivor stage to the list. Every staged pair passed
     /// the prefilter in the walk, so one atomic reserves the stage's place
     /// in `out` and the cube copies it there. Must be called by the whole
@@ -3409,6 +3600,7 @@ impl<R: Runtime> JoinDevice<R> {
                 nwork_u32,
                 self.nbp,
                 self.list_cap,
+                self.w_f0,
                 self.b,
                 self.key_level,
                 ENTRIES_PER_THREAD,
@@ -5747,6 +5939,261 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The batch load's `ceil(D·2^32/b²)`, as [`join_kernel`] forms it:
+    /// `D·Q + ceil(D·R/b²)`.
+    fn fx_top(d: u32, base: u32) -> u32 {
+        let (_, q, r) = super::kernels::fx_consts(base);
+        d * q + (d * r).div_ceil(base * base)
+    }
+
+    /// [`walk_pf_lean`]'s two digits of `F = ah + p·dh mod 2^32`: the high
+    /// words of `F·b` and of `(F·b mod 2^32)·b`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn fx_digits(ah: u32, p: u32, dh: u32, base: u32) -> (u32, u32) {
+        let f = ah.wrapping_add(p.wrapping_mul(dh));
+        let fb = u64::from(f) * u64::from(base);
+        (
+            (fb >> 32) as u32,
+            ((u64::from(fb as u32) * u64::from(base)) >> 32) as u32,
+        )
+    }
+
+    /// [`walk_pf`]'s digit test at mid = 2: four one-hot masks.
+    fn pf_masks(seen: u64, g2: u32, g3: u32, h2: u32, h3: u32) -> bool {
+        let at_k = (1u64 << g2) | (1u64 << g3);
+        let at_k1 = (1u64 << h2) | (1u64 << h3);
+        !(g2 == g3 || h2 == h3 || seen & at_k != 0 || (seen | at_k) & at_k1 != 0)
+    }
+
+    /// [`walk_pf_lean`]'s digit test on the bit-reversed `seen`: digit g is
+    /// in it iff the sign bit of `hi32(seen << g)` is set; six compares.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn pf_lean(rseen: u64, g2: u32, g3: u32, h2: u32, h3: u32) -> bool {
+        let hi = |g: u32| ((rseen << g) >> 32) as u32;
+        let hit = hi(g2) | hi(g3) | hi(h2) | hi(h3);
+        !(g2 == g3 || h2 == h3 || g2 == h2 || g2 == h3 || g3 == h2 || g3 == h3 || (hit as i32) < 0)
+    }
+
+    fn xorshift(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    /// The lean prefilter's fixed-point digits at every base 10-64: `C =
+    /// ceil(2^32/b²)` and the batch load's `dh` are the true ceilings (every
+    /// D < b²), `A·C` fits a word, and the error `Δ = A·(C·b² − 2^32) +
+    /// P·(dh·b² − D·2^32)` stays below 2^32 for every A, P, D < b². Then the
+    /// digits themselves: every (P, D) at the largest A, and every (A, D) at
+    /// the largest P, against `(A + P·D) mod b²` (the error grows with A and
+    /// P; `fx_digits_are_exact_everywhere` runs every triple).
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn fx_digits_match_the_division() {
+        for base in 10u32..=64 {
+            let b2 = base * base;
+            let (c, q, r) = super::kernels::fx_consts(base);
+            assert_eq!(
+                u128::from(c),
+                (1u128 << 32).div_ceil(u128::from(b2)),
+                "b{base}"
+            );
+            assert_eq!(
+                u64::from(q) * u64::from(b2) + u64::from(r),
+                1u64 << 32,
+                "b{base}"
+            );
+            assert!((b2 - 1).checked_mul(c).is_some(), "b{base}: A·C overflows");
+            let e1 = u64::from(c) * u64::from(b2) - (1u64 << 32);
+            let mut e2max = 0u64;
+            let dh: Vec<u32> = (0..b2).map(|d| fx_top(d, base)).collect();
+            for d in 0..b2 {
+                let want = (u128::from(d) << 32).div_ceil(u128::from(b2));
+                assert_eq!(u128::from(dh[d as usize]), want, "b{base} D={d}");
+                e2max = e2max.max(u64::from(dh[d as usize]) * u64::from(b2) - (u64::from(d) << 32));
+            }
+            let m = u64::from(b2 - 1);
+            assert!(m * e1 + m * e2max < 1u64 << 32, "b{base}: Δ bound");
+            let amax = b2 - 1;
+            for p in 0..b2 {
+                for d in 0..b2 {
+                    let x = (amax + p * d) % b2;
+                    assert_eq!(
+                        fx_digits(amax * c, p, dh[d as usize], base),
+                        (x / base, x % base),
+                        "b{base} A={amax} P={p} D={d}"
+                    );
+                }
+            }
+            for a in 0..b2 {
+                for d in 0..b2 {
+                    let x = (a + amax * d) % b2;
+                    assert_eq!(
+                        fx_digits(a * c, amax, dh[d as usize], base),
+                        (x / base, x % base),
+                        "b{base} A={a} P={amax} D={d}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fixed-point digits over every operand the join can give them: all
+    /// (A, P, D) below b² at every base 10-64 (6.6e11 triples, minutes on all
+    /// cores).
+    #[test]
+    #[ignore = "exhaustive, minutes on all cores; opt-in, NICE_TEST_FX_EXHAUSTIVE=1"]
+    #[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
+    fn fx_digits_are_exact_everywhere() {
+        if std::env::var("NICE_TEST_FX_EXHAUSTIVE").is_err() {
+            eprintln!("skipping: set NICE_TEST_FX_EXHAUSTIVE=1 to run every operand triple");
+            return;
+        }
+        let threads = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
+        let t0 = Instant::now();
+        let mut total = 0u64;
+        for base in 10u32..=64 {
+            let b2 = base * base;
+            let c = super::kernels::fx_consts(base).0;
+            let next = std::sync::atomic::AtomicU32::new(0);
+            std::thread::scope(|sc| {
+                for _ in 0..threads {
+                    sc.spawn(|| {
+                        loop {
+                            let d = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if d >= b2 {
+                                break;
+                            }
+                            let dh = fx_top(d, base);
+                            for p in 0..b2 {
+                                let u = p.wrapping_mul(dh);
+                                let y = p * d % b2;
+                                // (h, g): the digits of (A + P·D) mod b², stepped with A.
+                                let (mut h, mut g) = (y / base, y % base);
+                                let mut bad = 0u32;
+                                for a in 0..b2 {
+                                    let f = (a * c).wrapping_add(u);
+                                    let fb = u64::from(f) * u64::from(base);
+                                    let fh = (fb >> 32) as u32;
+                                    let fg =
+                                        ((u64::from(fb as u32) * u64::from(base)) >> 32) as u32;
+                                    bad |= (fh ^ h) | (fg ^ g);
+                                    g += 1;
+                                    if g == base {
+                                        g = 0;
+                                        h += 1;
+                                        if h == base {
+                                            h = 0;
+                                        }
+                                    }
+                                }
+                                assert_eq!(bad, 0, "b{base} P={p} D={d}");
+                            }
+                        }
+                    });
+                }
+            });
+            total += u64::from(b2).pow(3);
+        }
+        println!(
+            "fixed-point digits: {total} triples (A, P, D < b², b = 10-64) exact in {:.1}s on {threads} threads",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
+    /// The lean membership test (bit-reversed masks, four shifts and a sign
+    /// test, six compares) is the four-mask test: every digit 4-tuple at
+    /// every base 10-64 against a random set of seen digits (about a quarter
+    /// of the bits, as the entry's 12 and a top's certificate give), and 10^7
+    /// random tuples against sets of every density.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn lean_membership_matches_the_masks() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut fails, mut pass, mut n) = (0u64, 0u64, 0u64);
+        for base in 10u32..=64 {
+            for g2 in 0..base {
+                for g3 in 0..base {
+                    for h2 in 0..base {
+                        for h3 in 0..base {
+                            let seen = xorshift(&mut x) & xorshift(&mut x);
+                            let want = pf_masks(seen, g2, g3, h2, h3);
+                            fails +=
+                                u64::from(want != pf_lean(seen.reverse_bits(), g2, g3, h2, h3));
+                            pass += u64::from(want);
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for _ in 0..10_000_000 {
+            let r = xorshift(&mut x);
+            let base = 10 + (r % 55) as u32;
+            let dig = |s: u64| (s % u64::from(base)) as u32;
+            let (g2, g3, h2, h3) = (dig(r >> 8), dig(r >> 20), dig(r >> 32), dig(r >> 44));
+            let mut seen = xorshift(&mut x);
+            for _ in 0..(r >> 60) % 4 {
+                seen &= xorshift(&mut x);
+            }
+            seen &= u64::MAX >> (64 - base);
+            let want = pf_masks(seen, g2, g3, h2, h3);
+            fails += u64::from(want != pf_lean(seen.reverse_bits(), g2, g3, h2, h3));
+            pass += u64::from(want);
+            n += 1;
+        }
+        assert_eq!(fails, 0, "{fails} of {n} differ");
+        assert!(pass > n / 50 && pass < n / 2, "{pass} of {n} pass");
+    }
+
+    /// The lean prefilter end to end against a host model of the division
+    /// form ([`walk_pf`] at mid = 2: the digits of `(A + P·D) mod b²` and the
+    /// four one-hot masks): random entries (A2, A3, P2, P3 < b², masks) and
+    /// tops (D < b², certificate, seed flag), 10^6 per base 10-64. The device
+    /// tests compare the kernel itself with the CPU join.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn lean_prefilter_matches_the_division_form() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut pass = 0u64;
+        for base in 10u32..=64 {
+            let b2 = base * base;
+            let c = super::kernels::fx_consts(base).0;
+            let full = u64::MAX >> (64 - base);
+            for _ in 0..1_000_000 {
+                let r = xorshift(&mut x);
+                let (a2, a3) = (
+                    (r % u64::from(b2)) as u32,
+                    ((r >> 16) % u64::from(b2)) as u32,
+                );
+                let (p2, p3) = (
+                    ((r >> 32) % u64::from(b2)) as u32,
+                    ((r >> 48) % u64::from(b2)) as u32,
+                );
+                let r2 = xorshift(&mut x);
+                let d = (r2 % u64::from(b2)) as u32;
+                let flag = (r2 >> 20) & 1 == 1;
+                let em = xorshift(&mut x) & xorshift(&mut x) & xorshift(&mut x) & full;
+                let tm = xorshift(&mut x) & xorshift(&mut x) & full;
+                let seen = em | if flag { tm } else { 0 };
+                let (x2, x3) = ((a2 + p2 * d) % b2, (a3 + p3 * d) % b2);
+                let want = pf_masks(seen, x2 % base, x3 % base, x2 / base, x3 / base);
+                let dh = fx_top(d, base);
+                let (h2, g2) = fx_digits(a2 * c, p2, dh, base);
+                let (h3, g3) = fx_digits(a3 * c, p3, dh, base);
+                let gated = if flag { tm.reverse_bits() } else { 0 };
+                assert_eq!(
+                    pf_lean(em.reverse_bits() | gated, g2, g3, h2, h3),
+                    want,
+                    "b{base}"
+                );
+                pass += u64::from(want);
+            }
+        }
+        assert!(pass > 0);
     }
 
     // ---------------------------------------------------------------------
