@@ -29,6 +29,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// is b^p partitions (3,249 at base 57), so this sets the launch count: 16
 /// measured 1.11-1.37x faster per field than 4 on an RTX 3080 and an RTX
 /// 4090, where launch overhead was most of the join's fixed per-field cost.
+/// Bytes per top record (`cubecl_join::TOP_REC_WORDS` words of 4 bytes; asserted there).
+pub(crate) const TOP_RECORD_BYTES: usize = 32;
+
 const SLOTS: usize = 16;
 /// Launched batches kept in flight before the driver waits for the oldest
 /// (each holds a little scratch of its own, counted in [`Footprint`]).
@@ -188,8 +191,8 @@ pub(crate) struct Footprint {
     pub(crate) ext_q: usize,
     pub(crate) lists: usize,
     pub(crate) counts: usize,
-    /// Each of `top_p`, `top_m`, `top_r` and `top_x`.
-    pub(crate) top: usize,
+    /// The tops' records, [`TOP_RECORD_BYTES`] each (`TOP_REC_WORDS` words).
+    pub(crate) top_rec: usize,
     pub(crate) top_b: usize,
     pub(crate) tl: usize,
     pub(crate) work: usize,
@@ -234,7 +237,7 @@ impl Footprint {
             ext_q: nbp.max(1) * 8,
             lists: nbp * b * 4,
             counts: nkeys * (b - 1) * 4,
-            top: ntl * 8,
+            top_rec: ntl * TOP_RECORD_BYTES,
             top_b: ntl * 4,
             tl: ntl * nroots * 4,
             work: fs.nb * 16,
@@ -250,7 +253,7 @@ impl Footprint {
             + self.ext_q
             + self.lists
             + self.counts
-            + 4 * self.top
+            + self.top_rec
             + self.top_b
             + self.tl
             + self.work
@@ -265,7 +268,7 @@ impl Footprint {
             self.ext_q,
             self.lists,
             self.counts,
-            self.top,
+            self.top_rec,
             self.top_b,
             self.tl,
             self.work,
@@ -358,7 +361,7 @@ pub(crate) fn max_slice_prefixes(fs: &FieldSetup, lim: JoinLimits) -> usize {
     // Bytes per prefix: in the field's tables, and per slot.
     let per_fixed = two.fixed - one.fixed;
     let per_slot = two.per_slot() - one.per_slot();
-    let per_largest = two.top.max(two.tl) - one.top.max(one.tl);
+    let per_largest = two.top_rec.max(two.tl) - one.top_rec.max(one.tl);
     let list_cap = (list_bound(lim) as usize)
         .min(lim.max_binding / 8)
         .min(lim.budget / 4 / 8);
