@@ -556,7 +556,7 @@ pub struct Base {
 const DIGIT_BUF: usize = 48;
 
 /// Digits `lo..=hi` as a mask (`lo <= hi < 64`).
-fn digit_range_mask(lo: u8, hi: u8) -> u64 {
+pub(crate) fn digit_range_mask(lo: u8, hi: u8) -> u64 {
     let width = u32::from(hi - lo) + 1;
     let ones = if width >= 64 {
         u64::MAX
@@ -573,7 +573,7 @@ fn digit_range_mask(lo: u8, hi: u8) -> u64 {
 /// every such n out, and one with a single free digit adds it to the mask,
 /// which can empty or force the other interval in turn. For two positions
 /// that is all of Hall's condition.
-fn close_certificate(mut mask: u64, doms: [u64; 2]) -> Option<u64> {
+pub(crate) fn close_certificate(mut mask: u64, doms: [u64; 2]) -> Option<u64> {
     let mut forced = [false; 2];
     loop {
         let mut changed = false;
@@ -693,9 +693,14 @@ impl Base {
         self.poww[i as usize].0
     }
 
+    /// The 256-bit power table: b^i at index i.
+    pub(crate) fn poww(&self) -> &[W4] {
+        &self.poww
+    }
+
     /// Smallest i with b^i > x.
     #[inline]
-    fn ndig_w(&self, x: &W4) -> u32 {
+    pub(crate) fn ndig_w(&self, x: &W4) -> u32 {
         let (mut lo, mut hi) = (0usize, self.poww.len() - 1);
         while lo < hi {
             let mid = usize::midpoint(lo, hi);
