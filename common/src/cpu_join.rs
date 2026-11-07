@@ -20,8 +20,9 @@
 //!    digit-sum class (about a megabyte at base 57, so they stay in cache),
 //!    and each of the key's tops scans the classes its roots name, one
 //!    64-bit AND per bottom.
-//! 4. **Survivors** go through the middle-digit prefilter, as on the GPU,
-//!    and then the client's own full check.
+//! 4. **Survivors** go through the middle-digit prefilter, as on the GPU
+//!    (its digits read off a fixed-point fraction), and then the client's
+//!    own full check.
 //!
 //! The client sends it the nice-only fields the GPU's join would take, a
 //! slice at a time ([`slices_for`]): the host's top layer grows with the
@@ -96,16 +97,20 @@ struct Top {
     p: u128,
     /// The certificate: output digits at positions `>= k`.
     mask: u64,
+    /// The certificate if every certified position is `>= k2`, so that the
+    /// prefilter's digits must avoid it too; otherwise 0.
+    gmask: u64,
     rlo: u32,
     rhi: u32,
-    /// `n`'s digits `k..k2` (the next digits of `P`), as a number.
-    dm: u32,
-    /// Every certified position is `>= k2`, so the prefilter's digits must
-    /// avoid the certificate too.
-    seed: bool,
+    /// `⌈D·2^32/b²⌉` for `D` = `n`'s digits `k..k2` (the next digits of
+    /// `P`) as a number: the prefilter's fixed-point `D` ([`Fx`]).
+    dh: u32,
     /// `P mod (b − 1)`.
     pc: u32,
 }
+
+// The tops a thread sorts and scans: 48 bytes each (`u128` alignment).
+const _: () = assert!(std::mem::size_of::<Top>() == 48);
 
 /// The bottom-list residues that survive the partition's fixed digits,
 /// each `r` with what the last bottom digit `d` needs, by column: the
@@ -199,12 +204,6 @@ impl SmallDiv {
         (q, x - q * self.d)
     }
 
-    /// `x % d` for `x < 2^48/d` and `d < 2^32`.
-    #[inline]
-    fn rem(self, x: u64) -> u32 {
-        self.divrem(x).1 as u32
-    }
-
     /// `(x / d, x % d)` with one 64-bit multiply, exact below `2^32/d`
     /// (which `2^26` is for `d <= 64`).
     #[inline]
@@ -212,6 +211,104 @@ impl SmallDiv {
         let q = ((u64::from(x) * self.magic32) >> 32) as u32;
         (q, x - q * self.d as u32)
     }
+}
+
+/// The prefilter's two digits at `mid = 2` by fixed point: the base-b
+/// digits `(h, g)` of `x = (A + P·D) mod b²` for `A, P, D < b²` and `b <=
+/// 64`, with four multiplies (`A·C`, `P·δ̂` and two by `b`) and no
+/// reduction.
+///
+/// With `C = ⌈2^32/b²⌉` and `δ̂ = ⌈D·2^32/b²⌉`, write `C·b² = 2^32 + ε1`
+/// and `δ̂·b² = D·2^32 + ε2` (`0 <= ε1, ε2 < b²`), and `A + P·D = m·b² +
+/// x`. Then `(A·C + P·δ̂)·b² = m·b²·2^32 + x·2^32 + Δ` with `Δ = A·ε1 +
+/// P·ε2 < 2b⁴ <= 2^25`. So `F = (A·C + P·δ̂) mod 2^32` is `(x·2^32 + Δ)/b²`,
+/// an integer below 2^32, and `F·b² = x·2^32 + Δ`. Two multiplies by `b`
+/// split `F·b²` exactly, `F·b = h·2^32 + F'` and `F'·b = g·2^32 + F''`
+/// (`g < b`), so `h·b + g = ⌊F·b²/2^32⌋`, which is `x` because `Δ <
+/// 2^32`.
+#[derive(Clone, Copy)]
+struct Fx {
+    b: u64,
+    /// `C = ⌈2^32/b²⌉`.
+    c: u32,
+    /// `2^32 = q·b² + r`, for `δ̂ = D·q + ⌈D·r/b²⌉`.
+    q: u32,
+    r: u32,
+    b2: SmallDiv,
+}
+
+// Narrowed: C and q are at most 2^32/b² + 1 and r below b², for b >= 2.
+#[allow(clippy::cast_possible_truncation)]
+impl Fx {
+    fn new(b: u32) -> Self {
+        let b2 = u64::from(b) * u64::from(b);
+        Self {
+            b: u64::from(b),
+            c: (1u64 << 32).div_ceil(b2) as u32,
+            q: ((1u64 << 32) / b2) as u32,
+            r: ((1u64 << 32) % b2) as u32,
+            b2: SmallDiv::new(b2),
+        }
+    }
+
+    /// `δ̂ = ⌈D·2^32/b²⌉` for `D < b²` (once per top). `D·r + b² − 1 <
+    /// b⁴ <= 2^24` is in `SmallDiv::divrem`'s range, and the sum is below
+    /// `2^32`.
+    fn dh(self, d: u32) -> u32 {
+        let (up, _) = self
+            .b2
+            .divrem(u64::from(d) * u64::from(self.r) + self.b2.d - 1);
+        d * self.q + up as u32
+    }
+
+    /// `x`'s digits `(h, g)`, high and low, from `A`, `P` and `δ̂`. `A·C`
+    /// fits a word: `(b² − 1)·C < 2^32` for `b < 256`.
+    #[inline]
+    fn digits(self, a: u32, p: u32, dh: u32) -> (u64, u64) {
+        let f = (a * self.c).wrapping_add(p.wrapping_mul(dh));
+        let fb = u64::from(f) * self.b;
+        (fb >> 32, (u64::from(fb as u32) * self.b) >> 32)
+    }
+
+    /// The prefilter at `mid = 2`: the digits of `x2 = (A2 + P2·D) mod b²`
+    /// and `x3 = (A3 + P3·D) mod b²` (`carries = A2 | A3 << 16`, `D` as
+    /// `δ̂`) pairwise distinct and none in `seen` ([`fresh4`]).
+    #[inline]
+    fn pass(self, seen: u64, carries: u32, p2: u32, p3: u32, dh: u32) -> bool {
+        let (h2, g2) = self.digits(carries & 0xFFFF, p2, dh);
+        let (h3, g3) = self.digits(carries >> 16, p3, dh);
+        fresh4(seen, h2, g2, h3, g3)
+    }
+}
+
+/// Four digits (each below 64) pairwise distinct and none in `seen`: one
+/// shift per digit and six compares, without a branch. The same predicate
+/// as [`fresh_digits`]' four one-hot masks at `mid = 2`.
+// `&`, not `&&`: branch-free on purpose (the outcome is data-dependent).
+#[allow(clippy::needless_bitwise_bool)]
+#[inline]
+fn fresh4(seen: u64, h2: u64, g2: u64, h3: u64, g3: u64) -> bool {
+    let hit = (seen >> g2) | (seen >> g3) | (seen >> h2) | (seen >> h3);
+    ((hit & 1) == 0) & (g2 != g3) & (h2 != h3) & (g2 != h2) & (g2 != h3) & (g3 != h2) & (g3 != h3)
+}
+
+/// The prefilter's digits of `n²` and `n³` (`x2`, `x3`, `mid` digits each,
+/// below `b^mid`), divided out low digit first: distinct from each other
+/// and new against `seen` (the bottom's digits, and the certificate when
+/// it sits above them).
+#[inline]
+fn fresh_digits(sb: SmallDiv, mid: u32, mut seen: u64, mut x2: u32, mut x3: u32) -> bool {
+    for _ in 0..mid {
+        let (q2, g2) = sb.divrem_small(x2);
+        let (q3, g3) = sb.divrem_small(x3);
+        let bits = (1u64 << g2) | (1u64 << g3);
+        if g2 == g3 || seen & bits != 0 {
+            return false;
+        }
+        seen |= bits;
+        (x2, x3) = (q2, q3);
+    }
+    true
 }
 
 /// A field prepared for the CPU join.
@@ -240,7 +337,12 @@ pub struct CpuJoin {
     div_k1: Div64,
     div_m: Div64,
     sb: SmallDiv,
-    smid: SmallDiv,
+    /// The prefilter's digits by fixed point, and whether the field takes
+    /// them: `mid = 2` and `k > mid`, so that the last bottom digit adds
+    /// nothing below `b^mid` (every production shape). Every other shape
+    /// takes the general form ([`Self::prefilter_any`]).
+    fx: Fx,
+    lean: bool,
     /// The top certificates by finite differences, for every unclipped
     /// block; `None` if the field's digit arrays would not fit them (then
     /// `Base::cert` certifies every block).
@@ -311,7 +413,8 @@ impl CpuJoin {
             div_k1: Div64::new(bk1),
             div_m: Div64::new(big_m),
             sb: SmallDiv::new(b),
-            smid: SmallDiv::new(bmid),
+            fx: Fx::new(base),
+            lean: mid == 2 && k > mid,
             fd,
             #[cfg(target_arch = "x86_64")]
             avx2: std::arch::is_x86_feature_detected!("avx2"),
@@ -442,6 +545,7 @@ impl CpuJoin {
         let fs = &self.fs;
         let (w, v) = (fs.w, u128::from(v));
         let mut st = TopFd::default();
+        let full_seed = fs.full_floor >= fs.k2;
         for &(p0, _) in layer {
             let p = p0 * fs.nparts + v;
             if p < fs.plo || p > fs.phi {
@@ -459,10 +563,10 @@ impl CpuJoin {
                     tops.push(Top {
                         p,
                         mask,
+                        gmask: if full_seed { mask } else { 0 },
                         rlo: 0,
                         rhi: w as u32,
-                        dm: st.dm,
-                        seed: fs.full_floor >= fs.k2,
+                        dh: self.fx.dh(st.dm),
                         pc: st.pc,
                     });
                 }
@@ -479,10 +583,10 @@ impl CpuJoin {
             tops.push(Top {
                 p,
                 mask,
+                gmask: if floor >= fs.k2 { mask } else { 0 },
                 rlo: (a - lo) as u32,
                 rhi: (e - lo + 1) as u32,
-                dm: ((p / self.pk) % u128::from(self.bmid)) as u32,
-                seed: floor >= fs.k2,
+                dh: self.fx.dh(((p / self.pk) % u128::from(self.bmid)) as u32),
                 pc: (p % u128::from(fs.m1)) as u32,
             });
         }
@@ -787,7 +891,7 @@ impl CpuJoin {
         }
         out.survivors += 1;
         let ext = pass.ext;
-        let pass_mid = if self.kb == 0 && self.bk == 0 && self.b2k == 0 {
+        let pass_mid = if self.lean {
             self.prefilter(top, bmask, info.carries, ext.p2[row], ext.p3[row])
         } else {
             // R mod b^mid: the residue's, plus what the last digit adds.
@@ -818,23 +922,23 @@ impl CpuJoin {
     /// `k..k2` must be distinct and new (and avoid the certificate when it
     /// sits above them). With `n = R + D·b^k` (`R` the bottom, `D` the top's
     /// next digits) they are the digits of `⌊R²/b^k⌋ + 2RD` and
-    /// `⌊R³/b^k⌋ + 3R²D` mod `b^mid` when `k >= mid` (the production
-    /// parameters), with `2R`, `3R²` (`p2`, `p3`) the bottom's.
+    /// `⌊R³/b^k⌋ + 3R²D` mod `b^mid` when `k > mid` (the production
+    /// parameters), with `2R`, `3R²` (`p2`, `p3`) the bottom's. At `mid = 2`
+    /// (`self.lean`) the digits come by fixed point ([`Fx`]), the top's `D`
+    /// as `δ̂`, and its certificate is pre-gated (`gmask`).
     #[inline]
     fn prefilter(&self, top: &Top, bmask: u64, carries: u32, p2: u32, p3: u32) -> bool {
-        let dm = u64::from(top.dm);
-        let x2 = self
-            .smid
-            .rem(u64::from(carries & 0xFFFF) + u64::from(p2) * dm);
-        let x3 = self.smid.rem(u64::from(carries >> 16) + u64::from(p3) * dm);
-        self.prefilter_digits(top, bmask, x2, x3)
+        self.fx.pass(bmask | top.gmask, carries, p2, p3, top.dh)
     }
 
     /// [`Self::prefilter`] for any parameters: also the terms in `b^k`
     /// (`D²b^k`, `3RD²b^k`, `D³b^(2k)`), which vanish unless `k` is below
     /// the prefilter's depth, and `R mod b^mid` as given.
+    // D = P's digits k..k2 as a number, below b^mid < 2^32.
+    #[allow(clippy::cast_possible_truncation)]
     fn prefilter_any(&self, top: &Top, bmask: u64, carries: u32, rho: u64) -> bool {
-        let (m, dm) = (self.bmid, u64::from(top.dm));
+        let m = self.bmid;
+        let dm = ((top.p / self.pk) % u128::from(m)) as u64;
         let (a2, a3) = (u64::from(carries & 0xFFFF), u64::from(carries >> 16));
         let (rho2, d2) = (rho * rho % m, dm * dm % m);
         let x2 = (a2 + 2 * rho * dm + d2 * self.bk) % m;
@@ -847,19 +951,8 @@ impl CpuJoin {
     /// each, below `b^mid`) against each other, the bottom's digits and
     /// the certificate when it sits above them.
     #[inline]
-    fn prefilter_digits(&self, top: &Top, bmask: u64, mut x2: u32, mut x3: u32) -> bool {
-        let mut seen = bmask | if top.seed { top.mask } else { 0 };
-        for _ in 0..self.mid {
-            let (q2, g2) = self.sb.divrem_small(x2);
-            let (q3, g3) = self.sb.divrem_small(x3);
-            let bits = (1u64 << g2) | (1u64 << g3);
-            if g2 == g3 || seen & bits != 0 {
-                return false;
-            }
-            seen |= bits;
-            (x2, x3) = (q2, q3);
-        }
-        true
+    fn prefilter_digits(&self, top: &Top, bmask: u64, x2: u32, x3: u32) -> bool {
+        fresh_digits(self.sb, self.mid, bmask | top.gmask, x2, x3)
     }
 }
 
@@ -1001,12 +1094,17 @@ mod tests {
     }
 
     /// The stepped top certificates cover the test windows (all but base
-    /// 10's, whose blocks are single numbers).
+    /// 10's, whose blocks are single numbers). Their blocks, full ones, are
+    /// all seeded: `e² − a² >= (b^f0 − 1)·2b^(L−1)` has `L + f0 >= k + 2`
+    /// digits, so the certificate sits above the prefilter's digits.
     #[test]
     fn the_test_windows_step_their_top_certificates() {
         for (b, s, e, jp) in windows() {
             let join = CpuJoin::new(b, &FieldSize::new(s, e), jp).expect("field setup");
             assert_eq!(join.fd.is_some(), b != 10, "b{b} [{s}, {e}) {jp:?}");
+            if join.fd.is_some() {
+                assert!(join.fs.full_floor >= join.fs.k2, "b{b} [{s}, {e}) {jp:?}");
+            }
         }
     }
 
@@ -1223,6 +1321,205 @@ mod tests {
                 before / nparts,
                 after / nparts,
                 100.0 * (1.0 - after as f64 / before as f64)
+            );
+        }
+    }
+
+    /// splitmix64, for the random tests.
+    fn next_u64(x: &mut u64) -> u64 {
+        *x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A random number below `m` (multiply-shift).
+    #[allow(clippy::cast_possible_truncation)]
+    fn below(x: &mut u64, m: u32) -> u32 {
+        (((next_u64(x) >> 32) * u64::from(m)) >> 32) as u32
+    }
+
+    /// A random set of exactly `size` of the digits below `b`.
+    fn random_set(x: &mut u64, b: u32, size: u32) -> u64 {
+        let mut digits: [u32; 64] = std::array::from_fn(|i| u32::try_from(i).expect("< 64"));
+        let mut set = 0;
+        for i in 0..size {
+            let pick = (i + below(x, b - i)) as usize;
+            digits.swap(i as usize, pick);
+            set |= 1u64 << digits[i as usize];
+        }
+        set
+    }
+
+    /// The fixed-point digits ([`Fx`]) at every base 10–64: the constants
+    /// and `δ̂` against exact ceilings for every `D < b²`, the error bound
+    /// `Δ < 2^32`, and the digits against `(A + P·D) mod b²` for every `(P,
+    /// D)` at the largest `A` and every `(A, D)` at the largest `P`.
+    #[test]
+    fn fx_digits_match_the_division() {
+        let two32 = 1u64 << 32;
+        let mut n = 0u64;
+        for b in 10..=64u32 {
+            let fx = Fx::new(b);
+            let (b2, bb) = (b * b, u64::from(b));
+            let b2w = u64::from(b2);
+            assert_eq!(u64::from(fx.c), two32.div_ceil(b2w), "b{b}: C");
+            assert_eq!(u64::from(fx.q) * b2w + u64::from(fx.r), two32, "b{b}: q, r");
+            assert!(u64::from(fx.r) < b2w, "b{b}: r");
+            let e1 = u64::from(fx.c) * b2w - two32;
+            let dhs: Vec<u32> = (0..b2).map(|d| fx.dh(d)).collect();
+            let mut e2 = 0;
+            for (d, &dh) in (0u64..).zip(&dhs) {
+                assert_eq!(u64::from(dh), (d << 32).div_ceil(b2w), "b{b} D {d}: δ̂");
+                e2 = e2.max(u64::from(dh) * b2w - (d << 32));
+            }
+            assert!(e1 < b2w && e2 < b2w, "b{b}: ε");
+            assert!((b2w - 1) * (e1 + e2) < two32, "b{b}: Δ");
+            let top = b2 - 1;
+            for x in 0..b2 {
+                for (d, &dh) in (0..b2).zip(&dhs) {
+                    for (a, p) in [(top, x), (x, top)] {
+                        let want = (u64::from(a) + u64::from(p) * u64::from(d)) % b2w;
+                        let (h, g) = fx.digits(a, p, dh);
+                        assert!(g < bb && h * bb + g == want, "b{b} A {a} P {p} D {d}");
+                    }
+                }
+            }
+            n += 2 * b2w * b2w;
+        }
+        eprintln!("FX: {n} (A, P, D) at bases 10-64 equal the division");
+    }
+
+    /// Opt-in (`NICE_TEST_FX_EXHAUSTIVE=1`; minutes on every core): the
+    /// fixed-point digits for every `A, P, D < b²` at every base 10–64.
+    #[test]
+    #[ignore = "opt-in, minutes of CPU"]
+    fn fx_digits_are_exact_everywhere() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        if std::env::var("NICE_TEST_FX_EXHAUSTIVE").is_err() {
+            eprintln!("skipping: set NICE_TEST_FX_EXHAUSTIVE to check every (A, P, D)");
+            return;
+        }
+        let items: Vec<(u32, u32)> = (10..=64u32)
+            .rev()
+            .flat_map(|b| (0..b * b).map(move |d| (b, d)))
+            .collect();
+        let threads = std::thread::available_parallelism().map_or(4, usize::from);
+        let next = AtomicUsize::new(0);
+        let t = Instant::now();
+        let n: u64 = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut n = 0u64;
+                        while let Some(&(b, d)) = items.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let fx = Fx::new(b);
+                            let (b2, bb, dh) = (b * b, u64::from(b), fx.dh(d));
+                            for p in 0..b2 {
+                                // x = (A + P·D) mod b² for A = 0, 1, ...
+                                let x0 = p * d % b2;
+                                let split = b2 - x0;
+                                let mut bad = 0u32;
+                                for a in 0..b2 {
+                                    let want = x0 + a - if a >= split { b2 } else { 0 };
+                                    let (h, g) = fx.digits(a, p, dh);
+                                    bad += u32::from(h * bb + g != u64::from(want));
+                                }
+                                assert_eq!(bad, 0, "b{b} P {p} D {d}");
+                                n += u64::from(b2);
+                            }
+                        }
+                        n
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("an FX worker panicked"))
+                .sum()
+        });
+        eprintln!(
+            "FX exhaustive: {n} (A, P, D) at bases 10-64 on {threads} threads in {:.0}s",
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    /// The shift membership ([`fresh4`]) is the four one-hot masks'
+    /// predicate ([`fresh_digits`] at `mid = 2`): every digit 4-tuple at
+    /// every base 10–64 against two random sets, and 200,000 random tuples
+    /// per base against sets of every size.
+    #[test]
+    fn lean_membership_matches_the_masks() {
+        let mut x = 0x2545_F491_4F6C_DD1D;
+        for b in 10..=64u32 {
+            let sb = SmallDiv::new(u64::from(b));
+            let sets = [random_set(&mut x, b, b / 4), random_set(&mut x, b, b / 2)];
+            for seen in sets {
+                for h2 in 0..b {
+                    for g2 in 0..b {
+                        for h3 in 0..b {
+                            for g3 in 0..b {
+                                let want = fresh_digits(sb, 2, seen, h2 * b + g2, h3 * b + g3);
+                                let got = fresh4(seen, h2.into(), g2.into(), h3.into(), g3.into());
+                                assert_eq!(
+                                    got, want,
+                                    "b{b} {seen:#x} h2 {h2} g2 {g2} h3 {h3} g3 {g3}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for i in 0..200_000u32 {
+                let seen = random_set(&mut x, b, i % (b + 1));
+                let [h2, g2, h3, g3] = std::array::from_fn(|_| below(&mut x, b));
+                let want = fresh_digits(sb, 2, seen, h2 * b + g2, h3 * b + g3);
+                let got = fresh4(seen, h2.into(), g2.into(), h3.into(), g3.into());
+                assert_eq!(got, want, "b{b} {seen:#x} h2 {h2} g2 {g2} h3 {h3} g3 {g3}");
+            }
+        }
+    }
+
+    /// The fixed-point prefilter ([`Fx::pass`]) against the division form
+    /// (the digits of `(A + P·D) mod b²` by [`fresh_digits`]) on 10^6
+    /// random pairs per base 10–64: carries, coefficients and `D` below
+    /// `b²`, and sets of every size from 0 to `b`.
+    #[test]
+    fn lean_prefilter_matches_the_division_form() {
+        let mut x = 0x6A09_E667_F3BC_C908;
+        for b in 10..=64u32 {
+            let (fx, sb, b2) = (Fx::new(b), SmallDiv::new(u64::from(b)), b * b);
+            let mut passed = 0u32;
+            for i in 0..1_000_000u32 {
+                let seen = random_set(&mut x, b, i % (b + 1));
+                let [a2, a3, p2, p3, d] = std::array::from_fn(|_| below(&mut x, b2));
+                let want = fresh_digits(sb, 2, seen, (a2 + p2 * d) % b2, (a3 + p3 * d) % b2);
+                let got = fx.pass(seen, a2 | a3 << 16, p2, p3, fx.dh(d));
+                assert_eq!(got, want, "b{b} {seen:#x} A {a2} {a3} P {p2} {p3} D {d}");
+                passed += u32::from(want);
+            }
+            assert!(passed > 0 && passed < 1_000_000, "b{b}: {passed} passed");
+        }
+    }
+
+    /// The fixed-point prefilter covers exactly the shapes with `mid = 2`
+    /// and `k > 2`: every production field, and every test window but
+    /// b10's `k = 1` and b20's `k = 2`, which take the general form.
+    #[test]
+    fn production_shapes_take_the_fixed_point_prefilter() {
+        for &(b, s, size) in PLAN_FIELDS {
+            let range = FieldSize::new(s, s + size);
+            let jp = join_params_for(b, &range).expect("a join field");
+            let join = CpuJoin::new(b, &range, jp).expect("field setup");
+            assert!(join.lean && join.mid == 2, "b{b} {jp:?}");
+        }
+        for (b, s, e, jp) in windows() {
+            let join = CpuJoin::new(b, &FieldSize::new(s, e), jp).expect("field setup");
+            assert_eq!(
+                join.lean,
+                join.mid == 2 && jp.k > 2,
+                "b{b} [{s}, {e}) {jp:?}"
             );
         }
     }
