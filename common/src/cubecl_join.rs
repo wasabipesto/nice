@@ -128,6 +128,16 @@ const TOP_FD_MIN_UNITS: u32 = 1 << 17;
 /// FD at power-of-two bases too: no, `top_kernel`'s division is shifts there and FD measured slower.
 const TOP_FD_AT_POW2_BASES: bool = false;
 
+/// Whether [`top_fd_kernel`]'s append ranks a plane's kept tops with one
+/// ballot (`top_slot`): only on devices whose planes have at most 32 lanes.
+/// `CubeCL`'s C++ backends (CUDA, HIP, Metal) return a ballot's first 32
+/// bits, and HIP's wave64 devices (CDNA) and Metal on AMD GPUs have 64-lane
+/// planes, where a ballot would miss the upper half; those keep the sum and
+/// exclusive scan.
+pub(crate) const fn ballot_append(plane_size_max: u32) -> bool {
+    plane_size_max <= 32
+}
+
 // ---------------------------------------------------------------------------
 // Device kernels
 // ---------------------------------------------------------------------------
@@ -1731,6 +1741,12 @@ mod kernels {
     /// kept, no atomic), and lane 0's group differs from its kept lanes' only
     /// where the plane straddles a group boundary. Only such a plane can take
     /// per-lane atomics where one would have done.
+    ///
+    /// With `ballot` (`ballot_append`: planes of at most 32 lanes) the
+    /// plane's count and each lane's rank are popcounts of the ballot's first
+    /// word, instead of a sum and an exclusive scan over the plane. `CubeCL`'s
+    /// C++ backends return only that word (HIP truncates a 64-lane ballot to
+    /// it), so wider planes keep the scans.
     #[cube]
     fn top_slot(
         kept: bool,
@@ -1740,12 +1756,27 @@ mod kernels {
         ntlay: u32,
         grp_cnt: &mut Array<Atomic<u32>>,
         #[comptime] nb: u32,
+        #[comptime] ballot: bool,
     ) -> u32 {
         let g0 = plane_broadcast(g, 0u32);
         let one = plane_all(!kept || g == g0);
         let kc = select(kept && one, 1u32, 0u32);
-        let n = plane_sum(kc);
-        let pre = plane_exclusive_sum(kc);
+        let b0 = if comptime!(ballot) {
+            let bal = plane_ballot(kept && one);
+            bal[0usize]
+        } else {
+            kc
+        };
+        let n = if comptime!(ballot) {
+            b0.count_ones()
+        } else {
+            plane_sum(kc)
+        };
+        let pre = if comptime!(ballot) {
+            (b0 & ((1u32 << UNIT_POS_PLANE) - 1u32)).count_ones()
+        } else {
+            plane_exclusive_sum(kc)
+        };
         let mut a0 = 0u32;
         if UNIT_POS_PLANE == 0u32 && n > 0u32 {
             a0 = grp_cnt[(slot * nb + g0) as usize].fetch_add(n);
@@ -1935,8 +1966,9 @@ mod kernels {
     // -----------------------------------------------------------------
 
     /// `x += c` for a digit constant `c < b`, the packed digits of `x` over
-    /// `kd` words (four to a u32, as `cubecl_detailed_fd`'s), with the carry
-    /// rippled through all of them: `fd_add_top` with a one-digit addend.
+    /// `kd` words (four to a u32, as `cubecl_detailed_fd`'s): `fd_add_top`
+    /// with a one-digit addend, the carry out of word 0 rippled through the
+    /// others only when there is one.
     #[cube]
     fn fd_add_small(
         x: &mut Array<u32>,
@@ -1946,12 +1978,51 @@ mod kernels {
     ) {
         let bias = comptime!((256 - base) * 0x0101_0101u32);
         let fix = comptime!(256 - base);
+        let t0 = x[0] + comptime!(bias + c);
+        let mut cin = (t0 >> 31u32) ^ 1u32;
+        x[0] = t0 - ((t0 >> 7u32) & 0x0101_0101u32) * fix;
+        // A word plus the bias and no carry comes back unchanged.
+        if comptime!(kd > 1) {
+            if cin != 0u32 {
+                #[unroll]
+                for w in 1..kd {
+                    let t = x[w as usize] + bias + cin;
+                    cin = (t >> 31u32) ^ 1u32;
+                    x[w as usize] = t - ((t >> 7u32) & 0x0101_0101u32) * fix;
+                }
+            }
+        }
+    }
+
+    /// `fd_add_top`'s biased add of `y`'s `wy` packed-digit words into `x`
+    /// (`kd` words), with the carry past `y`'s words propagated only when
+    /// there is one.
+    #[cube]
+    fn fd_add_carry(
+        x: &mut Array<u32>,
+        y: &Array<u32>,
+        #[comptime] wy: u32,
+        #[comptime] kd: u32,
+        #[comptime] base: u32,
+    ) {
+        let bias = comptime!((256 - base) * 0x0101_0101u32);
+        let fix = comptime!(256 - base);
         let mut cin = 0u32;
         #[unroll]
-        for w in 0..kd {
-            let t = x[w as usize] + comptime!(bias + if w == 0 { c } else { 0 }) + cin;
+        for w in 0..wy {
+            let t = x[w as usize] + y[w as usize] + bias + cin;
             cin = (t >> 31u32) ^ 1u32;
             x[w as usize] = t - ((t >> 7u32) & 0x0101_0101u32) * fix;
+        }
+        if comptime!(wy < kd) {
+            if cin != 0u32 {
+                #[unroll]
+                for w in wy..kd {
+                    let t = x[w as usize] + bias + cin;
+                    cin = (t >> 31u32) ^ 1u32;
+                    x[w as usize] = t - ((t >> 7u32) & 0x0101_0101u32) * fix;
+                }
+            }
         }
     }
 
@@ -2143,27 +2214,141 @@ mod kernels {
         let wq2 = comptime!(q2.div_ceil(4));
         let wdc = comptime!((q2 + 1).div_ceil(4));
         let wq3 = comptime!(q3.div_ceil(4));
-        fd_add_top(sq, ds, wq1, wq2, base);
+        fd_add_carry(sq, ds, wq1, wq2, base);
         fd_add_small(ds, 2u32, wq1, base);
-        fd_add_top(cu, dc, wdc, wq3, base);
-        fd_add_top(dc, ddc, wq1, wdc, base);
+        fd_add_carry(cu, dc, wdc, wq3, base);
+        fd_add_carry(dc, ddc, wq1, wdc, base);
         fd_add_small(ddc, 6u32, wq1, base);
     }
 
     /// `x += y` over `nx` u32 words (`y` has `ny` <= `nx`), the carry out of
-    /// the top word dropped (the caller's values fit).
+    /// the top word dropped (the caller's values fit); a carry past `y`'s
+    /// words is propagated only when there is one.
     #[cube]
     fn add_words(x: &mut Array<u32>, y: &Array<u32>, #[comptime] ny: u32, #[comptime] nx: u32) {
         let mut c = 0u64;
         #[unroll]
-        for j in 0..nx {
-            if comptime!(j < ny) {
-                c += u64::cast_from(x[j as usize]) + u64::cast_from(y[j as usize]);
-            } else {
-                c += u64::cast_from(x[j as usize]);
-            }
+        for j in 0..ny {
+            c += u64::cast_from(x[j as usize]) + u64::cast_from(y[j as usize]);
             x[j as usize] = u32::cast_from(c);
             c >>= 32u64;
+        }
+        if comptime!(ny < nx) {
+            if c != 0u64 {
+                #[unroll]
+                for j in ny..nx {
+                    c += u64::cast_from(x[j as usize]);
+                    x[j as usize] = u32::cast_from(c);
+                    c >>= 32u64;
+                }
+            }
+        }
+    }
+
+    /// `x -= y` over `nx` u32 words (`y` has `ny` <= `nx`); returns the borrow
+    /// out of the top word. A borrow past `y`'s words is propagated only when
+    /// there is one.
+    #[cube]
+    fn sub_words(
+        x: &mut Array<u32>,
+        y: &Array<u32>,
+        #[comptime] ny: u32,
+        #[comptime] nx: u32,
+    ) -> u32 {
+        // x + !y + 1, carried as `add_words` carries.
+        let mut c = 1u64;
+        #[unroll]
+        for j in 0..ny {
+            c += u64::cast_from(x[j as usize]) + u64::cast_from(y[j as usize] ^ 0xFFFF_FFFFu32);
+            x[j as usize] = u32::cast_from(c);
+            c >>= 32u64;
+        }
+        if comptime!(ny < nx) {
+            if c == 0u64 {
+                #[unroll]
+                for j in ny..nx {
+                    c += u64::cast_from(x[j as usize]) + 0xFFFF_FFFFu64;
+                    x[j as usize] = u32::cast_from(c);
+                    c >>= 32u64;
+                }
+            }
+        }
+        1u32 - u32::cast_from(c)
+    }
+
+    /// Words that bound the binary steps for blocks of width w = b^f0 (δ =
+    /// w - 1), each at most its array's ([`top_fd_consts`]: `c2` 3 words,
+    /// `k3` 4) and the difference's (`nl2`, `nl3` = 2·`limbs`, 3·`limbs`):
+    /// c2 = 2wδ < 2w², k3 = 6w²δ < 6w³, and Δ3 = 3wδ(2a + 2w - 1) <
+    /// 3w²·2^(32·limbs + 2) for a block start a < 2^(32·limbs).
+    fn fd_step_words(base: u32, f0: u32, limbs: u32) -> (u32, u32, u32) {
+        let w = u128::from(base).pow(f0);
+        let bits = |x: u128| 128 - x.leading_zeros();
+        (
+            bits(2 * w * w).div_ceil(32).min(3).min(2 * limbs),
+            bits(6 * w * w * w).div_ceil(32).min(4).min(3 * limbs),
+            (bits(3 * w * w) + 32 * limbs + 2)
+                .div_ceil(32)
+                .min(3 * limbs),
+        )
+    }
+
+    /// `out = b^c - 1 - x` over `nl` words (mod 2^(32·nl)), b^c from the
+    /// power table `pw` (`nl3` words a power); it is its own inverse.
+    #[cube]
+    fn pw_minus1(
+        pw: &Array<u32>,
+        c: u32,
+        x: &Array<u32>,
+        out: &mut Array<u32>,
+        #[comptime] nl: u32,
+        #[comptime] nl3: u32,
+    ) {
+        let mut cy = 0u64;
+        #[unroll]
+        for j in 0..nl {
+            cy += u64::cast_from(pw[(c * nl3 + j) as usize])
+                + u64::cast_from(x[j as usize] ^ 0xFFFF_FFFFu32);
+            out[j as usize] = u32::cast_from(cy);
+            cy >>= 32u64;
+        }
+    }
+
+    /// The base-b value of a word's four packed digits.
+    #[cube]
+    fn word_value(word: u32, #[comptime] base: u32) -> u32 {
+        (word & 0xFFu32)
+            + comptime!(base)
+                * (((word >> 8u32) & 0xFFu32)
+                    + comptime!(base)
+                        * (((word >> 16u32) & 0xFFu32) + comptime!(base) * (word >> 24u32)))
+    }
+
+    /// `acc += v · b^p0` over `nl` words, for a sum below b^(p0 + 4).
+    #[cube]
+    fn add_scaled_pow(
+        acc: &mut Array<u32>,
+        v: u32,
+        #[comptime] nl: u32,
+        #[comptime] base: u32,
+        #[comptime] p0: u32,
+    ) {
+        let len = comptime!((pow_words32(base, p0).len() as u32).min(nl));
+        let topk = comptime!((pow_words32(base, p0 + 4).len() as u32).min(nl));
+        let mut c = 0u64;
+        #[unroll]
+        for k in 0..len {
+            let t = u64::cast_from(v) * comptime!(u64::from(pow_words32(base, p0)[k as usize]))
+                + u64::cast_from(acc[k as usize])
+                + c;
+            acc[k as usize] = u32::cast_from(t);
+            c = t >> 32u64;
+        }
+        #[unroll]
+        for k in len..topk {
+            let t = u64::cast_from(acc[k as usize]) + c;
+            acc[k as usize] = u32::cast_from(t);
+            c = t >> 32u64;
         }
     }
 
@@ -2245,28 +2430,29 @@ mod kernels {
 
     /// [`cert_power`] with the power's digits read from the finite-difference
     /// state instead of divided out: x = Q·b^z (Q's packed digits in `q`,
-    /// four to a word; the `z` digits below are zero) and d = y - x (`nl`
-    /// u32 words); `c0` = max(cap, ndig(d) clamped to sp), computed by the
-    /// caller. The same results from the same digits as `cert_power`, by a
-    /// scan over Q's words from the bottom: a word wholly below c0 only adds
-    /// its value times b^pos to x mod b^c0 (u32 words here; nothing divides
-    /// it), and the digits of the others go through `cert_power`'s scan step
-    /// in order. The repeat flags come from the masks' popcounts at the end
-    /// (a digit repeats among the n positions a mask covers iff it has fewer
-    /// than n bits), and the end of x's run of (b - 1)s from c0 up is kept as
-    /// a position. The zero digits at c0..z, if c0 < z (never for an
-    /// unclipped block with P >= 1, where d2 >= w² and d3 >= w³), are put in
-    /// before the scan: the first ends the run, the rest lie above it.
+    /// four to a word; the `z` digits below are zero), `c0` = max(cap,
+    /// ndig(y - x) clamped to sp) and `dm` = b^c0 - 1 - (y - x) (`nl` u32
+    /// words), both kept by the caller. The same results from the same digits
+    /// as `cert_power`, by a scan over Q's words from the bottom: a word
+    /// wholly below c0 only adds its value times b^pos to x mod b^c0 (u32
+    /// words here; nothing divides it), and the digits of the others go
+    /// through `cert_power`'s scan step in order, those of a word above the
+    /// end of x's run of (b - 1)s from c0 up without the run's bookkeeping.
+    /// The carry is x mod b^c0 > dm. The repeat flags come from
+    /// the masks' popcounts at the end (a digit repeats among the n positions
+    /// a mask covers iff it has fewer than n bits), and the end of x's run of
+    /// (b - 1)s from c0 up is kept as a position. The zero digits at c0..z, if
+    /// c0 < z (never for an unclipped block with P >= 1, where d2 >= w² and d3
+    /// >= w³), are put in before the scan: the first ends the run, the rest
+    /// lie above it.
     #[cube]
     pub(super) fn cert_power_fd(
         q: &Array<u32>,
-        d: &Array<u32>,
-        pw: &Array<u32>,
+        dm: &Array<u32>,
         c0: u32,
         out_dup: &mut Array<u32>,
         out_dom: &mut Array<u32>,
         #[comptime] nl: u32,
-        #[comptime] nl3: u32,
         #[comptime] sp: u32,
         #[comptime] base: u32,
         #[comptime] z: u32,
@@ -2297,13 +2483,8 @@ mod kernels {
             let mut low = 0u32;
             if c0 >= wend {
                 // Every digit of the word below c0 (those at sp and up are 0).
-                low = (word & 0xFFu32)
-                    + comptime!(base)
-                        * (((word >> 8u32) & 0xFFu32)
-                            + comptime!(base)
-                                * (((word >> 16u32) & 0xFFu32)
-                                    + comptime!(base) * (word >> 24u32)));
-            } else {
+                low = word_value(word, base);
+            } else if in_run {
                 #[unroll]
                 for i in 0..4u32 {
                     let pos = comptime!(p0 + i);
@@ -2320,27 +2501,24 @@ mod kernels {
                         low += select(above, 0u32, dx * comptime!(base.pow(i)));
                     }
                 }
+            } else {
+                // x's run has ended (in a lower word, or before the scan when
+                // c0 < z): every digit here lies above c0.
+                let mut wb = 0u64;
+                #[unroll]
+                for i in 0..4u32 {
+                    let pos = comptime!(p0 + i);
+                    if comptime!(pos < sp) {
+                        let dx = (word >> comptime!(8 * i)) & 0xFFu32;
+                        wb |= 1u64 << u64::cast_from(dx);
+                    }
+                }
+                run |= wb;
+                runc |= wb;
             }
             // rem += low · b^p0 (the sum is below b^(p0 + 4)).
             if p0 < c0 {
-                let len = comptime!((pow_words32(base, p0).len() as u32).min(nl));
-                let topk = comptime!((pow_words32(base, p0 + 4).len() as u32).min(nl));
-                let mut c = 0u64;
-                #[unroll]
-                for k in 0..len {
-                    let t = u64::cast_from(low)
-                        * comptime!(u64::from(pow_words32(base, p0)[k as usize]))
-                        + u64::cast_from(rem[k as usize])
-                        + c;
-                    rem[k as usize] = u32::cast_from(t);
-                    c = t >> 32u64;
-                }
-                #[unroll]
-                for k in len..topk {
-                    let t = u64::cast_from(rem[k as usize]) + c;
-                    rem[k as usize] = u32::cast_from(t);
-                    c = t >> 32u64;
-                }
+                add_scaled_pow(&mut rem, low, nl, base, p0);
             }
         }
         let mut nabove = 0u32;
@@ -2355,42 +2533,19 @@ mod kernels {
         }
         let pruc = u32::cast_from(runc).count_ones() + u32::cast_from(runc >> 32u64).count_ones();
         let dupc = select(pruc != nc, 1u32, 0u32);
+        // floor(y / b^c0) is one more than floor(x / b^c0) iff (x mod b^c0) +
+        // (y - x) >= b^c0, i.e. x mod b^c0 > dm: dm - rem borrows (only the
+        // borrow is kept).
         let mut one_more = false;
         if c0 < sp {
-            let mut s = Array::<u32>::new(nl as usize);
-            let mut carry = 0u32;
+            let mut c = 1u64;
             #[unroll]
             for j in 0..nl {
-                let rj = rem[j as usize];
-                let t = rj + d[j as usize];
-                let t2 = t + carry;
-                let mut nc2 = 0u32;
-                if t < rj || t2 < t {
-                    nc2 = 1u32;
-                }
-                s[j as usize] = t2;
-                carry = nc2;
+                c += u64::cast_from(dm[j as usize])
+                    + u64::cast_from(rem[j as usize] ^ 0xFFFF_FFFFu32);
+                c >>= 32u64;
             }
-            let mut ge = true;
-            let mut eq = true;
-            #[unroll]
-            for jj in 0..nl3 {
-                let j = comptime!(nl3 - 1 - jj);
-                let pj = pw[(c0 * nl3 + j) as usize];
-                let mut sj = 0u32;
-                if comptime!(j < nl) {
-                    sj = s[j as usize];
-                }
-                if eq {
-                    if sj < pj {
-                        ge = false;
-                        eq = false;
-                    } else if sj > pj {
-                        eq = false;
-                    }
-                }
-            }
-            one_more = carry != 0u32 || ge;
+            one_more = c == 0u64;
         }
         let mut dom_lo = 1u32;
         let mut dom_hi = 0u32;
@@ -2408,17 +2563,16 @@ mod kernels {
     }
 
     /// [`top_cert`] for an unclipped block a = P·b^f0, e = a + b^f0 - 1 from
-    /// the state's P² and P³ digits and the binary differences `d2`, `d3`,
-    /// with the c0s computed (both at least their power's zero digits).
+    /// the state's P² and P³ digits, the c0s (both at least their power's
+    /// zero digits) and b^c0 - 1 - (e^k - a^k) of each power (`dm2`, `dm3`).
     #[cube]
     pub(super) fn top_cert_fd(
         sq: &Array<u32>,
         cu: &Array<u32>,
-        d2: &Array<u32>,
-        d3: &Array<u32>,
+        dm2: &Array<u32>,
+        dm3: &Array<u32>,
         c0a: u32,
         c0b: u32,
-        pw: &Array<u32>,
         res: &mut Array<u32>,
         #[comptime] base: u32,
         #[comptime] limbs: u32,
@@ -2434,25 +2588,21 @@ mod kernels {
         let mut domb = Array::<u32>::new(2usize);
         let msq = cert_power_fd(
             sq,
-            d2,
-            pw,
+            dm2,
             c0a,
             &mut dupa,
             &mut doma,
             nl2,
-            nl3,
             s2,
             base,
             comptime!(2 * f0),
         );
         let mcu = cert_power_fd(
             cu,
-            d3,
-            pw,
+            dm3,
             c0b,
             &mut dupb,
             &mut domb,
-            nl3,
             nl3,
             s3,
             base,
@@ -2467,11 +2617,12 @@ mod kernels {
     /// its group's slots in order. An unclipped block a = P·w (w = b^f0) has
     /// a^k = P^k·b^(k·f0), and consecutive partition values are consecutive
     /// P, so the digits of P² and P³ step from slot to slot by additions
-    /// ([`top_fd_step`]), as do e² - a² and e³ - a³ in binary; they are
-    /// divided out ([`top_fd_seed`], [`powers_diff`]) only for a group's
-    /// first unclipped slot, after a gap in `vs` and after a clipped or
-    /// out-of-range slot. Clipped blocks (P = plo, phi: the slice's ends) are
-    /// left to [`top_kernel`] with `only_clipped`, launched beside this one.
+    /// ([`top_fd_step`]), as do each power's c0 and b^c0 - 1 - (e^k - a^k) in
+    /// binary; they are divided out ([`top_fd_seed`], [`powers_diff`]) only
+    /// for a group's first unclipped slot, after a gap in `vs` and after a
+    /// clipped or out-of-range slot. Clipped blocks (P = plo, phi: the
+    /// slice's ends) are left to [`top_kernel`] with `only_clipped`, launched
+    /// beside this one.
     /// The certificate is [`cert_power_fd`]'s, the same function of the same
     /// digits as [`cert_power`]'s; the outputs are [`top_kernel`]'s.
     #[cube(launch_unchecked)]
@@ -2500,6 +2651,7 @@ mod kernels {
         #[comptime] nb: u32,
         #[comptime] f0: u32,
         #[comptime] tq: u32,
+        #[comptime] ballot: bool,
     ) {
         let nl2 = comptime!(2 * limbs);
         let nl3 = comptime!(3 * limbs);
@@ -2557,8 +2709,10 @@ mod kernels {
             for j in 0..wdc {
                 dc[j as usize] = 0u32;
             }
-            // d2 = e² - a², d3 = e³ - a³ and Δ3 = d3(P + 1) - d3(P), stepped
-            // in binary: d2 += 2wδ, d3 += Δ3, Δ3 += 6w²δ.
+            // d2 = e² - a², d3 = e³ - a³ and Δ3 = d3(P + 1) - d3(P): d2 grows
+            // by 2wδ a step, d3 by Δ3, and Δ3 by 6w²δ. What is stepped is
+            // each power's c0 = max(cap, ndig(d)) (it rarely moves) and dm
+            // = b^c0 - 1 - d, the bound of the carry test.
             let mut d2 = Array::<u32>::new(nl2 as usize);
             let mut d3 = Array::<u32>::new(nl3 as usize);
             let mut del3 = Array::<u32>::new(nl3 as usize);
@@ -2573,6 +2727,18 @@ mod kernels {
             #[unroll]
             for j in 0..nl2 {
                 d2[j as usize] = 0u32;
+            }
+            let mut c0a = 0u32;
+            let mut c0b = 0u32;
+            let mut dm2 = Array::<u32>::new(nl2 as usize);
+            let mut dm3 = Array::<u32>::new(nl3 as usize);
+            #[unroll]
+            for j in 0..nl2 {
+                dm2[j as usize] = 0u32;
+            }
+            #[unroll]
+            for j in 0..nl3 {
+                dm3[j as usize] = 0u32;
             }
             let mut valid = false;
             let mut prev_v = 0u32;
@@ -2589,71 +2755,76 @@ mod kernels {
                 let mut kept = false;
                 let mut mask = 0u64;
                 if live && p >= plo && p <= phi {
-                    // a = p*w (< 2^96, 3 limbs), e = a + w - 1, clipped to [s, e-1].
-                    let t0 = (p & 0xFFFF_FFFFu64) * u64::cast_from(w);
-                    let t1 = (p >> 32u64) * u64::cast_from(w) + (t0 >> 32u64);
-                    let pw0 = u32::cast_from(t0);
                     let mut a = Array::<u32>::new(limbs as usize);
                     let mut e = Array::<u32>::new(limbs as usize);
-                    #[unroll]
-                    for j in 0..limbs {
-                        if comptime!(j == 0) {
-                            a[j as usize] = pw0;
-                        } else if comptime!(j == 1) {
-                            a[j as usize] = u32::cast_from(t1);
-                        } else if comptime!(j == 2) {
-                            a[j as usize] = u32::cast_from(t1 >> 32u64);
-                        } else {
-                            a[j as usize] = 0u32;
-                        }
-                    }
-                    let mut carry = w - 1u32;
-                    #[unroll]
-                    for j in 0..limbs {
-                        let t = a[j as usize] + carry;
-                        let mut c = 0u32;
-                        if t < carry {
-                            c = 1u32;
-                        }
-                        e[j as usize] = t;
-                        carry = c;
-                    }
                     let mut a_lt_s = false;
                     let mut e_gt_e = false;
-                    let mut eq_a = true;
-                    let mut eq_e = true;
-                    #[unroll]
-                    for jj in 0..limbs {
-                        let j = comptime!(limbs - 1 - jj);
-                        let sj = fb[j as usize];
-                        let ej = fb[comptime!(3 + j) as usize];
-                        if eq_a {
-                            if a[j as usize] < sj {
-                                a_lt_s = true;
-                                eq_a = false;
-                            } else if a[j as usize] > sj {
-                                eq_a = false;
-                            }
-                        }
-                        if eq_e {
-                            if e[j as usize] > ej {
-                                e_gt_e = true;
-                                eq_e = false;
-                            } else if e[j as usize] < ej {
-                                eq_e = false;
-                            }
-                        }
-                    }
-                    if a_lt_s {
+                    // Only P = plo and P = phi can be clipped, and a slot that
+                    // steps needs neither a nor e (they feed a seed).
+                    let interior_step = valid && v == prev_v + 1u32 && p != plo && p != phi;
+                    if !interior_step {
+                        // a = p*w (< 2^96, 3 limbs), e = a + w - 1, clipped to [s, e-1].
+                        let t0 = (p & 0xFFFF_FFFFu64) * u64::cast_from(w);
+                        let t1 = (p >> 32u64) * u64::cast_from(w) + (t0 >> 32u64);
+                        let pw0 = u32::cast_from(t0);
                         #[unroll]
                         for j in 0..limbs {
-                            a[j as usize] = fb[j as usize];
+                            if comptime!(j == 0) {
+                                a[j as usize] = pw0;
+                            } else if comptime!(j == 1) {
+                                a[j as usize] = u32::cast_from(t1);
+                            } else if comptime!(j == 2) {
+                                a[j as usize] = u32::cast_from(t1 >> 32u64);
+                            } else {
+                                a[j as usize] = 0u32;
+                            }
                         }
-                    }
-                    if e_gt_e {
+                        let mut carry = w - 1u32;
                         #[unroll]
                         for j in 0..limbs {
-                            e[j as usize] = fb[comptime!(3 + j) as usize];
+                            let t = a[j as usize] + carry;
+                            let mut c = 0u32;
+                            if t < carry {
+                                c = 1u32;
+                            }
+                            e[j as usize] = t;
+                            carry = c;
+                        }
+                        let mut eq_a = true;
+                        let mut eq_e = true;
+                        #[unroll]
+                        for jj in 0..limbs {
+                            let j = comptime!(limbs - 1 - jj);
+                            let sj = fb[j as usize];
+                            let ej = fb[comptime!(3 + j) as usize];
+                            if eq_a {
+                                if a[j as usize] < sj {
+                                    a_lt_s = true;
+                                    eq_a = false;
+                                } else if a[j as usize] > sj {
+                                    eq_a = false;
+                                }
+                            }
+                            if eq_e {
+                                if e[j as usize] > ej {
+                                    e_gt_e = true;
+                                    eq_e = false;
+                                } else if e[j as usize] < ej {
+                                    eq_e = false;
+                                }
+                            }
+                        }
+                        if a_lt_s {
+                            #[unroll]
+                            for j in 0..limbs {
+                                a[j as usize] = fb[j as usize];
+                            }
+                        }
+                        if e_gt_e {
+                            #[unroll]
+                            for j in 0..limbs {
+                                e[j as usize] = fb[comptime!(3 + j) as usize];
+                            }
                         }
                     }
                     // Clipped blocks (P = plo, P = phi) are `top_kernel`'s
@@ -2670,14 +2841,30 @@ mod kernels {
                             top_fd_step(
                                 &mut sq, &mut cu, &mut ds, &mut dc, &mut ddc, base, tq, q2, q3,
                             );
-                            add_words(&mut d2, &c2, comptime!(if nl2 < 3 { nl2 } else { 3 }), nl2);
-                            add_words(&mut d3, &del3, nl3, nl3);
-                            add_words(
-                                &mut del3,
-                                &k3,
-                                comptime!(if nl3 < 4 { nl3 } else { 4 }),
-                                nl3,
-                            );
+                            // dm -= the step of d. A borrow means d reached
+                            // b^c0 (rare): d = b^c0 - 1 - dm, c0 and dm anew.
+                            let nc2 = comptime!(fd_step_words(base, f0, limbs).0);
+                            let nk3 = comptime!(fd_step_words(base, f0, limbs).1);
+                            let nd3 = comptime!(fd_step_words(base, f0, limbs).2);
+                            let br2 = sub_words(&mut dm2, &c2, nc2, nl2);
+                            let br3 = sub_words(&mut dm3, &del3, nd3, nl3);
+                            add_words(&mut del3, &k3, nk3, nl3);
+                            if c0a < s2 && br2 != 0u32 {
+                                pw_minus1(pw, c0a, &dm2, &mut d2, nl2, nl3);
+                                c0a = ndig_fast(&d2, pw, nl2, nl3, s2, base);
+                                if c0a < cap {
+                                    c0a = cap.runtime();
+                                }
+                                pw_minus1(pw, c0a, &d2, &mut dm2, nl2, nl3);
+                            }
+                            if c0b < s3 && br3 != 0u32 {
+                                pw_minus1(pw, c0b, &dm3, &mut d3, nl3, nl3);
+                                c0b = ndig_fast(&d3, pw, nl3, nl3, s3, base);
+                                if c0b < cap {
+                                    c0b = cap.runtime();
+                                }
+                                pw_minus1(pw, c0b, &d3, &mut dm3, nl3, nl3);
+                            }
                         } else {
                             let mut a2 = Array::<u32>::new(nh2 as usize);
                             let mut a3 = Array::<u32>::new(nh3 as usize);
@@ -2699,17 +2886,19 @@ mod kernels {
                                 chunk_digits,
                                 chunk_div,
                             );
-                        }
-                        let mut c0a = ndig_fast(&d2, pw, nl2, nl3, s2, base);
-                        if c0a < cap {
-                            c0a = cap.runtime();
-                        }
-                        let mut c0b = ndig_fast(&d3, pw, nl3, nl3, s3, base);
-                        if c0b < cap {
-                            c0b = cap.runtime();
+                            c0a = ndig_fast(&d2, pw, nl2, nl3, s2, base);
+                            if c0a < cap {
+                                c0a = cap.runtime();
+                            }
+                            c0b = ndig_fast(&d3, pw, nl3, nl3, s3, base);
+                            if c0b < cap {
+                                c0b = cap.runtime();
+                            }
+                            pw_minus1(pw, c0a, &d2, &mut dm2, nl2, nl3);
+                            pw_minus1(pw, c0b, &d3, &mut dm3, nl3, nl3);
                         }
                         mask = top_cert_fd(
-                            &sq, &cu, &d2, &d3, c0a, c0b, pw, &mut res, base, limbs, s2, s3, f0,
+                            &sq, &cu, &dm2, &dm3, c0a, c0b, &mut res, base, limbs, s2, s3, f0,
                         );
                     }
                     valid = !clipped;
@@ -2719,7 +2908,7 @@ mod kernels {
                     valid = false;
                 }
                 // Append the plane's kept tops into their groups' segments.
-                let rec = top_slot(kept, tl_g, tl_off, slot, ntlay, grp_cnt, nb);
+                let rec = top_slot(kept, tl_g, tl_off, slot, ntlay, grp_cnt, nb, ballot);
                 if kept {
                     let r8 = TOP_REC_WORDS * rec;
                     top_rec[r8 as usize] = u32::cast_from(p);
@@ -2993,9 +3182,15 @@ fn u32_words(x: u128) -> [u32; 4] {
 }
 
 /// What `client`'s device allows the join: `CubeCL` reports its largest
-/// buffer as `max_page_size`.
+/// buffer as `max_page_size`, on CUDA a quarter of the device's memory
+/// ([`JoinLimits::vram_budget`]).
 pub(crate) fn limits_of<R: Runtime>(client: &ComputeClient<R>) -> JoinLimits {
-    JoinLimits::for_buffer(client.properties().memory.max_page_size)
+    let lim = JoinLimits::for_buffer(client.properties().memory.max_page_size);
+    if R::name(client).contains("cuda") {
+        lim.with_vram_budget()
+    } else {
+        lim
+    }
 }
 
 /// Device buffers for one field: the field's tables, the per-slot scratch
@@ -3027,6 +3222,8 @@ pub(crate) struct JoinDevice<R: Runtime> {
     clip_vs: Vec<u32>,
     /// [`TOP_FD_MIN_UNITS`] (the tests lower it to force slot groups).
     top_fd_min: u32,
+    /// [`ballot_append`] for the device's largest plane.
+    ballot: bool,
     w_f0: u32,
     nbp: u32,
     /// The field's certificate (`FieldSetup::fc`), low and high words.
@@ -3093,6 +3290,13 @@ pub(crate) fn top_fd_fits(fs: &FieldSetup) -> bool {
     }
     let (q2, q3) = (s2 - 2 * f0, s3 - 3 * f0);
     (t + 1).div_ceil(4) <= q2.div_ceil(4) && (q2 + 1).div_ceil(4) <= q3.div_ceil(4)
+}
+
+/// Whether `fs`'s tops are certified by [`top_fd_kernel`]: where it fits,
+/// except at power-of-two bases, where the top kernel's division is shifts
+/// and masks and the FD kernel measured slower (b64).
+pub(crate) fn top_fd_runs(fs: &FieldSetup) -> bool {
+    top_fd_fits(fs) && (TOP_FD_AT_POW2_BASES || !fs.b.is_power_of_two())
 }
 
 impl<R: Runtime> JoinDevice<R> {
@@ -3212,11 +3416,10 @@ impl<R: Runtime> JoinDevice<R> {
             chunk_digits,
             chunk_div,
             wide,
-            // At a power-of-two base the top kernel's division is shifts and
-            // masks, and the FD kernel measured slower (b64).
-            top_fd: top_fd_fits(fs) && (TOP_FD_AT_POW2_BASES || !fs.b.is_power_of_two()),
+            top_fd: top_fd_runs(fs),
             tq: fs.base.l - fs.f0,
             top_fd_min: TOP_FD_MIN_UNITS,
+            ballot: ballot_append(client.properties().hardware.plane_size_max),
             clip_vs: {
                 let mut c = Vec::new();
                 if fs.plo * fs.w < fs.s {
@@ -3374,6 +3577,7 @@ impl<R: Runtime> JoinDevice<R> {
                     self.nb,
                     self.f0,
                     self.tq,
+                    self.ballot,
                 );
             }
             if !fd || fix {
@@ -4351,6 +4555,7 @@ mod tests {
         let lim = JoinLimits {
             max_binding: lim.max_binding,
             budget: 4 << 30,
+            vram_budget: lim.vram_budget,
         };
         JoinPlan::new(fs, lim, slots, 1 << 24, 1, 2 << 30).expect("the test layout fits")
     }
@@ -6224,7 +6429,10 @@ mod tests {
     /// production plans' first and last slices (`heavy`: also 1e16 fields),
     /// in consecutive batches (the first ones, the middle, the last), in the
     /// windows' thinned live partitions (gaps), and in a batch that steps
-    /// back and skips.
+    /// back and skips. Of all of these, only the b20 windows' batches step
+    /// across a change of a power's c0 (P = 201 for the square, P = 231 for
+    /// the cube), the only place the FD kernel re-forms its carried c0 and
+    /// dm: keep them (`top_fd_test_windows_step_across_a_c0_change`).
     fn check_top_fd<R: Runtime>(client: &ComputeClient<R>, name: &str, heavy: bool) {
         let lim = device_limits(client, name);
         let mut fields: Vec<(String, FieldSetup, JoinPlan)> = Vec::new();
@@ -6328,6 +6536,65 @@ mod tests {
             nfields > 10 && ntops > 0 && nfix > 0,
             "the FD comparison ran"
         );
+    }
+
+    /// The FD kernel keeps each power's c0 = max(k, ndig(e^k - a^k)) from
+    /// slot to slot and re-forms it (with dm) only when e^k - a^k reaches
+    /// b^c0. Only small windows step across such a change, and within
+    /// `check_top_fd`'s batches only the b20 ones do (P = 201 for the square,
+    /// P = 231 for the cube); no production-size field changes c0 within a
+    /// slice. This pins that the b20 windows still cross one for each power.
+    #[test]
+    fn top_fd_test_windows_step_across_a_c0_change() {
+        fn ndig(mut x: u128, b: u128) -> u32 {
+            let mut n = 0;
+            while x > 0 {
+                x /= b;
+                n += 1;
+            }
+            n
+        }
+        let mut crossed = [false; 2];
+        for &(b, s, e, t, k, p) in WINDOWS {
+            if e >= 1 << 40 {
+                continue; // cubes in u128
+            }
+            let fs = FieldSetup::new(b, s, e, JoinParams { t, k, p }).expect("field setup");
+            let c0 = |p: u128, pow: u32| {
+                let a = p * fs.w;
+                let ee = a + fs.w - 1;
+                let sp = if pow == 2 { fs.base.s2 } else { fs.base.s3 };
+                let d = ee.pow(pow) - a.pow(pow);
+                (fs.jp.k.max(ndig(d, u128::from(fs.b)).min(sp)), sp)
+            };
+            let unclipped = |p: u128| p * fs.w >= fs.s && p * fs.w + fs.w - 1 < fs.e;
+            for q in fs.plo + 1..=fs.phi {
+                if !(unclipped(q - 1) && unclipped(q)) {
+                    continue;
+                }
+                for (i, pow) in [2u32, 3].into_iter().enumerate() {
+                    let ((c_prev, sp), (c_now, _)) = (c0(q - 1, pow), c0(q, pow));
+                    if c_prev < sp && c_now != c_prev && b == 20 {
+                        crossed[i] = true;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            crossed,
+            [true, true],
+            "the windows no longer cross a c0 change"
+        );
+    }
+
+    /// The FD kernel's append ranks kept tops with a ballot only on planes
+    /// of at most 32 lanes: `CubeCL`'s C++ backends keep a ballot's first
+    /// word, and HIP on CDNA (and Metal on AMD GPUs) has 64-lane planes.
+    #[test]
+    fn the_ballot_append_is_for_planes_of_at_most_32_lanes() {
+        for (lanes, ballot) in [(8, true), (16, true), (32, true), (64, false), (128, false)] {
+            assert_eq!(ballot_append(lanes), ballot, "{lanes} lanes");
+        }
     }
 
     #[test]
