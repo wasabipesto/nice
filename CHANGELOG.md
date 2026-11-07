@@ -11,6 +11,7 @@
 - Speed up the GPU overlap join's top certificates by stepping each top prefix through a batch's consecutive partitions with digit-array additions, as the detailed mode does with consecutive numbers, instead of dividing its square and cube into digits for every partition ([#240](https://github.com/wasabipesto/nice/pull/240)).
 - Speed up the GPU overlap join by keeping each top's words in one 32-byte record, so that the join reads one memory sector per top instead of one from each of three arrays ([#241](https://github.com/wasabipesto/nice/pull/241)).
 - Speed up the GPU overlap join's middle-digit prefilter by reading each pair's digits off a fixed-point fraction with multiplications instead of divisions, and testing them with fewer instructions ([#246](https://github.com/wasabipesto/nice/pull/246)).
+- Speed up the GPU overlap join by sorting each slice's top prefixes once by the buckets they feed, so that the tops need no bucketing pass and the join reads each bucket's tops in order ([#NNN](https://github.com/wasabipesto/nice/pull/NNN)).
 
 ## Nice v3.4.7
 

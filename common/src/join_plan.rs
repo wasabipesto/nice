@@ -191,14 +191,11 @@ pub(crate) struct Footprint {
     pub(crate) ext_q: usize,
     pub(crate) lists: usize,
     pub(crate) counts: usize,
-    /// The tops' records, [`TOP_RECORD_BYTES`] each (`TOP_REC_WORDS` words).
+    /// The tops' records, [`TOP_RECORD_BYTES`] each (`TOP_REC_WORDS` words),
+    /// in segments by the top layer's groups.
     pub(crate) top_rec: usize,
-    pub(crate) top_b: usize,
-    pub(crate) tl: usize,
-    pub(crate) work: usize,
-    pub(crate) cursor: usize,
-    /// What a launched batch allocates for itself (`bucket_cnt`), for every
-    /// batch in flight.
+    /// What a launched batch allocates for itself (`grp_cnt`, the kept tops
+    /// per group), for every batch in flight.
     pub(crate) scratch: usize,
     /// The field's tables and the output list.
     pub(crate) fixed: usize,
@@ -226,6 +223,7 @@ impl Footprint {
             nbp * 8,                               // bp_m
             fs.seg.len() * 4,                      // seg
             ntl * 5 * 4,                           // tlay
+            (fs.nb + 1) * 4,                       // goff
             10 * 4,                                // fb
             (fs.base.s3 as usize + 1) * nl3 * 4,   // pw
             nroots * 4,                            // roots
@@ -238,10 +236,6 @@ impl Footprint {
             lists: nbp * b * 4,
             counts: nkeys * (b - 1) * 4,
             top_rec: ntl * TOP_RECORD_BYTES,
-            top_b: ntl * 4,
-            tl: ntl * nroots * 4,
-            work: fs.nb * 16,
-            cursor: fs.nb * 4,
             scratch: fs.nb * 4 * BATCHES_IN_FLIGHT,
             fixed: tables.iter().sum(),
             largest_fixed: tables.into_iter().max().unwrap_or(0),
@@ -249,16 +243,7 @@ impl Footprint {
     }
 
     pub(crate) fn per_slot(&self) -> usize {
-        self.ext_m
-            + self.ext_q
-            + self.lists
-            + self.counts
-            + self.top_rec
-            + self.top_b
-            + self.tl
-            + self.work
-            + self.cursor
-            + self.scratch
+        self.ext_m + self.ext_q + self.lists + self.counts + self.top_rec + self.scratch
     }
 
     /// The largest buffer one slot adds to (all of them grow linearly).
@@ -269,10 +254,6 @@ impl Footprint {
             self.lists,
             self.counts,
             self.top_rec,
-            self.top_b,
-            self.tl,
-            self.work,
-            self.cursor,
         ]
         .into_iter()
         .max()
@@ -361,7 +342,7 @@ pub(crate) fn max_slice_prefixes(fs: &FieldSetup, lim: JoinLimits) -> usize {
     // Bytes per prefix: in the field's tables, and per slot.
     let per_fixed = two.fixed - one.fixed;
     let per_slot = two.per_slot() - one.per_slot();
-    let per_largest = two.top_rec.max(two.tl) - one.top_rec.max(one.tl);
+    let per_largest = two.top_rec - one.top_rec;
     let list_cap = (list_bound(lim) as usize)
         .min(lim.max_binding / 8)
         .min(lim.budget / 4 / 8);
