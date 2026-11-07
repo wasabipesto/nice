@@ -422,7 +422,7 @@ mod kernels {
     /// there and then ([`walk_pf_lean`], or [`walk_pf`] for small test
     /// shapes); only the pairs that pass it, about 6% at bases 57-64, are
     /// staged in shared memory, and the stage goes to the list once it is
-    /// half full, checked after every 32 tops. The range test is done per
+    /// half full, checked after every batch of tops. The range test is done per
     /// chunk, not per pair: only a clipped top (a block at the field's ends,
     /// whose range is not the whole `[0, w)`) can reject a residue, so the
     /// batch load marks the clipped tops in a word per chunk (`s_cw`), and a
@@ -972,46 +972,43 @@ mod kernels {
                                 }
                             }
                         }
-                        // Write the stage out once it is half full, after
-                        // every chunk of 32 tops. A chunk that adds more than
-                        // the half left (it can add up to 32 x 512 pairs, and
-                        // adds about 40 on the densest production fields)
-                        // writes its overflow to the list directly, above:
-                        // those pairs passed the prefilter too, so the list
-                        // holds the same entries either way.
-                        //
-                        // Every thread reads the count before any appends the
-                        // next chunk's survivors (the second barrier): a plane
-                        // that read it after a faster plane's appends could
-                        // decide alone to flush, and from then on the cube's
-                        // barriers would pair up at different call sites. The
-                        // lone plane's flush writes at a list offset no one
-                        // reserved for it, which costs full checks of stale
-                        // list entries and can overwrite ones another flush
-                        // reserved.
-                        sync_cube();
-                        let sc = s_cnt[0].load();
-                        sync_cube();
-                        if sc >= SURV_FLUSH {
-                            flush_survivors(
-                                &s_t,
-                                &s_r,
-                                &mut s_cnt,
-                                &mut s_base,
-                                surv,
-                                surv_count,
-                                surv_cap,
-                                sc,
-                            );
-                            sync_cube();
-                        }
                         jc += 32u32;
                     }
                     ws += wave;
                 }
-                // Every thread is past its last read of the clip words (each
-                // chunk ends with barriers), and the next batch sets them
-                // after the barrier below.
+                // Write the stage out once it is half full, checked once per
+                // batch of tops (per chunk, its two barriers cost 2 % of a
+                // field). A batch can add more than the half left (up to 256
+                // tops times the bucket's entries): the pairs past a full
+                // stage go to the list directly, above. They passed the
+                // prefilter too, so the list holds the same entries either
+                // way.
+                //
+                // Every thread reads the count before any appends the next
+                // batch's survivors (the second barrier): a plane that read
+                // it after a faster plane's appends could decide alone to
+                // flush, and from then on the cube's barriers would pair up
+                // at different call sites. The lone plane's flush writes at a
+                // list offset no one reserved for it, which costs full checks
+                // of stale list entries and can overwrite ones another flush
+                // reserved. The first barrier also puts every thread past its
+                // last read of the batch's clip words, cleared below.
+                sync_cube();
+                let sc = s_cnt[0].load();
+                sync_cube();
+                if sc >= SURV_FLUSH {
+                    flush_survivors(
+                        &s_t,
+                        &s_r,
+                        &mut s_cnt,
+                        &mut s_base,
+                        surv,
+                        surv_count,
+                        surv_cap,
+                        sc,
+                    );
+                    sync_cube();
+                }
                 if UNIT_POS_X < comptime!(TOP_CAP / 32) {
                     s_cw[UNIT_POS_X as usize].store(0u32);
                 }
