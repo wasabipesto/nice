@@ -36,7 +36,8 @@
 //!    keeps about 6% at bases 57-64, and only those are staged in shared
 //!    memory and written out. (Dan's design ran the prefilter as a separate
 //!    pass over a full survivor list, which was never small.)
-//! 4. [`check_kernel`]: the client's own `candidate_check`.
+//! 4. [`check_kernel`]: the full check of every prefilter survivor, in
+//!    base-b² limbs from the top's record (`crate::join_check`).
 //!
 //! Buffers are sized per field to the device (`join_plan::JoinPlan`): each
 //! within the device's largest binding and all of them within a budget. A
@@ -49,10 +50,11 @@
 //! overflows that is re-run on halves of its top layer.
 #![cfg(feature = "cubecl")]
 
-use crate::cubecl_backend::{LaunchFence, NICEONLY_STRIDE, launch_fence, wide_chunk_for};
-use crate::gpu_config::{chunk_constants, chunk_constants_u16, n_limbs};
+use crate::cubecl_backend::{LaunchFence, NICEONLY_STRIDE, launch_fence};
+use crate::gpu_config::{chunk_constants_u16, n_limbs};
 use crate::gpu_niceonly::{FIELDS_IN_FLIGHT, NiceonlyStats};
 use crate::gpu_route::{FieldTicket, Route};
+use crate::join_check::{CheckShape, GATE_DIGITS};
 use crate::join_plan::{
     BATCHES_IN_FLIGHT, Footprint, JoinCeiling, JoinField, JoinLimits, JoinPlan, NICE_RECORD_BYTES,
     SortedLayer, TOP_RECORD_BYTES, sorted_layer,
@@ -112,14 +114,27 @@ pub const DEAD_MASK: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 /// waves of 1,024 or 1,536 entries (4 below base 62 and 6 from it before)
 /// ran mostly empty lanes. Two are the fastest at every base measured.
 const ENTRIES_PER_THREAD: u32 = 2;
-/// Cubes for the prefilter and check kernels (grid-stride loops).
-const CHECK_CUBES: u32 = 1024;
+/// Cubes for the check kernel: more than a GPU holds at once at its ~40
+/// registers (an RTX 3080 holds 408, an H100 792). It hands out the list
+/// through a counter, one entry per lane at a time (fewer registers, and
+/// faster on a 3080, than 4 or 8), so a cube that starts after the list is
+/// exhausted exits at once, and no part of the list waits for a last wave.
+const CHECK_CUBES: u32 = 2048;
+/// [`check_kernel`]'s modes: write the nice numbers; every n (tests); four
+/// words per list entry, with the gate bypassed or applied (tests, see the
+/// kernel).
+pub(crate) const CHECK_HITS: u32 = 0;
+pub(crate) const CHECK_PROBE: u32 = 1;
+pub(crate) const CHECK_COUNT: u32 = 2;
+pub(crate) const CHECK_GATED: u32 = 3;
 /// How deep the halving of an overflowing partition's top layer may go: a
 /// layer of up to 2^32 prefixes reaches single prefixes well within it.
 const MAX_SPLITS: u32 = 32;
 /// Kernels a batch launches (top, bucket, join, check), each counting its
-/// finished cubes.
-const STAGES: usize = 4;
+/// finished cubes in `ran`, whose next word is the check kernel's work
+/// counter.
+const STAGES_U32: u32 = 4;
+const STAGES: usize = STAGES_U32 as usize;
 /// The most digit-sum roots of any base the join takes (8, at bases 46, 50
 /// and 64): [`join_kernel`] holds a bucket's group segments in shared memory.
 const MAX_ROOTS: u32 = 8;
@@ -172,11 +187,12 @@ pub use kernels::{bucket_kernel, check_kernel, join_kernel, top_fd_kernel, top_k
 )]
 mod kernels {
     use super::{
-        AND_GROUP, DEAD_MASK, JOIN_WG, MAX_ROOTS, SURV_FLUSH, SURV_SH_CAP, TOP_CAP, TOP_REC_WORDS,
-        TRANSPOSE_MIN,
+        AND_GROUP, CHECK_COUNT, CHECK_GATED, CHECK_PROBE, DEAD_MASK, JOIN_WG, MAX_ROOTS,
+        STAGES_U32, SURV_FLUSH, SURV_SH_CAP, TOP_CAP, TOP_REC_WORDS, TRANSPOSE_MIN,
     };
-    use crate::cubecl_backend::candidate_check;
+    use crate::cubecl_backend::NICEONLY_STRIDE;
     use crate::cubecl_detailed_fd::fd_add_top;
+    use crate::join_check::{CheckShape, magic};
     use cubecl::prelude::*;
 
     /// Count the cube in `ran[stage]` once every unit of it is done (see
@@ -3094,76 +3110,346 @@ mod kernels {
         }
     }
 
-    /// Step 4: grid-stride over the survivor list; rebuild n = P*b^f0 + r0 and
-    /// run the client's full check (probe: report every n instead).
+    /// `⌊x / d⌋` for `x < 2^31` (`crate::join_check::magic`), or a shift.
+    #[cube]
+    fn d_div(x: u32, #[comptime] d: u32) -> u32 {
+        if comptime!(d.is_power_of_two()) {
+            x >> comptime!(d.trailing_zeros())
+        } else {
+            u32::mul_hi(x, comptime!(magic(d).0)) >> comptime!(magic(d).1)
+        }
+    }
+
+    /// `mask` with the two digits of the base-b² limb `y` set.
+    #[cube]
+    fn put2(mask: u64, y: u32, #[comptime] base: u32) -> u64 {
+        let hi = d_div(y, base);
+        let lo = y - hi * base;
+        mask | (1u64 << u64::cast_from(lo)) | (1u64 << u64::cast_from(hi))
+    }
+
+    /// The base-b² limbs of one part of n (`x`, n's digits `o..o + c`, below
+    /// 2^31) into `nn`. A part that starts at an odd digit completes the
+    /// limb whose low digit `pend` the part before left; returns the pending
+    /// digit of a part that ends inside a limb.
+    #[cube]
+    fn part_limbs(
+        x0: u32,
+        pend: u32,
+        nn: &mut Array<u32>,
+        #[comptime] o: u32,
+        #[comptime] c: u32,
+        #[comptime] l: u32,
+        #[comptime] base: u32,
+    ) -> u32 {
+        let mut x = x0;
+        let mut pd = pend;
+        if comptime!(c > 0) {
+            if comptime!(o % 2 == 1) {
+                if comptime!(c == 1) {
+                    nn[comptime!(o / 2) as usize] = pend + x * base;
+                } else {
+                    let q = d_div(x, base);
+                    nn[comptime!(o / 2) as usize] = pend + (x - q * base) * base;
+                    x = q;
+                }
+            }
+            let o2 = comptime!(o + o % 2);
+            let c2 = comptime!(c - o % 2);
+            #[unroll]
+            for q in 0..comptime!(c2 / 2) {
+                if comptime!(q + 1 == c2 / 2 && c2 % 2 == 0) {
+                    nn[comptime!(o2 / 2 + q) as usize] = x;
+                } else {
+                    let qq = d_div(x, comptime!(base * base));
+                    nn[comptime!(o2 / 2 + q) as usize] = x - qq * comptime!(base * base);
+                    x = qq;
+                }
+            }
+            if comptime!(c2 % 2 == 1) {
+                if comptime!(o2 + c2 == l) {
+                    nn[comptime!((l - 1) / 2) as usize] = x;
+                } else {
+                    pd = x;
+                }
+            }
+        }
+        pd
+    }
+
+    /// `v = (v[0] + v[1]·2^32) / d` in place, returning the remainder: long
+    /// division over 16-bit chunks, each dividend below `d·2^16 <= 2^28`
+    /// (`crate::join_check::wide_div`).
+    #[cube]
+    fn wide_div(v: &mut Array<u32>, #[comptime] d: u32) -> u32 {
+        let x3 = v[1] >> 16u32;
+        let q3 = d_div(x3, d);
+        let x2 = ((x3 - q3 * d) << 16u32) | (v[1] & 0xFFFFu32);
+        let q2 = d_div(x2, d);
+        let x1 = ((x2 - q2 * d) << 16u32) | (v[0] >> 16u32);
+        let q1 = d_div(x1, d);
+        let x0 = ((x1 - q1 * d) << 16u32) | (v[0] & 0xFFFFu32);
+        let q0 = d_div(x0, d);
+        v[1] = (q3 << 16u32) | q2;
+        v[0] = (q1 << 16u32) | q0;
+        x0 - q0 * d
+    }
+
+    /// [`part_limbs`] for a part of 2^31 or more (`H` in the tests' small
+    /// windows), held as two words in `v`.
+    #[cube]
+    fn part_limbs_wide(
+        v: &mut Array<u32>,
+        pend: u32,
+        nn: &mut Array<u32>,
+        #[comptime] o: u32,
+        #[comptime] c: u32,
+        #[comptime] l: u32,
+        #[comptime] base: u32,
+    ) -> u32 {
+        let mut pd = pend;
+        if comptime!(o % 2 == 1) {
+            let r = wide_div(v, base);
+            nn[comptime!(o / 2) as usize] = pend + r * base;
+        }
+        let o2 = comptime!(o + o % 2);
+        let c2 = comptime!(c - o % 2);
+        #[unroll]
+        for q in 0..comptime!(c2 / 2) {
+            let r = wide_div(v, comptime!(base * base));
+            nn[comptime!(o2 / 2 + q) as usize] = r;
+        }
+        if comptime!(c2 % 2 == 1) {
+            if comptime!(o2 + c2 == l) {
+                nn[comptime!((l - 1) / 2) as usize] = v[0];
+            } else {
+                pd = v[0];
+            }
+        }
+        pd
+    }
+
+    /// n from its base-b² limbs, as three words into `out[o..o + 4]`.
+    #[cube]
+    fn put_n(
+        nn: &Array<u32>,
+        out: &mut Array<u32>,
+        o: u32,
+        #[comptime] nl: u32,
+        #[comptime] bb: u32,
+    ) {
+        let mut w0 = 0u32;
+        let mut w1 = 0u32;
+        let mut w2 = 0u32;
+        #[unroll]
+        for jj in 0..nl {
+            let j = comptime!(nl - 1 - jj);
+            let t0 = u64::cast_from(w0) * u64::cast_from(bb) + u64::cast_from(nn[j as usize]);
+            let t1 = u64::cast_from(w1) * u64::cast_from(bb) + (t0 >> 32u64);
+            let t2 = u64::cast_from(w2) * u64::cast_from(bb) + (t1 >> 32u64);
+            w0 = u32::cast_from(t0);
+            w1 = u32::cast_from(t1);
+            w2 = u32::cast_from(t2);
+        }
+        out[o as usize] = w0;
+        out[(o + 1u32) as usize] = w1;
+        out[(o + 2u32) as usize] = w2;
+        out[(o + 3u32) as usize] = 0u32;
+    }
+
+    /// Step 4: the full check of every survivor on the list
+    /// (`crate::join_check`): n's base-b² limbs from `r0`, the record's
+    /// `w6 = P mod b^(k2 − f0)` and `H = (P − w6) / b^(k2 − f0)`; n² and
+    /// the gate's low limbs of n³ by u32 schoolbook columns, every digit out
+    /// of the carry normalisation into a mask; the rest of n³ only where a
+    /// lane of the plane passed the gate (n²'s digits and n³'s low `2·gl`
+    /// distinct). Each plane takes the next entry per lane from the batch's
+    /// counter (`ran[STAGES]`), so the grid has no wave tail. The counter
+    /// assumes full planes: a cube's `JOIN_WG` = 256 threads is a multiple
+    /// of every plane width (a power of two up to 128), so every plane
+    /// starts full, and the plane ops sit in plane-uniform control flow
+    /// (`cur`, `nxt` are broadcast and `count` is the same for every lane).
+    /// Modes: [`CHECK_HITS`] writes the nice numbers; [`CHECK_PROBE`] every
+    /// n (rebuilt from its limbs); [`CHECK_COUNT`] four words per list entry
+    /// (distinct digits, the gate, the digit mask) with the gate bypassed,
+    /// so every lane builds all of n³; [`CHECK_GATED`] the same four words
+    /// with the gate applied as in [`CHECK_HITS`] (the mask then holds all
+    /// of n³'s digits only where the gate passed).
     #[cube(launch_unchecked)]
     pub fn check_kernel(
         surv: &Array<u32>,
         surv_count: &mut Array<Atomic<u32>>,
-        top_rec: &Array<u32>, // per top, P's lo, hi words first (`TOP_REC_WORDS`)
+        top_rec: &Array<u32>, // P's lo, hi words and w6 (`TOP_REC_WORDS`)
         nice_out: &mut Array<u32>,
         nice_count: &mut Array<Atomic<u32>>,
         ran: &mut Array<Atomic<u32>>,
         surv_cap: u32,
         nice_cap: u32,
-        w_f0: u32, // b^f0
-        #[comptime] base: u32,
-        #[comptime] limbs: u32,
-        #[comptime] chunk_digits: u32,
-        #[comptime] chunk_div: u32,
-        #[comptime] wide_chunk: bool,
-        #[comptime] pre_limbs: u32,
-        #[comptime] pre_chunk_digits: u32,
-        #[comptime] pre_chunk_div: u32,
-        #[comptime] probe: bool,
+        #[comptime] sh: CheckShape,
+        #[comptime] mode: u32,
     ) {
-        let cu_limbs = comptime!(3 * limbs);
-        let sv_pad = comptime!(cu_limbs | 1);
-        let mut sv_s = SharedMemory::<u32>::new(comptime!((JOIN_WG * (cu_limbs | 1)) as usize));
-        let svb = UNIT_POS_X * sv_pad;
+        let base = comptime!(sh.b);
+        let l = comptime!(sh.l);
+        let s2 = comptime!(sh.s2);
+        let s3 = comptime!(sh.s3);
+        let bb = comptime!(sh.b * sh.b);
+        let nl = comptime!(sh.nl());
+        let ql = comptime!(sh.ql());
+        let cl = comptime!(sh.cl());
+        let gl = comptime!(sh.gl());
+        // n's digit parts: r0's [0, f0c), w6's [f0c, k2c), H's [k2c, l).
+        let f0c = comptime!(sh.part(1).0);
+        let k2c = comptime!(sh.part(2).0);
+        let hdig = comptime!(sh.part(2).1);
+        let hwide = comptime!(sh.h_wide());
+        let hz = comptime!(sh.h_div().0);
+        let hinv = comptime!(sh.h_div().1);
         let mut count = surv_count[0].load();
         if count > surv_cap {
             count = surv_cap;
         }
-        let stride = CUBE_COUNT_X * CUBE_DIM_X;
-        let mut i = ABSOLUTE_POS_X;
-        while i < count {
-            let t = surv[(2u32 * i) as usize];
-            let r0 = surv[(2u32 * i + 1u32) as usize];
-            let p_lo = u64::cast_from(top_rec[(TOP_REC_WORDS * t) as usize]);
-            let p_hi = u64::cast_from(top_rec[(TOP_REC_WORDS * t + 1u32) as usize]);
-            let wf = u64::cast_from(w_f0);
-            // n = (p_hi 2^32 + p_lo) * w + r0 over (lo, hi) u64 halves.
-            let a = p_lo * wf;
-            let bq = p_hi * wf;
-            let lo1 = a + (bq << 32u64);
-            let mut hi = bq >> 32u64;
-            if lo1 < a {
-                hi += 1u64;
+        let lane = UNIT_POS_PLANE;
+        let mut got = 0u32;
+        if lane == 0u32 {
+            got = ran[STAGES_U32 as usize].fetch_add(PLANE_DIM);
+        }
+        let mut cur = plane_broadcast(got, 0u32);
+        while cur < count {
+            // The next entries' index, asked for before this one's work.
+            let mut nxt = 0u32;
+            if lane == 0u32 {
+                nxt = ran[STAGES_U32 as usize].fetch_add(PLANE_DIM);
             }
-            let lo = lo1 + u64::cast_from(r0);
-            if lo < lo1 {
-                hi += 1u64;
+            let nxt = plane_broadcast(nxt, 0u32);
+            let i = cur + lane;
+            if i < count {
+                let t = surv[(2u32 * i) as usize];
+                let r0 = surv[(2u32 * i + 1u32) as usize];
+                let rb = TOP_REC_WORDS * t;
+                let p_lo = top_rec[rb as usize];
+                let p_hi = top_rec[(rb + 1u32) as usize];
+                let w6 = top_rec[(rb + 6u32) as usize];
+                // H = (P − w6) / b^(k2 − f0), exact: a shift, an inverse.
+                let x =
+                    ((u64::cast_from(p_hi) << 32u64) | u64::cast_from(p_lo)) - u64::cast_from(w6);
+                let mut nn = Array::<u32>::new(nl as usize);
+                let mut pend = part_limbs(r0, 0u32, &mut nn, 0u32, f0c, l, base);
+                pend = part_limbs(w6, pend, &mut nn, f0c, comptime!(k2c - f0c), l, base);
+                if comptime!(hdig > 0) {
+                    if comptime!(hwide) {
+                        let h = (x >> comptime!(u64::from(hz))) * comptime!(hinv);
+                        let mut hv = Array::<u32>::new(2usize);
+                        hv[0] = u32::cast_from(h);
+                        hv[1] = u32::cast_from(h >> 32u64);
+                        part_limbs_wide(&mut hv, pend, &mut nn, k2c, hdig, l, base);
+                    } else {
+                        let h =
+                            u32::cast_from(x >> comptime!(u64::from(hz))) * comptime!(hinv as u32);
+                        part_limbs(h, pend, &mut nn, k2c, hdig, l, base);
+                    }
+                }
+                // n²: column k is twice the products i < j (i + j = k),
+                // the square of limb k/2 and the carry.
+                let mut sq = Array::<u32>::new(ql as usize);
+                let mut carry = 0u32;
+                let mut mask = 0u64;
+                #[unroll]
+                for k in 0..ql {
+                    let mut s = 0u32;
+                    #[unroll]
+                    for i in 0..nl {
+                        if comptime!(2 * i < k && k < i + nl) {
+                            s += nn[i as usize] * nn[comptime!(k - i) as usize];
+                        }
+                    }
+                    let mut x2 = carry + s * 2u32;
+                    if comptime!(k % 2 == 0 && k / 2 < nl) {
+                        x2 += nn[comptime!(k / 2) as usize] * nn[comptime!(k / 2) as usize];
+                    }
+                    if comptime!(k + 1 == ql) {
+                        sq[k as usize] = x2;
+                        if comptime!(s2 % 2 == 0) {
+                            mask = put2(mask, x2, base);
+                        } else {
+                            mask |= 1u64 << u64::cast_from(x2);
+                        }
+                    } else {
+                        let q = d_div(x2, bb);
+                        let y = x2 - q * bb;
+                        sq[k as usize] = y;
+                        carry = q;
+                        mask = put2(mask, y, base);
+                    }
+                }
+                // n³ = n²·n, its low gl limbs first.
+                carry = 0u32;
+                #[unroll]
+                for k in 0..gl {
+                    let mut x3 = carry;
+                    #[unroll]
+                    for j in 0..nl {
+                        if comptime!(j <= k && k - j < ql) {
+                            x3 += sq[comptime!(k - j) as usize] * nn[j as usize];
+                        }
+                    }
+                    let q = d_div(x3, bb);
+                    carry = q;
+                    mask = put2(mask, x3 - q * bb, base);
+                }
+                let seen =
+                    u32::cast_from(mask).count_ones() + u32::cast_from(mask >> 32u64).count_ones();
+                let pass = seen == comptime!(s2 + 2 * gl);
+                if pass || comptime!(mode == CHECK_COUNT) {
+                    #[unroll]
+                    for k in gl..cl {
+                        let mut x3 = carry;
+                        #[unroll]
+                        for j in 0..nl {
+                            if comptime!(j <= k && k - j < ql) {
+                                x3 += sq[comptime!(k - j) as usize] * nn[j as usize];
+                            }
+                        }
+                        if comptime!(k + 1 == cl) {
+                            if comptime!(s3 % 2 == 0) {
+                                mask = put2(mask, x3, base);
+                            } else {
+                                mask |= 1u64 << u64::cast_from(x3);
+                            }
+                        } else {
+                            let q = d_div(x3, bb);
+                            carry = q;
+                            mask = put2(mask, x3 - q * bb, base);
+                        }
+                    }
+                }
+                let uniq =
+                    u32::cast_from(mask).count_ones() + u32::cast_from(mask >> 32u64).count_ones();
+                if comptime!(mode == CHECK_COUNT || mode == CHECK_GATED) {
+                    let o = 4u32 * i;
+                    nice_out[o as usize] = uniq;
+                    let mut pv = 0u32;
+                    if pass {
+                        pv = 1u32;
+                    }
+                    nice_out[(o + 1u32) as usize] = pv;
+                    nice_out[(o + 2u32) as usize] = u32::cast_from(mask);
+                    nice_out[(o + 3u32) as usize] = u32::cast_from(mask >> 32u64);
+                } else {
+                    let mut hit = false;
+                    if comptime!(mode == CHECK_PROBE) {
+                        hit = true;
+                    } else if comptime!(s2 + s3 == base) {
+                        hit = pass && uniq == base;
+                    }
+                    if hit {
+                        let pos = nice_count[0].fetch_add(1u32);
+                        if pos < nice_cap {
+                            put_n(&nn, nice_out, NICEONLY_STRIDE * pos, nl, bb);
+                        }
+                    }
+                }
             }
-            candidate_check(
-                lo,
-                hi,
-                &mut sv_s,
-                svb,
-                nice_out,
-                nice_count,
-                nice_cap,
-                base,
-                limbs,
-                chunk_digits,
-                chunk_div,
-                wide_chunk,
-                pre_limbs,
-                pre_chunk_digits,
-                pre_chunk_div,
-                probe,
-            );
-            i += stride;
+            cur = nxt;
         }
         cube_done(ran, 3u32);
     }
@@ -3196,7 +3482,7 @@ pub(crate) fn limits_of<R: Runtime>(client: &ComputeClient<R>) -> JoinLimits {
 /// Device buffers for one field: the field's tables, the per-slot scratch
 /// the kernels fill, and the survivor and output lists.
 // The bools are independent per-field choices (key level, walk barrier,
-// wide chunks, FD tops), not states of one machine.
+// FD tops, ballot append), not states of one machine.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct JoinDevice<R: Runtime> {
     client: ComputeClient<R>,
@@ -3210,9 +3496,8 @@ pub(crate) struct JoinDevice<R: Runtime> {
     /// barrier (CUDA only, see the walk).
     walk_sync: bool,
     limbs: u32,
-    chunk_digits: u32,
-    chunk_div: u32,
-    wide: bool,
+    /// The check kernel's shape (`crate::join_check`).
+    check: CheckShape,
     /// Certify tops with [`top_fd_kernel`] (where [`top_fd_fits`] the field
     /// and the base is not excluded, see [`TOP_FD_AT_POW2_BASES`]), the top
     /// layer's digit count t, and the partitions holding a clipped block
@@ -3316,12 +3601,15 @@ impl<R: Runtime> JoinDevice<R> {
     ) -> Result<Self> {
         let limbs = n_limbs(fs.b).ok_or_else(|| anyhow!("base {} has no u128 range", fs.b))?;
         ensure!(limbs <= 3, "device tops: n must fit 96 bits");
-        let wide = wide_chunk_for(client);
-        let (chunk_digits, chunk_div) = if wide {
-            chunk_constants(fs.b)
-        } else {
-            chunk_constants_u16(fs.b)
-        };
+        let check = CheckShape::new(
+            fs.b,
+            fs.base.l,
+            fs.base.s2,
+            fs.base.s3,
+            fs.f0,
+            fs.k2,
+            GATE_DIGITS,
+        )?;
         let nbp = fs.bp_r.len();
         // The prefilter's terms pack values below M = b^(k2 - k + 1) into
         // 18 bits (`bucket_kernel`).
@@ -3413,9 +3701,7 @@ impl<R: Runtime> JoinDevice<R> {
                     .plane
                     .contains(cubecl::ir::features::Plane::Sync),
             limbs,
-            chunk_digits,
-            chunk_div,
-            wide,
+            check,
             top_fd: top_fd_runs(fs),
             tq: fs.base.l - fs.f0,
             top_fd_min: TOP_FD_MIN_UNITS,
@@ -3656,8 +3942,9 @@ impl<R: Runtime> JoinDevice<R> {
             join_cubes,                       // join
             CHECK_CUBES,                      // check
         ];
-        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; expect.len()]));
-        let nran = expect.len();
+        // One more word: the check kernel's work counter.
+        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; STAGES + 1]));
+        let nran = STAGES + 1;
         #[cfg(test)]
         if self.bytes > tests::REFUSE_ABOVE.with(std::cell::Cell::get) {
             // A device that runs nothing of a layout this large.
@@ -3734,34 +4021,23 @@ impl<R: Runtime> JoinDevice<R> {
                 self.walk_sync,
             );
         }
-        unsafe {
-            check_kernel::launch_unchecked::<R>(
-                c,
-                CubeCount::Static(CHECK_CUBES, 1, 1),
-                CubeDim::new_1d(JOIN_WG),
-                ArrayArg::from_raw_parts(self.list.clone(), 2 * self.list_cap as usize),
-                ArrayArg::from_raw_parts(checked.clone(), 1),
-                ArrayArg::from_raw_parts(self.top_rec.clone(), rec_len),
-                ArrayArg::from_raw_parts(
-                    self.nice_out.clone(),
-                    self.nice_cap as usize * NICEONLY_STRIDE as usize,
-                ),
-                ArrayArg::from_raw_parts(self.nice_count.clone(), 1),
-                ArrayArg::from_raw_parts(ran.clone(), nran),
-                self.list_cap,
-                self.nice_cap,
-                self.w_f0,
-                self.b,
-                self.limbs,
-                self.chunk_digits,
-                self.chunk_div,
-                self.wide,
-                0u32,
-                0u32,
-                0u32,
-                probe,
-            );
-        }
+        self.launch_check(
+            CHECK_CUBES,
+            &self.list,
+            2 * self.list_cap as usize,
+            &checked,
+            &self.top_rec,
+            rec_len,
+            (
+                &self.nice_out,
+                self.nice_cap as usize * NICEONLY_STRIDE as usize,
+            ),
+            &self.nice_count,
+            &ran,
+            self.list_cap,
+            self.nice_cap,
+            if probe { CHECK_PROBE } else { CHECK_HITS },
+        );
         c.flush().map_err(|e| anyhow!("flush failed: {e:?}"))?;
         Ok(BatchRec {
             survivors,
@@ -3771,12 +4047,54 @@ impl<R: Runtime> JoinDevice<R> {
         })
     }
 
+    /// Launch [`check_kernel`] in `mode` over the survivor list `list`
+    /// (`count` holds its length, read on the device, at most `cap`), whose
+    /// entries index the records `recs`; hits (or the mode's output) go to
+    /// `out` (a handle and its words), counted in `out_count` up to
+    /// `out_cap`, and the cubes and the work counter in `ran`
+    /// (`STAGES + 1` words), on `cubes` cubes ([`CHECK_CUBES`] but in tests).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_check(
+        &self,
+        cubes: u32,
+        list: &Handle,
+        list_words: usize,
+        count: &Handle,
+        recs: &Handle,
+        rec_words: usize,
+        out: (&Handle, usize),
+        out_count: &Handle,
+        ran: &Handle,
+        cap: u32,
+        out_cap: u32,
+        mode: u32,
+    ) {
+        unsafe {
+            check_kernel::launch_unchecked::<R>(
+                &self.client,
+                CubeCount::Static(cubes, 1, 1),
+                CubeDim::new_1d(JOIN_WG),
+                ArrayArg::from_raw_parts(list.clone(), list_words),
+                ArrayArg::from_raw_parts(count.clone(), 1),
+                ArrayArg::from_raw_parts(recs.clone(), rec_words),
+                ArrayArg::from_raw_parts(out.0.clone(), out.1),
+                ArrayArg::from_raw_parts(out_count.clone(), 1),
+                ArrayArg::from_raw_parts(ran.clone(), STAGES + 1),
+                cap,
+                out_cap,
+                self.check,
+                mode,
+            );
+        }
+    }
+
     /// Whether every kernel of a batch finished every cube it was launched
     /// with (`ran` against `expect`, see [`Self::launch_batch`]). If not,
     /// the batch's counts and lists are not its own: a device that drops a
     /// dispatch without an error must not have the batch read as one with
     /// no survivors.
     fn ensure_ran(&self, ran: &[u32], expect: &[u32; STAGES]) -> Result<(), NotRun> {
+        let ran = &ran[..STAGES.min(ran.len())];
         if ran == expect.as_slice() {
             return Ok(());
         }
@@ -3835,10 +4153,10 @@ impl<R: Runtime> JoinDevice<R> {
         ))
     }
 
-    /// The prefilter's survivors of the most recent batch as n, sorted
-    /// (tests).
+    /// The prefilter's survivors of the most recent batch as n, in list
+    /// order (tests).
     #[cfg(test)]
-    fn read_checked(&self, rec: &BatchRec) -> Result<Vec<u128>> {
+    fn read_list(&self, rec: &BatchRec) -> Result<Vec<u128>> {
         let cnt = self.read_u32(&rec.checked)?[0];
         ensure!(
             cnt <= self.list_cap,
@@ -3847,13 +4165,19 @@ impl<R: Runtime> JoinDevice<R> {
         );
         let words = self.read_u32(&self.list)?;
         let tops = self.read_u32(&self.top_rec)?;
-        let mut v: Vec<u128> = (0..cnt as usize)
+        Ok((0..cnt as usize)
             .map(|i| {
                 let r8 = TOP_REC_WORDS as usize * words[2 * i] as usize;
                 let p = u128::from(tops[r8]) | (u128::from(tops[r8 + 1]) << 32);
                 p * u128::from(self.w_f0) + u128::from(words[2 * i + 1])
             })
-            .collect();
+            .collect())
+    }
+
+    /// [`Self::read_list`], sorted (tests).
+    #[cfg(test)]
+    fn read_checked(&self, rec: &BatchRec) -> Result<Vec<u128>> {
+        let mut v = self.read_list(rec)?;
         v.sort_unstable();
         Ok(v)
     }
@@ -5030,6 +5354,349 @@ mod tests {
             unreachable!("new_cuda is CUDA")
         };
         check_all(&client, &name);
+    }
+
+    /// [`check_kernel`] in `mode` on `cubes` cubes over `list` (`n` entries)
+    /// and the records `recs`: the output words (four per entry in count and
+    /// gated mode, else four per reported n). Every cube must have run, and
+    /// the work counter must end where whole takes put it: each plane takes
+    /// once more after the list is exhausted, so it ends at `n` rounded up
+    /// to a whole take (less than 128 more) plus one take per plane,
+    /// `cubes · JOIN_WG` entries in all.
+    #[allow(clippy::too_many_arguments)]
+    fn run_check<R: Runtime>(
+        dev: &JoinDevice<R>,
+        cubes: u32,
+        list: &Handle,
+        list_words: usize,
+        recs: &Handle,
+        rec_words: usize,
+        n: usize,
+        mode: u32,
+    ) -> Vec<u32> {
+        let c = &dev.client;
+        let words = 4 * n.max(1);
+        let out = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; words]));
+        let oc = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
+        let cap = u32::try_from(n).expect("a list fits u32");
+        let cnt = c.create(cubecl::bytes::Bytes::from_elems(vec![cap]));
+        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; STAGES + 1]));
+        dev.launch_check(
+            cubes,
+            list,
+            list_words,
+            &cnt,
+            recs,
+            rec_words,
+            (&out, words),
+            &oc,
+            &ran,
+            cap,
+            cap,
+            mode,
+        );
+        let ran = dev.read_u32(&ran).expect("ran");
+        assert_eq!(ran[3], cubes, "check cubes run");
+        let past = ran[STAGES]
+            .checked_sub(cubes * JOIN_WG)
+            .expect("one take per plane past the list");
+        assert!(
+            past >= cap && past - cap < 128,
+            "work counter {} on {cubes} cubes for a list of {n}",
+            ran[STAGES]
+        );
+        let out = dev.read_u32(&out).expect("out");
+        let got = if mode == CHECK_COUNT || mode == CHECK_GATED {
+            n
+        } else {
+            dev.read_u32(&oc).expect("count")[0] as usize
+        };
+        out[..4 * got].to_vec()
+    }
+
+    /// Count mode (`gated` false) or gated mode against the CPU, entry by
+    /// entry: the distinct digits of n² and n³ (`get_num_unique_digits`),
+    /// the gate's predicate (n²'s digits and n³'s low `2·gl` distinct) and
+    /// the digit mask. In gated mode an entry that fails the gate has only
+    /// the gate's digits in its mask. Returns the entries that passed.
+    fn assert_counts(sh: &CheckShape, ns: &[u128], got: &[u32], gated: bool, what: &str) -> usize {
+        let mut passed = 0;
+        for (i, &n) in ns.iter().enumerate() {
+            let (uniq, gate, mask, gate_mask) = crate::join_check::tests::reference(sh, n);
+            let want = if gated && !gate {
+                (gate_mask.count_ones(), 0, gate_mask)
+            } else {
+                (uniq, u32::from(gate), mask)
+            };
+            let w = &got[4 * i..4 * i + 4];
+            let gm = u64::from(w[2]) | (u64::from(w[3]) << 32);
+            assert_eq!(
+                (w[0], w[1], gm),
+                want,
+                "{what}: entry {i}, n = {n} ({sh:?}, gated {gated})"
+            );
+            passed += usize::from(gate);
+        }
+        passed
+    }
+
+    /// Probe mode: every n of the list, rebuilt from its limbs.
+    fn assert_probe(mut want: Vec<u128>, got: &[u32], what: &str) {
+        let mut v: Vec<u128> = got
+            .chunks(4)
+            .map(|w| {
+                u128::from(w[0])
+                    | (u128::from(w[1]) << 32)
+                    | (u128::from(w[2]) << 64)
+                    | (u128::from(w[3]) << 96)
+            })
+            .collect();
+        v.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(v, want, "{what}: probe");
+    }
+
+    /// Adversarial, edge and random n of `sh`'s shape (digit counts of n, n²
+    /// and n³) whose prefix `n / b^f0` fits u64, as the top records hold it.
+    #[allow(clippy::many_single_char_names)] // b, l, a, z, m as in the kernel and the bisection
+    fn synthetic(sh: &CheckShape, seed: u64) -> Vec<u128> {
+        use malachite::base::num::arithmetic::traits::Pow;
+        let (b, l) = (sh.b, sh.l);
+        let bb = u128::from(b);
+        // The n of l digits whose square and cube have s2 and s3 digits:
+        // [lo, hi), from the least n with x^k >= b^(s - 1) and b^s.
+        let root_above = |s: u32, k: u32| -> u128 {
+            let target = malachite::natural::Natural::from(bb).pow(u64::from(s));
+            let (mut a, mut z) = (0u128, bb.pow(l) + 1);
+            while a < z {
+                let m = a + (z - a) / 2;
+                if malachite::natural::Natural::from(m).pow(u64::from(k)) >= target {
+                    z = m;
+                } else {
+                    a = m + 1;
+                }
+            }
+            a
+        };
+        let lo = bb
+            .pow(l - 1)
+            .max(root_above(sh.s2 - 1, 2))
+            .max(root_above(sh.s3 - 1, 3));
+        let hi = bb
+            .pow(l)
+            .min(root_above(sh.s2, 2))
+            .min(root_above(sh.s3, 3));
+        let mut ns = crate::join_check::tests::adversarial(b, l);
+        // The band's ends, and the last n whose square or cube stays below a
+        // power of b (their top digits run to b − 1: the longest carries).
+        let (r2, r3) = (root_above(sh.s2, 2), root_above(sh.s3, 3));
+        ns.extend([lo, lo + 1, hi - 1, hi - 2, r2 - 1, r3 - 1]);
+        // The ends with their low i digits all b − 1 or all 0.
+        for i in 1..l {
+            let p = bb.pow(i);
+            for e in [lo, hi - 1] {
+                ns.extend([e / p * p, e / p * p + p - 1, e / p * p + p]);
+            }
+        }
+        // The ends' top digits over a low half of all b − 1, all 0, or 0 and
+        // b − 1 alternating (either way round).
+        let h = l / 2;
+        let alt = |first: u32| -> u128 {
+            (0..h).fold(0u128, |a, j| {
+                a + bb.pow(j)
+                    * u128::from(if (j + first).is_multiple_of(2) {
+                        b - 1
+                    } else {
+                        0
+                    })
+            })
+        };
+        let p = bb.pow(h);
+        for e in [lo, hi - 1] {
+            let top = e / p * p;
+            ns.extend([top, top + p - 1, top + alt(0), top + alt(1)]);
+        }
+        let mut r = seed | 1;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for _ in 0..4000 {
+            let x = (u128::from(next()) << 64) | u128::from(next());
+            ns.push(lo + x % (hi - lo).max(1));
+        }
+        let fits = |n: u128| {
+            let nd = |x: malachite::natural::Natural| {
+                use malachite::base::num::conversion::traits::Digits;
+                u32::try_from(x.to_digits_asc(&b).len()).expect("digits")
+            };
+            let nat = malachite::natural::Natural::from(n);
+            (lo..hi).contains(&n)
+                && n / bb.pow(sh.f0) < 1 << 64
+                && nd(&nat * &nat) == sh.s2
+                && nd(&nat * &nat * &nat) == sh.s3
+        };
+        ns.retain(|&n| fits(n));
+        ns.sort_unstable();
+        ns.dedup();
+        ns
+    }
+
+    /// The check kernel against the CPU, entry by entry, on the real
+    /// survivor lists of b10's window, every window and the production
+    /// fields at 1e14 (with the b57 frontier field's partitions 0, 1000 and
+    /// 3248), and on a synthetic list of adversarial, edge and random n of
+    /// each distinct shape. Count mode (the gate bypassed: every lane builds
+    /// all of n³) compares every entry's distinct digits, gate and digit
+    /// mask; gated mode, on a grid of a few cubes so every plane takes work
+    /// many times, the same with the gate applied as the hits mode applies
+    /// it; probe mode every n rebuilt from its limbs. The other tests compare
+    /// hit lists, which are empty everywhere but at base 10, so a check that
+    /// rejected too much would pass them; this one compares what the check
+    /// computes for every survivor.
+    // The field list (base, range, parameters, partitions), then each field's
+    // real and synthetic lists in turn.
+    #[allow(clippy::type_complexity, clippy::too_many_lines)]
+    fn check_counts<R: Runtime>(client: &ComputeClient<R>, name: &str) {
+        let mut fields: Vec<(u32, u128, u128, JoinParams, Option<Vec<u32>>)> =
+            vec![(10, 47, 100, JoinParams { t: 2, k: 1, p: 0 }, None)];
+        for &(b, s, e, t, k, p) in WINDOWS {
+            fields.push((b, s, e, JoinParams { t, k, p }, None));
+        }
+        for &(b, s, size) in PLAN_FIELDS {
+            let range = FieldSize::new(s, s + size);
+            let jp = crate::overlap_join::join_params_for(b, &range).expect("a join field");
+            let parts = if b == 57 && s == FRONTIER_57 {
+                vec![0, 1_000, 3_248]
+            } else {
+                vec![0, 700]
+            };
+            fields.push((b, s, s + size, jp, Some(parts)));
+        }
+        let mut shapes = std::collections::HashSet::new();
+        let (mut entries, mut passed, mut synth, mut lists) = (0usize, 0usize, 0usize, 0usize);
+        for (b, s, e, jp, parts) in fields {
+            let production = parts.is_some();
+            let fs = FieldSetup::new(b, s, e, jp).expect("field setup");
+            let parts = parts.unwrap_or_else(|| {
+                let live = live_partitions(&fs);
+                let step = live.len().div_ceil(8).max(1);
+                live.into_iter().step_by(step).collect()
+            });
+            // Within the device's ceiling, with a list for a few partitions:
+            // the macOS runner's device runs nothing in a large layout.
+            let lim = device_limits(client, name);
+            let plan = JoinPlan::new(&fs, lim, 2, 1 << 20, 1, lim.budget).expect("a layout fits");
+            let layer = sorted_layer(&fs).expect("sorted layer");
+            let mut dev = JoinDevice::new(client, &fs, layer, &plan).expect("device");
+            let sh = dev.check;
+            let rec_len = TOP_REC_WORDS as usize * dev.max_slots * dev.ntlay as usize;
+            let what = format!("b{b} [{s}, {e}) {jp:?}");
+            let mut field_entries = 0;
+            for batch in parts.chunks(dev.max_slots) {
+                let rec = dev.launch_batch(batch, false).expect("launch");
+                // A batch the device did not run in full must not pass as
+                // an empty list.
+                dev.ensure_ran(&dev.read_u32(&rec.ran).expect("ran"), &rec.expect)
+                    .expect("every kernel of the batch ran");
+                let ns = dev.read_list(&rec).expect("the batch's list");
+                let lw = 2 * dev.list_cap as usize;
+                let run = |cubes: u32, mode: u32| {
+                    run_check(
+                        &dev,
+                        cubes,
+                        &dev.list,
+                        lw,
+                        &dev.top_rec,
+                        rec_len,
+                        ns.len(),
+                        mode,
+                    )
+                };
+                passed += assert_counts(&sh, &ns, &run(CHECK_CUBES, CHECK_COUNT), false, &what);
+                assert_counts(&sh, &ns, &run(3, CHECK_GATED), true, &what);
+                assert_probe(ns.clone(), &run(CHECK_CUBES, CHECK_PROBE), &what);
+                field_entries += ns.len();
+                lists += 1;
+            }
+            assert!(
+                !production || field_entries > 0,
+                "{what}: no survivors on the production field's partitions"
+            );
+            entries += field_entries;
+            if !shapes.insert(sh) {
+                continue; // this shape's synthetic list ran already
+            }
+            // A synthetic list: record i holds n_i's prefix and residue.
+            let ns = synthetic(&sh, (u64::from(b) << 32) | u64::from(sh.f0 * 16 + sh.k2));
+            let (w, m) = (fs.base.powu(sh.f0), fs.base.powu(sh.k2 - sh.f0));
+            let mut recs = vec![0u32; 8 * ns.len().max(1)];
+            let mut list = vec![0u32; 2 * ns.len().max(1)];
+            for (i, &n) in ns.iter().enumerate() {
+                let p = n / w;
+                recs[8 * i] = u32::try_from(p & 0xFFFF_FFFF).unwrap();
+                recs[8 * i + 1] = u32::try_from(p >> 32).unwrap();
+                recs[8 * i + 6] = u32::try_from(p % m).unwrap();
+                list[2 * i] = u32::try_from(i).unwrap();
+                list[2 * i + 1] = u32::try_from(n % w).unwrap();
+            }
+            let (lh, rh) = (
+                client.create(cubecl::bytes::Bytes::from_elems(list.clone())),
+                client.create(cubecl::bytes::Bytes::from_elems(recs.clone())),
+            );
+            let run = |cubes: u32, mode: u32| {
+                run_check(
+                    &dev,
+                    cubes,
+                    &lh,
+                    list.len(),
+                    &rh,
+                    recs.len(),
+                    ns.len(),
+                    mode,
+                )
+            };
+            let syn = format!("{what} synthetic");
+            passed += assert_counts(&sh, &ns, &run(CHECK_CUBES, CHECK_COUNT), false, &syn);
+            assert_counts(&sh, &ns, &run(1, CHECK_GATED), true, &syn);
+            assert_probe(ns.clone(), &run(CHECK_CUBES, CHECK_PROBE), &syn);
+            synth += ns.len();
+            println!(
+                "{name}: b{b} {sh:?} counts agree ({} synthetic n, H {})",
+                ns.len(),
+                if sh.h_wide() { "wide" } else { "narrow" }
+            );
+        }
+        assert!(
+            entries > 10_000 && synth > 10_000 && passed > 0,
+            "{entries} / {synth} / {passed}"
+        );
+        println!(
+            "{name}: check counts agree on {lists} lists, {entries} list entries and {synth} \
+             synthetic n over {} shapes ({passed} past the gate)",
+            shapes.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn cubecl_check_counts_match_the_cpu() {
+        let (client, name) = client();
+        check_counts(&client, &name);
+    }
+
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_check_counts_match_the_cpu() {
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        let name = ctx.device_name();
+        let CubeclContext::Cuda { client, .. } = ctx else {
+            unreachable!("new_cuda is CUDA")
+        };
+        check_counts(&client, &name);
     }
 
     fn numbers(results: &crate::FieldResults) -> Vec<u128> {

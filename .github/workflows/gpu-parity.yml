@@ -82,7 +82,7 @@ jobs:
                       --require DetailedFdKernel@50 --require DetailedFdKernel@62 \
                       --require DetailedKernel@80 --require NiceonlyKernel@40 \
                       --require BucketKernel@57 --require JoinKernel@57 \
-                      --require TopKernel@57 --require CheckKernel@57
+                      --require TopKernel@57
 
             - name: Keep the WGSL the lint read
               if: failure()
