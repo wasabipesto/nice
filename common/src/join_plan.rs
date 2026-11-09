@@ -21,9 +21,10 @@ use crate::gpu_config::n_limbs;
 use crate::overlap_join::{
     FieldSetup, StrideReason, join_slices, join_verdict, ndigits, prefix_block,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow, ensure};
 use log::warn;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Partitions per launch (device slots), bounded below by memory. A field
 /// is b^p partitions (3,249 at base 57), so this sets the launch count: 16
@@ -191,14 +192,11 @@ pub(crate) struct Footprint {
     pub(crate) ext_q: usize,
     pub(crate) lists: usize,
     pub(crate) counts: usize,
-    /// The tops' records, [`TOP_RECORD_BYTES`] each (`TOP_REC_WORDS` words).
+    /// The tops' records, [`TOP_RECORD_BYTES`] each (`TOP_REC_WORDS` words),
+    /// in segments by the top layer's groups.
     pub(crate) top_rec: usize,
-    pub(crate) top_b: usize,
-    pub(crate) tl: usize,
-    pub(crate) work: usize,
-    pub(crate) cursor: usize,
-    /// What a launched batch allocates for itself (`bucket_cnt`), for every
-    /// batch in flight.
+    /// What a launched batch allocates for itself (`grp_cnt`, the kept tops
+    /// per group), for every batch in flight.
     pub(crate) scratch: usize,
     /// The field's tables and the output list.
     pub(crate) fixed: usize,
@@ -226,6 +224,7 @@ impl Footprint {
             nbp * 8,                               // bp_m
             fs.seg.len() * 4,                      // seg
             ntl * 5 * 4,                           // tlay
+            (fs.nb + 1) * 4,                       // goff
             10 * 4,                                // fb
             (fs.base.s3 as usize + 1) * nl3 * 4,   // pw
             nroots * 4,                            // roots
@@ -238,10 +237,6 @@ impl Footprint {
             lists: nbp * b * 4,
             counts: nkeys * (b - 1) * 4,
             top_rec: ntl * TOP_RECORD_BYTES,
-            top_b: ntl * 4,
-            tl: ntl * nroots * 4,
-            work: fs.nb * 16,
-            cursor: fs.nb * 4,
             scratch: fs.nb * 4 * BATCHES_IN_FLIGHT,
             fixed: tables.iter().sum(),
             largest_fixed: tables.into_iter().max().unwrap_or(0),
@@ -249,16 +244,7 @@ impl Footprint {
     }
 
     pub(crate) fn per_slot(&self) -> usize {
-        self.ext_m
-            + self.ext_q
-            + self.lists
-            + self.counts
-            + self.top_rec
-            + self.top_b
-            + self.tl
-            + self.work
-            + self.cursor
-            + self.scratch
+        self.ext_m + self.ext_q + self.lists + self.counts + self.top_rec + self.scratch
     }
 
     /// The largest buffer one slot adds to (all of them grow linearly).
@@ -269,10 +255,6 @@ impl Footprint {
             self.lists,
             self.counts,
             self.top_rec,
-            self.top_b,
-            self.tl,
-            self.work,
-            self.cursor,
         ]
         .into_iter()
         .max()
@@ -361,7 +343,7 @@ pub(crate) fn max_slice_prefixes(fs: &FieldSetup, lim: JoinLimits) -> usize {
     // Bytes per prefix: in the field's tables, and per slot.
     let per_fixed = two.fixed - one.fixed;
     let per_slot = two.per_slot() - one.per_slot();
-    let per_largest = two.top_rec.max(two.tl) - one.top_rec.max(one.tl);
+    let per_largest = two.top_rec - one.top_rec;
     let list_cap = (list_bound(lim) as usize)
         .min(lim.max_binding / 8)
         .min(lim.budget / 4 / 8);
@@ -375,19 +357,109 @@ pub(crate) fn max_slice_prefixes(fs: &FieldSetup, lim: JoinLimits) -> usize {
 }
 
 /// A nice-only field ready for the join on one device: its slices (one, for
-/// any field below about 1e15), the first slice's host side and its two
-/// device layouts, the batches' and the overflow re-run's. Preparing it
-/// decides the field's route ([`plan_join`]), and the device stage then has
-/// no host work left before its first launch; it prepares later slices
-/// itself, each while the previous one runs.
+/// any field below about 1e15), the first slice's host side, its sorted top
+/// layer and its two device layouts, the batches' and the overflow
+/// re-run's. Preparing it decides the field's route ([`plan_join`]), and the
+/// device stage then has no host work left before its first launch; it
+/// prepares later slices itself, each while the previous one runs.
 pub struct JoinField {
     /// The field's slices in order, and the device they were cut for.
     pub(crate) slices: Vec<FieldSize>,
     pub(crate) lim: JoinLimits,
-    /// The first slice's setup and layouts.
+    /// The first slice's setup, top layer and layouts.
     pub(crate) fs: FieldSetup,
+    pub(crate) layer: SortedLayer,
     pub(crate) plan: JoinPlan,
     pub(crate) retry: JoinPlan,
+}
+
+/// A slice's top layer as the device takes it ([`sorted_layer`]).
+#[derive(Clone)]
+pub(crate) struct SortedLayer {
+    /// 5 words per prefix: P0 lo, hi, its group `g`, `goff[g]`, P0 mod
+    /// b^(k2 - f0 - p).
+    pub(crate) words: Vec<u32>,
+    /// Each group's first index in the layer (`nb + 1` words).
+    pub(crate) goff: Vec<u32>,
+    /// The sort's host time.
+    pub(crate) secs: f64,
+}
+
+/// The device's top layer of `fs`: its prefixes sorted by group (stably: a
+/// counting sort), and the groups' offsets. Group `g = key·(b-1) + c0` with
+/// `key = P0 mod b` at the key level (else 0) and `c0 = P0·b^p mod (b-1)`: a
+/// top `P = P0·b^p + v` of slot `v` has digit-sum class `(c0 + v) mod (b-1)`
+/// (`overlap_join`'s `pc`), so for every slot a bucket's tops are the kept
+/// tops of one group per root (`cubecl_join`'s `join_kernel`).
+///
+/// The layer is ascending and its prefixes mostly a few apart, so each
+/// prefix's residues mod b, b - 1 and b^(k2 - f0 - p) come from the previous
+/// prefix's by adding the difference when that is below b and the power,
+/// and by division only after a larger gap. The device stage takes it ready
+/// (made beside the device's work: [`plan_join`] for a field's first slice,
+/// the device stage itself for the rest).
+///
+/// # Errors
+/// A prefix of `2^64` or more.
+pub(crate) fn sorted_layer(fs: &FieldSetup) -> Result<SortedLayer> {
+    let t0 = Instant::now();
+    let (b, m1) = (u64::from(fs.b), u64::from(fs.m1));
+    let nkeys = if fs.key_level { b } else { 1 };
+    ensure!(
+        usize::try_from(nkeys * m1) == Ok(fs.nb),
+        "{} buckets for {nkeys} keys",
+        fs.nb
+    );
+    // c0 = (P0 mod (b-1))·(b^p mod (b-1)) mod (b-1), by residue.
+    let pdiv_m1 = u64::try_from(fs.nparts % u128::from(m1))?;
+    let class: Vec<u64> = (0..m1).map(|r| r * pdiv_m1 % m1).collect();
+    // p0mod = b^(k2 - f0 - p) < 2^32, as `FieldSetup::new` chose k2.
+    let p0mod = u64::try_from(fs.base.powu(fs.k2 - fs.f0 - fs.jp.p))?;
+    ensure!(p0mod < 1 << 32, "b^(k2 - f0 - p) exceeds u32");
+    let step = b.min(p0mod);
+    let wrap = |r: u64, m: u64| if r >= m { r - m } else { r };
+    // Each prefix's group and residue mod p0mod, in layer order.
+    let mut gr: Vec<(u32, u32)> = Vec::with_capacity(fs.tlay.len());
+    let mut goff = vec![0u32; fs.nb + 1];
+    // The previous prefix and its residues mod b, b - 1 and p0mod.
+    let mut prev: Option<(u64, u64, u64, u64)> = None;
+    for &(p0, _) in &fs.tlay {
+        let p0 = u64::try_from(p0).map_err(|_| anyhow!("top-layer prefix exceeds u64"))?;
+        let (rb, rm, rp) = match prev {
+            // A residue plus a difference below its modulus is below twice it.
+            Some((q, rb, rm, rp)) if p0 >= q && p0 - q < step => {
+                let d = p0 - q;
+                (wrap(rb + d, b), wrap(rm + d, m1), wrap(rp + d, p0mod))
+            }
+            _ => (p0 % b, p0 % m1, p0 % p0mod),
+        };
+        prev = Some((p0, rb, rm, rp));
+        let key = if fs.key_level { rb } else { 0 };
+        // Below nb <= 64·63, and p0mod < 2^32.
+        #[allow(clippy::cast_possible_truncation)]
+        let (g, r) = ((key * m1 + class[rm as usize]) as u32, rp as u32);
+        goff[g as usize + 1] += 1;
+        gr.push((g, r));
+    }
+    for g in 0..fs.nb {
+        goff[g + 1] += goff[g];
+    }
+    let mut at = goff.clone();
+    let mut words = vec![0u32; 5 * gr.len()];
+    for (&(p0, _), &(g, r)) in fs.tlay.iter().zip(&gr) {
+        let gi = g as usize;
+        let i = at[gi] as usize;
+        at[gi] += 1;
+        // P0 < 2^64 (above).
+        #[allow(clippy::cast_possible_truncation)]
+        let (lo, hi) = (p0 as u32, (p0 >> 32) as u32);
+        words[5 * i..5 * i + 5].copy_from_slice(&[lo, hi, g, goff[gi], r]);
+    }
+    Ok(SortedLayer {
+        words,
+        goff,
+        secs: t0.elapsed().as_secs_f64(),
+    })
 }
 
 impl JoinField {
@@ -405,10 +477,12 @@ impl JoinField {
         lim: JoinLimits,
     ) -> Result<Option<Self>> {
         let fs = FieldSetup::new(base, range.start(), range.end(), jp)?;
+        let layer = sorted_layer(&fs)?;
         Ok(JoinPlan::for_field(&fs, lim).map(|(plan, retry)| Self {
             slices: vec![*range],
             lim,
             fs,
+            layer,
             plan,
             retry,
         }))
@@ -423,6 +497,7 @@ impl JoinField {
                 max_binding: usize::MAX,
                 budget: usize::MAX,
             },
+            layer: sorted_layer(&fs).expect("sorted layer"),
             fs,
             plan,
             retry,
@@ -442,6 +517,7 @@ impl JoinField {
         self.fs = self
             .fs
             .sub_range(self.slices[0].start(), self.slices[0].end())?;
+        self.layer = sorted_layer(&self.fs)?;
         Ok(self)
     }
 
@@ -468,8 +544,9 @@ impl JoinField {
 ///   cannot hold one partition of a slice gets none, and says so once in the
 ///   log.
 ///
-/// Preparing the first slice (20-300 ms) happens on the caller's thread, so
-/// in the client it overlaps the device's work on the previous field.
+/// Preparing the first slice and its sorted top layer happens on the
+/// caller's thread, so in the client it overlaps the device's work on the
+/// previous field.
 ///
 /// # Errors
 /// The reason the field takes the stride pipeline.
@@ -506,10 +583,12 @@ pub fn plan_join(base: u32, range: &FieldSize, lim: JoinLimits) -> Result<JoinFi
     // The first slice's setup includes the bottom list, built for the probe.
     fs.secs += probe.secs;
     let (plan, retry) = JoinPlan::for_field(&fs, lim).ok_or_else(too_small)?;
+    let layer = sorted_layer(&fs).map_err(cannot)?;
     Ok(JoinField {
         slices,
         lim,
         fs,
+        layer,
         plan,
         retry,
     })
