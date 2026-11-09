@@ -8,6 +8,9 @@
 //! 1. **Tops**, one key digit at a time: the key's top-layer prefixes
 //!    extended by the partition's digits and certified, as in the reference
 //!    join. A thread holds one key's tops (about `1/b` of the partition's).
+//!    A key's prefixes come in ascending order, a multiple of a power of the
+//!    base apart, so their certificates step from one to the next by
+//!    digit-array additions (`cpu_top_fd`) instead of dividing.
 //! 2. **Bottoms**: every residue of the field's bottom list extended by the
 //!    partition's fixed digits, with exact arithmetic once per residue.
 //!    What the last bottom digit `d` (the key digit) adds is affine in `d`:
@@ -29,6 +32,7 @@
 
 use crate::FieldSize;
 use crate::client_process::{get_is_nice, get_is_nice_with_known_lsd};
+use crate::cpu_top_fd::{TopFd, TopFdSetup};
 use crate::overlap_join::{
     Div64, FieldSetup, JoinParams, join_params_for, join_slices, join_verdict, ndigits,
     prefix_block,
@@ -87,6 +91,7 @@ pub struct Scratch {
 /// A top prefix of the partition: `n = P·b^f0 + r` for the bottom residues
 /// `r` (mod `b^f0`) in `rlo..rhi`.
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct Top {
     p: u128,
     /// The certificate: output digits at positions `>= k`.
@@ -169,7 +174,7 @@ struct Info {
 /// Exact division by a small divisor through a multiply: for `x < 2^48/d`
 /// ([`Self::divrem`]), or `x < 2^26` and `d <= 64` ([`Self::divrem_small`]).
 #[derive(Clone, Copy)]
-struct SmallDiv {
+pub(crate) struct SmallDiv {
     d: u64,
     magic: u64,
     magic32: u64,
@@ -179,7 +184,7 @@ struct SmallDiv {
 // `d` below 2^32 wherever it is narrowed.
 #[allow(clippy::cast_possible_truncation)]
 impl SmallDiv {
-    fn new(d: u64) -> Self {
+    pub(crate) fn new(d: u64) -> Self {
         Self {
             d,
             magic: (1u64 << 48).div_ceil(d),
@@ -189,7 +194,7 @@ impl SmallDiv {
 
     /// `(x / d, x % d)`.
     #[inline]
-    fn divrem(self, x: u64) -> (u64, u64) {
+    pub(crate) fn divrem(self, x: u64) -> (u64, u64) {
         let q = ((u128::from(x) * u128::from(self.magic)) >> 48) as u64;
         (q, x - q * self.d)
     }
@@ -236,6 +241,10 @@ pub struct CpuJoin {
     div_m: Div64,
     sb: SmallDiv,
     smid: SmallDiv,
+    /// The top certificates by finite differences, for every unclipped
+    /// block; `None` if the field's digit arrays would not fit them (then
+    /// `Base::cert` certifies every block).
+    fd: Option<TopFdSetup>,
     /// The AND scan may use AVX2 (detected at run time).
     #[cfg(target_arch = "x86_64")]
     avx2: bool,
@@ -283,6 +292,9 @@ impl CpuJoin {
         for d in 0..keyspace as usize {
             key_off[d + 1] += key_off[d];
         }
+        // A key's prefixes are `b^(p + key level) = b^o` apart in P, and
+        // `o = k − f0`: the step is `pk`.
+        let fd = TopFdSetup::try_new(&fs.base, fs.f0, k - fs.f0, k, fs.phi, u32::try_from(bmid)?);
         Ok(Self {
             k,
             mid,
@@ -300,6 +312,7 @@ impl CpuJoin {
             div_m: Div64::new(big_m),
             sb: SmallDiv::new(b),
             smid: SmallDiv::new(bmid),
+            fd,
             #[cfg(target_arch = "x86_64")]
             avx2: std::arch::is_x86_feature_detected!("avx2"),
             #[cfg(target_arch = "x86_64")]
@@ -418,7 +431,9 @@ impl CpuJoin {
     }
 
     /// The partition's tops from the top-layer prefixes `layer` (all of one
-    /// key), as the reference join makes them.
+    /// key, ascending), as the reference join makes them. An unclipped
+    /// block's certificate steps from the last one's (`TopFdSetup`); a
+    /// clipped one, at either end of the field, is divided out.
     // Below 2^32: w = b^f0 is (`JoinParams::supported`), and so are b^mid,
     // b - 1 and the key space. w, p, a, e as in `overlap_join`.
     #[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
@@ -426,6 +441,7 @@ impl CpuJoin {
         tops.clear();
         let fs = &self.fs;
         let (w, v) = (fs.w, u128::from(v));
+        let mut st = TopFd::default();
         for &(p0, _) in layer {
             let p = p0 * fs.nparts + v;
             if p < fs.plo || p > fs.phi {
@@ -434,6 +450,24 @@ impl CpuJoin {
             let lo = p * w;
             let a = lo.max(fs.s);
             let e = (lo + w - 1).min(fs.e - 1);
+            if let Some(fd) = &self.fd
+                && a == lo
+                && e == lo + w - 1
+            {
+                fd.advance(&mut st, p);
+                if let Some(mask) = fd.cert(&st) {
+                    tops.push(Top {
+                        p,
+                        mask,
+                        rlo: 0,
+                        rhi: w as u32,
+                        dm: st.dm,
+                        seed: fs.full_floor >= fs.k2,
+                        pc: st.pc,
+                    });
+                }
+                continue;
+            }
             let Some(mask) = fs.base.cert(a, e, self.k) else {
                 continue;
             };
@@ -860,15 +894,42 @@ mod tests {
         v
     }
 
+    /// Partition `v`'s tops, every key in order, as [`CpuJoin::run`] makes
+    /// them.
+    fn all_tops(join: &CpuJoin, v: u32) -> Vec<Top> {
+        let (mut out, mut tops) = (Vec::new(), Vec::new());
+        for key in 0..join.keyspace as usize {
+            let (lo, hi) = (join.key_off[key] as usize, join.key_off[key + 1] as usize);
+            join.tops(v, &join.fs.tlay[lo..hi], &mut tops);
+            out.extend_from_slice(&tops);
+        }
+        out
+    }
+
+    /// The join of `range` with every top block certified by `Base::cert`.
+    fn divided(b: u32, range: &FieldSize, jp: JoinParams) -> CpuJoin {
+        CpuJoin {
+            fd: None,
+            ..CpuJoin::new(b, range, jp).expect("field setup")
+        }
+    }
+
     /// Up to `samples` of the field's live partitions, each against the
     /// reference join: the same join survivor count, the same prefilter
-    /// survivors (by the prefilter's definition) and the same hits.
+    /// survivors (by the prefilter's definition) and the same hits. Every
+    /// key's tops are also those of [`divided`].
     fn check_partitions(b: u32, s: u128, e: u128, jp: JoinParams, samples: usize) {
         let join = CpuJoin::new(b, &FieldSize::new(s, e), jp).expect("field setup");
+        let plain = divided(b, &FieldSize::new(s, e), jp);
         let live = live_partitions(&join.fs);
         let step = live.len().div_ceil(samples).max(1);
         let mut scratch = Scratch::default();
         for v in live.into_iter().step_by(step) {
+            assert_eq!(
+                all_tops(&join, v),
+                all_tops(&plain, v),
+                "b{b} [{s}, {e}) {jp:?} partition {v}: tops"
+            );
             let mut cpu = Vec::new();
             let st = join_range(
                 &join.fs.base,
@@ -936,6 +997,46 @@ mod tests {
     fn cpu_join_matches_the_reference_on_the_test_windows() {
         for (b, s, e, jp) in windows() {
             check_partitions(b, s, e, jp, 96);
+        }
+    }
+
+    /// The stepped top certificates cover the test windows (all but base
+    /// 10's, whose blocks are single numbers).
+    #[test]
+    fn the_test_windows_step_their_top_certificates() {
+        for (b, s, e, jp) in windows() {
+            let join = CpuJoin::new(b, &FieldSize::new(s, e), jp).expect("field setup");
+            assert_eq!(join.fd.is_some(), b != 10, "b{b} [{s}, {e}) {jp:?}");
+        }
+    }
+
+    /// Every top of sampled partitions of the production fields (the first
+    /// and last live ones among them), every key: the stepped certificates
+    /// give the tops [`divided`] gives.
+    #[test]
+    fn stepped_tops_equal_divided_tops_on_production_fields() {
+        for &(b, s, size) in PLAN_FIELDS {
+            let range = FieldSize::new(s, s + size);
+            let jp = join_params_for(b, &range).expect("a join field");
+            let join = CpuJoin::new(b, &range, jp).expect("field setup");
+            assert!(join.fd.is_some(), "b{b}: no stepped certificates");
+            let plain = divided(b, &range, jp);
+            let live = live_partitions(&join.fs);
+            let mut vs: Vec<u32> = live
+                .iter()
+                .copied()
+                .step_by(live.len().div_ceil(24).max(1))
+                .collect();
+            if vs.last() != live.last() {
+                vs.extend(live.last());
+            }
+            let mut tops = 0;
+            for &v in &vs {
+                let got = all_tops(&join, v);
+                assert_eq!(got, all_tops(&plain, v), "b{b} partition {v}");
+                tops += got.len();
+            }
+            eprintln!("b{b} {jp:?}: {} partitions, {tops} tops", vs.len());
         }
     }
 
