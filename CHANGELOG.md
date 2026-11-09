@@ -17,6 +17,7 @@
 - Speed up the GPU overlap join by checking whether its survivor stage needs writing out once per batch of tops instead of after every 32 tops ([#249](https://github.com/wasabipesto/nice/pull/249)).
 - Speed up the GPU overlap join by sorting each slice's top prefixes while the device works on the previous slice or field, instead of between slices with the device idle ([#249](https://github.com/wasabipesto/nice/pull/249)).
 - Speed up the CPU overlap join's scan of each top against its bottoms by first listing the bottoms that pass, without a branch on each test, and only then taking them through the prefilter ([#252](https://github.com/wasabipesto/nice/pull/252)).
+- Speed up the CPU overlap join's full check of each pair that passes the prefilter: it starts from the digits the join has already proved and computes only the ones in between, two at a time and without long division ([#253](https://github.com/wasabipesto/nice/pull/253)).
 
 ## Nice v3.4.7
 
