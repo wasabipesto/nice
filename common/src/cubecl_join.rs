@@ -55,7 +55,7 @@ use crate::gpu_niceonly::{FIELDS_IN_FLIGHT, NiceonlyStats};
 use crate::gpu_route::{FieldTicket, Route};
 use crate::join_plan::{
     BATCHES_IN_FLIGHT, Footprint, JoinCeiling, JoinField, JoinLimits, JoinPlan, NICE_RECORD_BYTES,
-    TOP_RECORD_BYTES,
+    SortedLayer, TOP_RECORD_BYTES, sorted_layer,
 };
 use crate::overlap_join::{FieldSetup, JoinTelemetry};
 use crate::progress::FieldProgress;
@@ -3095,69 +3095,21 @@ pub(crate) fn top_fd_fits(fs: &FieldSetup) -> bool {
     (t + 1).div_ceil(4) <= q2.div_ceil(4) && (q2 + 1).div_ceil(4) <= q3.div_ceil(4)
 }
 
-/// The device's top layer: 5 words per prefix (P0 lo, hi, its group `g`,
-/// `goff[g]`, P0 mod b^(k2 - f0 - p)), sorted by group (stably: a counting
-/// sort), and the groups' offsets `goff` (`fs.nb + 1` words). Group `g =
-/// key·(b-1) + c0` with `key = P0 mod b` at the key level (else 0) and
-/// `c0 = P0·b^p mod (b-1)`: a top `P = P0·b^p + v` of slot `v` has digit-sum
-/// class `(c0 + v) mod (b-1)` (`overlap_join`'s `pc`), so for every slot a
-/// bucket's tops are the kept tops of one group per root ([`join_kernel`]).
-///
-/// # Errors
-/// A prefix of `2^64` or more.
-fn sorted_layer(fs: &FieldSetup, nkeys: u32) -> Result<(Vec<u32>, Vec<u32>)> {
-    let (m1, nk) = (u64::from(fs.m1), u64::from(nkeys));
-    ensure!(
-        usize::try_from(nk * m1) == Ok(fs.nb),
-        "{} buckets for {nkeys} keys",
-        fs.nb
-    );
-    let pdiv_m1 = u64::try_from(fs.nparts % u128::from(m1))?;
-    // p0mod = b^(k2 - f0 - p) < 2^32, as `FieldSetup::new` chose k2.
-    let p0mod = u64::try_from(fs.base.powu(fs.k2 - fs.f0 - fs.jp.p))?;
-    let p0s: Vec<u64> = fs
-        .tlay
-        .iter()
-        .map(|&(p0, _)| u64::try_from(p0).map_err(|_| anyhow!("top-layer prefix exceeds u64")))
-        .collect::<Result<_>>()?;
-    let group = |p0: u64| -> usize {
-        let key = if nkeys > 1 { p0 % nk } else { 0 };
-        // Below nb <= 64·63.
-        #[allow(clippy::cast_possible_truncation)]
-        let g = (key * m1 + (p0 % m1) * pdiv_m1 % m1) as usize;
-        g
-    };
-    let mut goff = vec![0u32; fs.nb + 1];
-    for &p0 in &p0s {
-        goff[group(p0) + 1] += 1;
-    }
-    for g in 0..fs.nb {
-        goff[g + 1] += goff[g];
-    }
-    let mut at = goff.clone();
-    let mut tl = vec![0u32; 5 * p0s.len()];
-    for &p0 in &p0s {
-        let g = group(p0);
-        let i = at[g] as usize;
-        at[g] += 1;
-        let w = u32_words(u128::from(p0));
-        tl[5 * i..5 * i + 5].copy_from_slice(&[
-            w[0],
-            w[1],
-            u32::try_from(g)?,
-            goff[g],
-            u32::try_from(p0 % p0mod)?,
-        ]);
-    }
-    Ok((tl, goff))
-}
-
 impl<R: Runtime> JoinDevice<R> {
+    /// The device side of `fs` with `layer`, its sorted top layer, in
+    /// `plan`'s layout.
+    ///
     /// # Errors
-    /// A base without a `u128` range, or `n` too wide for device tops.
+    /// A base without a `u128` range, `n` too wide for device tops, or a
+    /// layer of another length than `fs`'s.
     // One buffer per line, as the plan sized them.
     #[allow(clippy::too_many_lines)]
-    pub fn new(client: &ComputeClient<R>, fs: &FieldSetup, plan: &JoinPlan) -> Result<Self> {
+    pub fn new(
+        client: &ComputeClient<R>,
+        fs: &FieldSetup,
+        layer: SortedLayer,
+        plan: &JoinPlan,
+    ) -> Result<Self> {
         let limbs = n_limbs(fs.b).ok_or_else(|| anyhow!("base {} has no u128 range", fs.b))?;
         ensure!(limbs <= 3, "device tops: n must fit 96 bits");
         let wide = wide_chunk_for(client);
@@ -3194,7 +3146,13 @@ impl<R: Runtime> JoinDevice<R> {
         // Device-side tops: the top layer with its residues, sorted by
         // group, the field bounds, the power table and the per-slot records.
         let pp = fs.jp.p;
-        let (tl, goff) = sorted_layer(fs, nkeys)?;
+        let SortedLayer {
+            words: tl, goff, ..
+        } = layer;
+        ensure!(
+            tl.len() == 5 * fs.tlay.len() && goff.len() == fs.nb + 1,
+            "a sorted layer of another slice"
+        );
         // n < 2^96 (`FieldSetup::new`) and the prefix blocks below 2^64.
         let (s_w, e_w) = (u32_words(fs.s), u32_words(fs.e - 1));
         let (plo, phi) = (u32_words(fs.plo), u32_words(fs.phi));
@@ -3836,17 +3794,17 @@ fn run_slices_with<R: Runtime>(
     };
     let mut hits = Vec::new();
     let mut slots_hint = field.plan.slots;
-    let mut next: Option<Result<FieldSetup>> = None;
+    let mut next: Option<Result<(FieldSetup, SortedLayer)>> = None;
     for i in 0..count.min(field.slices.len()) {
         let owned;
-        let fs = if i == 0 {
-            &field.fs
+        let (fs, sorted) = if i == 0 {
+            (&field.fs, field.layer.clone())
         } else {
             owned = next.take().expect("prepared beside the previous slice")?;
-            &owned
+            (&owned.0, owned.1)
         };
         st.slices += 1;
-        st.setup_secs += fs.secs;
+        st.setup_secs += fs.secs + sorted.secs;
         // The field's own layouts, unless the ceiling came down since it was
         // planned.
         let lim = ceiling.cap(field.lim);
@@ -3859,10 +3817,19 @@ fn run_slices_with<R: Runtime>(
         let later = field.slices.get(i + 1).filter(|_| i + 1 < count);
         let start = slots_hint.clamp(1, layouts.0.slots);
         std::thread::scope(|scope| -> Result<()> {
-            let prep = later.map(|sl| scope.spawn(|| field.fs.sub_range(sl.start(), sl.end())));
+            // The next slice's setup and sorted top layer, beside this one's
+            // device work.
+            let prep = later.map(|sl| {
+                scope.spawn(|| -> Result<(FieldSetup, SortedLayer)> {
+                    let fs = field.fs.sub_range(sl.start(), sl.end())?;
+                    let sorted = sorted_layer(&fs)?;
+                    Ok((fs, sorted))
+                })
+            });
             let used = run_slice(
                 client,
                 fs,
+                sorted,
                 layouts,
                 field.lim,
                 ceiling,
@@ -3908,6 +3875,7 @@ fn run_slices_with<R: Runtime>(
 fn run_slice<R: Runtime>(
     client: &ComputeClient<R>,
     fs: &FieldSetup,
+    layer: SortedLayer,
     layouts: (JoinPlan, JoinPlan),
     lim: JoinLimits,
     ceiling: &JoinCeiling,
@@ -3926,7 +3894,7 @@ fn run_slice<R: Runtime>(
     }
     let t0 = Instant::now();
     let (plan, mut retry) = layouts;
-    let mut dev = JoinDevice::new(client, fs, &plan)?;
+    let mut dev = JoinDevice::new(client, fs, layer, &plan)?;
     let mut slots = slots_hint.clamp(1, dev.max_slots);
     let mut todo = parts.to_vec();
     loop {
@@ -3939,7 +3907,7 @@ fn run_slice<R: Runtime>(
             drop(dev);
             let (plan, smaller) = refit(client, fs, lim, ceiling, &why, st)?;
             retry = smaller;
-            dev = JoinDevice::new(client, fs, &plan)?;
+            dev = JoinDevice::new(client, fs, sorted_layer(fs)?, &plan)?;
             slots = slots.min(dev.max_slots);
             todo = [left.not_run, left.overflowed].concat();
             continue;
@@ -4142,7 +4110,7 @@ fn run_partition<R: Runtime>(
     st: &mut JoinFieldStats,
     hits: &mut Vec<u128>,
 ) -> Result<()> {
-    let mut dev = JoinDevice::new(client, fs, plan)?;
+    let mut dev = JoinDevice::new(client, fs, sorted_layer(fs)?, plan)?;
     let rec = dev.launch_batch(&[v], false)?;
     st.batches += 1;
     dev.ensure_ran(&dev.read_u32(&rec.ran)?, &rec.expect)?;
@@ -4406,7 +4374,8 @@ mod tests {
             live.into_iter().step_by(step).collect()
         });
         let plan = test_plan(&fs, limits_of(client), 4);
-        let mut dev = JoinDevice::new(client, &fs, &plan).expect("device");
+        let layer = sorted_layer(&fs).expect("sorted layer");
+        let mut dev = JoinDevice::new(client, &fs, layer, &plan).expect("device");
         let mut cpu_hits = Vec::new();
         for batch in parts.chunks(dev.max_slots) {
             let vs: Vec<u128> = batch.iter().map(|&v| u128::from(v)).collect();
@@ -6297,7 +6266,8 @@ mod tests {
                 println!("{name}: {label}: the FD state does not fit, skipped");
                 continue;
             }
-            let mut dev = JoinDevice::new(client, &fs, &plan).expect("device");
+            let layer = sorted_layer(&fs).expect("sorted layer");
+            let mut dev = JoinDevice::new(client, &fs, layer, &plan).expect("device");
             let n = u32::try_from(fs.nparts).expect("b^p < 2^32");
             let ms = dev.max_slots;
             let all: Vec<u32> = (0..n).collect();
@@ -6387,7 +6357,8 @@ mod tests {
     /// each bucket exactly the tops `cpu_join` lists there: key `P0 mod b` at
     /// the key level, class `(root - P mod (b-1)) mod (b-1)` per root. On b10,
     /// the test windows and two 1e14 fields (2 and 8 roots), a few partitions
-    /// each.
+    /// each, and on the b62 field's layer reversed (every prefix's residues by
+    /// division).
     #[test]
     #[allow(
         clippy::too_many_lines,
@@ -6407,13 +6378,19 @@ mod tests {
             let range = FieldSize::new(s, s + size);
             let jp = crate::overlap_join::join_params_for(b, &range).expect("a join field");
             let fs = FieldSetup::new(b, range.start(), range.end(), jp).expect("field setup");
+            if b == 62 {
+                let mut rev = fs.clone();
+                rev.tlay.reverse();
+                fields.push((format!("b{b} {size:e}, layer reversed"), rev));
+            }
             fields.push((format!("b{b} {size:e}"), fs));
         }
         let mut nbuckets = 0u64;
         for (label, fs) in &fields {
             let (b, m1, m1u) = (u64::from(fs.b), u64::from(fs.m1), fs.m1);
-            let nkeys = if fs.key_level { fs.b } else { 1 };
-            let (tl, goff) = sorted_layer(fs, nkeys).expect("sorted layer");
+            let SortedLayer {
+                words: tl, goff, ..
+            } = sorted_layer(fs).expect("sorted layer");
             let (n, nb) = (fs.tlay.len(), fs.nb);
             assert_eq!(
                 (goff.len(), goff[0], goff[nb] as usize),
@@ -6546,7 +6523,7 @@ mod tests {
         let range = FieldSize::new(start, start + size);
         let field = crate::join_plan::plan_join(b, &range, lim).expect("a join field");
         let fs = &field.fs;
-        let dev = JoinDevice::new(&client, fs, &field.plan).expect("device");
+        let dev = JoinDevice::new(&client, fs, field.layer.clone(), &field.plan).expect("device");
         let n = u32::try_from(fs.nparts).expect("small");
         let ms = dev.max_slots;
         let all: Vec<u32> = (0..n).collect();
