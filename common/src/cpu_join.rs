@@ -19,7 +19,9 @@
 //! 3. **Join**, one key digit at a time: the key's bottoms are listed by
 //!    digit-sum class (about a megabyte at base 57, so they stay in cache),
 //!    and each of the key's tops scans the classes its roots name, one
-//!    64-bit AND per bottom.
+//!    64-bit AND per bottom. A scan makes two passes over a class: the
+//!    first lists the bottoms that pass the AND by index, without a branch
+//!    on the outcome, and the second takes them on.
 //! 4. **Survivors** go through the middle-digit prefilter, as on the GPU
 //!    (its digits read off a fixed-point fraction), and then the client's
 //!    own full check.
@@ -30,6 +32,10 @@
 //! prefixes is cut into slices of that many. Its survivors, and the
 //! prefilter's, are exactly the reference join's: the tests compare them
 //! partition by partition.
+
+// A scan's second pass and the first pass's compaction are forced inline:
+// they are the per-pair and per-byte work of the join.
+#![allow(clippy::inline_always)]
 
 use crate::FieldSize;
 use crate::client_process::{get_is_nice, get_is_nice_with_known_lsd};
@@ -59,6 +65,42 @@ pub fn slices_for(base: u32, range: &FieldSize) -> Option<(JoinParams, Vec<Field
 /// The mask of a bottom whose fixed digits repeat: it joins no top.
 const DEAD: u64 = u64::MAX;
 
+/// The bottoms of a class that a scan's first pass takes at a time: the
+/// length of its index list, whose entries are `u16`. A class at the
+/// production shapes holds about 300 bottoms.
+const PIECE: usize = 1024;
+
+/// For each byte of pass bits, the positions of its set bits in ascending
+/// order, then zeros ([`emit`]).
+static BIT_POS: [[u16; 8]; 256] = {
+    let mut t = [[0u16; 8]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let (mut n, mut i) = (0, 0u16);
+        while i < 8 {
+            if (byte >> i) & 1 == 1 {
+                t[byte][n] = i;
+                n += 1;
+            }
+            i += 1;
+        }
+        byte += 1;
+    }
+    t
+};
+
+/// For each byte of pass bits, how many bits it has set ([`emit`]).
+static BIT_CNT: [u8; 256] = {
+    let mut t = [0u8; 256];
+    t[1] = 1;
+    let mut byte = 2;
+    while byte < 256 {
+        t[byte] = t[byte / 2] + t[byte % 2];
+        byte += 1;
+    }
+    t
+};
+
 /// What one partition through the join found and did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartitionResult {
@@ -87,6 +129,9 @@ pub struct Scratch {
     masks: Vec<u64>,
     info: Vec<Info>,
     offs: Vec<u32>,
+    /// A scan's first pass: the passing bottoms of a piece of a class, by
+    /// index (`PIECE` slots).
+    idx: Vec<u16>,
 }
 
 /// A top prefix of the partition: `n = P·b^f0 + r` for the bottom residues
@@ -350,9 +395,14 @@ pub struct CpuJoin {
     /// The AND scan may use AVX2 (detected at run time).
     #[cfg(target_arch = "x86_64")]
     avx2: bool,
-    /// The AND scan may use AVX-512F (detected at run time).
+    /// The AND scan may use AVX-512F (detected at run time, with AVX2:
+    /// `avx512f` implies `avx2` for code generation, and the scan's first
+    /// pass uses AVX2 instructions too).
     #[cfg(target_arch = "x86_64")]
     avx512: bool,
+    /// The bottoms a scan's first pass takes at a time: [`PIECE`]. Tests
+    /// lower it so that their short classes are scanned in pieces.
+    piece: usize,
     /// `fs.tlay` is ordered by key digit (stably): `key_off[d]..key_off[d +
     /// 1]` are the prefixes whose key is `d`.
     key_off: Vec<u32>,
@@ -419,7 +469,9 @@ impl CpuJoin {
             #[cfg(target_arch = "x86_64")]
             avx2: std::arch::is_x86_feature_detected!("avx2"),
             #[cfg(target_arch = "x86_64")]
-            avx512: std::arch::is_x86_feature_detected!("avx512f"),
+            avx512: std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx2"),
+            piece: PIECE,
             fs,
         })
     }
@@ -489,6 +541,7 @@ impl CpuJoin {
         let mut out = PartitionResult::default();
         let m1 = self.fs.m1;
         let roots = &self.fs.base.roots;
+        sc.idx.resize(PIECE, 0);
         // The bottoms are extended at the first key with a top, so a
         // partition without tops does no bottom work at all.
         let mut extended = false;
@@ -526,7 +579,8 @@ impl CpuJoin {
                         ext: &sc.ext,
                         info: &sc.info[lo..hi],
                     };
-                    self.scan(&pass, &sc.masks[lo..hi], &mut out, &mut record);
+                    let masks = &sc.masks[lo..hi];
+                    self.scan(&pass, masks, &mut sc.idx, &mut out, &mut record);
                 }
             }
         }
@@ -735,145 +789,65 @@ impl CpuJoin {
         offs.push(masks.len() as u32);
     }
 
-    /// One top against one class of bottoms: a 64-bit AND each, eight at a
-    /// time; the (rare) pairs that pass go to [`Self::survivor`].
+    /// One top against one class of bottoms, a 64-bit AND each, in two
+    /// passes over each piece of the class ([`PIECE`] bottoms): the first
+    /// lists the bottoms that pass, by index and without a branch on the
+    /// outcome, the second takes each through [`Self::survivor`]. They come
+    /// in the class's order, as a scan that took each pass on the spot
+    /// would visit them.
     fn scan(
         &self,
         pass: &Pass,
         masks: &[u64],
+        idx: &mut [u16],
         out: &mut PartitionResult,
         record: &mut Option<&mut Vec<u128>>,
     ) {
+        self.for_each_passing(pass.top.mask, masks, idx, |j| {
+            self.survivor(pass, masks[j], j, out, record);
+        });
+    }
+
+    /// Every bottom of `masks` that passes the AND with `t` (`m & t == 0`),
+    /// by index, in order, to `f`: [`Self::pass1`] over each piece
+    /// (`self.piece` bottoms), then `f` on its list. `idx` holds [`PIECE`]
+    /// entries at least.
+    #[inline(always)]
+    fn for_each_passing(&self, t: u64, masks: &[u64], idx: &mut [u16], mut f: impl FnMut(usize)) {
+        debug_assert!(self.piece > 0 && self.piece <= PIECE);
+        for (at, piece) in (0..).step_by(self.piece).zip(masks.chunks(self.piece)) {
+            let n = self.pass1(t, piece, idx);
+            for &i in &idx[..n] {
+                f(at + usize::from(i));
+            }
+        }
+    }
+
+    /// The first pass over one piece of a class (at most [`PIECE`]
+    /// bottoms, so that an index fits a `u16`, and no more than `idx`
+    /// holds), on the best path this CPU has: AVX-512F, AVX2 or the
+    /// portable loop ([`pass1_any`]).
+    fn pass1(&self, t: u64, masks: &[u64], idx: &mut [u16]) -> usize {
+        debug_assert!(masks.len() <= PIECE && masks.len() <= idx.len());
         #[cfg(target_arch = "x86_64")]
         if self.avx512 {
-            // SAFETY: `avx512` is only set where the CPU has AVX-512F.
-            unsafe { self.scan_avx512(pass, masks, out, record) };
-            return;
+            // SAFETY: `avx512` is only set where the CPU has AVX-512F and
+            // AVX2 (which `avx512f` implies for code generation).
+            return unsafe { pass1_avx512(t, masks, idx) };
         }
         #[cfg(target_arch = "x86_64")]
         if self.avx2 {
             // SAFETY: `avx2` is only set where the CPU has AVX2.
-            unsafe { self.scan_avx2(pass, masks, out, record) };
-            return;
+            return unsafe { pass1_avx2(t, masks, idx) };
         }
-        self.scan_any(pass, masks, out, record);
-    }
-
-    /// [`Self::scan_any`] with AVX-512F: `vptestnmq` gives the zero-AND
-    /// lanes of eight bottoms as a mask directly; 32 per step.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f")]
-    fn scan_avx512(
-        &self,
-        pass: &Pass,
-        masks: &[u64],
-        out: &mut PartitionResult,
-        record: &mut Option<&mut Vec<u128>>,
-    ) {
-        use std::arch::x86_64::{_mm512_loadu_si512, _mm512_set1_epi64, _mm512_testn_epi64_mask};
-        let t = _mm512_set1_epi64(pass.top.mask.cast_signed());
-        let (chunks, rest) = masks.as_chunks::<32>();
-        let mut at = 0;
-        for chunk in chunks {
-            let mut bits = 0u32;
-            for q in 0..4 {
-                // SAFETY: eight u64 at q * 8 of a 32-element chunk; the load
-                // is unaligned (`loadu`).
-                let v = unsafe { _mm512_loadu_si512(chunk.as_ptr().add(8 * q).cast()) };
-                bits |= u32::from(_mm512_testn_epi64_mask(v, t)) << (8 * q);
-            }
-            while bits != 0 {
-                let j = at + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                self.survivor(pass, masks[j], j, out, record);
-            }
-            at += 32;
-        }
-        let t = pass.top.mask;
-        for (j, &m) in rest.iter().enumerate() {
-            if m & t == 0 {
-                self.survivor(pass, m, at + j, out, record);
-            }
-        }
-    }
-
-    /// [`Self::scan_any`] with AVX2: sixteen ANDs per step, compared with
-    /// zero and turned into a bit per bottom.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    fn scan_avx2(
-        &self,
-        pass: &Pass,
-        masks: &[u64],
-        out: &mut PartitionResult,
-        record: &mut Option<&mut Vec<u128>>,
-    ) {
-        use std::arch::x86_64::{
-            __m256i, _mm256_and_si256, _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_loadu_si256,
-            _mm256_movemask_pd, _mm256_set1_epi64x, _mm256_setzero_si256,
-        };
-        let t = _mm256_set1_epi64x(pass.top.mask.cast_signed());
-        let zero = _mm256_setzero_si256();
-        let (chunks, rest) = masks.as_chunks::<16>();
-        let mut at = 0;
-        for chunk in chunks {
-            let mut bits = 0u32;
-            for q in 0..4 {
-                // SAFETY: four u64 at q * 4 of a 16-element chunk; the load
-                // is unaligned (`loadu`), so the pointer cast is too.
-                #[allow(clippy::cast_ptr_alignment)]
-                let v = unsafe { _mm256_loadu_si256(chunk.as_ptr().add(4 * q).cast::<__m256i>()) };
-                let z = _mm256_cmpeq_epi64(_mm256_and_si256(v, t), zero);
-                bits |= (_mm256_movemask_pd(_mm256_castsi256_pd(z)).cast_unsigned()) << (4 * q);
-            }
-            while bits != 0 {
-                let j = at + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                self.survivor(pass, masks[j], j, out, record);
-            }
-            at += 16;
-        }
-        let t = pass.top.mask;
-        for (j, &m) in rest.iter().enumerate() {
-            if m & t == 0 {
-                self.survivor(pass, m, at + j, out, record);
-            }
-        }
-    }
-
-    /// The scan without AVX2: eight ANDs per step.
-    fn scan_any(
-        &self,
-        pass: &Pass,
-        masks: &[u64],
-        out: &mut PartitionResult,
-        record: &mut Option<&mut Vec<u128>>,
-    ) {
-        let t = pass.top.mask;
-        let (chunks, rest) = masks.as_chunks::<8>();
-        let mut at = 0;
-        for chunk in chunks {
-            let mut bits = 0u32;
-            for (j, &m) in chunk.iter().enumerate() {
-                bits |= u32::from(m & t == 0) << j;
-            }
-            while bits != 0 {
-                let j = at + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                self.survivor(pass, masks[j], j, out, record);
-            }
-            at += 8;
-        }
-        for (j, &m) in rest.iter().enumerate() {
-            if m & t == 0 {
-                self.survivor(pass, m, at + j, out, record);
-            }
-        }
+        pass1_any(t, masks, idx)
     }
 
     /// A pair that passed the AND: inside the field, through the prefilter,
-    /// then the full check.
-    #[inline(never)]
+    /// then the full check. Inlined into the second pass of a scan: its
+    /// loads and the prefilter's arithmetic then overlap from one pair to
+    /// the next.
+    #[inline(always)]
     fn survivor(
         &self,
         pass: &Pass,
@@ -954,6 +928,99 @@ impl CpuJoin {
     fn prefilter_digits(&self, top: &Top, bmask: u64, x2: u32, x3: u32) -> bool {
         fresh_digits(self.sb, self.mid, bmask | top.gmask, x2, x3)
     }
+}
+
+/// The first pass's compaction: the positions of the set bits of `bits`
+/// (eight bottoms from index `at`) written to `idx` from `cnt` on, in
+/// order, and `cnt` moved past them. It always writes eight slots and moves
+/// `cnt` by the count, so nothing branches on the bits; the slots past the
+/// count are written over next or never read. A pass keeps `cnt <= at`, so
+/// the slots lie below `at + 8`, inside the piece's list.
+#[inline(always)]
+fn emit(idx: &mut [u16], cnt: usize, bits: u8, at: u16) -> usize {
+    let pos = &BIT_POS[usize::from(bits)];
+    for (slot, &p) in idx[cnt..cnt + 8].iter_mut().zip(pos) {
+        *slot = at + p;
+    }
+    cnt + usize::from(BIT_CNT[usize::from(bits)])
+}
+
+/// The first pass a bottom at a time, for the last bottoms of a piece
+/// (fewer than eight): each index is written at `cnt`, which moves on only
+/// for a pass.
+#[inline(always)]
+fn pass1_rest(t: u64, masks: &[u64], at: u16, idx: &mut [u16], mut cnt: usize) -> usize {
+    for (j, &m) in (at..).zip(masks) {
+        idx[cnt] = j;
+        cnt += usize::from(m & t == 0);
+    }
+    cnt
+}
+
+/// A scan's first pass over one piece of a class (at most [`PIECE`]
+/// bottoms): the indices of the bottoms whose mask misses `t`, in order, in
+/// `idx[..n]`; returns `n`. Eight ANDs make a byte of pass bits for
+/// [`emit`].
+fn pass1_any(t: u64, masks: &[u64], idx: &mut [u16]) -> usize {
+    let (chunks, rest) = masks.as_chunks::<8>();
+    let (mut cnt, mut at) = (0, 0u16);
+    for chunk in chunks {
+        let mut bits = 0u8;
+        for (i, &m) in chunk.iter().enumerate() {
+            bits |= u8::from(m & t == 0) << i;
+        }
+        cnt = emit(idx, cnt, bits, at);
+        at += 8;
+    }
+    pass1_rest(t, rest, at, idx, cnt)
+}
+
+/// [`pass1_any`] with AVX2: four ANDs at a time, compared with zero and
+/// turned into a bit per bottom.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn pass1_avx2(t: u64, masks: &[u64], idx: &mut [u16]) -> usize {
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_loadu_si256,
+        _mm256_movemask_pd, _mm256_set1_epi64x, _mm256_setzero_si256,
+    };
+    let tv = _mm256_set1_epi64x(t.cast_signed());
+    let zero = _mm256_setzero_si256();
+    let (chunks, rest) = masks.as_chunks::<8>();
+    let (mut cnt, mut at) = (0, 0u16);
+    for chunk in chunks {
+        let mut bits = 0u8;
+        for q in 0..2 {
+            // SAFETY: four u64 at q * 4 of an 8-element chunk; the load is
+            // unaligned (`loadu`), so the pointer cast is too.
+            #[allow(clippy::cast_ptr_alignment)]
+            let v = unsafe { _mm256_loadu_si256(chunk.as_ptr().add(4 * q).cast::<__m256i>()) };
+            let z = _mm256_cmpeq_epi64(_mm256_and_si256(v, tv), zero);
+            let [lanes, ..] = _mm256_movemask_pd(_mm256_castsi256_pd(z)).to_le_bytes();
+            bits |= lanes << (4 * q);
+        }
+        cnt = emit(idx, cnt, bits, at);
+        at += 8;
+    }
+    pass1_rest(t, rest, at, idx, cnt)
+}
+
+/// [`pass1_any`] with AVX-512F: `vptestnmq` gives the zero-AND lanes of
+/// eight bottoms as a byte of pass bits directly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+fn pass1_avx512(t: u64, masks: &[u64], idx: &mut [u16]) -> usize {
+    use std::arch::x86_64::{_mm512_loadu_si512, _mm512_set1_epi64, _mm512_testn_epi64_mask};
+    let tv = _mm512_set1_epi64(t.cast_signed());
+    let (chunks, rest) = masks.as_chunks::<8>();
+    let (mut cnt, mut at) = (0, 0u16);
+    for chunk in chunks {
+        // SAFETY: the eight u64 of a chunk; the load is unaligned (`loadu`).
+        let v = unsafe { _mm512_loadu_si512(chunk.as_ptr().cast()) };
+        cnt = emit(idx, cnt, _mm512_testn_epi64_mask(v, tv), at);
+        at += 8;
+    }
+    pass1_rest(t, rest, at, idx, cnt)
 }
 
 /// What a scan needs besides the masks: the top, the last bottom digit, the
@@ -1140,19 +1207,31 @@ mod tests {
 
     /// Every AND scan this CPU has (AVX-512F, AVX2, the portable loop)
     /// finds the same pairs: the same hits, join survivors and prefilter
-    /// survivors on every partition of the test windows.
+    /// survivors on every partition of the test windows. Each also runs
+    /// with pieces of 9 bottoms, so that the windows' classes (up to about
+    /// 140 bottoms) are scanned in pieces.
     #[test]
     fn every_scan_finds_the_same_pairs() {
         for (b, s, e, jp) in windows() {
             let range = FieldSize::new(s, e);
             let best = CpuJoin::new(b, &range, jp).expect("field setup");
-            #[allow(unused_mut)]
             let mut lesser: Vec<CpuJoin> = Vec::new();
-            #[cfg(target_arch = "x86_64")]
-            for (avx512, avx2) in [(false, true), (false, false)] {
+            for (avx512, avx2, piece) in [
+                (true, true, 9),
+                (false, true, PIECE),
+                (false, true, 9),
+                (false, false, PIECE),
+                (false, false, 9),
+            ] {
                 let mut join = CpuJoin::new(b, &range, jp).expect("field setup");
-                join.avx512 &= avx512;
-                join.avx2 &= avx2;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    join.avx512 &= avx512;
+                    join.avx2 &= avx2;
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                let _ = (avx512, avx2);
+                join.piece = piece;
                 lesser.push(join);
             }
             let mut sc = Scratch::default();
@@ -1167,6 +1246,137 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The compaction's tables for every byte: its set bits in ascending
+    /// order, and how many.
+    #[test]
+    fn the_bit_tables_list_every_byte() {
+        for b in 0..=255u8 {
+            let want: Vec<u16> = (0..8).filter(|&i| (b >> i) & 1 == 1).collect();
+            let n = usize::from(BIT_CNT[usize::from(b)]);
+            assert_eq!(n, want.len(), "{b:#04x}");
+            assert_eq!(BIT_POS[usize::from(b)][..n], want[..], "{b:#04x}");
+            assert!(
+                BIT_POS[usize::from(b)][n..].iter().all(|&p| p == 0),
+                "{b:#04x}"
+            );
+        }
+    }
+
+    /// A first pass ([`pass1_any`] or one of its SIMD forms).
+    type Pass1 = fn(u64, &[u64], &mut [u16]) -> usize;
+
+    /// Every first pass this CPU can run: the portable one, and the AVX2
+    /// and AVX-512F ones where the CPU has them.
+    fn pass1_paths() -> Vec<(&'static str, Pass1)> {
+        #[allow(unused_mut)]
+        let mut paths: Vec<(&'static str, Pass1)> = vec![("portable", pass1_any)];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: the CPU has AVX2.
+                paths.push(("avx2", |t, m, idx| unsafe { pass1_avx2(t, m, idx) }));
+            }
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx2")
+            {
+                // SAFETY: the CPU has AVX-512F and AVX2.
+                paths.push(("avx512", |t, m, idx| unsafe { pass1_avx512(t, m, idx) }));
+            }
+        }
+        paths
+    }
+
+    /// A random class of `len` bottom masks against the top mask `t` (not
+    /// zero), each of which passes the AND with probability `permille` in
+    /// 1000: a passing mask is a random one without `t`'s digits, a failing
+    /// one has one of them at least.
+    fn random_class(x: &mut u64, t: u64, len: usize, permille: u32) -> Vec<u64> {
+        (0..len)
+            .map(|_| {
+                let m = next_u64(x);
+                if below(x, 1000) < permille {
+                    m & !t
+                } else {
+                    let mut tt = t;
+                    for _ in 0..below(x, t.count_ones()) {
+                        tt &= tt - 1;
+                    }
+                    m | tt.isolate_lowest_one()
+                }
+            })
+            .collect()
+    }
+
+    /// The first pass lists exactly the bottoms whose mask misses the top's,
+    /// in order, on every path this CPU has, against a plain filter: random
+    /// classes of every length up to a piece (and the lengths around each
+    /// step), with none, 1 %, 40 % and all of their bottoms passing. Longer
+    /// classes go through [`CpuJoin::for_each_passing`] on each path, which takes
+    /// them a piece at a time. Prints the paths it ran.
+    #[test]
+    fn the_first_pass_lists_the_same_bottoms_on_every_path() {
+        let paths = pass1_paths();
+        let piece = u32::try_from(PIECE).expect("a piece fits u32");
+        let mut x = 0x243F_6A88_85A3_08D3;
+        let mut lens = vec![0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 300, PIECE - 1, PIECE];
+        lens.extend((0..100).map(|_| below(&mut x, piece + 1) as usize));
+        let mut idx = vec![0u16; PIECE];
+        let mut listed = 0;
+        for &len in &lens {
+            for permille in [0, 10, 400, 1000] {
+                let size = 1 + below(&mut x, 32);
+                let t = random_set(&mut x, 64, size);
+                let masks = random_class(&mut x, t, len, permille);
+                let want: Vec<u16> = (0u16..)
+                    .zip(&masks)
+                    .filter(|&(_, &m)| m & t == 0)
+                    .map(|(j, _)| j)
+                    .collect();
+                match permille {
+                    0 => assert_eq!(want, Vec::<u16>::new()),
+                    1000 => assert_eq!(want.len(), len),
+                    _ => {}
+                }
+                for &(name, pass1) in &paths {
+                    idx.fill(u16::MAX);
+                    let n = pass1(t, &masks, &mut idx);
+                    assert_eq!(
+                        idx[..n],
+                        want[..],
+                        "{name}: {len} bottoms, {permille}‰ passing"
+                    );
+                }
+                listed += want.len();
+            }
+        }
+        let range = FieldSize::new(47, 100);
+        let jp = JoinParams { t: 2, k: 1, p: 0 };
+        let mut joins = vec![CpuJoin::new(10, &range, jp).expect("field setup")];
+        #[cfg(target_arch = "x86_64")]
+        for (avx512, avx2) in [(false, true), (false, false)] {
+            let mut join = CpuJoin::new(10, &range, jp).expect("field setup");
+            join.avx512 &= avx512;
+            join.avx2 &= avx2;
+            joins.push(join);
+        }
+        for len in [PIECE + 1, 2 * PIECE + 37, 5 * PIECE] {
+            for permille in [10, 400, 1000] {
+                let size = 1 + below(&mut x, 32);
+                let t = random_set(&mut x, 64, size);
+                let masks = random_class(&mut x, t, len, permille);
+                let want: Vec<usize> = (0..len).filter(|&j| masks[j] & t == 0).collect();
+                for join in &joins {
+                    let mut got = Vec::new();
+                    join.for_each_passing(t, &masks, &mut idx, |j| got.push(j));
+                    assert_eq!(got, want, "{len} bottoms in pieces, {permille}‰ passing");
+                }
+                listed += want.len();
+            }
+        }
+        let names: Vec<&str> = paths.iter().map(|&(name, _)| name).collect();
+        eprintln!("first pass on {names:?}: {listed} bottoms listed alike");
     }
 
     /// Whole windows through [`CpuJoin::run_all`] find what the client's
