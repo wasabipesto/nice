@@ -3031,7 +3031,7 @@ mod kernels {
         // At b = 2^s the two digits are the fraction's bit fields: ⌊F·b/2^32⌋
         // = F >> (32 - s) and ⌊(F·b mod 2^32)·b/2^32⌋ = (F << s) >> (32 - s)
         // (`fx_digits_are_bit_fields_at_powers_of_two`).
-        let pow2 = comptime!(base.is_power_of_two());
+        let pow2 = comptime!(base >= 2 && base.is_power_of_two());
         let s = comptime!(base.trailing_zeros());
         let up = comptime!(32 - base.trailing_zeros());
         let h2 = if comptime!(pow2) {
