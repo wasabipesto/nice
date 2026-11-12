@@ -140,8 +140,6 @@ const STAGES: usize = STAGES_U32 as usize;
 const MAX_ROOTS: u32 = 8;
 /// Units [`top_fd_kernel`] should have: a smaller top layer splits a batch's slots into groups.
 const TOP_FD_MIN_UNITS: u32 = 1 << 17;
-/// FD at power-of-two bases too: no, `top_kernel`'s division is shifts there and FD measured slower.
-const TOP_FD_AT_POW2_BASES: bool = false;
 
 /// Whether [`top_fd_kernel`]'s append ranks a plane's kept tops with one
 /// ballot (`top_slot`): only on devices whose planes have at most 32 lanes.
@@ -3498,10 +3496,10 @@ pub(crate) struct JoinDevice<R: Runtime> {
     limbs: u32,
     /// The check kernel's shape (`crate::join_check`).
     check: CheckShape,
-    /// Certify tops with [`top_fd_kernel`] (where [`top_fd_fits`] the field
-    /// and the base is not excluded, see [`TOP_FD_AT_POW2_BASES`]), the top
-    /// layer's digit count t, and the partitions holding a clipped block
-    /// (P = plo or phi), which `top_kernel` certifies beside it.
+    /// Certify tops with [`top_fd_kernel`] (where [`top_fd_fits`] the field,
+    /// see [`top_fd_runs`]), the top layer's digit count t, and the
+    /// partitions holding a clipped block (P = plo or phi), which
+    /// `top_kernel` certifies beside it.
     top_fd: bool,
     tq: u32,
     clip_vs: Vec<u32>,
@@ -3577,11 +3575,12 @@ pub(crate) fn top_fd_fits(fs: &FieldSetup) -> bool {
     (t + 1).div_ceil(4) <= q2.div_ceil(4) && (q2 + 1).div_ceil(4) <= q3.div_ceil(4)
 }
 
-/// Whether `fs`'s tops are certified by [`top_fd_kernel`]: where it fits,
-/// except at power-of-two bases, where the top kernel's division is shifts
-/// and masks and the FD kernel measured slower (b64).
+/// Whether `fs`'s tops are certified by [`top_fd_kernel`]: wherever its
+/// state fits, power-of-two bases (b64) included. There `top_kernel`'s
+/// divisions are shifts and masks, but stepping each prefix's powers from
+/// slot to slot still costs less than forming them for every slot.
 pub(crate) fn top_fd_runs(fs: &FieldSetup) -> bool {
-    top_fd_fits(fs) && (TOP_FD_AT_POW2_BASES || !fs.b.is_power_of_two())
+    top_fd_fits(fs)
 }
 
 impl<R: Runtime> JoinDevice<R> {
@@ -4895,7 +4894,7 @@ mod tests {
         e: u128,
         jp: JoinParams,
         parts: Option<Vec<u32>>,
-    ) {
+    ) -> bool {
         let fs = FieldSetup::new(b, s, e, jp).expect("field setup");
         let parts = parts.unwrap_or_else(|| {
             let live = live_partitions(&fs);
@@ -4932,6 +4931,7 @@ mod tests {
             cpu_hits,
             "b{b} [{s}, {e}) {jp:?}: hits differ"
         );
+        dev.top_fd
     }
 
     /// Layouts far tighter than production's, against the CPU reference over
@@ -5007,8 +5007,13 @@ mod tests {
         assert_eq!(hits.iter().map(|n| n.number).collect::<Vec<_>>(), vec![69]);
         check_window(client, 10, 47, 100, jp, None);
         for &(b, s, e, t, k, p) in WINDOWS {
-            check_window(client, b, s, e, JoinParams { t, k, p }, None);
-            println!("{name}: b{b} [{s}, {e}) ({t},{k},{p}) agrees");
+            let fd = check_window(client, b, s, e, JoinParams { t, k, p }, None);
+            // A power-of-two base's tops go through the FD kernel too.
+            assert!(
+                fd || b != 64,
+                "b{b} [{s}, {e}): the FD kernel certifies the tops"
+            );
+            println!("{name}: b{b} [{s}, {e}) ({t},{k},{p}) agrees (FD tops: {fd})");
         }
         let field = FieldSize::new(FRONTIER_57, FRONTIER_57 + 100_000_000_000_000);
         let jp = crate::overlap_join::join_params_for(57, &field).expect("a join field");

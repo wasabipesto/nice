@@ -10,6 +10,7 @@ pub mod client_api_async;
 pub mod client_process;
 pub mod client_process_cuda;
 pub mod consensus;
+mod cpu_check;
 pub mod cpu_join;
 mod cpu_top_fd;
 pub mod cubecl_backend;

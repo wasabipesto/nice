@@ -78,16 +78,18 @@ const JOIN_MEMORY_MAX: usize = 4 << 30;
 const SURV_PER_PREFIX: usize = 2;
 /// The survivors per prefix and partition a batch is planned for where the
 /// budget is a quarter of the device's memory ([`JoinLimits::vram_budget`]:
-/// CUDA) and the FD top kernel certifies the tops (not at power-of-two
-/// bases). More partitions per launch mean fewer of its seeds; at the large
-/// fields this rate sets the batch size, and a batch's layout grows to near
-/// the budget. It halves the list's headroom: a batch is half full at this
-/// rate, about 80 % full at the densest rate measured (1.6), and overflows
-/// above about 2 survivors per prefix and partition (b62 1e17 and b60 1e16
-/// on a 10 GB card: 2.0-2.1, where it was 4.5-4.7), which re-runs it
-/// (above). Where the 16-partition cap binds first (fields up to about
-/// 1e15) the headroom is larger. Slices keep [`SURV_PER_PREFIX`]: a wider
-/// slice's field certificate prunes less and leaves the join more pairs.
+/// CUDA) and the FD top kernel certifies the tops. More partitions per launch
+/// mean fewer of its seeds; at the large fields this rate sets the batch size,
+/// and a batch's layout grows to near the budget. It halves the list's
+/// headroom: a batch is half full at this rate, about 80 % full at the densest
+/// rates measured (1.6: b64's 1e16 and 1e17 fields, whose batches were 75-80 %
+/// full on average on a 10 GB card, with none overflowing in about 7,000
+/// batches), and overflows above about 2 survivors per prefix and
+/// partition (b62 1e17 and b60 1e16 on a 10 GB card: 2.0-2.1, where it was
+/// 4.5-4.7), which re-runs it (above). Where the 16-partition cap binds first
+/// (fields up to about 1e15) the headroom is larger. Slices keep
+/// [`SURV_PER_PREFIX`]: a wider slice's field certificate prunes less and
+/// leaves the join more pairs.
 const SURV_PER_PREFIX_VRAM: usize = 1;
 /// Partitions per launch a slice of a large field is cut for
 /// ([`max_slice_prefixes`]). A slice of that size usually gets two or three
@@ -749,6 +751,17 @@ pub(crate) mod tests {
         FieldSize::new(s, s + size)
     }
 
+    /// A field of `size` at base `base` that starts `pct` percent into its
+    /// band. The middle of base 64's band is sparse (its 1e16 field there is
+    /// empty), so the plans of its mid-band fields are capped either way.
+    fn band_at(base: u32, size: u128, pct: u128) -> FieldSize {
+        let r = crate::base_range::get_base_range_u128(base)
+            .unwrap()
+            .unwrap();
+        let s = r.range_start + (r.range_end - r.range_start - size) / 100 * pct;
+        FieldSize::new(s, s + size)
+    }
+
     /// Fields of the sizes production uses and will use (1e14 at base 57,
     /// 1e15 at 58, 1e16 at 60, about 1e17 at 62) get the join on an 8-10 GB
     /// card, cut into as few slices as fit: one up to 1e15. Every slice's
@@ -806,16 +819,19 @@ pub(crate) mod tests {
 
     /// Where the budget is a quarter of the device's memory (CUDA), batches
     /// of FD fields are planned for [`SURV_PER_PREFIX_VRAM`] survivors per
-    /// prefix and get more partitions within the same budget; the slices are
-    /// cut as on any other device, and a power-of-two base (no FD kernel)
-    /// keeps its plan.
+    /// prefix and get more partitions within the same budget (b64 among
+    /// them); the slices are cut as on any other device.
     #[test]
     fn vram_budgets_get_larger_batches_in_the_same_slices() {
         let lim = JoinLimits::for_buffer(10 << 28);
         let vram = lim.with_vram_budget();
+        // Whether a field's plan grew: [a base that is not 64, base 64].
+        let mut grew = [false; 2];
         for (base, range) in [
             (60, mid_band(60, 10_000_000_000_000_000)),
             (62, mid_band(62, 100_000_000_000_000_000)),
+            (64, band_at(64, 10_000_000_000_000_000, 55)),
+            (64, band_at(64, 100_000_000_000_000_000, 55)),
         ] {
             let a = plan_join(base, &range, lim).expect("the join takes it");
             let b = plan_join(base, &range, vram).expect("the join takes it");
@@ -826,12 +842,14 @@ pub(crate) mod tests {
                     .collect::<Vec<_>>()
             };
             assert_eq!(cuts(&a), cuts(&b), "b{base}");
+            // More partitions per launch, unless the cap already binds.
             assert!(
-                b.plan.slots >= a.plan.slots,
+                b.plan.slots > a.plan.slots || a.plan.slots == SLOTS,
                 "b{base}: {:?} {:?}",
                 a.plan,
                 b.plan
             );
+            grew[usize::from(base == 64)] |= b.plan.slots > a.plan.slots;
             assert!(b.plan.bytes <= vram.budget, "b{base}: {:?}", b.plan);
             let ntl = b.fs.tlay.len();
             assert!(
@@ -839,12 +857,31 @@ pub(crate) mod tests {
                     <= b.plan.list_cap as usize / 2 + ntl * SURV_PER_PREFIX_VRAM
             );
         }
-        let range = mid_band(64, 10_000_000_000_000_000);
-        let (a, b) = (
-            plan_join(64, &range, lim).expect("the join takes it"),
-            plan_join(64, &range, vram).expect("the join takes it"),
-        );
-        assert_eq!(a.plan, b.plan, "b64");
+        assert!(grew[0] && grew[1], "no field's plan grew: {grew:?}");
+    }
+
+    /// The FD top kernel certifies the tops of production-shaped b64 fields
+    /// (1e16 and 1e17; the first and last slice of each) as at the other
+    /// bases: its state fits there and power-of-two bases are not excluded.
+    #[test]
+    fn top_fd_runs_at_base_64() {
+        let lim = JoinLimits::for_buffer(10 << 28);
+        for size in [10_000_000_000_000_000u128, 100_000_000_000_000_000] {
+            let range = mid_band(64, size);
+            let field = plan_join(64, &range, lim).expect("the join takes it");
+            assert!(crate::cubecl_join::top_fd_runs(&field.fs), "b64 {size:e}");
+            for sl in [field.slices.first(), field.slices.last()]
+                .into_iter()
+                .flatten()
+            {
+                let fs = field.fs.sub_range(sl.start(), sl.end()).expect("slice");
+                assert!(
+                    crate::cubecl_join::top_fd_runs(&fs),
+                    "b64 {size:e} slice at {}",
+                    sl.start()
+                );
+            }
+        }
     }
 
     /// A small device cuts the same field finer, and still holds each slice.

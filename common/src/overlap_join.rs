@@ -597,6 +597,22 @@ pub(crate) fn close_certificate(mut mask: u64, doms: [u64; 2]) -> Option<u64> {
     }
 }
 
+/// A block's certificate ([`Base::cert_parts`]) and what it rests on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cert {
+    /// The certificate: the common digits and those the closure adds.
+    pub(crate) mask: u64,
+    /// The common digits alone: n²'s at positions `from[0]..s2` and n³'s
+    /// at `from[1]..s3`, the same for every n of the block. A digit the
+    /// closure adds is not one of them: it sits below `from`, at the
+    /// position whose digit is d or d + 1, and only a nice n is sure to
+    /// have it there.
+    pub(crate) common: u64,
+    /// The lowest common position of n² and of n³ (the digit count of a
+    /// power that has none).
+    pub(crate) from: [u32; 2],
+}
+
 impl Base {
     /// `lo..=hi` must share the digit length of n, n² and n³ (true inside
     /// any field of a nice band), and n³ must have at most [`DIGIT_BUF`]
@@ -785,7 +801,14 @@ impl Base {
     /// Certificate of `[a, e]`: a mask of output digits of n² and n³ at
     /// positions `>= cap` that every n in the interval whose digits there
     /// are distinct (every nice n) must have, or `None` if there is no such
-    /// n.
+    /// n. It is `cert_parts`' `mask`.
+    #[must_use]
+    pub fn cert(&self, a: u128, e: u128, cap: u32) -> Option<u64> {
+        self.cert_parts(a, e, cap).map(|c| c.mask)
+    }
+
+    /// [`Self::cert`], with the digits it reads off position by position
+    /// ([`Cert`]).
     ///
     /// n ↦ n^j is increasing, so the digits that are the same for every n
     /// are exactly the common top digits of `a^j` and `e^j`, scanned down to
@@ -800,7 +823,7 @@ impl Base {
     /// common digits are the ones above that, and every n's digit there is
     /// d or d + 1, which [`close_certificate`] uses.
     #[must_use]
-    pub fn cert(&self, a: u128, e: u128, cap: u32) -> Option<u64> {
+    pub(crate) fn cert_parts(&self, a: u128, e: u128, cap: u32) -> Option<Cert> {
         let a2 = W4::mul_u128_u128(a, a);
         let e2 = W4::mul_u128_u128(e, e);
         let a3 = a2.mul_u128(a);
@@ -811,7 +834,12 @@ impl Base {
         let mut mask = 0u64;
         let mut dx = [0u8; DIGIT_BUF];
         let mut doms = [0u64; 2];
-        for (dom, (x, y, sp)) in doms.iter_mut().zip([(a2, e2, self.s2), (a3, e3, self.s3)]) {
+        let mut from = [self.s2, self.s3];
+        for ((dom, first), (x, y, sp)) in doms
+            .iter_mut()
+            .zip(&mut from)
+            .zip([(a2, e2, self.s2), (a3, e3, self.s3)])
+        {
             let d = y.sub(&x);
             let c0 = cap.max(self.ndig_w(&d));
             if c0 >= sp {
@@ -823,17 +851,24 @@ impl Base {
             let (qx, rem) = self.shift_down_rem(x, c0);
             let one_more = !rem.add(&d).lt(&self.poww[c0 as usize]);
             self.digits_w(qx, sp - c0, &mut dx);
-            let mut from = 0usize;
+            // The first common digit's index in `dx`: past the run of b − 1
+            // and the d / d + 1 digit above it, if e^j's value is one more.
+            let mut run = 0usize;
             if one_more {
                 // e^j's value there is below b^(sp − c0), so the run ends
                 // before the top digit.
-                while dx[from] == top {
-                    from += 1;
+                while dx[run] == top {
+                    run += 1;
                 }
-                *dom = digit_range_mask(dx[from], dx[from] + 1);
-                from += 1;
+                *dom = digit_range_mask(dx[run], dx[run] + 1);
+                run += 1;
             }
-            for &digit in &dx[from..(sp - c0) as usize] {
+            // `run` is below sp − c0 <= DIGIT_BUF.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                *first = c0 + run as u32;
+            }
+            for &digit in &dx[run..(sp - c0) as usize] {
                 let bit = 1u64 << digit;
                 if mask & bit != 0 {
                     return None;
@@ -841,7 +876,11 @@ impl Base {
                 mask |= bit;
             }
         }
-        close_certificate(mask, doms)
+        close_certificate(mask, doms).map(|closed| Cert {
+            mask: closed,
+            common: mask,
+            from,
+        })
     }
 
     /// Lowest output position the certificate of `[a, e]` (cap `cap`) can
@@ -1558,15 +1597,19 @@ mod tests {
         (seen, repeat)
     }
 
-    /// [`Base::cert`] the long way: both endpoints' digits, compared from
-    /// the top down to their first disagreement.
-    fn cert_reference(base: &Base, a: u128, e: u128, cap: u32) -> Option<u64> {
+    /// [`Base::cert_parts`] the long way: both endpoints' digits, compared
+    /// from the top down to their first disagreement.
+    fn cert_reference(base: &Base, a: u128, e: u128, cap: u32) -> Option<Cert> {
         let a2 = W4::mul_u128_u128(a, a);
         let e2 = W4::mul_u128_u128(e, e);
         let (a3, e3) = (a2.mul_u128(a), e2.mul_u128(e));
-        let (mut mask, mut doms) = (0u64, [0u64; 2]);
+        let (mut mask, mut doms, mut from) = (0u64, [0u64; 2], [base.s2, base.s3]);
         let (mut dx, mut dy) = ([0u8; DIGIT_BUF], [0u8; DIGIT_BUF]);
-        for (dom, (x, y, sp)) in doms.iter_mut().zip([(a2, e2, base.s2), (a3, e3, base.s3)]) {
+        for ((dom, first), (x, y, sp)) in doms
+            .iter_mut()
+            .zip(&mut from)
+            .zip([(a2, e2, base.s2), (a3, e3, base.s3)])
+        {
             let c0 = cap.max(base.ndig_w(&y.sub(&x)));
             if c0 >= sp {
                 continue;
@@ -1574,9 +1617,11 @@ mod tests {
             let len = sp - c0;
             base.digits_w(base.shift_down(x, c0), len, &mut dx);
             base.digits_w(base.shift_down(y, c0), len, &mut dy);
+            *first = c0;
             for i in (0..len as usize).rev() {
                 if dx[i] != dy[i] {
                     *dom = digit_range_mask(dx[i], dy[i]);
+                    *first = c0 + u32::try_from(i).unwrap() + 1;
                     break;
                 }
                 if mask & (1 << dx[i]) != 0 {
@@ -1585,7 +1630,11 @@ mod tests {
                 mask |= 1 << dx[i];
             }
         }
-        close_certificate(mask, doms)
+        close_certificate(mask, doms).map(|closed| Cert {
+            mask: closed,
+            common: mask,
+            from,
+        })
     }
 
     /// The certificate from `a^j`'s digits and a remainder equals the one
@@ -1619,7 +1668,8 @@ mod tests {
                 let lo = p * fs.w;
                 let (a, e) = (lo.max(fs.s), (lo + fs.w - 1).min(fs.e - 1));
                 let want = cert_reference(&fs.base, a, e, jp.k);
-                assert_eq!(fs.base.cert(a, e, jp.k), want, "b{b} [{a}, {e}]");
+                assert_eq!(fs.base.cert_parts(a, e, jp.k), want, "b{b} [{a}, {e}]");
+                assert_eq!(fs.base.cert(a, e, jp.k), want.map(|c| c.mask));
                 certified += u64::from(want.is_some());
             }
         }
@@ -1636,7 +1686,12 @@ mod tests {
                 };
                 let cap = u32::try_from(rng.below(6)).unwrap();
                 let want = cert_reference(&base, a, e, cap);
-                assert_eq!(base.cert(a, e, cap), want, "b{b} [{a}, {e}] cap {cap}");
+                assert_eq!(
+                    base.cert_parts(a, e, cap),
+                    want,
+                    "b{b} [{a}, {e}] cap {cap}"
+                );
+                assert_eq!(base.cert(a, e, cap), want.map(|c| c.mask));
                 certified += u64::from(want.is_some());
             }
         }
