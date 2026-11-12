@@ -23,8 +23,9 @@
 //!    first lists the bottoms that pass the AND by index, without a branch
 //!    on the outcome, and the second takes them on.
 //! 4. **Survivors** go through the middle-digit prefilter, as on the GPU
-//!    (its digits read off a fixed-point fraction), and then the client's
-//!    own full check.
+//!    (its digits read off a fixed-point fraction), and then the full
+//!    check, which starts from the digits the join has proved and converts
+//!    only the rest (`cpu_check`).
 //!
 //! The client sends it the nice-only fields the GPU's join would take, a
 //! slice at a time ([`slices_for`]): the host's top layer grows with the
@@ -38,10 +39,10 @@
 #![allow(clippy::inline_always)]
 
 use crate::FieldSize;
-use crate::client_process::{get_is_nice, get_is_nice_with_known_lsd};
+use crate::cpu_check::Check;
 use crate::cpu_top_fd::{TopFd, TopFdSetup};
 use crate::overlap_join::{
-    Div64, FieldSetup, JoinParams, join_params_for, join_slices, join_verdict, ndigits,
+    Cert, Div64, FieldSetup, JoinParams, join_params_for, join_slices, join_verdict, ndigits,
     prefix_block,
 };
 use anyhow::Result;
@@ -142,16 +143,33 @@ struct Top {
     p: u128,
     /// The certificate: output digits at positions `>= k`.
     mask: u64,
-    /// The certificate if every certified position is `>= k2`, so that the
-    /// prefilter's digits must avoid it too; otherwise 0.
-    gmask: u64,
+    /// If `gate`, the certificate's common digits ([`Cert::common`]): the
+    /// digits of `n²` at positions `ends[0]..s2` and of `n³` at
+    /// `ends[1]..s3`, which the full check takes as known. Otherwise 0,
+    /// and `ends` is `(s2, s3)`.
+    seed: u64,
     rlo: u32,
     rhi: u32,
     /// `⌈D·2^32/b²⌉` for `D` = `n`'s digits `k..k2` (the next digits of
     /// `P`) as a number: the prefilter's fixed-point `D` ([`Fx`]).
     dh: u32,
     /// `P mod (b − 1)`.
-    pc: u32,
+    pc: u8,
+    /// Every certified position is `>= k2`: the prefilter's digits must
+    /// avoid the certificate too, and the check may take its common
+    /// digits as known.
+    gate: bool,
+    /// Where the check's scan of `n²` and `n³` ends (below 48).
+    ends: [u8; 2],
+}
+
+impl Top {
+    /// The certificate if `gate`, otherwise 0: what the prefilter's digits
+    /// must avoid besides the bottom's.
+    #[inline(always)]
+    fn gmask(&self) -> u64 {
+        if self.gate { self.mask } else { 0 }
+    }
 }
 
 // The tops a thread sorts and scans: 48 bytes each (`u128` alignment).
@@ -317,7 +335,9 @@ impl Fx {
 
     /// The prefilter at `mid = 2`: the digits of `x2 = (A2 + P2·D) mod b²`
     /// and `x3 = (A3 + P3·D) mod b²` (`carries = A2 | A3 << 16`, `D` as
-    /// `δ̂`) pairwise distinct and none in `seen` ([`fresh4`]).
+    /// `δ̂`) pairwise distinct and none in `seen` ([`fresh4`]). The full
+    /// check re-reads these digits (`CpuJoin::mid_bits`): keep the two in
+    /// step.
     #[inline]
     fn pass(self, seen: u64, carries: u32, p2: u32, p3: u32, dh: u32) -> bool {
         let (h2, g2) = self.digits(carries & 0xFFFF, p2, dh);
@@ -356,9 +376,24 @@ fn fresh_digits(sb: SmallDiv, mid: u32, mut seen: u64, mut x2: u32, mut x3: u32)
     true
 }
 
+/// A checked survivor as the tests record it: `n = P·b^f0 + r0`, and what
+/// its full check took as known ([`Check::nice`]).
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // the tests read it
+struct Checked {
+    n: u128,
+    p: u128,
+    r0: u32,
+    low: u64,
+    top: u64,
+    ends: [u32; 2],
+}
+
 /// A field prepared for the CPU join.
 pub struct CpuJoin {
     fs: FieldSetup,
+    /// The full check of the field's survivors.
+    check: Check,
     k: u32,
     /// Prefilter digits above `k` (`k2 − k`).
     mid: u32,
@@ -447,7 +482,11 @@ impl CpuJoin {
         // A key's prefixes are `b^(p + key level) = b^o` apart in P, and
         // `o = k − f0`: the step is `pk`.
         let fd = TopFdSetup::try_new(&fs.base, fs.f0, k - fs.f0, k, fs.phi, u32::try_from(bmid)?);
+        let check = Check::new(
+            base, fs.base.l, fs.base.s2, fs.base.s3, fs.f0, fs.k2, fs.phi,
+        )?;
         Ok(Self {
+            check,
             k,
             mid,
             keyspace,
@@ -537,7 +576,12 @@ impl CpuJoin {
         (v / self.fs.b.pow(i)) % self.fs.b
     }
 
-    fn run(&self, v: u32, sc: &mut Scratch, mut record: Option<&mut Vec<u128>>) -> PartitionResult {
+    fn run(
+        &self,
+        v: u32,
+        sc: &mut Scratch,
+        mut record: Option<&mut Vec<Checked>>,
+    ) -> PartitionResult {
         let mut out = PartitionResult::default();
         let m1 = self.fs.m1;
         let roots = &self.fs.base.roots;
@@ -571,7 +615,7 @@ impl CpuJoin {
             self.list(d, &mut sc.ext, &mut sc.masks, &mut sc.info, &mut sc.offs);
             for top in &sc.tops {
                 for &root in roots {
-                    let c = ((root + m1 - top.pc) % m1) as usize;
+                    let c = ((root + m1 - u32::from(top.pc)) % m1) as usize;
                     let (lo, hi) = (sc.offs[c] as usize, sc.offs[c + 1] as usize);
                     let pass = Pass {
                         top,
@@ -613,20 +657,12 @@ impl CpuJoin {
                 && e == lo + w - 1
             {
                 fd.advance(&mut st, p);
-                if let Some(mask) = fd.cert(&st) {
-                    tops.push(Top {
-                        p,
-                        mask,
-                        gmask: if full_seed { mask } else { 0 },
-                        rlo: 0,
-                        rhi: w as u32,
-                        dh: self.fx.dh(st.dm),
-                        pc: st.pc,
-                    });
+                if let Some(c) = fd.cert(&st) {
+                    tops.push(self.top(p, c, full_seed, (0, w as u32), self.fx.dh(st.dm), st.pc));
                 }
                 continue;
             }
-            let Some(mask) = fs.base.cert(a, e, self.k) else {
+            let Some(c) = fs.base.cert_parts(a, e, self.k) else {
                 continue;
             };
             let floor = if a == lo && e == lo + w - 1 {
@@ -634,15 +670,42 @@ impl CpuJoin {
             } else {
                 fs.base.cert_floor(a, e, self.k)
             };
-            tops.push(Top {
+            tops.push(self.top(
                 p,
-                mask,
-                gmask: if floor >= fs.k2 { mask } else { 0 },
-                rlo: (a - lo) as u32,
-                rhi: (e - lo + 1) as u32,
-                dh: self.fx.dh(((p / self.pk) % u128::from(self.bmid)) as u32),
-                pc: (p % u128::from(fs.m1)) as u32,
-            });
+                c,
+                floor >= fs.k2,
+                ((a - lo) as u32, (e - lo + 1) as u32),
+                self.fx.dh(((p / self.pk) % u128::from(self.bmid)) as u32),
+                (p % u128::from(fs.m1)) as u32,
+            ));
+        }
+    }
+
+    /// A top from its certificate. With `gate` (every certified position
+    /// `>= k2`) its common digits sit above every digit the bottom and the
+    /// prefilter test (the lowest common position of a power is `>=` its
+    /// floor), so the check may take them as known.
+    // Positions below 48 and P mod (b − 1) below 64.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline(always)]
+    fn top(&self, p: u128, c: Cert, gate: bool, (rlo, rhi): (u32, u32), dh: u32, pc: u32) -> Top {
+        let fs = &self.fs;
+        let (seed, ends) = if gate {
+            debug_assert!(c.from[0] >= fs.k2 && c.from[1] >= fs.k2, "{c:?}");
+            (c.common, c.from)
+        } else {
+            (0, [fs.base.s2, fs.base.s3])
+        };
+        Top {
+            p,
+            mask: c.mask,
+            seed,
+            rlo,
+            rhi,
+            dh,
+            pc: pc as u8,
+            gate,
+            ends: [ends[0] as u8, ends[1] as u8],
         }
     }
 
@@ -801,7 +864,7 @@ impl CpuJoin {
         masks: &[u64],
         idx: &mut [u16],
         out: &mut PartitionResult,
-        record: &mut Option<&mut Vec<u128>>,
+        record: &mut Option<&mut Vec<Checked>>,
     ) {
         self.for_each_passing(pass.top.mask, masks, idx, |j| {
             self.survivor(pass, masks[j], j, out, record);
@@ -854,7 +917,7 @@ impl CpuJoin {
         bmask: u64,
         j: usize,
         out: &mut PartitionResult,
-        record: &mut Option<&mut Vec<u128>>,
+        record: &mut Option<&mut Vec<Checked>>,
     ) {
         let info = pass.info[j];
         let row = info.row as usize;
@@ -876,20 +939,65 @@ impl CpuJoin {
             return;
         }
         out.checked += 1;
-        let n = top.p * self.fs.w + u128::from(r0);
+        self.full_check(pass, bmask, info, r0, out, record);
+    }
+
+    /// The full check of a survivor that passed the prefilter: its digits
+    /// below `k2` are known (the bottom's, `bmask`, and the prefilter's),
+    /// and so are its top's common digits where the top's `gate` allows;
+    /// [`Check::nice`] converts the rest.
+    #[inline(never)]
+    fn full_check(
+        &self,
+        pass: &Pass,
+        bmask: u64,
+        info: Info,
+        r0: u32,
+        out: &mut PartitionResult,
+        record: &mut Option<&mut Vec<Checked>>,
+    ) {
+        let top = pass.top;
+        let low = bmask | self.mid_bits(pass, info);
+        let ends = [u32::from(top.ends[0]), u32::from(top.ends[1])];
+        let n = || top.p * self.fs.w + u128::from(r0);
         if let Some(rec) = record.as_deref_mut() {
-            rec.push(n);
+            rec.push(Checked {
+                n: n(),
+                p: top.p,
+                r0,
+                low,
+                top: top.seed,
+                ends,
+            });
         }
-        // With f0 = 3 (the production parameters) the bottom list's own
-        // mask is the low three digits of both powers, which the check skips.
-        let nice = if self.fs.f0 == 3 {
-            get_is_nice_with_known_lsd(n, self.fs.b, 3, self.fs.bp_m[ext.idx[row] as usize])
-        } else {
-            get_is_nice(n, self.fs.b)
-        };
-        if nice {
-            out.hits.push(n);
+        if self.check.nice(top.p, r0, low, top.seed, ends) {
+            out.hits.push(n());
         }
+    }
+
+    /// The prefilter's digits of a survivor that passed it (`n`'s output
+    /// digits at positions `k..k2`) as a mask: the same digits
+    /// [`Self::prefilter`] or [`Self::prefilter_any`] tested.
+    // Digits below b <= 64.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    fn mid_bits(&self, pass: &Pass, info: Info) -> u64 {
+        let (top, ext, row) = (pass.top, pass.ext, info.row as usize);
+        if self.lean {
+            let (h2, g2) = self.fx.digits(info.carries & 0xFFFF, ext.p2[row], top.dh);
+            let (h3, g3) = self.fx.digits(info.carries >> 16, ext.p3[row], top.dh);
+            return (1 << h2) | (1 << g2) | (1 << h3) | (1 << g3);
+        }
+        let rho = (u64::from(ext.rho[row]) + u64::from(pass.d) * self.kb) % self.bmid;
+        let (mut x2, mut x3) = self.mid_values(top, info.carries, rho);
+        let mut bits = 0u64;
+        for _ in 0..self.mid {
+            let (q2, g2) = self.sb.divrem_small(x2);
+            let (q3, g3) = self.sb.divrem_small(x3);
+            bits |= (1u64 << g2) | (1u64 << g3);
+            (x2, x3) = (q2, q3);
+        }
+        bits
     }
 
     /// The middle-digit prefilter: `n`'s output digits at positions
@@ -902,15 +1010,22 @@ impl CpuJoin {
     /// as `δ̂`, and its certificate is pre-gated (`gmask`).
     #[inline]
     fn prefilter(&self, top: &Top, bmask: u64, carries: u32, p2: u32, p3: u32) -> bool {
-        self.fx.pass(bmask | top.gmask, carries, p2, p3, top.dh)
+        self.fx.pass(bmask | top.gmask(), carries, p2, p3, top.dh)
     }
 
     /// [`Self::prefilter`] for any parameters: also the terms in `b^k`
     /// (`D²b^k`, `3RD²b^k`, `D³b^(2k)`), which vanish unless `k` is below
     /// the prefilter's depth, and `R mod b^mid` as given.
+    fn prefilter_any(&self, top: &Top, bmask: u64, carries: u32, rho: u64) -> bool {
+        let (x2, x3) = self.mid_values(top, carries, rho);
+        self.prefilter_digits(top, bmask, x2, x3)
+    }
+
+    /// [`Self::prefilter_any`]'s digits of `n²` and `n³` as numbers below
+    /// `b^mid`.
     // D = P's digits k..k2 as a number, below b^mid < 2^32.
     #[allow(clippy::cast_possible_truncation)]
-    fn prefilter_any(&self, top: &Top, bmask: u64, carries: u32, rho: u64) -> bool {
+    fn mid_values(&self, top: &Top, carries: u32, rho: u64) -> (u32, u32) {
         let m = self.bmid;
         let dm = ((top.p / self.pk) % u128::from(m)) as u64;
         let (a2, a3) = (u64::from(carries & 0xFFFF), u64::from(carries >> 16));
@@ -918,15 +1033,16 @@ impl CpuJoin {
         let x2 = (a2 + 2 * rho * dm + d2 * self.bk) % m;
         let x3 = (a3 + 3 * rho2 * dm + 3 * rho * d2 % m * self.bk + d2 * dm % m * self.b2k) % m;
         let narrow = |x: u64| u32::try_from(x).expect("below b^mid < 2^32");
-        self.prefilter_digits(top, bmask, narrow(x2), narrow(x3))
+        (narrow(x2), narrow(x3))
     }
 
     /// The prefilter's digits of `n²` and `n³` (`x2`, `x3`, `mid` digits
     /// each, below `b^mid`) against each other, the bottom's digits and
-    /// the certificate when it sits above them.
+    /// the certificate when it sits above them. The full check re-reads
+    /// these digits ([`Self::mid_bits`]): keep the two in step.
     #[inline]
     fn prefilter_digits(&self, top: &Top, bmask: u64, x2: u32, x3: u32) -> bool {
-        fresh_digits(self.sb, self.mid, bmask | top.gmask, x2, x3)
+        fresh_digits(self.sb, self.mid, bmask | top.gmask(), x2, x3)
     }
 }
 
@@ -1035,7 +1151,8 @@ struct Pass<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_process::process_range_niceonly;
+    use crate::client_process::{get_is_nice, get_num_unique_digits, process_range_niceonly};
+    use crate::fixed_width::U256;
     use crate::overlap_join::join_range;
     use crate::overlap_join::test_fields::{
         FRONTIER_57, PLAN_FIELDS, WINDOWS, live_partitions, mid_mirror, reference_field,
@@ -1101,8 +1218,9 @@ mod tests {
             );
             cpu.retain(|&n| mid_mirror(&join.fs, n));
             cpu.sort_unstable();
-            let mut got = Vec::new();
-            let res = join.run(v, &mut scratch, Some(&mut got));
+            let mut rec = Vec::new();
+            let res = join.run(v, &mut scratch, Some(&mut rec));
+            let mut got: Vec<u128> = rec.iter().map(|c| c.n).collect();
             got.sort_unstable();
             let mut hits = res.hits.clone();
             hits.sort_unstable();
@@ -1120,6 +1238,151 @@ mod tests {
                 "b{b} [{s}, {e}) {jp:?} partition {v}"
             );
             assert_eq!(hits, st.hits, "b{b} [{s}, {e}) {jp:?} partition {v}: hits");
+            assert_checked(&join, &rec);
+        }
+    }
+
+    /// The digits of `x`, low first.
+    fn u256_digits(mut x: U256, b: u32) -> Vec<u32> {
+        let mut v = Vec::new();
+        while !x.is_zero() {
+            v.push(x.div_assign_rem_u32(b));
+        }
+        v
+    }
+
+    /// Every checked survivor's full check against the client's
+    /// (`get_is_nice`, `get_num_unique_digits`): what it took as known is
+    /// exactly `n²`'s and `n³`'s digits below `k2` (`2·k2` distinct ones)
+    /// and, from its top, at and above `ends` (distinct, and none of
+    /// those); in count mode it takes exactly the digits in between,
+    /// its mask holds the client's count of distinct digits, and it finds
+    /// a repeat exactly where the client finds `n` not nice; and its
+    /// verdict is the client's. On four threads. Returns the survivors
+    /// whose top's digits were taken (`gate`).
+    fn assert_checked(join: &CpuJoin, rec: &[Checked]) -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (b, k2) = (join.fs.b, join.fs.k2 as usize);
+        let (s2, s3) = (join.fs.base.s2 as usize, join.fs.base.s3 as usize);
+        let bits = |d: &[u32]| d.iter().fold(0u64, |a, &x| a | 1 << x);
+        let gated = AtomicU64::new(0);
+        std::thread::scope(|sc| {
+            for part in rec.chunks(rec.len().div_ceil(4).max(1)) {
+                let gated = &gated;
+                sc.spawn(move || {
+                    for c in part {
+                        let n = c.n;
+                        let sq = U256::mul_u128_u128(n, n);
+                        let d2 = u256_digits(sq, b);
+                        let d3 = u256_digits(sq.mul_u128_truncating(n), b);
+                        assert_eq!((d2.len(), d3.len()), (s2, s3), "b{b} n = {n}");
+                        assert_eq!(
+                            c.low,
+                            bits(&d2[..k2]) | bits(&d3[..k2]),
+                            "b{b} n = {n}: low"
+                        );
+                        assert_eq!(c.low.count_ones() as usize, 2 * k2, "b{b} n = {n}");
+                        let (e0, e1) = (c.ends[0] as usize, c.ends[1] as usize);
+                        assert!(k2 <= e0 && e0 <= s2 && k2 <= e1 && e1 <= s3, "{c:?}");
+                        assert_eq!(
+                            c.top,
+                            bits(&d2[e0..]) | bits(&d3[e1..]),
+                            "b{b} n = {n}: top"
+                        );
+                        assert_eq!(
+                            c.top.count_ones() as usize,
+                            s2 - e0 + s3 - e1,
+                            "b{b} n = {n}"
+                        );
+                        assert_eq!(c.top & c.low, 0, "b{b} n = {n}");
+                        gated.fetch_add(u64::from(c.top != 0), Ordering::Relaxed);
+                        let cm = join.check.count(c.p, c.r0, c.low | c.top, c.ends, false);
+                        for (j, d, e) in [(0, &d2, e0), (1, &d3, e1)] {
+                            for (pos, &want) in d.iter().enumerate() {
+                                let want = if (k2..e).contains(&pos) { want } else { 255 };
+                                assert_eq!(
+                                    u32::from(cm.trace[j][pos]),
+                                    want,
+                                    "b{b} n = {n} power {}",
+                                    j + 2
+                                );
+                            }
+                        }
+                        let nice = get_is_nice(n, b);
+                        assert_eq!(
+                            cm.mask.count_ones(),
+                            get_num_unique_digits(n, b),
+                            "b{b} n = {n}"
+                        );
+                        assert_eq!(cm.repeat, !nice, "b{b} n = {n}");
+                        assert_eq!(
+                            join.check.nice(c.p, c.r0, c.low, c.top, c.ends),
+                            nice,
+                            "b{b} n = {n}: verdict"
+                        );
+                    }
+                });
+            }
+        });
+        gated.into_inner()
+    }
+
+    /// Partitions `parts` of slice `slice` of a field (in the benchmark's
+    /// order, `bench_defs::sample_order`): every checked survivor's full check ([`assert_checked`]).
+    /// Prints the counts.
+    fn check_survivors(b: u32, start: u128, size: u128, slice: usize, parts: usize) {
+        let range = FieldSize::new(start, start + size);
+        let (jp, slices) = slices_for(b, &range).expect("a join field");
+        let join = CpuJoin::new(b, &slices[slice], jp).expect("field setup");
+        let order = crate::bench_defs::sample_order(join.partitions());
+        let (mut sc, mut checked, mut gated) = (Scratch::default(), 0, 0);
+        let t = Instant::now();
+        for &v in order.iter().take(parts) {
+            let mut rec = Vec::new();
+            let res = join.run(v, &mut sc, Some(&mut rec));
+            assert_eq!(res.checked, rec.len() as u64);
+            gated += assert_checked(&join, &rec);
+            checked += rec.len();
+        }
+        eprintln!(
+            "b{b} [{start}, +{size:e}) slice {slice}, {parts} partitions: {checked} checked \
+             survivors ({gated} with their top's digits) exact in {:.1}s",
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    /// The full check on every checked survivor of two partitions of each
+    /// production field ([`assert_checked`]).
+    #[test]
+    fn the_full_check_is_exact_on_production_survivors() {
+        for &(b, s, size) in PLAN_FIELDS {
+            check_survivors(b, s, size, 0, 2);
+        }
+    }
+
+    /// Opt-in (`NICE_TEST_CPU_CHECK_REF=n`; minutes): the full check on
+    /// every checked survivor of `n` partitions of the production shapes
+    /// the timings use (b60 1e16, b62 1e17's first slice, the benchmark's
+    /// b58 1e15, and the b60, b62, b64 1e14 fields), [`assert_checked`].
+    #[test]
+    #[ignore = "opt-in, minutes"]
+    fn the_full_check_is_exact_on_production_shapes() {
+        let Ok(n) = std::env::var("NICE_TEST_CPU_CHECK_REF") else {
+            eprintln!("skipping: set NICE_TEST_CPU_CHECK_REF to a partition count per field");
+            return;
+        };
+        let n: usize = n
+            .parse()
+            .expect("NICE_TEST_CPU_CHECK_REF: a partition count");
+        for (b, s, size) in [
+            (60, 1_157_209_632_114_824_200_908, 10u128.pow(16)),
+            (62, 4_473_066_762_334_864_396_992, 10u128.pow(17)),
+            (58, 104_400_216_587_923_470_200, 10u128.pow(15)),
+            (60, 1_157_209_632_114_824_200_908, 10u128.pow(14)),
+            (62, 4_473_156_762_334_864_396_992, 10u128.pow(14)),
+            (64, 41_242_006_262_957_161_709_568, 10u128.pow(14)),
+        ] {
+            check_survivors(b, s, size, 0, n);
         }
     }
 

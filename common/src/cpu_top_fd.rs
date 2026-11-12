@@ -32,7 +32,7 @@
 #![allow(clippy::inline_always)]
 
 use crate::cpu_join::SmallDiv;
-use crate::overlap_join::{Base, Div64, W4, close_certificate, digit_range_mask};
+use crate::overlap_join::{Base, Cert, Div64, W4, close_certificate, digit_range_mask};
 
 /// The most steps the state walks to the next prefix; one farther away
 /// seeds it instead.
@@ -541,21 +541,22 @@ impl TopFdSetup {
     }
 
     /// The certificate of the block of `st`'s prefix (unclipped): the same
-    /// as `Base::cert(a, a + w − 1, cap)`, read from the stepped digits.
-    /// The digit of `a^j` at position `pos` is digit `pos − j·f0` of `P^j`
-    /// (zero below).
+    /// as `Base::cert_parts(a, a + w − 1, cap)`, read from the stepped
+    /// digits. The digit of `a^j` at position `pos` is digit `pos − j·f0`
+    /// of `P^j` (zero below).
     #[inline]
-    pub(crate) fn cert(&self, st: &TopFd) -> Option<u64> {
+    pub(crate) fn cert(&self, st: &TopFd) -> Option<Cert> {
         // A digit, below b <= 64.
         #[allow(clippy::cast_possible_truncation)]
         let top = (self.b - 1) as u8;
         let mut mask = 0u64;
         let mut doms = [0u64; 2];
+        let mut from = [self.s2, self.s3];
         let powers = [
             (&st.sq, &st.d2, self.s2, 2 * self.f0, self.bz[0]),
             (&st.cu, &st.d3, self.s3, 3 * self.f0, self.bz[1]),
         ];
-        for (dom, (x, d, sp, z, bz)) in doms.iter_mut().zip(powers) {
+        for ((dom, first), (x, d, sp, z, bz)) in doms.iter_mut().zip(&mut from).zip(powers) {
             let c0 = self.cap.max(self.ndig(d));
             if c0 >= sp {
                 continue;
@@ -571,6 +572,7 @@ impl TopFdSetup {
                 *dom = digit_range_mask(g, g + 1);
                 pos += 1;
             }
+            *first = pos;
             while pos < sp {
                 let bit = 1u64 << at(pos);
                 if mask & bit != 0 {
@@ -580,7 +582,11 @@ impl TopFdSetup {
                 pos += 1;
             }
         }
-        close_certificate(mask, doms)
+        close_certificate(mask, doms).map(|closed| Cert {
+            mask: closed,
+            common: mask,
+            from,
+        })
     }
 }
 
@@ -671,7 +677,7 @@ mod tests {
                                     let before = st.p;
                                     fd.advance(&mut st, p);
                                     seeds += u64::from(!(p > before && p - before <= fd.reach));
-                                    let want = base.cert(a, z, cap);
+                                    let want = base.cert_parts(a, z, cap);
                                     assert_eq!(
                                         fd.cert(&st),
                                         want,
