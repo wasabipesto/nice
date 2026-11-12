@@ -70,10 +70,25 @@ const JOIN_MEMORY_MAX: usize = 4 << 30;
 /// An upper bound on the prefilter survivors one partition yields per
 /// top-layer prefix of the field: measured 0.8-1.6 at bases 57-64 on fields
 /// of 1e14-1e15 (b57 frontier 1.08, b58 1.09-1.11, b60 0.79, Dan's dense
-/// b57 fields up to about 1.6). A batch is planned to fill at most half its
-/// survivor list on this bound; one that still overflows is re-run in
-/// smaller batches (`cubecl_join::run_field`).
+/// b57 fields up to about 1.6) and 0.53 on a b62 1e17 field. Slices are cut
+/// for it ([`max_slice_prefixes`]), and so are batches on devices whose
+/// budget is not a known share of their memory; a batch is planned to fill
+/// at most half its survivor list on this bound, and one that still
+/// overflows is re-run in smaller batches (`cubecl_join::run_field`).
 const SURV_PER_PREFIX: usize = 2;
+/// The survivors per prefix and partition a batch is planned for where the
+/// budget is a quarter of the device's memory ([`JoinLimits::vram_budget`]:
+/// CUDA) and the FD top kernel certifies the tops (not at power-of-two
+/// bases). More partitions per launch mean fewer of its seeds; at the large
+/// fields this rate sets the batch size, and a batch's layout grows to near
+/// the budget. It halves the list's headroom: a batch is half full at this
+/// rate, about 80 % full at the densest rate measured (1.6), and overflows
+/// above about 2 survivors per prefix and partition (b62 1e17 and b60 1e16
+/// on a 10 GB card: 2.0-2.1, where it was 4.5-4.7), which re-runs it
+/// (above). Where the 16-partition cap binds first (fields up to about
+/// 1e15) the headroom is larger. Slices keep [`SURV_PER_PREFIX`]: a wider
+/// slice's field certificate prunes less and leaves the join more pairs.
+const SURV_PER_PREFIX_VRAM: usize = 1;
 /// Partitions per launch a slice of a large field is cut for
 /// ([`max_slice_prefixes`]). A slice of that size usually gets two or three
 /// times as many, since only a third to a half of its top-layer prefixes
@@ -86,6 +101,12 @@ const SLICE_SLOTS: usize = 2;
 pub struct JoinLimits {
     pub(crate) max_binding: usize,
     pub(crate) budget: usize,
+    /// Whether the budget is a known share of the device's memory: on CUDA
+    /// `CubeCL`'s largest buffer is a quarter of it. On wgpu it is the
+    /// adapter's binding limit (or unbounded with 64-bit indexing), so the
+    /// 4 GiB budget can exceed a small card's or a unified-memory Mac's
+    /// share; there batches keep the sparser plan ([`SURV_PER_PREFIX`]).
+    pub(crate) vram_budget: bool,
 }
 
 impl JoinLimits {
@@ -105,6 +126,26 @@ impl JoinLimits {
             budget: max_binding
                 .clamp(JOIN_MEMORY, JOIN_MEMORY_MAX)
                 .min(max_binding.saturating_mul(2)),
+            vram_budget: false,
+        }
+    }
+
+    /// These limits on a device whose budget is a share of its memory.
+    #[must_use]
+    pub(crate) fn with_vram_budget(self) -> Self {
+        Self {
+            vram_budget: true,
+            ..self
+        }
+    }
+
+    /// The survivors per prefix and partition a batch of `fs` is planned
+    /// for: fewer only where it saves FD seeds.
+    fn batch_surv_per_prefix(self, fs: &FieldSetup) -> usize {
+        if self.vram_budget && crate::cubecl_join::top_fd_runs(fs) {
+            SURV_PER_PREFIX_VRAM
+        } else {
+            SURV_PER_PREFIX
         }
     }
 }
@@ -167,6 +208,7 @@ impl JoinCeiling {
         JoinLimits {
             max_binding: lim.max_binding.min(c),
             budget: lim.budget.min(c),
+            vram_budget: lim.vram_budget,
         }
     }
 
@@ -301,7 +343,7 @@ impl JoinPlan {
         let room = lim.budget.checked_sub(fp.fixed + list)?;
         // The batch's expected prefilter survivors fill at most half its list.
         let by_survivors =
-            (list_cap as usize / 2 / (SURV_PER_PREFIX * fs.tlay.len().max(1))).max(1);
+            (list_cap as usize / 2 / (lim.batch_surv_per_prefix(fs) * fs.tlay.len().max(1))).max(1);
         let slots = slots
             .min(lim.max_binding / fp.largest_per_slot().max(1))
             .min(room / fp.per_slot().max(1))
@@ -496,6 +538,7 @@ impl JoinField {
             lim: JoinLimits {
                 max_binding: usize::MAX,
                 budget: usize::MAX,
+                vram_budget: false,
             },
             layer: sorted_layer(&fs).expect("sorted layer"),
             fs,
@@ -613,6 +656,7 @@ pub(crate) mod tests {
         let lim = JoinLimits {
             max_binding: 2 << 30,
             budget: JOIN_MEMORY,
+            vram_budget: false,
         };
         for &(base, start, size) in PLAN_FIELDS {
             let fs = plan_field(base, start, size);
@@ -715,6 +759,7 @@ pub(crate) mod tests {
         let lim = JoinLimits {
             max_binding: 10 << 28,
             budget: JOIN_MEMORY,
+            vram_budget: false,
         };
         for (base, range, most) in [
             (
@@ -759,6 +804,49 @@ pub(crate) mod tests {
         }
     }
 
+    /// Where the budget is a quarter of the device's memory (CUDA), batches
+    /// of FD fields are planned for [`SURV_PER_PREFIX_VRAM`] survivors per
+    /// prefix and get more partitions within the same budget; the slices are
+    /// cut as on any other device, and a power-of-two base (no FD kernel)
+    /// keeps its plan.
+    #[test]
+    fn vram_budgets_get_larger_batches_in_the_same_slices() {
+        let lim = JoinLimits::for_buffer(10 << 28);
+        let vram = lim.with_vram_budget();
+        for (base, range) in [
+            (60, mid_band(60, 10_000_000_000_000_000)),
+            (62, mid_band(62, 100_000_000_000_000_000)),
+        ] {
+            let a = plan_join(base, &range, lim).expect("the join takes it");
+            let b = plan_join(base, &range, vram).expect("the join takes it");
+            let cuts = |f: &JoinField| {
+                f.slices
+                    .iter()
+                    .map(|s| (s.start(), s.end()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(cuts(&a), cuts(&b), "b{base}");
+            assert!(
+                b.plan.slots >= a.plan.slots,
+                "b{base}: {:?} {:?}",
+                a.plan,
+                b.plan
+            );
+            assert!(b.plan.bytes <= vram.budget, "b{base}: {:?}", b.plan);
+            let ntl = b.fs.tlay.len();
+            assert!(
+                b.plan.slots * ntl * SURV_PER_PREFIX_VRAM
+                    <= b.plan.list_cap as usize / 2 + ntl * SURV_PER_PREFIX_VRAM
+            );
+        }
+        let range = mid_band(64, 10_000_000_000_000_000);
+        let (a, b) = (
+            plan_join(64, &range, lim).expect("the join takes it"),
+            plan_join(64, &range, vram).expect("the join takes it"),
+        );
+        assert_eq!(a.plan, b.plan, "b64");
+    }
+
     /// A small device cuts the same field finer, and still holds each slice.
     #[test]
     fn small_devices_cut_large_fields_finer() {
@@ -767,6 +855,7 @@ pub(crate) mod tests {
         let soft = JoinLimits {
             max_binding: 128 << 20,
             budget: 256 << 20,
+            vram_budget: false,
         };
         let field = plan_join(58, &range, soft).expect("lavapipe holds a slice");
         assert!(field.slices.len() > desktop.slices.len());
@@ -774,6 +863,7 @@ pub(crate) mod tests {
         let tiny = JoinLimits {
             max_binding: 16 << 20,
             budget: 32 << 20,
+            vram_budget: false,
         };
         assert_eq!(
             plan_join(58, &range, tiny).err(),
@@ -792,6 +882,7 @@ pub(crate) mod tests {
         let lim = JoinLimits {
             max_binding: 128 << 20,
             budget: 256 << 20,
+            vram_budget: false,
         };
         let (plan, retry) = JoinPlan::for_field(&fs, lim).expect("lavapipe holds base 57");
         assert!((1..SLOTS).contains(&plan.slots), "{plan:?}");
@@ -803,12 +894,14 @@ pub(crate) mod tests {
         let lim = JoinLimits {
             max_binding: 16 << 20,
             budget: 1 << 30,
+            vram_budget: false,
         };
         assert_eq!(JoinPlan::for_field(&fs, lim), None);
         // A budget smaller than one partition and the re-run's list.
         let lim = JoinLimits {
             max_binding: 1 << 30,
             budget: 32 << 20,
+            vram_budget: false,
         };
         assert_eq!(JoinPlan::for_field(&fs, lim), None);
     }
