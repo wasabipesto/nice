@@ -99,10 +99,18 @@ const _: () = assert!(
     JOIN_WG == TOP_CAP && TOP_CAP.is_multiple_of(32 * AND_GROUP) && TRANSPOSE_MIN <= TOP_CAP
 );
 /// Prefilter survivors staged in shared memory before a flush to the global
-/// list.
-pub const SURV_SH_CAP: u32 = 1024;
-/// Staged-survivor level that triggers a flush at the next barrier.
-pub const SURV_FLUSH: u32 = 512;
+/// list, in two arrays of this many words. A pair that finds the stage full
+/// goes to the list directly ([`join_kernel`]), so the size trades shared
+/// memory against direct writes and never drops a pair. The stage is most of
+/// the join cube's shared memory beside the tops: on AMD's RDNA4 the cube's
+/// 18.9 KiB with 1,024 entries limits how many cubes run at once, and the
+/// 4 KiB less of 512 raises that by a third. On NVIDIA the kernel is bound by
+/// its registers, not its shared memory, and the size does not matter.
+pub const SURV_SH_CAP: u32 = 512;
+/// Staged-survivor level that triggers a flush at the next barrier: half the
+/// stage, so a batch of tops has the other half before its pairs go to the
+/// list directly.
+pub const SURV_FLUSH: u32 = 256;
 /// Sentinel mask of an extended entry that failed its fixed positions.
 pub const DEAD_MASK: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 /// Bottom entries each thread holds in registers in [`join_kernel`]: a wave
