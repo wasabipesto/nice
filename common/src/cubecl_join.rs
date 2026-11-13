@@ -3007,7 +3007,8 @@ mod kernels {
     /// `C = ceil(2^32/b²)` (the entry's) and `dh = ceil(D·2^32/b²)` (the
     /// top's); then `F·b² = (x mod b²)·2^32 + Δ` with `Δ = A·(C·b² − 2^32) +
     /// P·(dh·b² − D·2^32) < 2b⁴ <= 2^25`, so the high words of `F·b` and of
-    /// `(F·b mod 2^32)·b` are the two digits of `x mod b²` exactly. The masks
+    /// `(F·b mod 2^32)·b` are the two digits of `x mod b²` exactly (at a
+    /// power-of-two base, shifts of `F` give the same words). The masks
     /// are bit-reversed (digit d at bit 63 - d), so digit g is in `seen` iff
     /// bit 63 of `seen << g` is set: four shifts and a sign test, and six
     /// compares for the digits' distinctness. `tlo`/`thi` are the top's
@@ -3027,10 +3028,32 @@ mod kernels {
     ) -> bool {
         let f2 = ah2 + p2 * dh;
         let f3 = ah3 + p3 * dh;
-        let h2 = u32::mul_hi(f2, base);
-        let g2 = u32::mul_hi(f2 * base, base);
-        let h3 = u32::mul_hi(f3, base);
-        let g3 = u32::mul_hi(f3 * base, base);
+        // At b = 2^s the two digits are the fraction's bit fields: ⌊F·b/2^32⌋
+        // = F >> (32 - s) and ⌊(F·b mod 2^32)·b/2^32⌋ = (F << s) >> (32 - s)
+        // (`fx_digits_are_bit_fields_at_powers_of_two`).
+        let pow2 = comptime!(base >= 2 && base.is_power_of_two());
+        let s = comptime!(base.trailing_zeros());
+        let up = comptime!(32 - base.trailing_zeros());
+        let h2 = if comptime!(pow2) {
+            f2 >> up
+        } else {
+            u32::mul_hi(f2, base)
+        };
+        let g2 = if comptime!(pow2) {
+            (f2 << s) >> up
+        } else {
+            u32::mul_hi(f2 * base, base)
+        };
+        let h3 = if comptime!(pow2) {
+            f3 >> up
+        } else {
+            u32::mul_hi(f3, base)
+        };
+        let g3 = if comptime!(pow2) {
+            (f3 << s) >> up
+        } else {
+            u32::mul_hi(f3 * base, base)
+        };
         let seen = (u64::cast_from(mhi | thi) << 32u64) | u64::cast_from(mlo | tlo);
         let hit = u32::cast_from((seen << u64::cast_from(g2)) >> 32u64)
             | u32::cast_from((seen << u64::cast_from(g3)) >> 32u64)
@@ -6178,6 +6201,39 @@ mod tests {
                         "b{base} A={a} P={amax} D={d}"
                     );
                 }
+            }
+        }
+    }
+
+    /// At a power-of-two base b = 2^s, [`walk_pf_lean`] takes the two digits
+    /// of the fraction F as bit fields, `F >> (32 - s)` and `(F << s) >> (32 -
+    /// s)`: the same words as the high words of `F·b` and `(F·b mod 2^32)·b`,
+    /// for every F. Checked at b = 2-256 on the edges (0, the extremes, and
+    /// the first 4,096 multiples of 2^(32 - s) and of 2^(32 - 2s), each
+    /// ±1) and on 10^6 random fractions.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn fx_digits_are_bit_fields_at_powers_of_two() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for s in 1u32..=8 {
+            let base = 1u32 << s;
+            let up = 32 - s;
+            let mut fs = vec![0u32, 1, 2, u32::MAX, u32::MAX - 1, 1 << 31, (1 << 31) - 1];
+            for unit in [1u64 << up, 1u64 << (32 - 2 * s)] {
+                for j in 0..((1u64 << 32) / unit).min(4096) {
+                    let at = j * unit;
+                    for f in [at.wrapping_sub(1), at, at + 1] {
+                        fs.push((f & 0xFFFF_FFFF) as u32);
+                    }
+                }
+            }
+            fs.extend((0..1_000_000).map(|_| (xorshift(&mut x) >> 32) as u32));
+            for f in fs {
+                assert_eq!(
+                    (f >> up, (f << s) >> up),
+                    fx_digits(f, 0, 0, base),
+                    "b{base} F={f:#x}"
+                );
             }
         }
     }
