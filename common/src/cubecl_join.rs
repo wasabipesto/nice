@@ -127,14 +127,21 @@ pub(crate) const CHECK_HITS: u32 = 0;
 pub(crate) const CHECK_PROBE: u32 = 1;
 pub(crate) const CHECK_COUNT: u32 = 2;
 pub(crate) const CHECK_GATED: u32 = 3;
+/// Added to a [`check_kernel`] mode (tests): leave the list's first entry
+/// unchecked and uncounted, for the host's check that every listed entry
+/// was checked (`JoinDevice::ensure_checked`).
+pub(crate) const CHECK_SKIP_FIRST: u32 = 4;
 /// How deep the halving of an overflowing partition's top layer may go: a
 /// layer of up to 2^32 prefixes reaches single prefixes well within it.
 const MAX_SPLITS: u32 = 32;
 /// Kernels a batch launches (top, bucket, join, check), each counting its
 /// finished cubes in `ran`, whose next word is the check kernel's work
-/// counter.
+/// counter, then the list entries it checked and the sum of their indices
+/// (mod 2^32).
 const STAGES_U32: u32 = 4;
 const STAGES: usize = STAGES_U32 as usize;
+/// The words of `ran`.
+const RAN_WORDS: usize = STAGES + 3;
 /// The most digit-sum roots of any base the join takes (8, at bases 46, 50
 /// and 64): [`join_kernel`] holds a bucket's group segments in shared memory.
 const MAX_ROOTS: u32 = 8;
@@ -185,8 +192,8 @@ pub use kernels::{bucket_kernel, check_kernel, join_kernel, top_fd_kernel, top_k
 )]
 mod kernels {
     use super::{
-        AND_GROUP, CHECK_COUNT, CHECK_GATED, CHECK_PROBE, DEAD_MASK, JOIN_WG, MAX_ROOTS,
-        STAGES_U32, SURV_FLUSH, SURV_SH_CAP, TOP_CAP, TOP_REC_WORDS, TRANSPOSE_MIN,
+        AND_GROUP, CHECK_COUNT, CHECK_GATED, CHECK_PROBE, CHECK_SKIP_FIRST, DEAD_MASK, JOIN_WG,
+        MAX_ROOTS, STAGES_U32, SURV_FLUSH, SURV_SH_CAP, TOP_CAP, TOP_REC_WORDS, TRANSPOSE_MIN,
     };
     use crate::cubecl_backend::NICEONLY_STRIDE;
     use crate::cubecl_detailed_fd::fd_add_top;
@@ -3262,17 +3269,22 @@ mod kernels {
     /// of the carry normalisation into a mask; the rest of n³ only where a
     /// lane of the plane passed the gate (n²'s digits and n³'s low `2·gl`
     /// distinct). Each plane takes the next entry per lane from the batch's
-    /// counter (`ran[STAGES]`), so the grid has no wave tail. The counter
-    /// assumes full planes: a cube's `JOIN_WG` = 256 threads is a multiple
-    /// of every plane width (a power of two up to 128), so every plane
-    /// starts full, and the plane ops sit in plane-uniform control flow
-    /// (`cur`, `nxt` are broadcast and `count` is the same for every lane).
+    /// counter (`ran[STAGES]`, see [`take_entries`]), so the grid has no wave
+    /// tail; the take is complete whatever lanes of the plane run it. Every
+    /// lane counts the entries it checked into `ran[STAGES + 1]` and adds
+    /// their indices into `ran[STAGES + 2]`, which the host compares with the
+    /// entries listed (`JoinDevice::ensure_checked`). The plane ops sit in
+    /// plane-uniform control flow (`cur` is the same for every lane of a
+    /// take, and so is `count`). `ballot`: [`ballot_append`] for the
+    /// device's planes.
     /// Modes: [`CHECK_HITS`] writes the nice numbers; [`CHECK_PROBE`] every
     /// n (rebuilt from its limbs); [`CHECK_COUNT`] four words per list entry
     /// (distinct digits, the gate, the digit mask) with the gate bypassed,
     /// so every lane builds all of n³; [`CHECK_GATED`] the same four words
     /// with the gate applied as in [`CHECK_HITS`] (the mask then holds all
-    /// of n³'s digits only where the gate passed).
+    /// of n³'s digits only where the gate passed). [`CHECK_SKIP_FIRST`] added
+    /// to a mode (tests) leaves the list's first entry unchecked and
+    /// uncounted, as a device that lost an entry would.
     #[cube(launch_unchecked)]
     pub fn check_kernel(
         surv: &Array<u32>,
@@ -3285,7 +3297,10 @@ mod kernels {
         nice_cap: u32,
         #[comptime] sh: CheckShape,
         #[comptime] mode: u32,
+        #[comptime] ballot: bool,
     ) {
+        let skip_first = comptime!(mode & CHECK_SKIP_FIRST != 0);
+        let mode = comptime!(mode & !CHECK_SKIP_FIRST);
         let base = comptime!(sh.b);
         let l = comptime!(sh.l);
         let s2 = comptime!(sh.s2);
@@ -3306,21 +3321,24 @@ mod kernels {
         if count > surv_cap {
             count = surv_cap;
         }
-        let lane = UNIT_POS_PLANE;
-        let mut got = 0u32;
-        if lane == 0u32 {
-            got = ran[STAGES_U32 as usize].fetch_add(PLANE_DIM);
-        }
-        let mut cur = plane_broadcast(got, 0u32);
+        // tk: a take's first entry and this lane's rank in it.
+        let mut tk = Array::<u32>::new(2usize);
+        take_entries(ran, &mut tk, ballot);
+        let mut cur = tk[0];
+        let mut rank = tk[1];
+        let mut done = 0u32;
+        let mut isum = 0u32;
         while cur < count {
-            // The next entries' index, asked for before this one's work.
-            let mut nxt = 0u32;
-            if lane == 0u32 {
-                nxt = ran[STAGES_U32 as usize].fetch_add(PLANE_DIM);
+            // The next entries, asked for before this one's work.
+            take_entries(ran, &mut tk, ballot);
+            let i = cur + rank;
+            let mut live = i < count;
+            if comptime!(skip_first) {
+                live = live && i != 0u32;
             }
-            let nxt = plane_broadcast(nxt, 0u32);
-            let i = cur + lane;
-            if i < count {
+            if live {
+                done += 1u32;
+                isum += i;
                 let t = surv[(2u32 * i) as usize];
                 let r0 = surv[(2u32 * i + 1u32) as usize];
                 let rb = TOP_REC_WORDS * t;
@@ -3447,9 +3465,59 @@ mod kernels {
                     }
                 }
             }
-            cur = nxt;
+            cur = tk[0];
+            rank = tk[1];
+        }
+        if done > 0u32 {
+            ran[comptime!(STAGES_U32 + 1) as usize].fetch_add(done);
+            ran[comptime!(STAGES_U32 + 2) as usize].fetch_add(isum);
         }
         cube_done(ran, 3u32);
+    }
+
+    /// Take the next list entries from the counter `ran[STAGES]` for the
+    /// lanes of the plane that run this call together, however many those
+    /// are and whichever lanes they are: one lane takes as many entries as
+    /// lanes take part, and each lane gets its own. Writes the take's first
+    /// entry (the same for every lane of the take) to `tk[0]` and this
+    /// lane's rank among them to `tk[1]`, so the lane's entry is
+    /// `tk[0] + tk[1]`.
+    ///
+    /// Taking part, ranks and the leader come from the plane ops' active
+    /// lanes, never from `PLANE_DIM` or lane 0: Vulkan does not promise full
+    /// planes (wgpu does not ask for them), and a partly filled plane may
+    /// lack lane 0. With `ballot` (planes of at most 32 lanes, see
+    /// [`ballot_append`]): one ballot gives the lanes taking part (inactive
+    /// lanes' bits are clear on every backend), their count, each lane's
+    /// rank and the leader (the lowest such lane), whose take reaches the
+    /// others by a shuffle from that lane. `CUDA` lowers the sums below over
+    /// all 32 lanes, so on a partly filled warp (a group that is not a
+    /// multiple of 32, which only tests launch) only this form is defined.
+    /// Without (64- and 128-lane planes): an exclusive scan and a sum over
+    /// the active lanes, and the leader's take as the sum of it and zeros.
+    #[cube]
+    fn take_entries(ran: &mut Array<Atomic<u32>>, tk: &mut Array<u32>, #[comptime] ballot: bool) {
+        let mut got = 0u32;
+        if comptime!(ballot) {
+            let bal = plane_ballot(true);
+            let lanes = bal[0usize];
+            let rank = (lanes & ((1u32 << UNIT_POS_PLANE) - 1u32)).count_ones();
+            if rank == 0u32 {
+                got = ran[STAGES_U32 as usize].fetch_add(lanes.count_ones());
+            }
+            // The lowest lane taking part: the trailing zeros of `lanes`.
+            let lead = (lanes ^ (lanes - 1u32)).count_ones() - 1u32;
+            tk[0] = plane_shuffle(got, lead);
+            tk[1] = rank;
+        } else {
+            let rank = plane_exclusive_sum(1u32);
+            let lanes = plane_sum(1u32);
+            if rank == 0u32 {
+                got = ran[STAGES_U32 as usize].fetch_add(lanes);
+            }
+            tk[0] = plane_sum(got);
+            tk[1] = rank;
+        }
     }
 }
 
@@ -3941,9 +4009,10 @@ impl<R: Runtime> JoinDevice<R> {
             join_cubes,                       // join
             CHECK_CUBES,                      // check
         ];
-        // One more word: the check kernel's work counter.
-        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; STAGES + 1]));
-        let nran = STAGES + 1;
+        // Three more words: the check kernel's work counter, the entries it
+        // checked and the sum of their indices.
+        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; RAN_WORDS]));
+        let nran = RAN_WORDS;
         #[cfg(test)]
         if self.bytes > tests::REFUSE_ABOVE.with(std::cell::Cell::get) {
             // A device that runs nothing of a layout this large.
@@ -4020,8 +4089,16 @@ impl<R: Runtime> JoinDevice<R> {
                 self.walk_sync,
             );
         }
+        let mode = if probe { CHECK_PROBE } else { CHECK_HITS };
+        #[cfg(test)]
+        let mode = if tests::SKIP_FIRST.with(std::cell::Cell::get) {
+            mode | CHECK_SKIP_FIRST
+        } else {
+            mode
+        };
         self.launch_check(
             CHECK_CUBES,
+            JOIN_WG,
             &self.list,
             2 * self.list_cap as usize,
             &checked,
@@ -4035,7 +4112,7 @@ impl<R: Runtime> JoinDevice<R> {
             &ran,
             self.list_cap,
             self.nice_cap,
-            if probe { CHECK_PROBE } else { CHECK_HITS },
+            mode,
         );
         c.flush().map_err(|e| anyhow!("flush failed: {e:?}"))?;
         Ok(BatchRec {
@@ -4050,12 +4127,14 @@ impl<R: Runtime> JoinDevice<R> {
     /// (`count` holds its length, read on the device, at most `cap`), whose
     /// entries index the records `recs`; hits (or the mode's output) go to
     /// `out` (a handle and its words), counted in `out_count` up to
-    /// `out_cap`, and the cubes and the work counter in `ran`
-    /// (`STAGES + 1` words), on `cubes` cubes ([`CHECK_CUBES`] but in tests).
+    /// `out_cap`, and the cubes, the work counter and the entries checked in
+    /// `ran` (`RAN_WORDS` words), on `cubes` cubes of `wg` units
+    /// ([`CHECK_CUBES`] and [`JOIN_WG`] but in tests).
     #[allow(clippy::too_many_arguments)]
     fn launch_check(
         &self,
         cubes: u32,
+        wg: u32,
         list: &Handle,
         list_words: usize,
         count: &Handle,
@@ -4072,17 +4151,18 @@ impl<R: Runtime> JoinDevice<R> {
             check_kernel::launch_unchecked::<R>(
                 &self.client,
                 CubeCount::Static(cubes, 1, 1),
-                CubeDim::new_1d(JOIN_WG),
+                CubeDim::new_1d(wg),
                 ArrayArg::from_raw_parts(list.clone(), list_words),
                 ArrayArg::from_raw_parts(count.clone(), 1),
                 ArrayArg::from_raw_parts(recs.clone(), rec_words),
                 ArrayArg::from_raw_parts(out.0.clone(), out.1),
                 ArrayArg::from_raw_parts(out_count.clone(), 1),
-                ArrayArg::from_raw_parts(ran.clone(), STAGES + 1),
+                ArrayArg::from_raw_parts(ran.clone(), RAN_WORDS),
                 cap,
                 out_cap,
                 self.check,
                 mode,
+                self.ballot,
             );
         }
     }
@@ -4103,6 +4183,35 @@ impl<R: Runtime> JoinDevice<R> {
             ran: ran.to_vec(),
             expect: *expect,
         })
+    }
+
+    /// Whether the check kernel checked every entry the join listed: the
+    /// entries it counted as checked (`ran[STAGES + 1]`) against
+    /// `min(checked, list_cap)`, the prefilter's survivors the list holds,
+    /// and the sum of their indices (`ran[STAGES + 2]`, mod 2^32) against
+    /// that of `0..listed`, so an entry checked twice cannot stand in for one
+    /// skipped. Call it once [`Self::ensure_ran`] has passed (every cube
+    /// ran). A device that ran every cube but did not check exactly the
+    /// listed survivors is not fixed by a smaller layout: an error, never a
+    /// field with fewer candidates.
+    ///
+    /// # Errors
+    /// A count or an index sum other than the list's.
+    fn ensure_checked(&self, ran: &[u32], checked: u32) -> Result<()> {
+        let listed = checked.min(self.list_cap);
+        let want_sum =
+            u32::try_from(u64::from(listed) * u64::from(listed.saturating_sub(1)) / 2 % (1 << 32))?;
+        let (done, sum) = (ran.get(STAGES + 1).copied(), ran.get(STAGES + 2).copied());
+        ensure!(
+            done == Some(listed) && sum == Some(want_sum),
+            "overlap join b{}: the check kernel checked {} of the {listed} survivors the join \
+             listed ({checked} found, room for {}; index sum {sum:?}, want {want_sum}); a device \
+             that skips list entries cannot run the join",
+            self.b,
+            done.map_or_else(|| "none".to_string(), |d| d.to_string()),
+            self.list_cap
+        );
+        Ok(())
     }
 
     /// Whether a batch dropped prefilter survivors past the end of the list
@@ -4585,6 +4694,7 @@ fn run_pass<R: Runtime>(
         }
         let surv = u32::from_bytes(&counts[3 * i])[0];
         let checked = u32::from_bytes(&counts[3 * i + 1])[0];
+        dev.ensure_checked(u32::from_bytes(&counts[3 * i + 2]), checked)?;
         if dev.overflowed(checked) {
             left.overflowed.extend_from_slice(batch);
         } else {
@@ -4640,9 +4750,11 @@ fn run_partition<R: Runtime>(
     let mut dev = JoinDevice::new(client, fs, sorted_layer(fs)?, plan)?;
     let rec = dev.launch_batch(&[v], false)?;
     st.batches += 1;
-    dev.ensure_ran(&dev.read_u32(&rec.ran)?, &rec.expect)?;
+    let ran = dev.read_u32(&rec.ran)?;
+    dev.ensure_ran(&ran, &rec.expect)?;
     let surv = dev.read_u32(&rec.survivors)?[0];
     let checked = dev.read_u32(&rec.checked)?[0];
+    dev.ensure_checked(&ran, checked)?;
     if !dev.overflowed(checked) {
         st.survivors += u64::from(surv);
         st.checked += u64::from(checked);
@@ -4850,6 +4962,10 @@ mod tests {
         /// macOS runner's paravirtual Metal device, on this thread.
         pub(super) static REFUSE_ABOVE: std::cell::Cell<usize> =
             const { std::cell::Cell::new(usize::MAX) };
+        /// The check kernel of `launch_batch` leaves the list's first entry
+        /// unchecked ([`CHECK_SKIP_FIRST`]), on this thread.
+        pub(super) static SKIP_FIRST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
     }
 
     fn client() -> (ComputeClient<cubecl::wgpu::WgpuRuntime>, String) {
@@ -4913,7 +5029,11 @@ mod tests {
             cpu.sort_unstable();
             cpu_hits.extend(st.hits);
             let rec = dev.launch_batch(batch, false).expect("launch");
-            let (survivors, _) = dev.read_counts(&rec).expect("counts");
+            let (survivors, checked) = dev.read_counts(&rec).expect("counts");
+            let ran = dev.read_u32(&rec.ran).expect("ran");
+            dev.ensure_ran(&ran, &rec.expect).expect("every kernel ran");
+            dev.ensure_checked(&ran, checked)
+                .expect("every listed survivor was checked");
             assert_eq!(
                 u64::from(survivors),
                 st.survivors,
@@ -5030,6 +5150,63 @@ mod tests {
         check_slices(client, name);
         check_refused_layouts(client, name);
         check_production_shape(client, name);
+        check_skipped_entries(client, name);
+    }
+
+    /// A check kernel that leaves a listed survivor unchecked (the list's
+    /// first entry, [`CHECK_SKIP_FIRST`]), as a device whose planes lost
+    /// entries would: the field fails with an error, in a pass of batches and
+    /// in a partition's re-run, and never comes out as a field with fewer
+    /// candidates. The same fields then run as before.
+    fn check_skipped_entries<R: Runtime>(client: &ComputeClient<R>, name: &str) {
+        let skip = |on: bool| SKIP_FIRST.with(|c| c.set(on));
+        let lim = device_limits(client, name);
+        let w = WINDOWS[0];
+        for (b, s, e, jp) in [
+            (10, 47, 100, JoinParams { t: 2, k: 1, p: 0 }),
+            (
+                w.0,
+                w.1,
+                w.2,
+                JoinParams {
+                    t: w.3,
+                    k: w.4,
+                    p: w.5,
+                },
+            ),
+        ] {
+            let field = JoinField::prepare(b, &FieldSize::new(s, e), jp, lim)
+                .expect("field setup")
+                .expect("a join field");
+            let (want, st) = run_field(client, &field, &JoinCeiling::default()).expect("runs");
+            assert!(st.checked > 0, "b{b} [{s}, {e}): survivors to check");
+            // A partition with survivors to check, for the re-run.
+            let part = live_partitions(&field.fs)
+                .into_iter()
+                .find(|&v| {
+                    let (mut st, mut hits) = (JoinFieldStats::default(), Vec::new());
+                    run_partition(client, &field.fs, &field.retry, v, 0, &mut st, &mut hits)
+                        .expect("runs");
+                    st.checked > 0
+                })
+                .expect("a partition with survivors");
+            skip(true);
+            let pass = run_field(client, &field, &JoinCeiling::default());
+            let (mut st, mut hits) = (JoinFieldStats::default(), Vec::new());
+            let rerun = run_partition(client, &field.fs, &field.retry, part, 0, &mut st, &mut hits);
+            skip(false);
+            let err = pass
+                .expect_err("a skipped survivor fails the field")
+                .to_string();
+            assert!(err.contains("the check kernel checked"), "{err}");
+            let err = rerun
+                .expect_err("a skipped survivor fails the re-run")
+                .to_string();
+            assert!(err.contains("the check kernel checked"), "{err}");
+            let (again, _) = run_field(client, &field, &JoinCeiling::default()).expect("runs");
+            assert_eq!(again, want, "b{b} [{s}, {e}): hits after the skip");
+            println!("{name}: b{b} [{s}, {e}) {jp:?}: a skipped survivor fails the field: {err}");
+        }
     }
 
     /// The re-run and refusal paths at the production shape (the b57
@@ -5361,17 +5538,29 @@ mod tests {
         check_all(&client, &name);
     }
 
-    /// [`check_kernel`] in `mode` on `cubes` cubes over `list` (`n` entries)
-    /// and the records `recs`: the output words (four per entry in count and
-    /// gated mode, else four per reported n). Every cube must have run, and
-    /// the work counter must end where whole takes put it: each plane takes
-    /// once more after the list is exhausted, so it ends at `n` rounded up
-    /// to a whole take (less than 128 more) plus one take per plane,
-    /// `cubes · JOIN_WG` entries in all.
+    /// [`check_kernel`] in `mode` on `cubes` cubes of `wg` units over `list`
+    /// (`n` entries) and the records `recs`: the output words (four per entry
+    /// in count and gated mode, else four per reported n). Every cube must
+    /// have run and every entry must have been checked once (the kernel's
+    /// count, which the host compares in production too). The work counter
+    /// must end where whole takes put it: each take hands out one entry per
+    /// lane taking part, and every lane takes part in one take after the
+    /// list is exhausted, so it ends at `n` rounded up to the end of the take
+    /// that held the last entry (less than 128 more) plus `cubes · wg` (or a
+    /// little more, see below).
+    ///
+    /// `CubeCL`'s C++ backends (CUDA, HIP) take a unit's lane as its
+    /// position in the grid modulo the plane width, which is its lane only
+    /// where every cube starts a plane: with cubes whose unit count is not a
+    /// multiple of 32, the lanes of every cube but the first are wrong, and
+    /// so are the ballot ranks and scans built on them. Production's cubes
+    /// (`JOIN_WG`) are such multiples; a partly filled warp runs on one
+    /// cube here.
     #[allow(clippy::too_many_arguments)]
     fn run_check<R: Runtime>(
         dev: &JoinDevice<R>,
         cubes: u32,
+        wg: u32,
         list: &Handle,
         list_words: usize,
         recs: &Handle,
@@ -5380,14 +5569,21 @@ mod tests {
         mode: u32,
     ) -> Vec<u32> {
         let c = &dev.client;
+        let cpp = ["cuda", "hip"].iter().any(|r| R::name(c).contains(r));
+        let cubes = if cpp && !wg.is_multiple_of(32) {
+            1
+        } else {
+            cubes
+        };
         let words = 4 * n.max(1);
         let out = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; words]));
         let oc = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
         let cap = u32::try_from(n).expect("a list fits u32");
         let cnt = c.create(cubecl::bytes::Bytes::from_elems(vec![cap]));
-        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; STAGES + 1]));
+        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; RAN_WORDS]));
         dev.launch_check(
             cubes,
+            wg,
             list,
             list_words,
             &cnt,
@@ -5401,16 +5597,40 @@ mod tests {
             mode,
         );
         let ran = dev.read_u32(&ran).expect("ran");
-        assert_eq!(ran[3], cubes, "check cubes run");
-        let past = ran[STAGES]
-            .checked_sub(cubes * JOIN_WG)
-            .expect("one take per plane past the list");
+        let out = dev.read_u32(&out).expect("out");
+        let what = format!(
+            "{} check, mode {mode}, {cubes} cubes of {wg}, {n} entries",
+            if dev.ballot { "ballot" } else { "scan" }
+        );
+        assert_eq!(ran[3], cubes, "{what}: check cubes run");
+        if mode == CHECK_COUNT || mode == CHECK_GATED {
+            // An entry the kernel did not reach keeps its zeroed words.
+            let skipped: Vec<usize> = (0..n)
+                .filter(|&i| out[4 * i..4 * i + 4] == [0; 4])
+                .collect();
+            assert!(
+                skipped.is_empty(),
+                "{what}: {} entries never checked, the first {:?}",
+                skipped.len(),
+                &skipped[..skipped.len().min(16)]
+            );
+        }
+        assert_eq!(ran[STAGES + 1], cap, "{what}: entries the kernel checked");
+        let isum = u64::from(cap) * u64::from(cap.saturating_sub(1)) / 2 % (1 << 32);
+        assert_eq!(
+            u64::from(ran[STAGES + 2]),
+            isum,
+            "{what}: index sum of the entries checked"
+        );
+        // Lavapipe runs a cube's last plane full (its lanes past the cube's
+        // units take part), so the takes past the list may count up to a
+        // whole plane more per cube.
+        let lanes = (cubes * wg, cubes * wg.next_multiple_of(128));
         assert!(
-            past >= cap && past - cap < 128,
-            "work counter {} on {cubes} cubes for a list of {n}",
+            ran[STAGES] >= cap + lanes.0 && ran[STAGES] < cap + 128 + lanes.1,
+            "{what}: work counter {}",
             ran[STAGES]
         );
-        let out = dev.read_u32(&out).expect("out");
         let got = if mode == CHECK_COUNT || mode == CHECK_GATED {
             n
         } else {
@@ -5563,8 +5783,12 @@ mod tests {
     /// computes for every survivor.
     // The field list (base, range, parameters, partitions), then each field's
     // real and synthetic lists in turn.
+    ///
+    /// `groups`: the cube sizes and take forms ([`take_entries`]: ballot or
+    /// scan) to run every list with. A cube of 100 units ends in a partly
+    /// filled plane on every plane width.
     #[allow(clippy::type_complexity, clippy::too_many_lines)]
-    fn check_counts<R: Runtime>(client: &ComputeClient<R>, name: &str) {
+    fn check_counts<R: Runtime>(client: &ComputeClient<R>, name: &str, groups: &[(u32, bool)]) {
         let mut fields: Vec<(u32, u128, u128, JoinParams, Option<Vec<u32>>)> =
             vec![(10, 47, 100, JoinParams { t: 2, k: 1, p: 0 }, None)];
         for &(b, s, e, t, k, p) in WINDOWS {
@@ -5604,25 +5828,38 @@ mod tests {
                 let rec = dev.launch_batch(batch, false).expect("launch");
                 // A batch the device did not run in full must not pass as
                 // an empty list.
-                dev.ensure_ran(&dev.read_u32(&rec.ran).expect("ran"), &rec.expect)
+                let ran = dev.read_u32(&rec.ran).expect("ran");
+                dev.ensure_ran(&ran, &rec.expect)
                     .expect("every kernel of the batch ran");
+                let (_, checked) = dev.read_counts(&rec).expect("counts");
+                dev.ensure_checked(&ran, checked)
+                    .expect("every listed survivor was checked");
                 let ns = dev.read_list(&rec).expect("the batch's list");
                 let lw = 2 * dev.list_cap as usize;
-                let run = |cubes: u32, mode: u32| {
-                    run_check(
-                        &dev,
-                        cubes,
-                        &dev.list,
-                        lw,
-                        &dev.top_rec,
-                        rec_len,
-                        ns.len(),
-                        mode,
-                    )
-                };
-                passed += assert_counts(&sh, &ns, &run(CHECK_CUBES, CHECK_COUNT), false, &what);
-                assert_counts(&sh, &ns, &run(3, CHECK_GATED), true, &what);
-                assert_probe(ns.clone(), &run(CHECK_CUBES, CHECK_PROBE), &what);
+                for &(wg, ballot) in groups {
+                    dev.ballot = ballot;
+                    let run = |cubes: u32, mode: u32| {
+                        run_check(
+                            &dev,
+                            cubes,
+                            wg,
+                            &dev.list,
+                            lw,
+                            &dev.top_rec,
+                            rec_len,
+                            ns.len(),
+                            mode,
+                        )
+                    };
+                    let what = format!("{what}, cubes of {wg}, ballot {ballot}");
+                    let p = assert_counts(&sh, &ns, &run(CHECK_CUBES, CHECK_COUNT), false, &what);
+                    assert_counts(&sh, &ns, &run(3, CHECK_GATED), true, &what);
+                    assert_probe(ns.clone(), &run(CHECK_CUBES, CHECK_PROBE), &what);
+                    if wg == groups[0].0 && ballot == groups[0].1 {
+                        passed += p;
+                    }
+                }
+                dev.ballot = groups[0].1;
                 field_entries += ns.len();
                 lists += 1;
             }
@@ -5634,39 +5871,20 @@ mod tests {
             if !shapes.insert(sh) {
                 continue; // this shape's synthetic list ran already
             }
-            // A synthetic list: record i holds n_i's prefix and residue.
-            let ns = synthetic(&sh, (u64::from(b) << 32) | u64::from(sh.f0 * 16 + sh.k2));
-            let (w, m) = (fs.base.powu(sh.f0), fs.base.powu(sh.k2 - sh.f0));
-            let mut recs = vec![0u32; 8 * ns.len().max(1)];
-            let mut list = vec![0u32; 2 * ns.len().max(1)];
-            for (i, &n) in ns.iter().enumerate() {
-                let p = n / w;
-                recs[8 * i] = u32::try_from(p & 0xFFFF_FFFF).unwrap();
-                recs[8 * i + 1] = u32::try_from(p >> 32).unwrap();
-                recs[8 * i + 6] = u32::try_from(p % m).unwrap();
-                list[2 * i] = u32::try_from(i).unwrap();
-                list[2 * i + 1] = u32::try_from(n % w).unwrap();
+            let (ns, lh, lw, rh, rw) = synthetic_list(client, &fs, &sh);
+            for &(wg, ballot) in groups {
+                dev.ballot = ballot;
+                let run = |cubes: u32, mode: u32| {
+                    run_check(&dev, cubes, wg, &lh, lw, &rh, rw, ns.len(), mode)
+                };
+                let syn = format!("{what} synthetic, cubes of {wg}, ballot {ballot}");
+                let p = assert_counts(&sh, &ns, &run(CHECK_CUBES, CHECK_COUNT), false, &syn);
+                assert_counts(&sh, &ns, &run(1, CHECK_GATED), true, &syn);
+                assert_probe(ns.clone(), &run(CHECK_CUBES, CHECK_PROBE), &syn);
+                if wg == groups[0].0 && ballot == groups[0].1 {
+                    passed += p;
+                }
             }
-            let (lh, rh) = (
-                client.create(cubecl::bytes::Bytes::from_elems(list.clone())),
-                client.create(cubecl::bytes::Bytes::from_elems(recs.clone())),
-            );
-            let run = |cubes: u32, mode: u32| {
-                run_check(
-                    &dev,
-                    cubes,
-                    &lh,
-                    list.len(),
-                    &rh,
-                    recs.len(),
-                    ns.len(),
-                    mode,
-                )
-            };
-            let syn = format!("{what} synthetic");
-            passed += assert_counts(&sh, &ns, &run(CHECK_CUBES, CHECK_COUNT), false, &syn);
-            assert_counts(&sh, &ns, &run(1, CHECK_GATED), true, &syn);
-            assert_probe(ns.clone(), &run(CHECK_CUBES, CHECK_PROBE), &syn);
             synth += ns.len();
             println!(
                 "{name}: b{b} {sh:?} counts agree ({} synthetic n, H {})",
@@ -5680,7 +5898,87 @@ mod tests {
         );
         println!(
             "{name}: check counts agree on {lists} lists, {entries} list entries and {synth} \
-             synthetic n over {} shapes ({passed} past the gate)",
+             synthetic n over {} shapes ({passed} past the gate), cubes and take forms {groups:?}",
+            shapes.len()
+        );
+    }
+
+    /// A synthetic list of `sh`'s shape ([`synthetic`]) on the device, for
+    /// `fs`'s field: record i holds `n_i`'s prefix and residue. Returns the n,
+    /// the list's handle and words, and the records' handle and words.
+    fn synthetic_list<R: Runtime>(
+        client: &ComputeClient<R>,
+        fs: &FieldSetup,
+        sh: &CheckShape,
+    ) -> (Vec<u128>, Handle, usize, Handle, usize) {
+        let ns = synthetic(sh, (u64::from(sh.b) << 32) | u64::from(sh.f0 * 16 + sh.k2));
+        let (w, m) = (fs.base.powu(sh.f0), fs.base.powu(sh.k2 - sh.f0));
+        let mut recs = vec![0u32; 8 * ns.len().max(1)];
+        let mut list = vec![0u32; 2 * ns.len().max(1)];
+        for (i, &n) in ns.iter().enumerate() {
+            let p = n / w;
+            recs[8 * i] = u32::try_from(p & 0xFFFF_FFFF).unwrap();
+            recs[8 * i + 1] = u32::try_from(p >> 32).unwrap();
+            recs[8 * i + 6] = u32::try_from(p % m).unwrap();
+            list[2 * i] = u32::try_from(i).unwrap();
+            list[2 * i + 1] = u32::try_from(n % w).unwrap();
+        }
+        let (lw, rw) = (list.len(), recs.len());
+        let lh = client.create(cubecl::bytes::Bytes::from_elems(list));
+        let rh = client.create(cubecl::bytes::Bytes::from_elems(recs));
+        (ns, lh, lw, rh, rw)
+    }
+
+    /// The check kernel on cubes whose unit count is not a multiple of the
+    /// plane width, so each cube's last plane is partly filled (100 units: 4
+    /// lanes of a 32-lane warp, 4 of an 8-lane lavapipe plane; 48: 16 of a
+    /// warp), and on production's cubes, on one cube, three and the production grid (one cube only on
+    /// CUDA, see `run_check`), in each take form of `forms` ([`take_entries`]: ballot or scan): every entry of a
+    /// synthetic list of each distinct shape of the b10 band and the
+    /// production fields must be checked exactly once (`run_check`) and agree
+    /// with the CPU in count mode, and probe mode must rebuild every n. The
+    /// take once assumed full planes, and skipped the entries of a plane's
+    /// missing lanes.
+    fn check_partial_planes<R: Runtime>(client: &ComputeClient<R>, name: &str, forms: &[bool]) {
+        let mut fields = vec![(10, 47, 100, JoinParams { t: 2, k: 1, p: 0 })];
+        for &(b, s, size) in PLAN_FIELDS {
+            let range = FieldSize::new(s, s + size);
+            let jp = crate::overlap_join::join_params_for(b, &range).expect("a join field");
+            fields.push((b, s, s + size, jp));
+        }
+        let lim = device_limits(client, name);
+        let mut shapes = std::collections::HashSet::new();
+        let (mut runs, mut entries) = (0, 0);
+        for (b, s, e, jp) in fields {
+            let fs = FieldSetup::new(b, s, e, jp).expect("field setup");
+            let plan = JoinPlan::new(&fs, lim, 1, 1 << 16, 1, lim.budget).expect("a layout fits");
+            let layer = sorted_layer(&fs).expect("sorted layer");
+            let mut dev = JoinDevice::new(client, &fs, layer, &plan).expect("device");
+            let sh = dev.check;
+            if !shapes.insert(sh) {
+                continue;
+            }
+            let (ns, lh, lw, rh, rw) = synthetic_list(client, &fs, &sh);
+            for &ballot in forms {
+                dev.ballot = ballot;
+                for wg in [100, 48, JOIN_WG] {
+                    let what = format!("b{b} {sh:?}, cubes of {wg}, ballot {ballot}");
+                    for cubes in [1, 3, CHECK_CUBES] {
+                        let got =
+                            run_check(&dev, cubes, wg, &lh, lw, &rh, rw, ns.len(), CHECK_COUNT);
+                        assert_counts(&sh, &ns, &got, false, &what);
+                        runs += 1;
+                    }
+                    let got = run_check(&dev, 3, wg, &lh, lw, &rh, rw, ns.len(), CHECK_PROBE);
+                    assert_probe(ns.clone(), &got, &what);
+                    runs += 1;
+                }
+            }
+            entries += ns.len();
+        }
+        println!(
+            "{name}: every entry checked once on partly filled planes: {runs} runs over {} \
+             shapes ({entries} synthetic n), take forms (ballot) {forms:?}",
             shapes.len()
         );
     }
@@ -5689,7 +5987,19 @@ mod tests {
     #[ignore = "requires a wgpu device"]
     fn cubecl_check_counts_match_the_cpu() {
         let (client, name) = client();
-        check_counts(&client, &name);
+        // The device's take form on full cubes and on cubes that end in a
+        // partly filled plane; `check_partial_planes` runs the scan form.
+        let ballot = ballot_append(client.properties().hardware.plane_size_max);
+        check_counts(&client, &name, &[(JOIN_WG, ballot), (100, ballot)]);
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn cubecl_check_takes_every_entry_on_partly_filled_planes() {
+        let (client, name) = client();
+        let ballot = ballot_append(client.properties().hardware.plane_size_max);
+        let forms: &[bool] = if ballot { &[true, false] } else { &[false] };
+        check_partial_planes(&client, &name, forms);
     }
 
     #[test]
@@ -5701,7 +6011,25 @@ mod tests {
         let CubeclContext::Cuda { client, .. } = ctx else {
             unreachable!("new_cuda is CUDA")
         };
-        check_counts(&client, &name);
+        // CUDA takes with the ballot (32-lane warps); `CubeCL` lowers the
+        // scan form's sums over all 32 lanes, defined on full warps only.
+        check_counts(
+            &client,
+            &name,
+            &[(JOIN_WG, true), (100, true), (JOIN_WG, false)],
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_check_takes_every_entry_on_partly_filled_warps() {
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        let name = ctx.device_name();
+        let CubeclContext::Cuda { client, .. } = ctx else {
+            unreachable!("new_cuda is CUDA")
+        };
+        check_partial_planes(&client, &name, &[true]);
     }
 
     fn numbers(results: &crate::FieldResults) -> Vec<u128> {
