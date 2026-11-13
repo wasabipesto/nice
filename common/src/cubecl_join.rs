@@ -3047,7 +3047,6 @@ mod kernels {
         let g2 = u32::mul_hi(f2 * base, base);
         let h3 = u32::mul_hi(f3, base);
         let g3 = u32::mul_hi(f3 * base, base);
-        let mut ok = true;
         if comptime!(count) {
             // Every digit is below b <= 64, so each shift places one bit.
             let top = 0x8000_0000_0000_0000u64;
@@ -3057,15 +3056,16 @@ mod kernels {
                 | (top >> u64::cast_from(h3));
             let new = (u32::cast_from(a) & !(mlo | tlo)).count_ones()
                 + (u32::cast_from(a >> 32u64) & !(mhi | thi)).count_ones();
-            if new != 4u32 {
-                ok = false;
-            }
+            new == 4u32
         } else {
+            // The statements of the compare form, in the order they had before
+            // the count existed, so the other runtimes' kernels do not change.
             let seen = (u64::cast_from(mhi | thi) << 32u64) | u64::cast_from(mlo | tlo);
             let hit = u32::cast_from((seen << u64::cast_from(g2)) >> 32u64)
                 | u32::cast_from((seen << u64::cast_from(g3)) >> 32u64)
                 | u32::cast_from((seen << u64::cast_from(h2)) >> 32u64)
                 | u32::cast_from((seen << u64::cast_from(h3)) >> 32u64);
+            let mut ok = true;
             // Keep the sign test last in the chain: placed first, NVVM compiled
             // it to a select and a byte extension in front of the compares.
             if g2 == g3
@@ -3078,8 +3078,8 @@ mod kernels {
             {
                 ok = false;
             }
+            ok
         }
-        ok
     }
 
     /// Write the shared survivor stage to the list. Every staged pair passed
