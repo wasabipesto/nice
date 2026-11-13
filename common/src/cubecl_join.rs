@@ -99,10 +99,21 @@ const _: () = assert!(
     JOIN_WG == TOP_CAP && TOP_CAP.is_multiple_of(32 * AND_GROUP) && TRANSPOSE_MIN <= TOP_CAP
 );
 /// Prefilter survivors staged in shared memory before a flush to the global
-/// list.
-pub const SURV_SH_CAP: u32 = 1024;
-/// Staged-survivor level that triggers a flush at the next barrier.
-pub const SURV_FLUSH: u32 = 512;
+/// list, in two arrays of this many words. A pair that finds the stage full
+/// goes to the list directly ([`join_kernel`]), so the size trades shared
+/// memory against direct writes and never drops a pair. With 1,024 entries
+/// the stage was 8 KiB of the join cube's 18.1 KiB of shared arrays; with
+/// 512 it is 4 KiB of 14.1 KiB. Mesa's compiler for AMD's RDNA4 puts the
+/// cube at 12 waves per SIMD with the larger stage and 16 with this one,
+/// shared memory being what limits it there, and an RX 9070 XT ran fields
+/// 5-6 % faster with 512 entries. On an RTX 3080 the kernel's registers
+/// allow 5 cubes per SM with either size, and it ran the same.
+pub const SURV_SH_CAP: u32 = 512;
+/// Staged-survivor level that triggers a flush at the next barrier: half the
+/// stage, so a batch of tops has the other half before its pairs go to the
+/// list directly.
+pub const SURV_FLUSH: u32 = 256;
+const _: () = assert!(SURV_FLUSH > 0 && SURV_FLUSH <= SURV_SH_CAP);
 /// Sentinel mask of an extended entry that failed its fixed positions.
 pub const DEAD_MASK: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 /// Bottom entries each thread holds in registers in [`join_kernel`]: a wave
