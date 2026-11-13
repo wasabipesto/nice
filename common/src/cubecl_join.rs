@@ -131,6 +131,14 @@ pub(crate) const CHECK_GATED: u32 = 3;
 /// unchecked and uncounted, for the host's check that every listed entry
 /// was checked (`JoinDevice::ensure_checked`).
 pub(crate) const CHECK_SKIP_FIRST: u32 = 4;
+/// Added to a [`check_kernel`] mode (tests): the lane whose entry is the
+/// list's second checks and counts the first instead, so the count of
+/// entries checked is right and their index sum is one short.
+pub(crate) const CHECK_DUP_FIRST: u32 = 8;
+/// Added to a [`check_kernel`] mode (tests): every take's leader also
+/// lowers `ran[RAN_WORDS]` (which the caller allocates, set to `u32::MAX`)
+/// to the take's size, so a test can show it ran partly filled planes.
+pub(crate) const CHECK_MIN_TAKE: u32 = 16;
 /// How deep the halving of an overflowing partition's top layer may go: a
 /// layer of up to 2^32 prefixes reaches single prefixes well within it.
 const MAX_SPLITS: u32 = 32;
@@ -192,8 +200,9 @@ pub use kernels::{bucket_kernel, check_kernel, join_kernel, top_fd_kernel, top_k
 )]
 mod kernels {
     use super::{
-        AND_GROUP, CHECK_COUNT, CHECK_GATED, CHECK_PROBE, CHECK_SKIP_FIRST, DEAD_MASK, JOIN_WG,
-        MAX_ROOTS, STAGES_U32, SURV_FLUSH, SURV_SH_CAP, TOP_CAP, TOP_REC_WORDS, TRANSPOSE_MIN,
+        AND_GROUP, CHECK_COUNT, CHECK_DUP_FIRST, CHECK_GATED, CHECK_MIN_TAKE, CHECK_PROBE,
+        CHECK_SKIP_FIRST, DEAD_MASK, JOIN_WG, MAX_ROOTS, STAGES_U32, SURV_FLUSH, SURV_SH_CAP,
+        TOP_CAP, TOP_REC_WORDS, TRANSPOSE_MIN,
     };
     use crate::cubecl_backend::NICEONLY_STRIDE;
     use crate::cubecl_detailed_fd::fd_add_top;
@@ -3284,7 +3293,10 @@ mod kernels {
     /// with the gate applied as in [`CHECK_HITS`] (the mask then holds all
     /// of n³'s digits only where the gate passed). [`CHECK_SKIP_FIRST`] added
     /// to a mode (tests) leaves the list's first entry unchecked and
-    /// uncounted, as a device that lost an entry would.
+    /// uncounted, as a device that lost an entry would;
+    /// [`CHECK_DUP_FIRST`] checks the first entry twice and the second not
+    /// at all; [`CHECK_MIN_TAKE`] records the smallest take. The three are
+    /// comptime: the production modes compile without them.
     #[cube(launch_unchecked)]
     pub fn check_kernel(
         surv: &Array<u32>,
@@ -3300,7 +3312,9 @@ mod kernels {
         #[comptime] ballot: bool,
     ) {
         let skip_first = comptime!(mode & CHECK_SKIP_FIRST != 0);
-        let mode = comptime!(mode & !CHECK_SKIP_FIRST);
+        let dup_first = comptime!(mode & CHECK_DUP_FIRST != 0);
+        let min_take = comptime!(mode & CHECK_MIN_TAKE != 0);
+        let mode = comptime!(mode & !(CHECK_SKIP_FIRST | CHECK_DUP_FIRST | CHECK_MIN_TAKE));
         let base = comptime!(sh.b);
         let l = comptime!(sh.l);
         let s2 = comptime!(sh.s2);
@@ -3323,15 +3337,21 @@ mod kernels {
         }
         // tk: a take's first entry and this lane's rank in it.
         let mut tk = Array::<u32>::new(2usize);
-        take_entries(ran, &mut tk, ballot);
+        take_entries(ran, &mut tk, ballot, min_take);
         let mut cur = tk[0];
         let mut rank = tk[1];
         let mut done = 0u32;
         let mut isum = 0u32;
         while cur < count {
             // The next entries, asked for before this one's work.
-            take_entries(ran, &mut tk, ballot);
-            let i = cur + rank;
+            take_entries(ran, &mut tk, ballot, min_take);
+            // (A comptime `if` as an expression, so the production modes
+            // compile exactly as without the test bit.)
+            let i = if comptime!(dup_first) {
+                select(cur + rank == 1u32 && 1u32 < count, 0u32, cur + rank)
+            } else {
+                cur + rank
+            };
             let mut live = i < count;
             if comptime!(skip_first) {
                 live = live && i != 0u32;
@@ -3496,7 +3516,12 @@ mod kernels {
     /// Without (64- and 128-lane planes): an exclusive scan and a sum over
     /// the active lanes, and the leader's take as the sum of it and zeros.
     #[cube]
-    fn take_entries(ran: &mut Array<Atomic<u32>>, tk: &mut Array<u32>, #[comptime] ballot: bool) {
+    fn take_entries(
+        ran: &mut Array<Atomic<u32>>,
+        tk: &mut Array<u32>,
+        #[comptime] ballot: bool,
+        #[comptime] min_take: bool,
+    ) {
         let mut got = 0u32;
         if comptime!(ballot) {
             let bal = plane_ballot(true);
@@ -3504,6 +3529,9 @@ mod kernels {
             let rank = (lanes & ((1u32 << UNIT_POS_PLANE) - 1u32)).count_ones();
             if rank == 0u32 {
                 got = ran[STAGES_U32 as usize].fetch_add(lanes.count_ones());
+                if comptime!(min_take) {
+                    ran[comptime!(STAGES_U32 + 3) as usize].fetch_min(lanes.count_ones());
+                }
             }
             // The lowest lane taking part: the trailing zeros of `lanes`.
             let lead = (lanes ^ (lanes - 1u32)).count_ones() - 1u32;
@@ -3514,6 +3542,9 @@ mod kernels {
             let lanes = plane_sum(1u32);
             if rank == 0u32 {
                 got = ran[STAGES_U32 as usize].fetch_add(lanes);
+                if comptime!(min_take) {
+                    ran[comptime!(STAGES_U32 + 3) as usize].fetch_min(lanes);
+                }
             }
             tk[0] = plane_sum(got);
             tk[1] = rank;
@@ -4091,11 +4122,7 @@ impl<R: Runtime> JoinDevice<R> {
         }
         let mode = if probe { CHECK_PROBE } else { CHECK_HITS };
         #[cfg(test)]
-        let mode = if tests::SKIP_FIRST.with(std::cell::Cell::get) {
-            mode | CHECK_SKIP_FIRST
-        } else {
-            mode
-        };
+        let mode = mode | tests::CHECK_TEST_BITS.with(std::cell::Cell::get);
         self.launch_check(
             CHECK_CUBES,
             JOIN_WG,
@@ -4157,7 +4184,11 @@ impl<R: Runtime> JoinDevice<R> {
                 ArrayArg::from_raw_parts(recs.clone(), rec_words),
                 ArrayArg::from_raw_parts(out.0.clone(), out.1),
                 ArrayArg::from_raw_parts(out_count.clone(), 1),
-                ArrayArg::from_raw_parts(ran.clone(), RAN_WORDS),
+                // One more word for the smallest take (tests).
+                ArrayArg::from_raw_parts(
+                    ran.clone(),
+                    RAN_WORDS + usize::from(mode & CHECK_MIN_TAKE != 0),
+                ),
                 cap,
                 out_cap,
                 self.check,
@@ -4185,33 +4216,23 @@ impl<R: Runtime> JoinDevice<R> {
         })
     }
 
-    /// Whether the check kernel checked every entry the join listed: the
-    /// entries it counted as checked (`ran[STAGES + 1]`) against
-    /// `min(checked, list_cap)`, the prefilter's survivors the list holds,
-    /// and the sum of their indices (`ran[STAGES + 2]`, mod 2^32) against
-    /// that of `0..listed`, so an entry checked twice cannot stand in for one
-    /// skipped. Call it once [`Self::ensure_ran`] has passed (every cube
-    /// ran). A device that ran every cube but did not check exactly the
-    /// listed survivors is not fixed by a smaller layout: an error, never a
-    /// field with fewer candidates.
+    /// Whether the check kernel checked every entry the join listed
+    /// ([`check_complete`] on `ran`'s words). Call it once
+    /// [`Self::ensure_ran`] has passed (every cube ran). A device that ran
+    /// every cube but did not check exactly the listed survivors is not
+    /// fixed by a smaller layout: an error, never a field with fewer
+    /// candidates.
     ///
     /// # Errors
     /// A count or an index sum other than the list's.
     fn ensure_checked(&self, ran: &[u32], checked: u32) -> Result<()> {
-        let listed = checked.min(self.list_cap);
-        let want_sum =
-            u32::try_from(u64::from(listed) * u64::from(listed.saturating_sub(1)) / 2 % (1 << 32))?;
-        let (done, sum) = (ran.get(STAGES + 1).copied(), ran.get(STAGES + 2).copied());
-        ensure!(
-            done == Some(listed) && sum == Some(want_sum),
-            "overlap join b{}: the check kernel checked {} of the {listed} survivors the join \
-             listed ({checked} found, room for {}; index sum {sum:?}, want {want_sum}); a device \
-             that skips list entries cannot run the join",
-            self.b,
-            done.map_or_else(|| "none".to_string(), |d| d.to_string()),
-            self.list_cap
-        );
-        Ok(())
+        check_complete(
+            ran.get(STAGES + 1).copied(),
+            ran.get(STAGES + 2).copied(),
+            checked,
+            self.list_cap,
+        )
+        .map_err(|e| anyhow!("overlap join b{}: {e}", self.b))
     }
 
     /// Whether a batch dropped prefilter survivors past the end of the list
@@ -4289,6 +4310,35 @@ impl<R: Runtime> JoinDevice<R> {
         v.sort_unstable();
         Ok(v)
     }
+}
+
+/// Whether the check kernel's count of the entries it checked (`done`,
+/// `ran[STAGES + 1]`) and their indices' sum mod 2^32 (`sum`,
+/// `ran[STAGES + 2]`) are those of the list it was given: `min(checked,
+/// list_cap)` entries (the prefilter's survivors the list holds) and the
+/// sum of `0..listed`. The sum makes an entry checked twice in place of one
+/// skipped fail, which the count alone would pass.
+///
+/// # Errors
+/// A count or an index sum other than the list's (or a missing word).
+fn check_complete(done: Option<u32>, sum: Option<u32>, checked: u32, list_cap: u32) -> Result<()> {
+    let listed = checked.min(list_cap);
+    let want_sum =
+        u32::try_from(u64::from(listed) * u64::from(listed.saturating_sub(1)) / 2 % (1 << 32))?;
+    ensure!(
+        done == Some(listed),
+        "the check kernel checked {} of the {listed} survivors the join listed ({checked} found, \
+         room for {list_cap}); a device that skips list entries cannot run the join",
+        done.map_or_else(|| "none".to_string(), |d| d.to_string()),
+    );
+    ensure!(
+        sum == Some(want_sum),
+        "the indices of the {listed} survivors the check kernel checked sum to {} (mod 2^32), \
+         not {want_sum}: it checked some entries more than once and skipped others; a device \
+         that does cannot run the join",
+        sum.map_or_else(|| "none".to_string(), |d| d.to_string()),
+    );
+    Ok(())
 }
 
 /// A batch the device did not run in full: a kernel finished fewer cubes
@@ -4962,10 +5012,13 @@ mod tests {
         /// macOS runner's paravirtual Metal device, on this thread.
         pub(super) static REFUSE_ABOVE: std::cell::Cell<usize> =
             const { std::cell::Cell::new(usize::MAX) };
-        /// The check kernel of `launch_batch` leaves the list's first entry
-        /// unchecked ([`CHECK_SKIP_FIRST`]), on this thread.
-        pub(super) static SKIP_FIRST: std::cell::Cell<bool> =
-            const { std::cell::Cell::new(false) };
+        /// Test bits added to the mode of `launch_batch`'s check kernel
+        /// ([`CHECK_SKIP_FIRST`], [`CHECK_DUP_FIRST`]), on this thread.
+        pub(super) static CHECK_TEST_BITS: std::cell::Cell<u32> =
+            const { std::cell::Cell::new(0) };
+        /// The smallest take `run_check` has seen since it was last reset.
+        pub(super) static SMALLEST_TAKE: std::cell::Cell<u32> =
+            const { std::cell::Cell::new(u32::MAX) };
     }
 
     fn client() -> (ComputeClient<cubecl::wgpu::WgpuRuntime>, String) {
@@ -5153,15 +5206,19 @@ mod tests {
         check_skipped_entries(client, name);
     }
 
-    /// A check kernel that leaves a listed survivor unchecked (the list's
-    /// first entry, [`CHECK_SKIP_FIRST`]), as a device whose planes lost
-    /// entries would: the field fails with an error, in a pass of batches and
-    /// in a partition's re-run, and never comes out as a field with fewer
+    /// A check kernel that does not check exactly the listed survivors, as a
+    /// device whose planes lost entries would: one that leaves the list's
+    /// first entry unchecked ([`CHECK_SKIP_FIRST`]: the count is short), and
+    /// one that checks the first entry in place of the second
+    /// ([`CHECK_DUP_FIRST`]: the count is right, the index sum one short).
+    /// The field fails with the matching error, in a pass of batches and in a
+    /// partition's re-run, and never comes out as a field with fewer
     /// candidates. The same fields then run as before.
     fn check_skipped_entries<R: Runtime>(client: &ComputeClient<R>, name: &str) {
-        let skip = |on: bool| SKIP_FIRST.with(|c| c.set(on));
+        let set_bits = |bits: u32| CHECK_TEST_BITS.with(|c| c.set(bits));
         let lim = device_limits(client, name);
         let w = WINDOWS[0];
+        let mut failed = 0;
         for (b, s, e, jp) in [
             (10, 47, 100, JoinParams { t: 2, k: 1, p: 0 }),
             (
@@ -5179,34 +5236,50 @@ mod tests {
                 .expect("field setup")
                 .expect("a join field");
             let (want, st) = run_field(client, &field, &JoinCeiling::default()).expect("runs");
-            assert!(st.checked > 0, "b{b} [{s}, {e}): survivors to check");
-            // A partition with survivors to check, for the re-run.
-            let part = live_partitions(&field.fs)
-                .into_iter()
-                .find(|&v| {
-                    let (mut st, mut hits) = (JoinFieldStats::default(), Vec::new());
-                    run_partition(client, &field.fs, &field.retry, v, 0, &mut st, &mut hits)
-                        .expect("runs");
-                    st.checked > 0
-                })
-                .expect("a partition with survivors");
-            skip(true);
-            let pass = run_field(client, &field, &JoinCeiling::default());
-            let (mut st, mut hits) = (JoinFieldStats::default(), Vec::new());
-            let rerun = run_partition(client, &field.fs, &field.retry, part, 0, &mut st, &mut hits);
-            skip(false);
-            let err = pass
-                .expect_err("a skipped survivor fails the field")
-                .to_string();
-            assert!(err.contains("the check kernel checked"), "{err}");
-            let err = rerun
-                .expect_err("a skipped survivor fails the re-run")
-                .to_string();
-            assert!(err.contains("the check kernel checked"), "{err}");
+            // (test bits, the error's words, the survivors a list needs for
+            // the bits to change what is checked)
+            for (bits, says, least) in [
+                (CHECK_SKIP_FIRST, "survivors the join listed", 1),
+                (
+                    CHECK_DUP_FIRST,
+                    "survivors the check kernel checked sum to",
+                    2,
+                ),
+            ] {
+                if st.checked < least {
+                    continue; // b10's band lists one survivor
+                }
+                // A partition with enough survivors, for the re-run.
+                let part = live_partitions(&field.fs)
+                    .into_iter()
+                    .find(|&v| {
+                        let (mut st, mut hits) = (JoinFieldStats::default(), Vec::new());
+                        run_partition(client, &field.fs, &field.retry, v, 0, &mut st, &mut hits)
+                            .expect("runs");
+                        st.checked >= least
+                    })
+                    .expect("a partition with survivors");
+                set_bits(bits);
+                let pass = run_field(client, &field, &JoinCeiling::default());
+                let (mut st, mut hits) = (JoinFieldStats::default(), Vec::new());
+                let rerun =
+                    run_partition(client, &field.fs, &field.retry, part, 0, &mut st, &mut hits);
+                set_bits(0);
+                let err = pass.expect_err("a wrong check fails the field").to_string();
+                assert!(err.contains(says), "bits {bits}: {err}");
+                let err = rerun
+                    .expect_err("a wrong check fails the re-run")
+                    .to_string();
+                assert!(err.contains(says), "bits {bits}: {err}");
+                println!(
+                    "{name}: b{b} [{s}, {e}) {jp:?}, test bits {bits}: the field fails: {err}"
+                );
+                failed += 1;
+            }
             let (again, _) = run_field(client, &field, &JoinCeiling::default()).expect("runs");
-            assert_eq!(again, want, "b{b} [{s}, {e}): hits after the skip");
-            println!("{name}: b{b} [{s}, {e}) {jp:?}: a skipped survivor fails the field: {err}");
+            assert_eq!(again, want, "b{b} [{s}, {e}): hits after the test bits");
         }
+        assert!(failed >= 3, "{name}: {failed} failing runs");
     }
 
     /// The re-run and refusal paths at the production shape (the b57
@@ -5580,7 +5653,9 @@ mod tests {
         let oc = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
         let cap = u32::try_from(n).expect("a list fits u32");
         let cnt = c.create(cubecl::bytes::Bytes::from_elems(vec![cap]));
-        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; RAN_WORDS]));
+        let mut ran0 = vec![0u32; RAN_WORDS + 1];
+        ran0[RAN_WORDS] = u32::MAX;
+        let ran = c.create(cubecl::bytes::Bytes::from_elems(ran0));
         dev.launch_check(
             cubes,
             wg,
@@ -5594,9 +5669,10 @@ mod tests {
             &ran,
             cap,
             cap,
-            mode,
+            mode | CHECK_MIN_TAKE,
         );
         let ran = dev.read_u32(&ran).expect("ran");
+        SMALLEST_TAKE.with(|c| c.set(c.get().min(ran[RAN_WORDS])));
         let out = dev.read_u32(&out).expect("out");
         let what = format!(
             "{} check, mode {mode}, {cubes} cubes of {wg}, {n} entries",
@@ -5949,6 +6025,8 @@ mod tests {
         let lim = device_limits(client, name);
         let mut shapes = std::collections::HashSet::new();
         let (mut runs, mut entries) = (0, 0);
+        // The smallest take per (form, cube size), over every run.
+        let mut smallest = std::collections::BTreeMap::new();
         for (b, s, e, jp) in fields {
             let fs = FieldSetup::new(b, s, e, jp).expect("field setup");
             let plan = JoinPlan::new(&fs, lim, 1, 1 << 16, 1, lim.budget).expect("a layout fits");
@@ -5963,6 +6041,7 @@ mod tests {
                 dev.ballot = ballot;
                 for wg in [100, 48, JOIN_WG] {
                     let what = format!("b{b} {sh:?}, cubes of {wg}, ballot {ballot}");
+                    SMALLEST_TAKE.with(|c| c.set(u32::MAX));
                     for cubes in [1, 3, CHECK_CUBES] {
                         let got =
                             run_check(&dev, cubes, wg, &lh, lw, &rh, rw, ns.len(), CHECK_COUNT);
@@ -5972,6 +6051,8 @@ mod tests {
                     let got = run_check(&dev, 3, wg, &lh, lw, &rh, rw, ns.len(), CHECK_PROBE);
                     assert_probe(ns.clone(), &got, &what);
                     runs += 1;
+                    let least = smallest.entry((ballot, wg)).or_insert(u32::MAX);
+                    *least = (*least).min(SMALLEST_TAKE.with(std::cell::Cell::get));
                 }
             }
             entries += ns.len();
@@ -5981,6 +6062,28 @@ mod tests {
              shapes ({entries} synthetic n), take forms (ballot) {forms:?}",
             shapes.len()
         );
+        // Whether the device really ran partly filled planes: the smallest
+        // take of each cube size. CUDA's warps are 32 lanes, so a cube of 100
+        // (48) units ends in a take of 4 (16); lavapipe runs a cube's last
+        // subgroup with every lane, so it never shows one.
+        let width = client.properties().hardware.plane_size_max;
+        let cuda = R::name(client).contains("cuda");
+        for (&(ballot, wg), &least) in &smallest {
+            let partial = least < width.min(wg);
+            println!(
+                "{name}: ballot {ballot}, cubes of {wg}: smallest take {least} of planes up to \
+                 {width} lanes: {}",
+                if partial {
+                    "partly filled planes ran"
+                } else {
+                    "no partly filled plane ran on this device"
+                }
+            );
+            if cuda {
+                let want = if wg.is_multiple_of(32) { 32 } else { wg % 32 };
+                assert_eq!(least, want, "{name}: cubes of {wg}: smallest take");
+            }
+        }
     }
 
     #[test]
@@ -7585,6 +7688,43 @@ mod tests {
             [true, true],
             "the windows no longer cross a c0 change"
         );
+    }
+
+    /// The host's check that the check kernel checked exactly the listed
+    /// survivors: a right count and index sum pass (also on an overflowed
+    /// list, which holds `list_cap` of them); one entry skipped fails on the
+    /// count, one checked twice in place of another on the sum; the sum is
+    /// the device's, mod 2^32, past where it wraps.
+    #[test]
+    fn check_complete_wants_every_listed_entry_once() {
+        let sum = |n: u64| u32::try_from(n * n.saturating_sub(1) / 2 % (1 << 32)).unwrap();
+        assert!(check_complete(Some(5), Some(10), 5, 100).is_ok());
+        assert!(check_complete(Some(0), Some(0), 0, 100).is_ok());
+        // An overflowed list holds list_cap entries, all checked.
+        assert!(check_complete(Some(100), Some(sum(100)), 250, 100).is_ok());
+        assert!(check_complete(Some(250), Some(sum(250)), 250, 100).is_err());
+        // Entry 3 of 5 skipped: four checked, indices 0 + 1 + 2 + 4.
+        let e = check_complete(Some(4), Some(7), 5, 100)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("checked 4 of the 5 survivors"), "{e}");
+        // Entry 1 twice, entry 3 not: five checked, indices 0 + 1 + 1 + 2 + 4.
+        let e = check_complete(Some(5), Some(8), 5, 100)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("sum to 8 (mod 2^32), not 10"), "{e}");
+        // Words missing from `ran`.
+        assert!(check_complete(None, Some(10), 5, 100).is_err());
+        assert!(check_complete(Some(5), None, 5, 100).is_err());
+        // The sum wraps from 92,682 entries on: 100,000 entries sum to
+        // 4,999,950,000 = 704,982,704 + 2^32.
+        assert_eq!(sum(100_000), 704_982_704);
+        assert!(check_complete(Some(100_000), Some(704_982_704), 100_000, 1 << 26).is_ok());
+        // The largest list, summed as the device sums it (wrapping u32).
+        let n = 1u32 << 26;
+        let dev = (0..n).fold(0u32, u32::wrapping_add);
+        assert!(check_complete(Some(n), Some(dev), n, n).is_ok());
+        assert!(check_complete(Some(n), Some(dev.wrapping_sub(1)), n, n).is_err());
     }
 
     /// The FD kernel's append ranks kept tops with a ballot only on planes
