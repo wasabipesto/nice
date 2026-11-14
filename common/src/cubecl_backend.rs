@@ -1577,11 +1577,14 @@ fn niceonly_kernel(
 /// queue's first cube barrier): words 0-1 for the queue's own use, 2-3 for
 /// [`report_queue_account`].
 ///
-/// Units 0-3 clear one word each, at an index that is not a compile-time
-/// constant. Four stores of `0` at constant indices by one unit came out of
-/// `CubeCL`'s direct SPIR-V compiler as a single store to word 0, so words
-/// 1-3 kept whatever the workgroup's memory held, and the account read that
-/// as survivors queued and never checked.
+/// Units 0-3 clear one word each, so the clear is a single store in a
+/// loop, and it must stay one. `cubecl-opt`'s expression merge, which only
+/// the direct SPIR-V compiler runs, keeps the first of several atomic
+/// stores of one value in a basic block and drops the rest, whatever they
+/// point at: a store's target is not part of what the pass compares. Four
+/// `store(0)` in a row by one unit came out as a single store to word 0, so
+/// words 1-3 kept whatever the workgroup's memory held, and the account
+/// read that as survivors queued and never checked.
 #[cube]
 fn clear_queue_account(q_acct: &mut SharedMemory<Atomic<u32>>) {
     let mut i = UNIT_POS_X;
