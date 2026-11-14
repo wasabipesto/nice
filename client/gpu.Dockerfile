@@ -4,7 +4,8 @@
 #
 # This image includes the CUDA 12.8 runtime libraries (NVRTC for the CUDA
 # backends). The base must carry a glibc at least as new as the runner that
-# built the binary: CI builds on ubuntu-latest (24.04, glibc 2.39), and
+# built the binary: CI builds on ubuntu-24.04 (glibc 2.39; the workflow pins
+# the runner, since ubuntu-latest moves on to newer releases), and
 # since #117 the rustls crypto backend (aws-lc-sys) references GLIBC_2.38
 # symbols, so a 22.04 base (2.35) fails at load time with
 # "version `GLIBC_2.38' not found". The CPU image (debian trixie, 2.41)

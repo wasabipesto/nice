@@ -22,7 +22,10 @@ env:
 jobs:
     build-and-push-amd64:
         name: Build (amd64) + Push arch image
-        runs-on: ubuntu-latest
+        # Built on the runner and copied into the Debian trixie image of
+        # client/cpu.Dockerfile (glibc 2.41): pinned for the same reason as the
+        # GPU job below, and to the same release as the arm64 job.
+        runs-on: ubuntu-24.04
         permissions:
             contents: read
             packages: write
@@ -91,7 +94,12 @@ jobs:
 
     build-and-push-amd64-gpu:
         name: Build (amd64, GPU) + Push arch image
-        runs-on: ubuntu-latest
+        # The binary is built on the runner and copied into the Ubuntu 24.04
+        # image of client/gpu.Dockerfile, so the runner must not have a newer
+        # glibc than that image. ubuntu-latest has started to resolve to 26.04
+        # (glibc 2.43), where the smoke test below fails with "GLIBC_2.43 not
+        # found". Move this pin together with the image's base.
+        runs-on: ubuntu-24.04
         permissions:
             contents: read
             packages: write
