@@ -1573,16 +1573,21 @@ fn niceonly_kernel(
     }
 }
 
-/// Clear a queue's shared words (unit 0; ordered before their first use by
-/// the queue's first cube barrier): words 0-1 for the queue's own use, 2-3
-/// for [`report_queue_account`].
+/// Clear a queue's shared words (ordered before their first use by the
+/// queue's first cube barrier): words 0-1 for the queue's own use, 2-3 for
+/// [`report_queue_account`].
+///
+/// Units 0-3 clear one word each, at an index that is not a compile-time
+/// constant. Four stores of `0` at constant indices by one unit came out of
+/// `CubeCL`'s direct SPIR-V compiler as a single store to word 0, so words
+/// 1-3 kept whatever the workgroup's memory held, and the account read that
+/// as survivors queued and never checked.
 #[cube]
 fn clear_queue_account(q_acct: &mut SharedMemory<Atomic<u32>>) {
-    if UNIT_POS_X == 0u32 {
-        q_acct[0].store(0u32);
-        q_acct[1].store(0u32);
-        q_acct[2].store(0u32);
-        q_acct[3].store(0u32);
+    let mut i = UNIT_POS_X;
+    while i < 4u32 {
+        q_acct[i as usize].store(0u32);
+        i += CUBE_DIM_X;
     }
 }
 
