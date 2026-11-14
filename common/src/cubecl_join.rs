@@ -118,8 +118,29 @@ const CHECK_CUBES: u32 = 1024;
 /// layer of up to 2^32 prefixes reaches single prefixes well within it.
 const MAX_SPLITS: u32 = 32;
 /// Kernels a batch launches (top, bucket, join, check), each counting its
-/// finished cubes.
+/// finished cubes in `ran`, whose next two words are the top stage's account
+/// of its appends (see [`TOP_ACCOUNT`]).
 const STAGES: usize = 4;
+/// Where in `ran` [`top_fd_kernel`] keeps the account of its appends: the
+/// tops it kept minus the records it reserved for them in `grp_cnt`, and
+/// the record indices it wrote minus those it reserved (mod 2^32). Both end
+/// at zero when every kept top went to a record of its own that the join
+/// reads (`JoinDevice::ensure_appended`).
+const TOP_ACCOUNT: u32 = 4;
+/// The words of `ran`.
+const RAN_WORDS: usize = STAGES + 2;
+const _: () = assert!(TOP_ACCOUNT as usize == STAGES);
+/// Added to [`top_fd_kernel`]'s test bits (tests): every plane's lane 0
+/// appends its top with an atomic of its own and sits out the plane's
+/// append, as on a device that runs a plane without lane 0.
+pub(crate) const TOP_LANE0_OUT: u32 = 1;
+/// Added to [`top_fd_kernel`]'s test bits (tests): the leader of every plane
+/// that keeps a top reserves one record fewer than the plane's (or its own)
+/// kept tops need.
+pub(crate) const TOP_SHORT_TAKE: u32 = 2;
+/// Added to [`top_fd_kernel`]'s test bits (tests): a plane's second kept top
+/// is written to the record of its first (the leader's).
+pub(crate) const TOP_DUP_RANK: u32 = 4;
 /// The most digit-sum roots of any base the join takes (8, at bases 46, 50
 /// and 64): [`join_kernel`] holds a bucket's group segments in shared memory.
 const MAX_ROOTS: u32 = 8;
@@ -170,8 +191,8 @@ pub use kernels::{bucket_kernel, check_kernel, join_kernel, top_fd_kernel, top_k
 )]
 mod kernels {
     use super::{
-        AND_GROUP, DEAD_MASK, JOIN_WG, MAX_ROOTS, SURV_FLUSH, SURV_SH_CAP, TOP_CAP, TOP_REC_WORDS,
-        TRANSPOSE_MIN,
+        AND_GROUP, DEAD_MASK, JOIN_WG, MAX_ROOTS, SURV_FLUSH, SURV_SH_CAP, TOP_ACCOUNT, TOP_CAP,
+        TOP_DUP_RANK, TOP_LANE0_OUT, TOP_REC_WORDS, TOP_SHORT_TAKE, TRANSPOSE_MIN,
     };
     use crate::cubecl_backend::candidate_check;
     use crate::cubecl_detailed_fd::fd_add_top;
@@ -1725,26 +1746,34 @@ mod kernels {
         mask
     }
 
-    /// Append a plane's kept tops of one slot into their groups' segments of
-    /// `top_rec` (see [`top_kernel`], which takes one atomic per top) and
-    /// return a kept lane's record index:
-    /// `slot·ntlay + goff + at`, `at` its place among the group's kept tops
-    /// (`grp_cnt[slot·nb + g]`). The host sorts the top layer by group, so a
-    /// plane's kept tops are almost always of one group, and take one atomic;
-    /// a plane that straddles groups takes one per kept lane. Every lane of
-    /// the plane must call it.
+    /// Append the kept tops of one slot, of the lanes of a plane that run
+    /// this call together, into their groups' segments of `top_rec` (see
+    /// [`top_kernel`], which takes one atomic per top), and return a kept
+    /// lane's record index: `slot·ntlay + goff + at`, `at` its place among
+    /// the group's kept tops (`grp_cnt[slot·nb + g]`). The host sorts the top
+    /// layer by group, so a plane's kept tops are almost always of one group,
+    /// and take one atomic; a plane whose kept tops straddle groups takes one
+    /// per kept lane. Every lane of the plane must call it.
     ///
-    /// The group tested is lane 0's, kept or not: lane 0 holds the plane's
-    /// lowest prefix index, so a dead lane 0 means a dead plane (nothing
-    /// kept, no atomic), and lane 0's group differs from its kept lanes' only
-    /// where the plane straddles a group boundary. Only such a plane can take
-    /// per-lane atomics where one would have done.
+    /// Everything comes from the lanes that run the call, never from lane 0
+    /// or `PLANE_DIM`: Vulkan does not promise full planes (wgpu does not ask
+    /// for them), and a plane may lack lane 0. The leader is the lowest kept
+    /// lane (rank 0 among the kept); its group `g0` is tested, it alone takes
+    /// the atomic when every kept lane is of `g0`, and its result reaches the
+    /// others from it. With `ballot` (`ballot_append`: planes of at most 32
+    /// lanes) the kept lanes are one ballot's first word (inactive lanes' bits
+    /// are clear on every backend): their count, each lane's rank, and the
+    /// leader's lane (the lowest set bit), from which a shuffle reads `g0` and
+    /// the atomic's result. `CubeCL`'s C++ backends return only that word
+    /// (HIP truncates a 64-lane ballot to it), so wider planes take the count,
+    /// rank, `g0` and result as sums and an exclusive scan over the active
+    /// lanes (only the leader adds a nonzero term).
     ///
-    /// With `ballot` (`ballot_append`: planes of at most 32 lanes) the
-    /// plane's count and each lane's rank are popcounts of the ballot's first
-    /// word, instead of a sum and an exclusive scan over the plane. `CubeCL`'s
-    /// C++ backends return only that word (HIP truncates a 64-lane ballot to
-    /// it), so wider planes keep the scans.
+    /// `acct` (two words, the lane's running account, see [`TOP_ACCOUNT`])
+    /// gains the record this lane writes (one, at the index returned, if it
+    /// kept a top) and loses each record it reserves: the leader's `n` from
+    /// the plane's atomic, or a lane's own one. `test` ([`TOP_SHORT_TAKE`],
+    /// [`TOP_DUP_RANK`]): an append the account must catch (tests).
     #[cube]
     fn top_slot(
         kept: bool,
@@ -1753,37 +1782,92 @@ mod kernels {
         slot: u32,
         ntlay: u32,
         grp_cnt: &mut Array<Atomic<u32>>,
+        acct: &mut Array<u32>,
         #[comptime] nb: u32,
         #[comptime] ballot: bool,
+        #[comptime] test: u32,
     ) -> u32 {
-        let g0 = plane_broadcast(g, 0u32);
-        let one = plane_all(!kept || g == g0);
-        let kc = select(kept && one, 1u32, 0u32);
-        let b0 = if comptime!(ballot) {
-            let bal = plane_ballot(kept && one);
+        let kc = select(kept, 1u32, 0u32);
+        let kb = if comptime!(ballot) {
+            let bal = plane_ballot(kept);
             bal[0usize]
         } else {
             kc
         };
         let n = if comptime!(ballot) {
-            b0.count_ones()
+            kb.count_ones()
         } else {
             plane_sum(kc)
         };
-        let pre = if comptime!(ballot) {
-            (b0 & ((1u32 << UNIT_POS_PLANE) - 1u32)).count_ones()
+        let rank = if comptime!(ballot) {
+            (kb & ((1u32 << UNIT_POS_PLANE) - 1u32)).count_ones()
         } else {
             plane_exclusive_sum(kc)
         };
+        let lead = kept && rank == 0u32;
+        // The leader's lane (ballot): the lowest set bit of `kb`. With nothing
+        // kept, each lane reads its own (the values are then unused).
+        let src = if comptime!(ballot) {
+            select(
+                kb == 0u32,
+                UNIT_POS_PLANE,
+                (kb ^ (kb - 1u32)).count_ones() - 1u32,
+            )
+        } else {
+            UNIT_POS_PLANE // (unused)
+        };
+        let g0 = if comptime!(ballot) {
+            plane_shuffle(g, src)
+        } else {
+            plane_sum(select(lead, g, 0u32))
+        };
+        let one = plane_all(!kept || g == g0);
+        let short = comptime!(test & TOP_SHORT_TAKE != 0);
+        // (Tests: the leader reserves one record fewer than it should.)
+        let take = if comptime!(short) { n - 1u32 } else { n };
         let mut a0 = 0u32;
-        if UNIT_POS_PLANE == 0u32 && n > 0u32 {
-            a0 = grp_cnt[(slot * nb + g0) as usize].fetch_add(n);
+        if lead && one {
+            a0 = grp_cnt[(slot * nb + g0) as usize].fetch_add(take);
+            // The leader is of g0: records slot·ntlay + goff + a0 .. + take.
+            let r0 = slot * ntlay + goff + a0;
+            acct[0] = acct[0] - take;
+            acct[1] = acct[1] - (take * r0 + take * (take - 1u32) / 2u32);
         }
-        let mut at = plane_broadcast(a0, 0u32) + pre;
+        let a = if comptime!(ballot) {
+            plane_shuffle(a0, src)
+        } else {
+            plane_sum(a0)
+        };
+        let mut at = a + rank;
         if kept && !one {
-            at = grp_cnt[(slot * nb + g) as usize].fetch_add(1u32);
+            if comptime!(short) {
+                let mine = select(lead, 0u32, 1u32);
+                at = grp_cnt[(slot * nb + g) as usize].fetch_add(mine);
+                acct[0] = acct[0] - mine;
+                acct[1] = acct[1] - mine * (slot * ntlay + goff + at);
+            } else {
+                at = grp_cnt[(slot * nb + g) as usize].fetch_add(1u32);
+                acct[0] = acct[0] - 1u32;
+                acct[1] = acct[1] - (slot * ntlay + goff + at);
+            }
         }
-        slot * ntlay + goff + at
+        if comptime!(test & TOP_DUP_RANK != 0) {
+            // (Tests: the second kept lane writes to the leader's record.)
+            let lat = if comptime!(ballot) {
+                plane_shuffle(at, src)
+            } else {
+                plane_sum(select(lead, at, 0u32))
+            };
+            if kept && rank == 1u32 {
+                at = lat;
+            }
+        }
+        let rec = slot * ntlay + goff + at;
+        if kept {
+            acct[0] = acct[0] + 1u32;
+            acct[1] = acct[1] + rec;
+        }
+        rec
     }
 
     /// Stage 0a: certify every top prefix of every slot's partition. Grid: x
@@ -2622,7 +2706,10 @@ mod kernels {
     /// slice's ends) are left to [`top_kernel`] with `only_clipped`, launched
     /// beside this one.
     /// The certificate is [`cert_power_fd`]'s, the same function of the same
-    /// digits as [`cert_power`]'s; the outputs are [`top_kernel`]'s.
+    /// digits as [`cert_power`]'s; the outputs are [`top_kernel`]'s, and the
+    /// account of its appends in `ran` ([`TOP_ACCOUNT`], see [`top_slot`]).
+    /// `test`: 0, or test bits ([`TOP_LANE0_OUT`], [`TOP_SHORT_TAKE`],
+    /// [`TOP_DUP_RANK`]); comptime, so production compiles without them.
     #[cube(launch_unchecked)]
     pub fn top_fd_kernel(
         tlay: &Array<u32>,
@@ -2650,6 +2737,7 @@ mod kernels {
         #[comptime] f0: u32,
         #[comptime] tq: u32,
         #[comptime] ballot: bool,
+        #[comptime] test: u32,
     ) {
         let nl2 = comptime!(2 * limbs);
         let nl3 = comptime!(3 * limbs);
@@ -2664,6 +2752,16 @@ mod kernels {
         // Every unit runs the slot loop (the tops are appended per plane at
         // the end of each slot, so every lane of a plane must get there).
         let i = ABSOLUTE_POS_X;
+        // The cube's account of its appends ([`TOP_ACCOUNT`]), summed from
+        // each lane's (`acct`) once the slots are done.
+        let s_acct = SharedMemory::<Atomic<u32>>::new(2usize);
+        if UNIT_POS_X < 2u32 {
+            s_acct[UNIT_POS_X as usize].store(0u32);
+        }
+        sync_cube();
+        let mut acct = Array::<u32>::new(2usize);
+        acct[0] = 0u32;
+        acct[1] = 0u32;
         let live = i < ntlay;
         let mut p0 = 0u64;
         let mut tl_g = 0u32;
@@ -2906,7 +3004,27 @@ mod kernels {
                     valid = false;
                 }
                 // Append the plane's kept tops into their groups' segments.
-                let rec = top_slot(kept, tl_g, tl_off, slot, ntlay, grp_cnt, nb, ballot);
+                let rec = if comptime!(test & TOP_LANE0_OUT != 0) {
+                    // (Tests: lane 0 appends alone, the rest of the plane
+                    // without it.)
+                    let mut r = 0u32;
+                    if UNIT_POS_PLANE == 0u32 {
+                        if kept {
+                            r = slot * ntlay
+                                + tl_off
+                                + grp_cnt[(slot * nb + tl_g) as usize].fetch_add(1u32);
+                        }
+                    } else {
+                        r = top_slot(
+                            kept, tl_g, tl_off, slot, ntlay, grp_cnt, &mut acct, nb, ballot, test,
+                        );
+                    }
+                    r
+                } else {
+                    top_slot(
+                        kept, tl_g, tl_off, slot, ntlay, grp_cnt, &mut acct, nb, ballot, test,
+                    )
+                };
                 if kept {
                     let r8 = TOP_REC_WORDS * rec;
                     top_rec[r8 as usize] = u32::cast_from(p);
@@ -2921,7 +3039,23 @@ mod kernels {
                 slot += 1u32;
             }
         }
+        if acct[0] != 0u32 {
+            s_acct[0].fetch_add(acct[0]);
+        }
+        if acct[1] != 0u32 {
+            s_acct[1].fetch_add(acct[1]);
+        }
         cube_done(ran, 0u32);
+        if UNIT_POS_X == 0u32 {
+            let dn = s_acct[0].load();
+            let ds = s_acct[1].load();
+            if dn != 0u32 {
+                ran[TOP_ACCOUNT as usize].fetch_add(dn);
+            }
+            if ds != 0u32 {
+                ran[comptime!(TOP_ACCOUNT + 1) as usize].fetch_add(ds);
+            }
+        }
     }
 
     /// The middle-digit prefilter of one join survivor, in [`join_kernel`]'s
@@ -3220,6 +3354,9 @@ pub(crate) struct JoinDevice<R: Runtime> {
     clip_vs: Vec<u32>,
     /// [`TOP_FD_MIN_UNITS`] (the tests lower it to force slot groups).
     top_fd_min: u32,
+    /// The top stage's cube size: [`JOIN_WG`] (the tests change it to run
+    /// partly filled planes).
+    top_wg: u32,
     /// [`ballot_append`] for the device's largest plane.
     ballot: bool,
     w_f0: u32,
@@ -3418,6 +3555,7 @@ impl<R: Runtime> JoinDevice<R> {
             top_fd: top_fd_runs(fs),
             tq: fs.base.l - fs.f0,
             top_fd_min: TOP_FD_MIN_UNITS,
+            top_wg: JOIN_WG,
             ballot: ballot_append(client.properties().hardware.plane_size_max),
             clip_vs: {
                 let mut c = Vec::new();
@@ -3492,7 +3630,7 @@ impl<R: Runtime> JoinDevice<R> {
             0u32;
             self.nb as usize
         ]));
-        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; STAGES]));
+        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; RAN_WORDS]));
         self.launch_top(&[v], &vs_h, &gc, &ran, self.top_fd);
     }
 
@@ -3514,7 +3652,7 @@ impl<R: Runtime> JoinDevice<R> {
 
     /// The top stage's cubes for batch `vs` (see [`Self::launch_top`]).
     fn top_expect(&self, vs: &[u32], fd: bool) -> u32 {
-        let top_cubes = self.ntlay.div_ceil(JOIN_WG).max(1);
+        let top_cubes = self.ntlay.div_ceil(self.top_wg).max(1);
         let nslots = u32::try_from(vs.len()).expect("a batch fits u32");
         let per_slot = top_cubes * nslots;
         let fd_cubes = top_cubes * self.top_fd_groups(nslots).1;
@@ -3537,21 +3675,25 @@ impl<R: Runtime> JoinDevice<R> {
         let ntl = self.ntlay as usize;
         let nb = self.nb as usize;
         let max_slots = self.max_slots;
-        let nran = STAGES;
+        let nran = RAN_WORDS;
         let nslots_u32 = u32::try_from(nslots).expect("a batch fits u32");
-        let top_cubes = self.ntlay.div_ceil(JOIN_WG).max(1);
+        let top_cubes = self.ntlay.div_ceil(self.top_wg).max(1);
         let rec_len = TOP_REC_WORDS as usize * max_slots * ntl;
         let (cd16, cdiv16) = chunk_constants_u16(self.b);
         let vs_h = vs_h.clone();
         let grp_cnt = grp_cnt.clone();
         let ran = ran.clone();
+        #[cfg(not(test))]
+        let test = 0;
+        #[cfg(test)]
+        let test = tests::TOP_TEST_BITS.with(std::cell::Cell::get);
         unsafe {
             if fd {
                 let (slot_k, groups) = self.top_fd_groups(nslots_u32);
                 top_fd_kernel::launch_unchecked::<R>(
                     c,
                     CubeCount::Static(top_cubes, groups, 1),
-                    CubeDim::new_1d(JOIN_WG),
+                    CubeDim::new_1d(self.top_wg),
                     ArrayArg::from_raw_parts(self.tlay.clone(), 5 * ntl),
                     ArrayArg::from_raw_parts(vs_h.clone(), nslots),
                     ArrayArg::from_raw_parts(self.fb.clone(), 10),
@@ -3577,13 +3719,14 @@ impl<R: Runtime> JoinDevice<R> {
                     self.f0,
                     self.tq,
                     self.ballot,
+                    test,
                 );
             }
             if !fd || fix {
                 top_kernel::launch_unchecked::<R>(
                     c,
                     CubeCount::Static(top_cubes, nslots_u32, 1),
-                    CubeDim::new_1d(JOIN_WG),
+                    CubeDim::new_1d(self.top_wg),
                     ArrayArg::from_raw_parts(self.tlay.clone(), 5 * ntl),
                     ArrayArg::from_raw_parts(vs_h.clone(), nslots),
                     ArrayArg::from_raw_parts(self.fb.clone(), 10),
@@ -3655,8 +3798,9 @@ impl<R: Runtime> JoinDevice<R> {
             join_cubes,                       // join
             CHECK_CUBES,                      // check
         ];
-        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; expect.len()]));
-        let nran = expect.len();
+        // Two more words: the top stage's account of its appends.
+        let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; RAN_WORDS]));
+        let nran = RAN_WORDS;
         #[cfg(test)]
         if self.bytes > tests::REFUSE_ABOVE.with(std::cell::Cell::get) {
             // A device that runs nothing of a layout this large.
@@ -3776,6 +3920,7 @@ impl<R: Runtime> JoinDevice<R> {
     /// dispatch without an error must not have the batch read as one with
     /// no survivors.
     fn ensure_ran(&self, ran: &[u32], expect: &[u32; STAGES]) -> Result<(), NotRun> {
+        let ran = &ran[..ran.len().min(STAGES)];
         if ran == expect.as_slice() {
             return Ok(());
         }
@@ -3785,6 +3930,20 @@ impl<R: Runtime> JoinDevice<R> {
             ran: ran.to_vec(),
             expect: *expect,
         })
+    }
+
+    /// Whether the top stage appended every top it kept to a record of its
+    /// own that the join reads ([`top_complete`] on `ran`'s account words).
+    /// Call it once [`Self::ensure_ran`] has passed (every cube ran). A
+    /// device whose planes lose or overwrite tops is not fixed by a smaller
+    /// layout: an error, never a field with fewer candidates.
+    ///
+    /// # Errors
+    /// An account other than zero.
+    fn ensure_appended(&self, ran: &[u32]) -> Result<()> {
+        let at = TOP_ACCOUNT as usize;
+        top_complete(ran.get(at).copied(), ran.get(at + 1).copied())
+            .map_err(|e| anyhow!("overlap join b{}: {e}", self.b))
     }
 
     /// Whether a batch dropped prefilter survivors past the end of the list
@@ -3856,6 +4015,36 @@ impl<R: Runtime> JoinDevice<R> {
         v.sort_unstable();
         Ok(v)
     }
+}
+
+/// Whether the top stage's account of its appends ([`TOP_ACCOUNT`]) is
+/// zero: `kept`, the tops its planes kept minus the records they reserved
+/// for them in the group counts, and `sum`, the indices of the records they
+/// wrote minus those of the records they reserved (mod 2^32). A top kept and
+/// not counted (lost to the join, and possibly overwriting another) makes
+/// the count positive, a record counted and not written negative, and a
+/// record written twice in place of one left unwritten moves the sum.
+///
+/// # Errors
+/// An account other than zero (or a missing word).
+fn top_complete(kept: Option<u32>, sum: Option<u32>) -> Result<()> {
+    // Two's complement: a difference, read as signed.
+    #[allow(clippy::cast_possible_wrap)]
+    let signed = |x: Option<u32>| x.map_or_else(|| "none".to_string(), |d| (d as i32).to_string());
+    ensure!(
+        kept == Some(0),
+        "the top stage kept {} more tops than it counted for the join; a device whose planes \
+         lose tops cannot run the join",
+        signed(kept)
+    );
+    ensure!(
+        sum == Some(0),
+        "the record indices the top stage wrote differ from those it counted by {} (mod 2^32): \
+         it wrote some records twice and others not at all; a device that does cannot run the \
+         join",
+        signed(sum)
+    );
+    Ok(())
 }
 
 /// A batch the device did not run in full: a kernel finished fewer cubes
@@ -4259,6 +4448,7 @@ fn run_pass<R: Runtime>(
             left.refused.get_or_insert(why);
             continue;
         }
+        dev.ensure_appended(u32::from_bytes(&counts[3 * i + 2]))?;
         let surv = u32::from_bytes(&counts[3 * i])[0];
         let checked = u32::from_bytes(&counts[3 * i + 1])[0];
         if dev.overflowed(checked) {
@@ -4316,7 +4506,9 @@ fn run_partition<R: Runtime>(
     let mut dev = JoinDevice::new(client, fs, sorted_layer(fs)?, plan)?;
     let rec = dev.launch_batch(&[v], false)?;
     st.batches += 1;
-    dev.ensure_ran(&dev.read_u32(&rec.ran)?, &rec.expect)?;
+    let ran = dev.read_u32(&rec.ran)?;
+    dev.ensure_ran(&ran, &rec.expect)?;
+    dev.ensure_appended(&ran)?;
     let surv = dev.read_u32(&rec.survivors)?[0];
     let checked = dev.read_u32(&rec.checked)?[0];
     if !dev.overflowed(checked) {
@@ -4526,6 +4718,11 @@ mod tests {
         /// macOS runner's paravirtual Metal device, on this thread.
         pub(super) static REFUSE_ABOVE: std::cell::Cell<usize> =
             const { std::cell::Cell::new(usize::MAX) };
+        /// Test bits of the top stage's [`top_fd_kernel`]
+        /// ([`TOP_LANE0_OUT`], [`TOP_SHORT_TAKE`], [`TOP_DUP_RANK`]), on this
+        /// thread.
+        pub(super) static TOP_TEST_BITS: std::cell::Cell<u32> =
+            const { std::cell::Cell::new(0) };
     }
 
     fn client() -> (ComputeClient<cubecl::wgpu::WgpuRuntime>, String) {
@@ -4706,6 +4903,68 @@ mod tests {
         check_slices(client, name);
         check_refused_layouts(client, name);
         check_production_shape(client, name);
+        check_lost_tops(client, name);
+    }
+
+    /// A top stage that does not append exactly the tops it kept, as a
+    /// device whose planes lose tops would: one that reserves a record too
+    /// few for a plane's kept tops ([`TOP_SHORT_TAKE`]: the count is off) and
+    /// one that writes a plane's second kept top over its first
+    /// ([`TOP_DUP_RANK`]: the count is right, the record indices are not).
+    /// On the first test window whose planes keep two tops, the field fails
+    /// with the matching error, in a pass of batches and in a partition's
+    /// re-run, and never comes out as a field with fewer candidates. The
+    /// same field then runs as before.
+    fn check_lost_tops<R: Runtime>(client: &ComputeClient<R>, name: &str) {
+        let set_bits = |bits: u32| TOP_TEST_BITS.with(|c| c.set(bits));
+        let lim = device_limits(client, name);
+        let mut failed = 0;
+        for &(b, s, e, t, k, p) in WINDOWS {
+            let jp = JoinParams { t, k, p };
+            let field = JoinField::prepare(b, &FieldSize::new(s, e), jp, lim)
+                .expect("field setup")
+                .expect("a join field");
+            if !top_fd_runs(&field.fs) {
+                continue;
+            }
+            let (want, _) = run_field(client, &field, &JoinCeiling::default()).expect("runs");
+            let mut here = 0;
+            for (bits, says) in [
+                (TOP_SHORT_TAKE, "more tops than it counted"),
+                (TOP_DUP_RANK, "differ from those it counted"),
+            ] {
+                set_bits(bits);
+                let pass = run_field(client, &field, &JoinCeiling::default());
+                // A partition whose re-run fails the same way.
+                let rerun = live_partitions(&field.fs).into_iter().find_map(|v| {
+                    let (mut st, mut hits) = (JoinFieldStats::default(), Vec::new());
+                    run_partition(client, &field.fs, &field.retry, v, 0, &mut st, &mut hits)
+                        .err()
+                        .map(|e| (v, e.to_string()))
+                });
+                set_bits(0);
+                let Err(err) = pass else {
+                    // No plane of this window keeps two tops.
+                    assert!(rerun.is_none(), "b{b}: only the re-run failed");
+                    continue;
+                };
+                let err = err.to_string();
+                assert!(err.contains(says), "bits {bits}: {err}");
+                let (v, rerr) = rerun.expect("a partition's re-run fails too");
+                assert!(rerr.contains(says), "bits {bits}, partition {v}: {rerr}");
+                println!(
+                    "{name}: b{b} [{s}, {e}) {jp:?}, test bits {bits}: the field fails: {err}"
+                );
+                here += 1;
+            }
+            let (again, _) = run_field(client, &field, &JoinCeiling::default()).expect("runs");
+            assert_eq!(again, want, "b{b} [{s}, {e}): hits after the test bits");
+            failed += here;
+            if here == 2 {
+                break;
+            }
+        }
+        assert_eq!(failed, 2, "{name}: failing runs");
     }
 
     /// The re-run and refusal paths at the production shape (the b57
@@ -6380,11 +6639,14 @@ mod tests {
             }
             let vs_h = c.create(cubecl::bytes::Bytes::from_elems(vs.to_vec()));
             let grp_cnt = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; nslots * nb]));
-            let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; STAGES]));
+            let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; RAN_WORDS]));
             self.launch_top(vs, &vs_h, &grp_cnt, &ran, fd);
             let counts = self.read_u32(&grp_cnt).expect("group counts");
             let want = self.top_expect(vs, fd);
-            assert_eq!(self.read_u32(&ran).expect("ran")[0], want, "top cubes run");
+            let ran = self.read_u32(&ran).expect("ran");
+            assert_eq!(ran[0], want, "top cubes run");
+            self.ensure_appended(&ran)
+                .expect("every kept top appended once");
             let rec = self.read_u32(&self.top_rec).unwrap();
             let goff = self.read_u32(&self.goff).unwrap();
             let ntl = self.ntlay as usize;
@@ -6543,6 +6805,160 @@ mod tests {
         );
     }
 
+    /// `fs` with only `len` of its top-layer prefixes, those from `off` on
+    /// in the device's order (sorted by group, see [`sorted_layer`]), so its
+    /// layer fits one cube and several of a plane's prefixes share a group.
+    fn layer_window(fs: &FieldSetup, off: usize, len: usize) -> FieldSetup {
+        let (b, m1) = (u128::from(fs.b), u128::from(fs.m1));
+        let pdiv = fs.nparts % m1;
+        let group = |p0: u128| {
+            let key = if fs.key_level { p0 % b } else { 0 };
+            key * m1 + (p0 % m1) * pdiv % m1
+        };
+        let mut order: Vec<usize> = (0..fs.tlay.len()).collect();
+        order.sort_by_key(|&i| group(fs.tlay[i].0));
+        let off = off.min(order.len().saturating_sub(len));
+        let mut keep = order[off..(off + len).min(order.len())].to_vec();
+        keep.sort_unstable();
+        with_tops(fs, keep.into_iter().map(|i| fs.tlay[i]).collect())
+    }
+
+    /// [`top_fd_kernel`]'s append (`top_slot`) on planes that are partly
+    /// filled or lack lane 0 must give exactly `top_kernel`'s tops, with the
+    /// account at zero (`run_tops`): cubes of 100 units (each cube's last
+    /// plane holds 4 lanes of a 32- or 8-lane plane), 48 (16 of a warp) and
+    /// production's `JOIN_WG`, in each append form of `forms` (`ballot`: the
+    /// ballot, else the sums and scan), and with `lane0` also with every
+    /// plane's lane 0 appending alone ([`TOP_LANE0_OUT`]: the rest of the
+    /// plane runs without lane 0). The append once took the plane's group and
+    /// atomic from lane 0, and without it wrote kept tops over other planes'.
+    /// On the test windows and the production fields' first slices. `CubeCL`
+    /// takes a unit's lane on CUDA and HIP as its position in the grid
+    /// modulo the plane width (see `run_check`), so there a cube size that is
+    /// not a multiple of 32 runs one cube: the field's layer is cut to a
+    /// window of one cube's prefixes (or a few fewer, so the last plane also
+    /// has dead lanes).
+    fn check_top_partial_planes<R: Runtime>(
+        client: &ComputeClient<R>,
+        name: &str,
+        forms: &[bool],
+        lane0: bool,
+    ) {
+        let lim = device_limits(client, name);
+        let cpp = ["cuda", "hip"].iter().any(|r| R::name(client).contains(r));
+        let mut fields: Vec<(String, FieldSetup, JoinPlan)> = Vec::new();
+        for &(b, s, e, t, k, p) in WINDOWS {
+            let jp = JoinParams { t, k, p };
+            let fs = FieldSetup::new(b, s, e, jp).expect("field setup");
+            let plan = test_plan(&fs, limits_of(client), 4);
+            fields.push((format!("b{b} [{s}, {e}) ({t},{k},{p})"), fs, plan));
+        }
+        for &(b, start, size) in PLAN_FIELDS {
+            let range = FieldSize::new(start, start + size);
+            let field = crate::join_plan::plan_join(b, &range, lim).expect("a join field");
+            fields.push((format!("b{b} {size:e}, first slice"), field.fs, field.plan));
+        }
+        let (mut runs, mut ntops, mut nfields) = (0usize, 0u64, 0usize);
+        for (label, fs, plan) in fields {
+            if !top_fd_fits(&fs) {
+                continue;
+            }
+            nfields += 1;
+            for wg in [100, 48, JOIN_WG] {
+                let one_cube = cpp && !wg.is_multiple_of(32);
+                let subs: Vec<(String, FieldSetup)> = if one_cube {
+                    let mid = fs.tlay.len() / 2;
+                    let wgs = wg as usize;
+                    vec![
+                        (
+                            format!("{label}, prefixes 0..{wgs}"),
+                            layer_window(&fs, 0, wgs),
+                        ),
+                        (
+                            format!("{label}, {} prefixes from {mid}", wgs - 3),
+                            layer_window(&fs, mid, wgs - 3),
+                        ),
+                    ]
+                } else {
+                    vec![(label.clone(), fs.clone())]
+                };
+                for (what, sub) in subs {
+                    let layer = sorted_layer(&sub).expect("sorted layer");
+                    let mut dev = JoinDevice::new(client, &sub, layer, &plan).expect("device");
+                    if one_cube {
+                        assert!(dev.ntlay <= wg, "{what}: one cube");
+                    }
+                    let n = u32::try_from(sub.nparts).expect("b^p < 2^32");
+                    let ms = dev.max_slots;
+                    let mut batches = vec![(0..n.min(u32::try_from(ms).unwrap())).collect()];
+                    let live = live_partitions(&sub);
+                    let step = live.len().div_ceil(96).max(1);
+                    let thinned: Vec<u32> = live.into_iter().step_by(step).take(ms).collect();
+                    batches.push(thinned);
+                    for vs in &batches {
+                        let want = dev.run_tops(vs, false);
+                        ntops += want.0.iter().map(|&x| u64::from(x)).sum::<u64>();
+                        dev.top_wg = wg;
+                        // One slot group: one cube in y (see above).
+                        dev.top_fd_min = 0;
+                        for &ballot in forms {
+                            dev.ballot = ballot;
+                            let bits: &[u32] = if lane0 { &[0, TOP_LANE0_OUT] } else { &[0] };
+                            for &b in bits {
+                                TOP_TEST_BITS.with(|c| c.set(b));
+                                let got = dev.run_tops(vs, true);
+                                TOP_TEST_BITS.with(|c| c.set(0));
+                                let how = format!(
+                                    "{what} {vs:?}: cubes of {wg}, ballot {ballot}, test bits {b}"
+                                );
+                                assert_eq!(want.0, got.0, "{how}: group counts differ");
+                                assert!(want.1 == got.1, "{how}: top entries differ");
+                                runs += 1;
+                            }
+                        }
+                        dev.top_wg = JOIN_WG;
+                        dev.top_fd_min = TOP_FD_MIN_UNITS;
+                    }
+                }
+            }
+        }
+        println!(
+            "{name}: top_fd's append = top_kernel's on partly filled planes{}: {runs} runs on \
+             {nfields} fields ({ntops} tops), append forms (ballot) {forms:?}",
+            if lane0 {
+                " and planes without lane 0"
+            } else {
+                ""
+            }
+        );
+        assert!(nfields > 10 && ntops > 0, "the comparison ran");
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn top_fd_appends_every_top_on_partly_filled_planes() {
+        let (client, name) = client();
+        let ballot = ballot_append(client.properties().hardware.plane_size_max);
+        let forms: &[bool] = if ballot { &[true, false] } else { &[false] };
+        check_top_partial_planes(&client, &name, forms, true);
+    }
+
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_top_fd_appends_every_top_on_partly_filled_warps() {
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        let name = ctx.device_name();
+        let CubeclContext::Cuda { client, .. } = ctx else {
+            unreachable!("new_cuda is CUDA")
+        };
+        // CUDA appends with the ballot (32-lane warps); `CubeCL` lowers the
+        // scan form's sums over all 32 lanes, defined on full warps only, and
+        // its plane ops name every lane of the warp, so a lane that sits out
+        // is not defined there either.
+        check_top_partial_planes(&client, &name, &[true], false);
+    }
+
     /// The FD kernel keeps each power's c0 = max(k, ndig(e^k - a^k)) from
     /// slot to slot and re-forms it (with dm) only when e^k - a^k reaches
     /// b^c0. Only small windows step across such a change, and within
@@ -6590,6 +7006,43 @@ mod tests {
             [true, true],
             "the windows no longer cross a c0 change"
         );
+    }
+
+    /// The host's check of the top stage's account: zero passes; a top kept
+    /// and not counted, or counted and not written, fails on the count; a
+    /// record written twice in place of one fails on the indices (also past
+    /// the wrap of the u32 sum).
+    #[test]
+    fn top_complete_wants_every_kept_top_once() {
+        assert!(top_complete(Some(0), Some(0)).is_ok());
+        let e = top_complete(Some(1), Some(0)).unwrap_err().to_string();
+        assert!(e.contains("kept 1 more tops than it counted"), "{e}");
+        let e = top_complete(Some(u32::MAX), Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("kept -1 more tops"), "{e}");
+        let e = top_complete(Some(0), Some(u32::MAX))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("differ from those it counted by -1"), "{e}");
+        assert!(top_complete(None, Some(0)).is_err());
+        assert!(top_complete(Some(0), None).is_err());
+        // A plane of n kept tops reserving records r0..r0 + n and writing
+        // each once nets to zero in wrapping u32, wherever r0 lies.
+        for (r0, n) in [
+            (0u32, 1u32),
+            (7, 32),
+            (u32::MAX - 40, 32),
+            (3_000_000_000, 17),
+        ] {
+            let reserved = n.wrapping_mul(r0).wrapping_add(n * (n - 1) / 2);
+            let written = (0..n).fold(0u32, |a, j| a.wrapping_add(r0.wrapping_add(j)));
+            let (dn, ds) = (n.wrapping_sub(n), written.wrapping_sub(reserved));
+            assert!(top_complete(Some(dn), Some(ds)).is_ok(), "r0 {r0}, n {n}");
+            // The second written over the first.
+            let dup = written.wrapping_sub(1);
+            assert!(top_complete(Some(dn), Some(dup.wrapping_sub(reserved))).is_err());
+        }
     }
 
     /// The FD kernel's append ranks kept tops with a ballot only on planes
@@ -6810,7 +7263,7 @@ mod tests {
                 let c = &dev.client;
                 let vs_h = c.create(cubecl::bytes::Bytes::from_elems(vs.clone()));
                 let gc = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; vs.len() * nb]));
-                let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; STAGES]));
+                let ran = c.create(cubecl::bytes::Bytes::from_elems(vec![0u32; RAN_WORDS]));
                 dev.launch_top(vs, &vs_h, &gc, &ran, fd);
                 last = Some(ran);
             }
