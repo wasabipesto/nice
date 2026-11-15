@@ -36,16 +36,6 @@ const DETAILED_REFILL_AMOUNT: usize = 100;
 const NEXT_REFILL_THRESHOLD: usize = 20;
 const NEXT_REFILL_AMOUNT: usize = 100;
 
-/// The detailed queues drop a pre-claimed field, instead of handing it out, once
-/// its claim is older than this: a detailed client always gets at least half the
-/// claim window. A dropped field is claimable again when its claim expires.
-///
-/// At today's consumption no detailed queue holds a field this long (each
-/// turns over in minutes), so this only acts if detailed claims slow right down.
-/// The niceonly queue has no age limit: it renews each claim as it hands the
-/// field out (see [`FieldQueue::claim_niceonly`]).
-const DETAILED_MAX_QUEUED_AGE: TimeDelta = TimeDelta::minutes(CLAIM_DURATION_HOURS * 30);
-
 /// How long a request that finds its queue empty waits for a refill already in
 /// flight, instead of claiming directly. Under the client's 5 s request timeout.
 const REFILL_WAIT: Duration = Duration::from_secs(2);
@@ -97,9 +87,6 @@ struct Preclaimed {
     refilling: AtomicBool,
     refilled: Condvar,
     threshold: usize,
-    /// Fields whose claim is older than this are dropped rather than handed
-    /// out. `None`: no age limit, the caller checks each field at hand-out.
-    max_age: Option<TimeDelta>,
 }
 
 /// Clears `Preclaimed::refilling` and wakes the waiters when a refill ends,
@@ -121,7 +108,7 @@ impl Drop for RefillGuard<'_> {
 }
 
 impl Preclaimed {
-    fn new(name: &'static str, threshold: usize, max_age: Option<TimeDelta>) -> Self {
+    fn new(name: &'static str, threshold: usize) -> Self {
         Self {
             name,
             fields: Mutex::new(VecDeque::new()),
@@ -129,38 +116,11 @@ impl Preclaimed {
             refilling: AtomicBool::new(false),
             refilled: Condvar::new(),
             threshold,
-            max_age,
         }
     }
 
     fn len(&self) -> usize {
         self.fields.lock().unwrap().len()
-    }
-
-    /// Whether `field`'s claim is too old to hand out. A field without a claim
-    /// time never came from a bulk claim and is never handed out.
-    fn too_old(&self, field: &FieldRecord, now: chrono::DateTime<Utc>) -> bool {
-        self.max_age
-            .is_some_and(|age| field.last_claim_time.is_none_or(|t| now - t > age))
-    }
-
-    /// Drop the fields too old to hand out, then return how many are left.
-    fn prune(&self) -> usize {
-        let mut queue = self.fields.lock().unwrap();
-        if self.max_age.is_some() {
-            let now = Utc::now();
-            let before = queue.len();
-            queue.retain(|f| !self.too_old(f, now));
-            let dropped = before - queue.len();
-            if dropped > 0 {
-                tracing::info!(
-                    queue = self.name,
-                    dropped,
-                    "Dropped queued fields whose claims are too old to hand out"
-                );
-            }
-        }
-        queue.len()
     }
 
     /// Pop the next pre-claimed field, refilling first (single-flight, via
@@ -174,7 +134,7 @@ impl Preclaimed {
         &self,
         refill: impl FnOnce() -> Result<Vec<FieldRecord>, E>,
     ) -> Option<FieldRecord> {
-        if self.prune() <= self.threshold {
+        if self.len() <= self.threshold {
             // try_lock: winner refills, losers pop whatever is present. A
             // poisoned gate (a previous refill panicked) is treated the same
             // as a contended one — skip, and let the fallback path serve.
@@ -198,13 +158,7 @@ impl Preclaimed {
             }
             queue = self.refilled.wait_timeout(queue, left).unwrap().0;
         }
-        let now = Utc::now();
-        while let Some(field) = queue.pop_front() {
-            if !self.too_old(&field, now) {
-                return Some(field);
-            }
-        }
-        None
+        queue.pop_front()
     }
 
     /// Run one bulk claim and append its result. Callers must hold the refill
@@ -362,22 +316,10 @@ impl FieldQueue {
     /// Create a new field queue with the given database pool.
     pub fn new(pool: PgPool) -> Self {
         Self {
-            niceonly: Preclaimed::new("niceonly", REFILL_THRESHOLD, None),
-            detailed_thin: Preclaimed::new(
-                "detailed-thin",
-                DETAILED_REFILL_THRESHOLD,
-                Some(DETAILED_MAX_QUEUED_AGE),
-            ),
-            detailed_next: Preclaimed::new(
-                "detailed-next",
-                NEXT_REFILL_THRESHOLD,
-                Some(DETAILED_MAX_QUEUED_AGE),
-            ),
-            detailed_recheck: Preclaimed::new(
-                "detailed-recheck",
-                NEXT_REFILL_THRESHOLD,
-                Some(DETAILED_MAX_QUEUED_AGE),
-            ),
+            niceonly: Preclaimed::new("niceonly", REFILL_THRESHOLD),
+            detailed_thin: Preclaimed::new("detailed-thin", DETAILED_REFILL_THRESHOLD),
+            detailed_next: Preclaimed::new("detailed-next", NEXT_REFILL_THRESHOLD),
+            detailed_recheck: Preclaimed::new("detailed-recheck", NEXT_REFILL_THRESHOLD),
             next_cursor: NextCursor::new(),
             recheck_cursor: NextCursor::new(),
             pool,
@@ -1043,43 +985,6 @@ mod tests {
         .last_claim_time
     }
 
-    /// A detailed queue consumed too slowly drops the fields whose claims are
-    /// past `DETAILED_MAX_QUEUED_AGE` instead of handing them out, and refills.
-    fn detailed_queues_drop_old_claims(url: &str) {
-        let pool = test_pool(url, 2);
-        reset_fixture(&mut pool.get().unwrap());
-        let queue = FieldQueue::new(pool.clone());
-        let mut conn = pool.get().unwrap();
-
-        let first = queue
-            .claim_detailed_next(&mut conn, 1)
-            .expect("field")
-            .field_id;
-        assert_eq!(first, 1);
-        let minutes = DETAILED_MAX_QUEUED_AGE.num_minutes() + 1;
-        sql_query(format!(
-            "UPDATE fields SET last_claim_time = last_claim_time - interval '{minutes} minutes'
-             WHERE last_claim_time IS NOT NULL"
-        ))
-        .execute(&mut conn)
-        .expect("age claims");
-        for field in queue.detailed_next.fields.lock().unwrap().iter_mut() {
-            field.last_claim_time = field
-                .last_claim_time
-                .map(|t| t - TimeDelta::minutes(minutes));
-        }
-
-        let next = queue
-            .claim_detailed_next(&mut conn, 1)
-            .expect("a field from a new refill")
-            .field_id;
-        assert!(
-            next > NEXT_REFILL_AMOUNT as u128,
-            "a field with an old claim was handed out ({next})"
-        );
-        assert!(queue.detailed_next_queue_size() < NEXT_REFILL_AMOUNT);
-    }
-
     #[test]
     fn field_queue_against_postgres() {
         let Ok(url) = std::env::var("NICE_TEST_DATABASE_URL") else {
@@ -1096,7 +1001,6 @@ mod tests {
         a_statement_timeout_releases_a_pinned_frontier(&url);
         a_slow_niceonly_queue_hands_no_field_out_twice(&url);
         niceonly_claims_are_renewed_at_hand_out(&url);
-        detailed_queues_drop_old_claims(&url);
     }
 
     fn record(id: u128) -> FieldRecord {
@@ -1123,7 +1027,7 @@ mod tests {
     /// `None` (which sends it to a direct claim).
     #[test]
     fn an_empty_queue_waits_for_the_refill_in_flight() {
-        let queue = Preclaimed::new("test", 0, None);
+        let queue = Preclaimed::new("test", 0);
         std::thread::scope(|s| {
             let winner = s.spawn(|| {
                 queue.claim(|| {
@@ -1146,7 +1050,7 @@ mod tests {
     /// after the full `REFILL_WAIT`.
     #[test]
     fn an_empty_refill_releases_its_waiters() {
-        let queue = Preclaimed::new("test", 0, None);
+        let queue = Preclaimed::new("test", 0);
         std::thread::scope(|s| {
             s.spawn(|| {
                 queue.claim(|| {
@@ -1185,37 +1089,5 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(queue[2].last_claim_time, Some(new));
         assert_eq!(queue[0].last_claim_time, Some(old));
-    }
-
-    /// A queue with an age limit drops the fields past it before deciding
-    /// whether to refill, so a queue of old fields refills and serves a new one.
-    #[test]
-    fn an_aged_queue_drops_old_fields_and_refills() {
-        let queue = Preclaimed::new("test", 1, Some(TimeDelta::minutes(30)));
-        let old = Utc::now() - TimeDelta::minutes(31);
-        queue
-            .fields
-            .lock()
-            .unwrap()
-            .extend((1..=5).map(|id| claimed(id, old)));
-        let field = queue
-            .claim(|| Ok::<_, String>(vec![record(6), record(7)]))
-            .expect("a field from the refill");
-        assert_eq!(field.field_id, 6);
-        assert_eq!(queue.len(), 1);
-
-        // Without an age limit the same queue hands its oldest field out.
-        let queue = Preclaimed::new("test", 1, None);
-        queue
-            .fields
-            .lock()
-            .unwrap()
-            .extend((1..=5).map(|id| claimed(id, old)));
-        let field = queue
-            .claim(|| -> Result<Vec<FieldRecord>, String> {
-                panic!("no refill above the threshold")
-            })
-            .expect("field");
-        assert_eq!(field.field_id, 1);
     }
 }
