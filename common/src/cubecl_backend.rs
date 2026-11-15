@@ -29,7 +29,7 @@
 
 use crate::client_process::process_range_detailed;
 use crate::cubecl_detailed_fd::{FD_RUN_LEN, detailed_fd_kernel, fd_plan};
-use crate::cubecl_join::{JoinPipeline, limits_of, run_slices};
+use crate::cubecl_join::{JoinPipeline, ballot_append, limits_of, run_slices};
 use crate::gpu_config::{
     VulkanPrefilterParams, chunk_constants_u16, gpu_supports_base, n_limbs, vulkan_prefilter_params,
 };
@@ -352,6 +352,9 @@ fn detailed_kernel(
 
 /// u32 slots per niceonly hit: n as four u32 limbs.
 pub const NICEONLY_STRIDE: u32 = 4;
+/// Words of the stride walk's count buffer: the hits written, then the
+/// survivor queues' account (see `queue_complete`).
+const NICEONLY_COUNT_WORDS: usize = 3;
 
 /// Capacity of the niceonly output buffer (in nice numbers) per field.
 /// Genuinely nice numbers are astronomically rare; this is pure headroom.
@@ -896,6 +899,8 @@ fn niceonly_kernel(
     #[comptime] cross: bool, // cross-end residue filter (certificate x low mask)
     #[comptime] compact: bool, // plane-compact mask survivors before checking
     #[comptime] plane_scoped: bool, // compaction queue per plane (needs Plane::Sync)
+    #[comptime] ballot: bool, // queue ranks by ballot (planes of at most 32 lanes)
+    #[comptime] test_bits: u32, // test-only queue faults; 0 in production
 ) {
     let cu_limbs = comptime!(3 * limbs);
     let offset_chunks = comptime!(64 / offset_chunk_bits);
@@ -920,18 +925,69 @@ fn niceonly_kernel(
     if comptime!(compact && plane_scoped) {
         // Plane-scoped compaction: the same cursors and survivor production
         // as the cube-scoped path below, but each plane owns a private
-        // queue (2*PLANE_DIM slots) in shared memory, takes positions
-        // straight from plane_exclusive_sum, fences the write->drain handoff
-        // with sync_plane, and drains in PLANE_DIM-wide waves. No cube
-        // barrier, no serial walk over plane totals, and a plane whose
-        // ranges are exhausted leaves as soon as its queue is dry instead
-        // of idling through the other planes' iterations. Control flow is
-        // plane-uniform: `qn` comes from plane_sum and `done` from
-        // plane_all. Requires Plane::Sync (spirv/msl/cuda; not wgsl).
+        // queue (two slots per lane) in shared memory, takes positions
+        // from its own ranks, fences the write->drain handoff with
+        // sync_plane, and drains in waves as wide as the plane. No cube
+        // barrier in the loop, no serial walk over plane totals, and a plane
+        // whose ranges are exhausted leaves as soon as its queue is dry
+        // instead of idling through the other planes' iterations. Control
+        // flow is plane-uniform: `qn` comes from the plane's count and
+        // `done` from plane_all. Requires Plane::Sync (spirv/msl/cuda; not
+        // wgsl).
+        //
+        // Only the lanes that run decide: a lane's rank and the plane's lane
+        // count come from a ballot (planes of at most 32 lanes) or a scan
+        // over the lanes that execute it, never from PLANE_DIM, the
+        // lane's UNIT_POS_X or a lane 0, so a partly filled plane, one
+        // without lane 0 or one whose lanes are not consecutive in
+        // UNIT_POS_X drains every survivor it queues. Its queue is reserved
+        // once, by its lowest running lane, from a cube counter: two slots
+        // for each running lane, so the planes' queues are disjoint and fit
+        // the cube's 2*CUBE_DIM_X slots however the cube is cut into planes.
+        // Survivors queued minus survivors checked by this lane, and the same
+        // for their low words (mod 2^32); see `report_queue_account`.
+        let mut q_acct = SharedMemory::<Atomic<u32>>::new(4usize);
+        let mut acc_n = 0u32;
+        let mut acc_s = 0u32;
+        clear_queue_account(&mut q_acct);
         let mut q_lo = SharedMemory::<u64>::new(comptime!((2 * WORKGROUP_SIZE) as usize));
         let mut q_hi = SharedMemory::<u64>::new(comptime!((2 * WORKGROUP_SIZE) as usize));
-        let qbase = PLANE_POS * (2u32 * PLANE_DIM);
-        let lane_in_plane = UNIT_POS_X % PLANE_DIM;
+        // q_acct[0] counts the reserved slots (cleared above).
+        sync_cube();
+        let lt = (1u32 << UNIT_POS_PLANE) - 1u32;
+        let zero = 0u32.runtime();
+        let one = 1u32.runtime();
+        let bl0 = if comptime!(ballot) {
+            let bal = plane_ballot(true);
+            bal[0usize]
+        } else {
+            zero
+        };
+        let mut rank = if comptime!(ballot) {
+            (bl0 & lt).count_ones()
+        } else {
+            plane_exclusive_sum(one)
+        };
+        let mut n = if comptime!(ballot) {
+            bl0.count_ones()
+        } else {
+            plane_sum(one)
+        };
+        // The lowest running lane (ballot form): rank 0.
+        let lead = if comptime!(ballot) {
+            (bl0 ^ (bl0 - 1u32)).count_ones() - 1u32
+        } else {
+            zero
+        };
+        let mut got = 0u32;
+        if rank == 0u32 {
+            got = q_acct[0].fetch_add(2u32 * n);
+        }
+        let qbase = if comptime!(ballot) {
+            plane_shuffle(got, lead)
+        } else {
+            plane_sum(got)
+        };
 
         let mut r = ABSOLUTE_POS_X >> lane_shift;
         let mut have_range = r < num_ranges;
@@ -1037,26 +1093,78 @@ fn niceonly_kernel(
                 }
             }
 
-            let idx_in_plane = plane_exclusive_sum(pf);
-            let tot = plane_sum(pf);
+            // Position among this plane's survivors and their number, with
+            // this lane's rank among the running lanes and their number
+            // (the scan form packs both counts into one scan and one sum:
+            // survivors in the low 16 bits, lanes above).
+            let v = pf | 65536u32;
+            let ex = if comptime!(ballot) {
+                zero
+            } else {
+                plane_exclusive_sum(v)
+            };
+            let sv = if comptime!(ballot) {
+                zero
+            } else {
+                plane_sum(v)
+            };
+            let bp = if comptime!(ballot) {
+                let bal = plane_ballot(pf != 0u32);
+                bal[0usize]
+            } else {
+                zero
+            };
+            let bl = if comptime!(ballot) {
+                let bal = plane_ballot(true);
+                bal[0usize]
+            } else {
+                zero
+            };
+            let idx_in_plane = if comptime!(ballot) {
+                (bp & lt).count_ones()
+            } else {
+                ex & 65535u32
+            };
+            let tot = if comptime!(ballot) {
+                bp.count_ones()
+            } else {
+                sv & 65535u32
+            };
+            rank = if comptime!(ballot) {
+                (bl & lt).count_ones()
+            } else {
+                ex >> 16u32
+            };
+            n = if comptime!(ballot) {
+                bl.count_ones()
+            } else {
+                sv >> 16u32
+            };
             let done = plane_all(!have_range);
             if pf != 0u32 {
                 let dst = (qbase + qn + idx_in_plane) as usize;
                 q_lo[dst] = cand_lo;
                 q_hi[dst] = cand_hi;
+                acc_n += 1u32;
+                acc_s += u32::cast_from(cand_lo);
             }
             qn += tot;
             // Queue writes become visible to the drain below.
             sync_plane();
 
+            // A wave takes one entry per running lane (the newest), or what
+            // is left once the plane's ranges are done. The queue holds less
+            // than `n` entries between waves, so `qn + tot < 2n` fits.
             let mut take = 0u32;
-            if qn >= PLANE_DIM {
-                take = PLANE_DIM;
+            if qn >= n {
+                take = n;
             } else if done {
                 take = qn;
             }
-            if lane_in_plane < take {
-                let s = (qbase + qn - take + lane_in_plane) as usize;
+            let s = queue_slot(qbase + qn - take + rank, qbase, test_bits);
+            if rank < take && queue_kept(s, qbase, test_bits) {
+                acc_n -= 1u32;
+                acc_s -= u32::cast_from(q_lo[s]);
                 candidate_check(
                     q_lo[s],
                     q_hi[s],
@@ -1083,6 +1191,7 @@ fn niceonly_kernel(
                 break;
             }
         }
+        report_queue_account(&mut q_acct, acc_n, acc_s, nice_count);
     } else if compact {
         // Cube-compacted enumeration (cross filter survivors only).
         //
@@ -1095,20 +1204,35 @@ fn niceonly_kernel(
         // The queue is cube-scoped rather than plane-scoped because WGSL
         // has no plane barrier (cubecl's sync_plane panics in the wgsl
         // compiler), so the write->read handoff is fenced with sync_cube.
-        // Queue positions come from a two-level scan: plane_exclusive_sum
-        // within a plane, plane totals through shared memory. Control flow
-        // is cube-uniform: every thread runs every iteration with exactly
-        // two barriers, planes whose ranges are exhausted just stop
-        // producing, and everyone leaves together once the queue is dry.
-        // Wave-size agnostic: nothing assumes a plane width, only that it
-        // divides CUBE_DIM_X.
+        // Queue positions come from a two-level scan: each lane's position
+        // among its plane's survivors, and the plane's offset, which the
+        // plane's lowest running lane reserves with one atomic add of the
+        // plane's total on a shared word. Control flow is cube-uniform:
+        // every thread runs every iteration with exactly two barriers, planes
+        // whose ranges are exhausted just stop producing, and everyone leaves
+        // together once the queue is dry.
+        //
+        // Only the lanes that run decide: ranks and totals come from a ballot
+        // (planes of at most 32 lanes) or a scan over the lanes that execute
+        // it, so nothing assumes a plane width, full planes, a lane 0, or
+        // planes laid out along UNIT_POS_X. The shared word packs the
+        // planes' survivors (bits 0-9) and running lanes with ranges left
+        // (bits 10-19); words 0 and 1 of `q_acct` alternate between
+        // iterations, so unit 0 can clear the next iteration's word while
+        // this one's is still being read (it was last read before barrier 1
+        // of this iteration, and is next added to after barrier 1 of the
+        // next).
+        // Survivors queued minus survivors checked by this lane, and the same
+        // for their low words (mod 2^32); see `report_queue_account`.
+        let mut q_acct = SharedMemory::<Atomic<u32>>::new(4usize);
+        let mut acc_n = 0u32;
+        let mut acc_s = 0u32;
+        clear_queue_account(&mut q_acct);
         let mut q_lo = SharedMemory::<u64>::new(comptime!((2 * WORKGROUP_SIZE) as usize));
         let mut q_hi = SharedMemory::<u64>::new(comptime!((2 * WORKGROUP_SIZE) as usize));
-        // Indexed by plane id; sized for the narrowest plane wgpu allows.
-        let mut plane_tot = SharedMemory::<u32>::new(comptime!(WORKGROUP_SIZE as usize));
-        let mut plane_done = SharedMemory::<u32>::new(comptime!(WORKGROUP_SIZE as usize));
-        let my_plane = UNIT_POS_X / PLANE_DIM;
-        let num_planes = CUBE_DIM_X / PLANE_DIM;
+        let lt = (1u32 << UNIT_POS_PLANE) - 1u32;
+        let zero = 0u32.runtime();
+        let mut it: u32 = 0u32;
 
         let mut r = ABSOLUTE_POS_X >> lane_shift;
         let mut have_range = r < num_ranges;
@@ -1214,45 +1338,85 @@ fn niceonly_kernel(
                 }
             }
 
-            let idx_in_plane = plane_exclusive_sum(pf);
-            let tot = plane_sum(pf);
-            let pd = plane_all(!have_range);
-            if UNIT_POS_PLANE == 0u32 {
-                plane_tot[my_plane as usize] = tot;
-                let mut d = 0u32;
-                if pd {
-                    d = 1u32;
-                }
-                plane_done[my_plane as usize] = d;
+            let mut v = pf | 1_048_576u32;
+            if have_range {
+                v |= 1024u32;
             }
-            // Barrier 1: plane totals/done flags become visible, and the
-            // previous iteration's drain reads are ordered before this
-            // iteration's queue writes reuse those slots.
+            let ex = if comptime!(ballot) {
+                zero
+            } else {
+                plane_exclusive_sum(v)
+            };
+            let bp = if comptime!(ballot) {
+                let bal = plane_ballot(pf != 0u32);
+                bal[0usize]
+            } else {
+                zero
+            };
+            let bh = if comptime!(ballot) {
+                let bal = plane_ballot(have_range);
+                bal[0usize]
+            } else {
+                zero
+            };
+            let bl = if comptime!(ballot) {
+                let bal = plane_ballot(true);
+                bal[0usize]
+            } else {
+                zero
+            };
+            let idx_in_plane = if comptime!(ballot) {
+                (bp & lt).count_ones()
+            } else {
+                ex & 1023u32
+            };
+            let rank = if comptime!(ballot) {
+                (bl & lt).count_ones()
+            } else {
+                ex >> 20u32
+            };
+            let lead = if comptime!(ballot) {
+                (bl ^ (bl - 1u32)).count_ones() - 1u32
+            } else {
+                zero
+            };
+            let add = if comptime!(ballot) {
+                bp.count_ones() | (bh.count_ones() << 10u32)
+            } else {
+                plane_sum(v) & 1_048_575u32
+            };
+            let w: u32 = it & 1u32;
+            // Barrier 1: the previous iteration's drain reads are ordered
+            // before this iteration's queue writes reuse those slots, and
+            // unit 0's clearing of word `w` before the adds below.
             sync_cube();
 
-            let mut base_off = qn;
-            let mut incoming = 0u32;
-            let mut all_done = true;
-            let mut p = 0u32;
-            while p < num_planes {
-                let t = plane_tot[p as usize];
-                if p < my_plane {
-                    base_off += t;
-                }
-                incoming += t;
-                if plane_done[p as usize] == 0u32 {
-                    all_done = false;
-                }
-                p += 1u32;
+            let mut got = 0u32;
+            if rank == 0u32 {
+                got = q_acct[w as usize].fetch_add(add);
             }
+            let off = if comptime!(ballot) {
+                plane_shuffle(got, lead)
+            } else {
+                plane_sum(got)
+            };
             if pf != 0u32 {
-                let dst = (base_off + idx_in_plane) as usize;
+                let dst = (qn + (off & 1023u32) + idx_in_plane) as usize;
                 q_lo[dst] = cand_lo;
                 q_hi[dst] = cand_hi;
+                acc_n += 1u32;
+                acc_s += u32::cast_from(cand_lo);
             }
-            qn += incoming;
-            // Barrier 2: queue writes become visible to the drain below.
+            // Barrier 2: queue writes and the planes' adds become visible.
             sync_cube();
+            let tw = q_acct[w as usize].load();
+            let incoming = tw & 1023u32;
+            let all_done = (tw >> 10u32) == 0u32;
+            qn += incoming;
+            if UNIT_POS_X == 0u32 {
+                q_acct[(1u32 - w) as usize].store(0u32);
+            }
+            it += 1u32;
 
             // qn and all_done are cube-uniform (derived from the shared
             // totals alone), so drain sizing and loop exit stay uniform.
@@ -1262,8 +1426,10 @@ fn niceonly_kernel(
             } else if all_done {
                 take = qn;
             }
-            if UNIT_POS_X < take {
-                let s = (qn - take + UNIT_POS_X) as usize;
+            let s = queue_slot(qn - take + UNIT_POS_X, 0u32, test_bits);
+            if UNIT_POS_X < take && queue_kept(s, 0u32, test_bits) {
+                acc_n -= 1u32;
+                acc_s -= u32::cast_from(q_lo[s]);
                 candidate_check(
                     q_lo[s],
                     q_hi[s],
@@ -1288,6 +1454,7 @@ fn niceonly_kernel(
                 break;
             }
         }
+        report_queue_account(&mut q_acct, acc_n, acc_s, nice_count);
     } else {
         let mut r = ABSOLUTE_POS_X >> lane_shift;
         while r < num_ranges {
@@ -1404,6 +1571,88 @@ fn niceonly_kernel(
             r += nwarps;
         }
     }
+}
+
+/// Clear a queue's shared words (ordered before their first use by the
+/// queue's first cube barrier): words 0-1 for the queue's own use, 2-3 for
+/// [`report_queue_account`].
+///
+/// Units 0-3 clear one word each, so the clear is a single store in a
+/// loop, and it must stay one. `cubecl-opt`'s expression merge, which only
+/// the direct SPIR-V compiler runs, keeps the first of several atomic
+/// stores of one value in a basic block and drops the rest, whatever they
+/// point at: a store's target is not part of what the pass compares. Four
+/// `store(0)` in a row by one unit came out as a single store to word 0, so
+/// words 1-3 kept whatever the workgroup's memory held, and the account
+/// read that as survivors queued and never checked.
+#[cube]
+fn clear_queue_account(q_acct: &mut SharedMemory<Atomic<u32>>) {
+    let mut i = UNIT_POS_X;
+    while i < 4u32 {
+        q_acct[i as usize].store(0u32);
+        i += CUBE_DIM_X;
+    }
+}
+
+/// Add the cube's queue account to `nice_count[1..3]` if it is not zero:
+/// each lane's survivors queued minus survivors it checked, and the same for
+/// their low words (mod 2^32). The host requires both totals to be zero, so
+/// a survivor queued and never checked, or checked in place of another,
+/// fails the field. Called after the queue loop, which every unit leaves, so
+/// the whole cube reaches the barrier.
+#[cube]
+fn report_queue_account(
+    q_acct: &mut SharedMemory<Atomic<u32>>,
+    acc_n: u32,
+    acc_s: u32,
+    nice_count: &mut Array<Atomic<u32>>,
+) {
+    if acc_n != 0u32 || acc_s != 0u32 {
+        q_acct[2].fetch_add(acc_n);
+        q_acct[3].fetch_add(acc_s);
+    }
+    sync_cube();
+    if UNIT_POS_X == 0u32 {
+        let dn = q_acct[2].load();
+        let ds = q_acct[3].load();
+        if dn != 0u32 || ds != 0u32 {
+            nice_count[1].fetch_add(dn);
+            nice_count[2].fetch_add(ds);
+        }
+    }
+}
+
+/// Test-only faults in [`niceonly_kernel`]'s survivor queues (`test_bits`;
+/// production launches pass 0): leave the entry at a queue's first slot
+/// unchecked and uncounted, or check the first slot's entry in place of the
+/// second's. Both must fail the field on the host.
+pub(crate) const QUEUE_SKIP_FIRST: u32 = 1;
+pub(crate) const QUEUE_DUP_FIRST: u32 = 2;
+
+/// The queue slot a drain lane reads for queue position `pos` (`first` is
+/// the queue's first slot); the identity unless [`QUEUE_DUP_FIRST`].
+#[cube]
+fn queue_slot(pos: u32, first: u32, #[comptime] test_bits: u32) -> usize {
+    if comptime!(test_bits & QUEUE_DUP_FIRST != 0) {
+        if pos == first + 1u32 {
+            first as usize
+        } else {
+            pos as usize
+        }
+    } else {
+        pos as usize
+    }
+}
+
+/// Whether a drain lane checks the entry at `slot`: always, unless
+/// [`QUEUE_SKIP_FIRST`] and `slot` is the queue's first.
+#[cube]
+fn queue_kept(slot: usize, first: u32, #[comptime] test_bits: u32) -> bool {
+    let mut keep = true;
+    if comptime!(test_bits & QUEUE_SKIP_FIRST != 0) {
+        keep = slot != first as usize;
+    }
+    keep
 }
 
 /// One-thread smoke kernel for [`CubeclContext::new_cuda`]: proves the
@@ -2672,6 +2921,7 @@ fn cached_plan<R: cubecl::prelude::Runtime>(
 /// hand backends never do.
 // Public because it names a field type of the public context enum; its own
 // fields stay private, so nothing outside this module can touch it.
+#[allow(clippy::struct_excessive_bools)]
 pub struct NiceonlyPlan {
     stride_m: u32,
     stride_r: u32,
@@ -2688,6 +2938,9 @@ pub struct NiceonlyPlan {
     /// (default on under `wgpu<spirv>` and `cuda`; `NICE_CUBECL_PLANE_COMPACT=0|1`
     /// overrides; requires `compact` and a device with plane barriers).
     plane_compact: bool,
+    /// Rank the queues' survivors by ballot (`ballot_append`: planes of at
+    /// most 32 lanes) instead of by scan.
+    ballot: bool,
 }
 
 impl NiceonlyPlan {
@@ -2773,6 +3026,7 @@ impl NiceonlyPlan {
             cross,
             compact,
             plane_compact,
+            ballot: ballot_append(client.properties().hardware.plane_size_max),
         })
     }
 }
@@ -2802,6 +3056,16 @@ struct CubeclNiceonlyRun<R: cubecl::prelude::Runtime> {
     /// Force the plane-scoped queue on or off (device tests).
     #[cfg(test)]
     plane_override: Option<bool>,
+    /// Force the queues' ballot (true) or scan (false) form (device tests).
+    #[cfg(test)]
+    ballot_override: Option<bool>,
+    /// Units per cube instead of [`WORKGROUP_SIZE`] (device tests: at most
+    /// that, so the kernel's shared arrays still fit).
+    #[cfg(test)]
+    cube_dim_override: Option<u32>,
+    /// [`QUEUE_SKIP_FIRST`] / [`QUEUE_DUP_FIRST`] (device tests).
+    #[cfg(test)]
+    test_bits: u32,
 }
 
 impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
@@ -2840,7 +3104,10 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
                 * NICEONLY_STRIDE
                     as usize
         ]));
-        let nice_count = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 1]));
+        let nice_count = client.create(cubecl::bytes::Bytes::from_elems(vec![
+            0u32;
+            NICEONLY_COUNT_WORDS
+        ]));
 
         #[allow(clippy::cast_possible_truncation)]
         let fs_mod_m = (field_start % u128::from(plan.stride_m)) as u32;
@@ -2862,6 +3129,12 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
             compact_override: None,
             #[cfg(test)]
             plane_override: None,
+            #[cfg(test)]
+            ballot_override: None,
+            #[cfg(test)]
+            cube_dim_override: None,
+            #[cfg(test)]
+            test_bits: 0,
         })
     }
 
@@ -2890,7 +3163,9 @@ fn read_niceonly_hits<R: cubecl::prelude::Runtime>(
     let bytes = client
         .read_one(nice_count.clone())
         .map_err(|e| anyhow::anyhow!("nice count read failed: {e:?}"))?;
-    let written = u32::from_bytes(&bytes)[0] as usize;
+    let counts = u32::from_bytes(&bytes);
+    queue_complete(base, counts)?;
+    let written = counts[0] as usize;
     ensure!(
         written <= NICEONLY_OUT_CAPACITY,
         "niceonly output buffer overflow: {written} > {NICEONLY_OUT_CAPACITY} \
@@ -2913,6 +3188,33 @@ fn read_niceonly_hits<R: cubecl::prelude::Runtime>(
         .collect();
     hits.sort_by_key(|n| n.number);
     Ok(hits)
+}
+
+/// The stride walk's survivor queues checked every survivor they queued,
+/// once: the kernel adds each cube's survivors queued minus survivors
+/// checked, and the same for their low words (mod 2^32), to `counts[1]` and
+/// `counts[2]` over the field's launches. Both must be zero; a missed
+/// survivor is a missed candidate, so the field fails rather than reporting
+/// fewer hits.
+///
+/// # Errors
+/// Returns an error if either word is not zero, or missing.
+fn queue_complete(base: u32, counts: &[u32]) -> Result<()> {
+    let (Some(&dn), Some(&ds)) = (counts.get(1), counts.get(2)) else {
+        anyhow::bail!("stride walk b{base}: the survivor queue account is missing");
+    };
+    ensure!(
+        dn == 0,
+        "stride walk b{base}: the survivor queues checked {} fewer survivors than they queued",
+        dn.cast_signed()
+    );
+    ensure!(
+        ds == 0,
+        "stride walk b{base}: the survivors the queues checked differ from those they queued \
+         (low words differ by {} mod 2^32)",
+        ds.cast_signed()
+    );
+    Ok(())
 }
 
 /// Certificates as (lo, hi) u32 words, matching the offset encoding; a
@@ -2950,6 +3252,38 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
             return compact && forced;
         }
         compact && self.plan.plane_compact
+    }
+
+    /// Whether the queues rank by ballot (else by scan).
+    fn dispatch_ballot(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.ballot_override {
+            return forced;
+        }
+        self.plan.ballot
+    }
+
+    /// Units per cube.
+    #[allow(clippy::unused_self)]
+    fn cube_dim(&self) -> u32 {
+        #[cfg(test)]
+        if let Some(dim) = self.cube_dim_override {
+            return dim.min(WORKGROUP_SIZE);
+        }
+        WORKGROUP_SIZE
+    }
+
+    /// The kernel's test-only queue faults; 0 outside device tests.
+    #[allow(clippy::unused_self)]
+    fn test_bits(&self) -> u32 {
+        #[cfg(test)]
+        {
+            self.test_bits
+        }
+        #[cfg(not(test))]
+        {
+            0
+        }
     }
 }
 
@@ -2996,6 +3330,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn launch(&mut self, _field: u64, offsets: &[u64], lens: &[u32], masks: &[u64]) -> Result<()> {
         ensure!(
             offsets.len() == lens.len() && offsets.len() == masks.len(),
@@ -3051,9 +3386,10 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
             });
         let num_ranges = u32::try_from(offsets.len()).unwrap_or(u32::MAX);
         let threads = u64::from(num_ranges) << lane_shift;
+        let cube_dim = self.cube_dim();
         #[allow(clippy::cast_possible_truncation)]
         let cubes = threads
-            .div_ceil(u64::from(WORKGROUP_SIZE))
+            .div_ceil(u64::from(cube_dim))
             .clamp(1, u64::from(MAX_CUBES)) as u32;
 
         let (pre_limbs, pre_chunk_digits, pre_chunk_div) = self
@@ -3066,7 +3402,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
             niceonly_kernel::launch_unchecked::<R>(
                 &self.client,
                 CubeCount::Static(cubes, 1, 1),
-                CubeDim::new_1d(WORKGROUP_SIZE),
+                CubeDim::new_1d(cube_dim),
                 ArrayArg::from_raw_parts(self.plan.residues.clone(), self.plan.stride_r as usize),
                 ArrayArg::from_raw_parts(offsets_handle, offsets.len() * 2),
                 ArrayArg::from_raw_parts(lens_handle, lens.len()),
@@ -3074,7 +3410,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
                     self.nice_out.clone(),
                     NICEONLY_OUT_CAPACITY * NICEONLY_STRIDE as usize,
                 ),
-                ArrayArg::from_raw_parts(self.nice_count.clone(), 1),
+                ArrayArg::from_raw_parts(self.nice_count.clone(), NICEONLY_COUNT_WORDS),
                 ArrayArg::from_raw_parts(
                     self.plan.low_masks.clone(),
                     if self.plan.cross {
@@ -3107,6 +3443,8 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
                 self.plan.cross,
                 compact,
                 self.dispatch_plane_scoped(compact),
+                self.dispatch_ballot(),
+                self.test_bits(),
             );
         }
         Ok(())
@@ -3814,5 +4152,262 @@ mod tests {
                 gpu.nice_numbers.len()
             );
         }
+    }
+
+    /// Whether a wgpu device runs the plane-scoped queue: it needs a plane
+    /// barrier, and llvmpipe's misses survivors (see
+    /// [`is_software_rasterizer`]), so on lavapipe only the cube-scoped queue
+    /// is tested.
+    fn plane_queue_runs<R: cubecl::prelude::Runtime>(
+        client: &cubecl::prelude::ComputeClient<R>,
+        device: &str,
+    ) -> bool {
+        let plane_sync = client
+            .properties()
+            .features
+            .plane
+            .contains(cubecl::ir::features::Plane::Sync);
+        if plane_sync && is_software_rasterizer(device) {
+            println!("{device}: the plane-scoped queue is not tested (plane barrier)");
+        }
+        plane_sync && !is_software_rasterizer(device)
+    }
+
+    /// The window, certificate and host-mirror survivors of the queue tests:
+    /// b50 (no prefilter, so every queued survivor is reported in probe
+    /// mode) and b40 (prefilter), with certificates that fire.
+    fn queue_cases() -> Vec<(u32, u64, u128, u32, Vec<u128>)> {
+        let mut cases = Vec::new();
+        for (base, mask) in [
+            (50u32, (1u64 << 3) | (1u64 << 45)),
+            (40, (1u64 << 5) | (1u64 << 39)),
+        ] {
+            let pre = vulkan_prefilter_params(base);
+            let table = StrideTable::new(base, GPU_LSD_K);
+            let start = crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap()
+                .range_start;
+            let len: u32 = 400_000;
+            let end = start + u128::from(len);
+            let (mut n, mut idx) = table.first_valid_at_or_after(start);
+            let mut want = Vec::new();
+            while n < end {
+                if table.low_digit_masks[idx] & mask == 0
+                    && pre.is_none_or(|p| prefilter_mirror(n, base, &p))
+                {
+                    want.push(n);
+                }
+                n += u128::from(table.gap_table[idx]);
+                idx = (idx + 1) % table.gap_table.len();
+            }
+            assert!(want.len() < NICEONLY_OUT_CAPACITY / 2);
+            cases.push((base, mask, start, len, want));
+        }
+        cases
+    }
+
+    /// The queued stride walk's survivor set (probe mode) against the host
+    /// mirror on cubes of `dims` units, so that a cube's last plane is
+    /// partly filled wherever `dim` is not a multiple of the plane width,
+    /// for each queue (`plane`: per plane, else per cube) and rank form
+    /// (`forms`: ballot, scan). The window is cut into one range per
+    /// `1 << shift` units, so that every unit has candidates and the launch
+    /// is one cube (`CubeCL`'s CUDA lane id is right only in a grid's first
+    /// cube when cubes are not whole warps). Returns the runs that lost,
+    /// duplicated or failed, after printing every run.
+    fn queue_partial_planes<R: cubecl::prelude::Runtime>(
+        client: &cubecl::prelude::ComputeClient<R>,
+        planes: &[bool],
+        forms: &[bool],
+        dims: &[u32],
+    ) -> Vec<String> {
+        let mut bad = Vec::new();
+        let mut runs = 0usize;
+        for (base, mask, start, len, want) in queue_cases() {
+            for &plane in planes {
+                for &ballot in forms {
+                    for &dim in dims {
+                        for shift in [0u32, 2] {
+                            let nr = dim >> shift;
+                            let step = len / nr;
+                            let offsets: Vec<u64> = (0..nr).map(|i| u64::from(i * step)).collect();
+                            let lens: Vec<u32> = (0..nr)
+                                .map(|i| if i + 1 == nr { len - i * step } else { step })
+                                .collect();
+                            let masks = vec![mask; nr as usize];
+                            let mut run = CubeclNiceonlyRun::new(client, base, start, false)
+                                .expect("probe run");
+                            run.probe = true;
+                            run.compact_override = Some(true);
+                            run.plane_override = Some(plane);
+                            run.ballot_override = Some(ballot);
+                            run.cube_dim_override = Some(dim);
+                            run.lane_shift_override = Some(shift);
+                            run.launch(0, &offsets, &lens, &masks).expect("dispatch");
+                            let tag = format!(
+                                "b{base} plane={plane} ballot={ballot} cube={dim} lanes/range={}",
+                                1u32 << shift
+                            );
+                            runs += 1;
+                            match run.finish() {
+                                Err(e) => {
+                                    println!("{tag}: FAILED: {e:#}");
+                                    bad.push(format!("{tag}: {e:#}"));
+                                }
+                                Ok(hits) => {
+                                    let mut got: Vec<u128> =
+                                        hits.iter().map(|n| n.number).collect();
+                                    got.sort_unstable();
+                                    let mut uniq = got.clone();
+                                    uniq.dedup();
+                                    let missing = want
+                                        .iter()
+                                        .filter(|n| uniq.binary_search(n).is_err())
+                                        .count();
+                                    let dup = got.len() - uniq.len();
+                                    let extra = uniq
+                                        .iter()
+                                        .filter(|n| want.binary_search(n).is_err())
+                                        .count();
+                                    println!(
+                                        "{tag}: {} of {} survivors, {missing} missing, {dup} \
+                                         duplicated, {extra} extra",
+                                        got.len(),
+                                        want.len()
+                                    );
+                                    if got != want {
+                                        bad.push(format!(
+                                            "{tag}: {missing} missing, {dup} duplicated, {extra} extra"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("{runs} runs, {} wrong", bad.len());
+        bad
+    }
+
+    /// Both queues on planes that are partly filled: every survivor is
+    /// checked once, by ballot and by scan, and the host's account agrees.
+    /// lavapipe runs 8-lane subgroups, so cubes of 100 and 36 units end in a
+    /// 4-lane one.
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn cubecl_queues_check_every_survivor_on_partly_filled_planes() {
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        #[allow(irrefutable_let_patterns)]
+        let CubeclContext::Wgpu { client, .. } = &ctx else {
+            unreachable!("new_default returns the wgpu variant");
+        };
+        let planes: &[bool] = if plane_queue_runs(client, &ctx.device_name()) {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        let bad = queue_partial_planes(client, planes, &[true, false], &[256, 100, 48, 36]);
+        assert!(bad.is_empty(), "{} wrong runs: {bad:#?}", bad.len());
+    }
+
+    /// The same on CUDA, one cube: cubes of 100, 48 and 36 units end in a
+    /// warp of 4, 16 and 4 lanes. CUDA always takes the ballot form.
+    /// `NICE_TEST_QUEUE_SCAN` adds the scan form, which is defined on CUDA
+    /// only for whole warps (cubecl's CUDA scans read every lane): it is
+    /// exact at these sizes and loses survivors at others (a last warp of
+    /// 31, 17 or 9 lanes), where the account fails the field.
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_queues_check_every_survivor_on_partly_filled_warps() {
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        let CubeclContext::Cuda { client, .. } = &ctx else {
+            unreachable!("new_cuda returns the CUDA variant");
+        };
+        let forms: &[bool] = if std::env::var_os("NICE_TEST_QUEUE_SCAN").is_some() {
+            &[true, false]
+        } else {
+            &[true]
+        };
+        let bad = queue_partial_planes(client, &[true, false], forms, &[256, 100, 48, 36]);
+        assert!(bad.is_empty(), "{} wrong runs: {bad:#?}", bad.len());
+    }
+
+    /// A queue that skips a survivor, or checks one twice in place of
+    /// another, fails the field with the account's message.
+    fn queue_faults<R: cubecl::prelude::Runtime>(
+        client: &cubecl::prelude::ComputeClient<R>,
+        planes: &[bool],
+    ) {
+        let (base, mask, start, len, _) = queue_cases().swap_remove(0);
+        for &plane in planes {
+            for (bits, what) in [
+                (QUEUE_SKIP_FIRST, "fewer survivors than they queued"),
+                (QUEUE_DUP_FIRST, "differ from those they queued"),
+            ] {
+                let mut run =
+                    CubeclNiceonlyRun::new(client, base, start, false).expect("fault run");
+                run.compact_override = Some(true);
+                run.plane_override = Some(plane);
+                run.test_bits = bits;
+                run.launch(0, &[0], &[len], &[mask]).expect("dispatch");
+                let err = run
+                    .finish()
+                    .expect_err("a queue fault must fail the field")
+                    .to_string();
+                println!("plane={plane} bits={bits}: {err}");
+                assert!(err.contains(what), "plane={plane} bits={bits}: {err}");
+            }
+            let mut run = CubeclNiceonlyRun::new(client, base, start, false).expect("clean run");
+            run.compact_override = Some(true);
+            run.plane_override = Some(plane);
+            run.launch(0, &[0], &[len], &[mask]).expect("dispatch");
+            run.finish().expect("the same field without faults");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn cubecl_queue_faults_fail_the_field() {
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        #[allow(irrefutable_let_patterns)]
+        let CubeclContext::Wgpu { client, .. } = &ctx else {
+            unreachable!("new_default returns the wgpu variant");
+        };
+        let planes: &[bool] = if plane_queue_runs(client, &ctx.device_name()) {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        queue_faults(client, planes);
+    }
+
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_queue_faults_fail_the_field() {
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        let CubeclContext::Cuda { client, .. } = &ctx else {
+            unreachable!("new_cuda returns the CUDA variant");
+        };
+        queue_faults(client, &[true, false]);
+    }
+
+    #[test]
+    fn queue_complete_wants_every_queued_survivor_once() {
+        assert!(queue_complete(50, &[0, 0, 0]).is_ok());
+        assert!(queue_complete(50, &[7, 0, 0]).is_ok());
+        let skipped = queue_complete(50, &[0, 1, 12345]).unwrap_err().to_string();
+        assert!(skipped.contains("checked 1 fewer survivors"), "{skipped}");
+        let dup = queue_complete(50, &[0, 0, 5]).unwrap_err().to_string();
+        assert!(dup.contains("differ by 5"), "{dup}");
+        let over = queue_complete(50, &[0, u32::MAX, 0])
+            .unwrap_err()
+            .to_string();
+        assert!(over.contains("checked -1 fewer"), "{over}");
+        assert!(queue_complete(50, &[0]).is_err());
     }
 }
