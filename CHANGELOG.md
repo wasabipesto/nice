@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Stop the API handing out a nice-only field twice when its queue is consumed more slowly than the claim window ([#264](https://github.com/wasabipesto/nice/pull/264)).
 - Time out API database statements after 30 seconds, so one stalled claim can no longer block detailed claims and the scheduled jobs ([#238](https://github.com/wasabipesto/nice/pull/238)).
 - Let the `Next` queue's cursor read past longer finished stretches before falling back to a full frontier search ([#238](https://github.com/wasabipesto/nice/pull/238)).
 - Speed up the GPU overlap join's test of each bottom entry against each top: for large batches of tops, transpose the tops' digit masks so that an entry's test against 32 tops is one OR per digit it has, instead of a test per top ([#239](https://github.com/wasabipesto/nice/pull/239)).
@@ -21,6 +22,7 @@
 - Speed up the CPU overlap join's full check of each pair that passes the prefilter: it starts from the digits the join has already proved and computes only the ones in between, two at a time and without long division ([#253](https://github.com/wasabipesto/nice/pull/253)).
 - Speed up the GPU overlap join at base 64 by stepping its top certificates through consecutive partitions there too, as at every other base ([#254](https://github.com/wasabipesto/nice/pull/254)).
 - Speed up the GPU overlap join on AMD's RDNA4 cards by halving the shared-memory stage of the join's prefilter survivors to 512 entries, so that more of its work groups run at once ([#256](https://github.com/wasabipesto/nice/pull/256)).
+- Speed up the GPU overlap join's full check of each survivor by squaring and cubing it in two-digit limbs taken straight from its top's record, with multiplications instead of divisions ([#251](https://github.com/wasabipesto/nice/pull/251)).
 
 ## Nice v3.4.7
 
