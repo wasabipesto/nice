@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Stop the API handing out a nice-only field twice when its queue is consumed more slowly than the claim window ([#NNN](https://github.com/wasabipesto/nice/pull/NNN)).
+- Stop the API handing out a nice-only field twice when its queue is consumed more slowly than the claim window ([#264](https://github.com/wasabipesto/nice/pull/264)).
 - Time out API database statements after 30 seconds, so one stalled claim can no longer block detailed claims and the scheduled jobs ([#238](https://github.com/wasabipesto/nice/pull/238)).
 - Let the `Next` queue's cursor read past longer finished stretches before falling back to a full frontier search ([#238](https://github.com/wasabipesto/nice/pull/238)).
 - Speed up the GPU overlap join's test of each bottom entry against each top: for large batches of tops, transpose the tops' digit masks so that an entry's test against 32 tops is one OR per digit it has, instead of a test per top ([#239](https://github.com/wasabipesto/nice/pull/239)).
