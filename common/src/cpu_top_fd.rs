@@ -27,6 +27,27 @@
 //! steps above the last one (a key's first, or after a gap) seeds the
 //! state: `P`, `P²` and `P³` are converted to digits with reciprocal
 //! multiplies, and the differences are built from those by digit additions.
+//!
+//! # Runs of failing blocks
+//!
+//! A block whose certificate fails on a repeated digit also says how many
+//! of the blocks after it fail the same way ([`TopFdSetup::cert`]'s
+//! `Err`). Say the digit at position `i` of `a^j` repeats one at `i'` of
+//! `a^j'`, both certified. Position `i` is certified exactly when `i >=
+//! from_j = max(c0, h)`, `h` the lowest position from which `a^j` and
+//! `e^j` agree (`TopFdSetup::first_certified`, from which both the
+//! certificate and the run take it), so `X = ⌊a^j/b^i⌋ = ⌊e^j/b^i⌋`. For
+//! every later block `[a', e']` with `e'^j < (X + 1)·b^i` the same holds: `X <= ⌊a'^j/b^i⌋ <=
+//! ⌊e'^j/b^i⌋ <= X` (n ↦ n^j increases), so the digits from `i` up are
+//! `a^j`'s, `e'^j − a'^j < b^i` puts `c0` at or below `i`, and `h <= i`.
+//! Both digits are certified again and still equal, and the certificate
+//! fails. With `e = a + δ` and `G = (X + 1)·b^i − e^j > 0`, the block `D`
+//! steps on has `e'^j − e^j = (e + Dw)^j − e^j <= j(e + Dw)^(j − 1)·Dw`, so
+//! every block before `D_j = G / (j(e + Sw)^(j − 1)·w)` steps (for `D_j <=
+//! S`, any bound on the steps asked about) fails. `G/b^i = 1 − (a^j mod
+//! b^i)/b^i − (e^j − a^j)/b^i`, the first from the top digits of `a^j`
+//! below `i` (rounded up), the second from `d_j`, all in f64 with margins
+//! far above its rounding: the run is a lower bound, never more.
 
 // The digit-array helpers are forced inline: they sit in the per-prefix loop.
 #![allow(clippy::inline_always)]
@@ -35,8 +56,10 @@ use crate::cpu_join::SmallDiv;
 use crate::overlap_join::{Base, Cert, Div64, W4, close_certificate, digit_range_mask};
 
 /// The most steps the state walks to the next prefix; one farther away
-/// seeds it instead.
-const MAX_STEPS: u32 = 4;
+/// seeds it instead. A seed costs about twelve steps; the join's failing
+/// runs (`cpu_join`) leave gaps of several steps between the prefixes it
+/// certifies.
+const MAX_STEPS: u32 = 12;
 
 /// Digits of every digit array: `P³` for every field the join takes, with
 /// the word a carry out of the longest addend runs into.
@@ -189,6 +212,10 @@ fn w4_f64(x: &W4) -> f64 {
 /// error (below 1e-11, see [`TopFdSetup::carry`]).
 const SCREEN_MARGIN: f64 = 1.0 / 1_048_576.0;
 
+/// The margins of a failing run's length ([`TopFdSetup::run_of`]): its
+/// f64 values carry relative errors of a few `2^-52`.
+const RUN_MARGIN: f64 = 1.0 / 1_099_511_627_776.0;
+
 /// The field's constants for stepping its top prefixes.
 pub(crate) struct TopFdSetup {
     b: u32,
@@ -235,6 +262,15 @@ pub(crate) struct TopFdSetup {
     /// b^mid` step with `P`.
     m1: u32,
     bmid: u32,
+    /// Every position `(power index, i)` the certificates can read, the
+    /// slowest-changing first ([`TopFdSetup::run`]).
+    order: Vec<(u8, u8)>,
+    /// `b^i` and `1/b^i` as f64; the steps a failing run is asked about
+    /// (`S`) and `w` as f64.
+    bpow: Vec<f64>,
+    binv: Vec<f64>,
+    span: f64,
+    wf: f64,
 }
 
 /// The state at one prefix `P`: its digit arrays, the binary differences,
@@ -276,12 +312,13 @@ impl Default for TopFd {
 impl TopFdSetup {
     /// The constants for blocks of `w = b^f0`, prefixes stepped by `h = b^o`
     /// up to `phi`, and certificates from position `cap`; `bmid` as in
-    /// [`TopFd`]. `None` if a digit array would not hold its
-    /// values over the field, or the base has no room for the step's
-    /// digits (`b <= 6`); the join then certifies every block by
-    /// `Base::cert`.
-    // b, w, h, o and f0 as in the module docs.
-    #[allow(clippy::many_single_char_names)]
+    /// [`TopFd`]; failing runs ([`Self::cert`]) of at most `span` blocks.
+    /// `None` if a digit array would not hold its values over the field, or
+    /// the base has no room for the step's digits (`b <= 6`); the join then
+    /// certifies every block by `Base::cert`.
+    // b, w, h, o and f0 as in the module docs; positions are below 48 and
+    // the power index below 2 (`order`).
+    #[allow(clippy::many_single_char_names, clippy::cast_possible_truncation)]
     pub(crate) fn try_new(
         base: &Base,
         f0: u32,
@@ -289,6 +326,7 @@ impl TopFdSetup {
         cap: u32,
         phi: u128,
         bmid: u32,
+        span: u32,
     ) -> Option<Self> {
         let b = base.b;
         if !(7..=64).contains(&b) || f0 == 0 || o == 0 {
@@ -340,6 +378,19 @@ impl TopFdSetup {
         let inv = (0..pw.len())
             .map(|c| if c < 2 { 0.0 } else { 1.0 / w4_f64(&pw[c - 2]) })
             .collect();
+        // Position i of a^j changes about every b^i / (j·a^(j − 1)·w) blocks.
+        #[allow(clippy::cast_precision_loss)]
+        let (lb, la) = (f64::from(b).ln(), ((phi * w) as f64).ln());
+        let mut order: Vec<(u8, u8)> = [base.s2, base.s3]
+            .iter()
+            .enumerate()
+            .flat_map(|(j, &sp)| (cap..sp).map(move |i| (j as u8, i as u8)))
+            .collect();
+        let slow =
+            |&(j, i): &(u8, u8)| f64::from(i) * lb - f64::from(j + 2).ln() - f64::from(j + 1) * la;
+        order.sort_by(|x, y| slow(y).total_cmp(&slow(x)));
+        let bpow: Vec<f64> = pw.iter().map(w4_f64).collect();
+        let binv = bpow.iter().map(|x| 1.0 / x).collect();
         let b64 = u64::from(b);
         Some(Self {
             b,
@@ -374,6 +425,11 @@ impl TopFdSetup {
             sb: SmallDiv::new(b64),
             m1: b - 1,
             bmid,
+            order,
+            bpow,
+            binv,
+            span: f64::from(span),
+            wf: f64::from(u32::try_from(w).ok()?),
         })
     }
 
@@ -540,15 +596,46 @@ impl TopFdSetup {
         !rem.add(d).lt(&self.pw[c0 as usize])
     }
 
+    /// The lowest position of `a^j` the certificate reads, `from_j`, for
+    /// the power with digit array `x` (`a^j = X·b^z`), endpoint difference
+    /// `d` and `sp` digits, and the mask of the digit above the run of
+    /// `b − 1` that the high endpoint carries through (0 without a carry).
+    /// As in `Base::cert`: `c0 = max(cap, ndig(d))`, and with a carry out
+    /// of `c0` the position above the run and that digit; `sp` (nothing
+    /// read) if `c0 >= sp`. Both [`Self::cert`] and [`Self::run`] take the
+    /// positions they read from here: a failing run is only sound for
+    /// positions the certificate reads (module docs).
+    // A digit, below b <= 64.
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline(always)]
+    fn first_certified(&self, x: &Digits, d: &W4, sp: u32, z: u32, bz: u128) -> (u32, u64) {
+        let c0 = self.cap.max(self.ndig(d));
+        if c0 >= sp {
+            return (sp, 0);
+        }
+        if !self.carry(x, d, c0, z, bz) {
+            return (c0, 0);
+        }
+        // The run of b − 1 ends below sp.
+        let top = (self.b - 1) as u8;
+        let at = |pos: u32| if pos < z { 0 } else { digit(x, pos - z) };
+        let mut pos = c0;
+        while at(pos) == top {
+            pos += 1;
+        }
+        let g = at(pos);
+        (pos + 1, digit_range_mask(g, g + 1))
+    }
+
     /// The certificate of the block of `st`'s prefix (unclipped): the same
     /// as `Base::cert_parts(a, a + w − 1, cap)`, read from the stepped
     /// digits. The digit of `a^j` at position `pos` is digit `pos − j·f0`
-    /// of `P^j` (zero below).
+    /// of `P^j` (zero below). If it fails, `Err(n)`: this block and those
+    /// of `P + 1, …, P + n − 1` (the prefix's in the next `n − 1`
+    /// partitions) fail, `1 <= n <= span` (module docs). Without `runs`
+    /// the run is not worked out, and `n` is 1.
     #[inline]
-    pub(crate) fn cert(&self, st: &TopFd) -> Option<Cert> {
-        // A digit, below b <= 64.
-        #[allow(clippy::cast_possible_truncation)]
-        let top = (self.b - 1) as u8;
+    pub(crate) fn cert(&self, st: &TopFd, runs: bool) -> Result<Cert, u32> {
         let mut mask = 0u64;
         let mut doms = [0u64; 2];
         let mut from = [self.s2, self.s3];
@@ -556,37 +643,116 @@ impl TopFdSetup {
             (&st.sq, &st.d2, self.s2, 2 * self.f0, self.bz[0]),
             (&st.cu, &st.d3, self.s3, 3 * self.f0, self.bz[1]),
         ];
-        for ((dom, first), (x, d, sp, z, bz)) in doms.iter_mut().zip(&mut from).zip(powers) {
-            let c0 = self.cap.max(self.ndig(d));
-            if c0 >= sp {
-                continue;
-            }
+        for (jj, (x, d, sp, z, bz)) in powers.into_iter().enumerate() {
+            let (mut pos, dom) = self.first_certified(x, d, sp, z, bz);
+            doms[jj] = dom;
+            from[jj] = pos;
             let at = |pos: u32| if pos < z { 0 } else { digit(x, pos - z) };
-            let mut pos = c0;
-            if self.carry(x, d, c0, z, bz) {
-                // As in `Base::cert`: the run of b − 1 ends below sp.
-                while at(pos) == top {
-                    pos += 1;
-                }
-                let g = at(pos);
-                *dom = digit_range_mask(g, g + 1);
-                pos += 1;
-            }
-            *first = pos;
             while pos < sp {
                 let bit = 1u64 << at(pos);
                 if mask & bit != 0 {
-                    return None;
+                    return Err(if runs { self.run(st, from, jj) } else { 1 });
                 }
                 mask |= bit;
                 pos += 1;
             }
         }
-        close_certificate(mask, doms).map(|closed| Cert {
-            mask: closed,
-            common: mask,
-            from,
-        })
+        close_certificate(mask, doms)
+            .map(|closed| Cert {
+                mask: closed,
+                common: mask,
+                from,
+            })
+            .ok_or(1)
+    }
+
+    /// The failing run that starts at `st`'s block, whose certified digits
+    /// repeat (module docs): its length, at least 1. `from` is `cert`'s, up
+    /// to the power whose scan found the repeat (`failed`). Of the repeated pairs
+    /// it takes the first one met in [`Self::order`], whose faster digit is
+    /// the slowest of any pair's (up to the order's estimate).
+    // A digit is below b <= 64, an index into `order` below 2·48.
+    #[allow(clippy::cast_possible_truncation)]
+    #[cold]
+    #[inline(never)]
+    fn run(&self, st: &TopFd, mut from: [u32; 2], failed: usize) -> u32 {
+        let powers = [
+            (&st.sq, &st.d2, self.s2, 2 * self.f0, self.bz[0]),
+            (&st.cu, &st.d3, self.s3, 3 * self.f0, self.bz[1]),
+        ];
+        // The cube's lowest certified position, if its scan had not begun:
+        // the same helper as `cert`'s, so a pair is only ever taken from
+        // positions the certificate reads.
+        if failed == 0 {
+            let (x, d, sp, z, bz) = powers[1];
+            from[1] = self.first_certified(x, d, sp, z, bz).0;
+        }
+        let at = |j: usize, i: u32| {
+            let (x, _, _, z, _) = powers[j];
+            if i < z { 0 } else { digit(x, i - z) }
+        };
+        let (mut seen, mut slot) = (0u64, [0u8; 64]);
+        for (n, &(j, i)) in self.order.iter().enumerate() {
+            let (j, i) = (usize::from(j), u32::from(i));
+            if i < from[j] {
+                continue;
+            }
+            let g = at(j, i);
+            if seen & (1 << g) != 0 {
+                let (j0, i0) = self.order[usize::from(slot[usize::from(g)])];
+                return self
+                    .run_of(st, usize::from(j0), u32::from(i0))
+                    .min(self.run_of(st, j, i));
+            }
+            seen |= 1 << g;
+            slot[usize::from(g)] = n as u8;
+        }
+        1
+    }
+
+    /// Blocks from `st`'s on (at least 1, at most `span`) before the one
+    /// whose last `n` has `n^j >= (⌊a^j/b^i⌋ + 1)·b^i` (`j = 2 + pj`), as
+    /// a lower bound (module docs).
+    // Digits and steps are small; the f64 of P is rounded, then bounded.
+    // i, x, d, z, k, m, r, g, p, e, n as in the module docs.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn run_of(&self, st: &TopFd, pj: usize, i: u32) -> u32 {
+        let (x, d, z) = if pj == 0 {
+            (&st.sq, &st.d2, 2 * self.f0)
+        } else {
+            (&st.cu, &st.d3, 3 * self.f0)
+        };
+        // (a^j mod b^i) / b^i < (r + 1)/b^m for r its top m digits.
+        let mut low = 0.0;
+        if i > z {
+            let k = i - z;
+            let m = k.min(4);
+            let mut r = 0.0;
+            for t in 1..=m {
+                r = r * f64::from(self.b) + f64::from(digit(x, k - t));
+            }
+            low = (r + 1.0) * self.binv[m as usize];
+        }
+        let g = 1.0 - low - w4_f64(d) * self.binv[i as usize] - RUN_MARGIN;
+        if g <= 0.0 {
+            return 1;
+        }
+        // e + S·w < (P + 1 + S)·w.
+        let p = u64::try_from(st.p).map_or(st.p as f64, |p| p as f64);
+        let e = (p + 1.0 + self.span) * self.wf * (1.0 + RUN_MARGIN);
+        let slope = if pj == 0 { 2.0 * e } else { 3.0 * e * e } * self.wf;
+        let n = g * self.bpow[i as usize] / slope * (1.0 - RUN_MARGIN);
+        if n >= self.span {
+            return self.span as u32;
+        }
+        // ⌈n⌉ (without a libm call), at least 1.
+        let t = n as u32;
+        (t + u32::from(f64::from(t) < n)).max(1)
     }
 }
 
@@ -654,7 +820,8 @@ mod tests {
                             continue;
                         }
                         let (plo, phi) = (s / w, (e - 1) / w);
-                        let Some(fd) = TopFdSetup::try_new(&base, f0, o, cap, phi, b * b) else {
+                        let Some(fd) = TopFdSetup::try_new(&base, f0, o, cap, phi, b * b, b * b)
+                        else {
                             continue;
                         };
                         setups += 1;
@@ -679,7 +846,7 @@ mod tests {
                                     seeds += u64::from(!(p > before && p - before <= fd.reach));
                                     let want = base.cert_parts(a, z, cap);
                                     assert_eq!(
-                                        fd.cert(&st),
+                                        fd.cert(&st, rng.next().is_multiple_of(2)).ok(),
                                         want,
                                         "b{b} [{s}, {e}) f0 {f0} o {o} P {p}"
                                     );
@@ -712,6 +879,109 @@ mod tests {
             "{setups} setups: {certs} blocks certified ({kept} kept, {seeds} seeds), {clipped} clipped left out"
         );
         assert!(setups > 1500 && certs > 1_000_000 && clipped > 1000 && kept > 100_000);
+    }
+
+    /// The failing runs (`cert`'s `Err(n)`): bases 7-64, random fields in
+    /// each band, blocks of `b^f0` for several `f0` and `o`; at random
+    /// blocks and, on small fields, at every block: the `n − 1` blocks after
+    /// a failing one (`P + 1, …`) inside the field all fail by
+    /// `Base::cert_parts`, clipped or not, and `1 <= n <= span`. Also how
+    /// often the block at `P + n` passes, i.e. how tight the runs are.
+    #[test]
+    #[allow(clippy::many_single_char_names)] // b, s, e, l, w, o, p as above
+    fn a_failing_run_fails_at_every_block() {
+        let mut rng = Lcg(0x0DDB_A11C_0FFE_E123);
+        let (mut runs, mut covered, mut longest, mut ends_pass, mut ones) =
+            (0u64, 0u64, 0u32, 0u64, 0u64);
+        for b in 7..=64u32 {
+            let Some(band) = get_base_range_u128(b).expect("base range") else {
+                continue;
+            };
+            let mut fields = 0;
+            for attempt in 0..60 {
+                if fields == 6 {
+                    break;
+                }
+                // Small fields (every block) and large ones (random blocks).
+                let small = attempt % 2 == 0;
+                let size = if small {
+                    1 + rng.below(band.size().min(2_000_000))
+                } else {
+                    1 + rng.below(band.size())
+                };
+                let s = band.start() + rng.below(band.size() - size + 1);
+                let e = s + size;
+                let Some(base) = Base::try_new(b, s, e - 1) else {
+                    continue;
+                };
+                fields += 1;
+                for f0 in 1..base.l {
+                    let w = base.powu(f0);
+                    if w >= 1 << 32 {
+                        break;
+                    }
+                    for o in 1..=2u32 {
+                        let cap = f0 + o;
+                        if cap >= base.l {
+                            continue;
+                        }
+                        let (plo, phi) = (s / w, (e - 1) / w);
+                        let span = match rng.next() % 3 {
+                            0 => 1,
+                            1 => b,
+                            _ => b * b,
+                        };
+                        let Some(fd) = TopFdSetup::try_new(&base, f0, o, cap, phi, b * b, span)
+                        else {
+                            continue;
+                        };
+                        let every = phi - plo < 3000;
+                        let picks: Vec<u128> = if every {
+                            (plo..=phi).collect()
+                        } else {
+                            (0..300).map(|_| plo + rng.below(phi - plo + 1)).collect()
+                        };
+                        for p in picks {
+                            let lo = p * w;
+                            if lo < s || lo + w > e {
+                                continue;
+                            }
+                            let mut st = TopFd::default();
+                            fd.advance(&mut st, p);
+                            let Err(n) = fd.cert(&st, true) else {
+                                continue;
+                            };
+                            assert!(n >= 1 && n <= span, "b{b} P {p}: run {n} of {span}");
+                            runs += 1;
+                            ones += u64::from(n == 1);
+                            longest = longest.max(n);
+                            for m in 1..u128::from(n) {
+                                let q = p + m;
+                                if q > phi {
+                                    break;
+                                }
+                                let (a, z) = ((q * w).max(s), (q * w + w - 1).min(e - 1));
+                                assert_eq!(
+                                    base.cert_parts(a, z, cap),
+                                    None,
+                                    "b{b} [{s}, {e}) f0 {f0} o {o}: run {n} from P {p}, block {q} passes"
+                                );
+                                covered += 1;
+                            }
+                            let q = p + u128::from(n);
+                            if q <= phi {
+                                let (a, z) = ((q * w).max(s), (q * w + w - 1).min(e - 1));
+                                ends_pass += u64::from(base.cert_parts(a, z, cap).is_some());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{runs} failing blocks: {covered} blocks after them proved failing, longest run {longest}, {ones} runs of 1, {ends_pass} runs followed by a passing block"
+        );
+        assert!(runs > 200_000 && covered > 10_000_000);
     }
 
     /// A carry through words of b − 1: into word 0, through the words above
