@@ -198,6 +198,7 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use env_logger::Env;
 use log::{LevelFilter, debug, error, info, warn};
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -859,6 +860,33 @@ fn process_field_sync(
     }
 }
 
+thread_local! {
+    /// The CPU join's buffers, one per worker thread while a field's join
+    /// runs rather than one per rayon job: rayon cuts a slice's partitions
+    /// into ranges down to single partitions on many threads, while each
+    /// thread still runs its partitions mostly in ascending order, and a
+    /// [`Scratch`] carries the failing top certificates of one partition
+    /// over to the thread's next (`cpu_join`). Freed when the field's join
+    /// ends ([`FreeJoinScratch`]). Nothing that runs under a borrow of it
+    /// may call into rayon: a thread that waits there can pick up another
+    /// partition, or the freeing broadcast, and borrow it a second time.
+    static JOIN_SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
+/// Frees every worker thread's [`JOIN_SCRATCH`] when dropped, so the
+/// join's per-thread buffers (`Scratch`'s docs: about 10 MB a thread at
+/// production shapes) are held only while a field's join runs, however it
+/// ends. The partitions run on the pool the caller is in (the client's
+/// global pool, or the benchmark's one-thread pool), and `rayon::broadcast`
+/// runs once on each of that pool's threads.
+struct FreeJoinScratch;
+
+impl Drop for FreeJoinScratch {
+    fn drop(&mut self) {
+        rayon::broadcast(|_| JOIN_SCRATCH.take());
+    }
+}
+
 /// A nice-only field through the CPU overlap join, a slice at a time (one,
 /// below about 1e16), each slice's partitions on the thread pool. The
 /// field's progress counts partitions, every slice's. Returns its results
@@ -876,6 +904,7 @@ fn process_field_join(
     };
     let mut hits: Vec<u128> = Vec::new();
     let mut field_progress = None;
+    let _free = FreeJoinScratch;
     for slice in slices {
         let t0 = Instant::now();
         let join = match CpuJoin::new(base, slice, jp) {
@@ -902,8 +931,8 @@ fn process_field_join(
         let t1 = Instant::now();
         let out = (0..join.partitions())
             .into_par_iter()
-            .map_init(Scratch::default, |scratch, v| {
-                let out = join.run_partition(v, scratch);
+            .map(|v| {
+                let out = JOIN_SCRATCH.with_borrow_mut(|scratch| join.run_partition(v, scratch));
                 progress.tick();
                 out
             })
