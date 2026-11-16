@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Speed up the GPU overlap join's middle-digit prefilter at base 64 by reading each pair's two digits off its fixed-point fraction with shifts instead of multiplications ([#255](https://github.com/wasabipesto/nice/pull/255)).
 - Speed up the CPU overlap join by not re-testing a top prefix in the partitions where its last failed test shows it must fail again ([#262](https://github.com/wasabipesto/nice/pull/262)).
 - Stop the API handing out a nice-only field twice when its queue is consumed more slowly than the claim window ([#264](https://github.com/wasabipesto/nice/pull/264)).
 - Time out API database statements after 30 seconds, so one stalled claim can no longer block detailed claims and the scheduled jobs ([#238](https://github.com/wasabipesto/nice/pull/238)).
