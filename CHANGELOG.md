@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Make the GPU overlap join's top stage append the tops it keeps correctly on any GPU subgroup, including one that runs without its first lane, and fail the field if the tops it appends do not add up to the ones it kept ([#260](https://github.com/wasabipesto/nice/pull/260)).
 - Speed up the GPU overlap join's middle-digit prefilter on Vulkan with the SPIR-V compiler (measured on an AMD RX 9070 XT) by testing its four digits with one population count instead of six comparisons ([#259](https://github.com/wasabipesto/nice/pull/259)).
 - Speed up the CPU overlap join by not re-testing a top prefix in the partitions where its last failed test shows it must fail again ([#262](https://github.com/wasabipesto/nice/pull/262)).
 - Stop the API handing out a nice-only field twice when its queue is consumed more slowly than the claim window ([#264](https://github.com/wasabipesto/nice/pull/264)).
