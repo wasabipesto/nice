@@ -742,6 +742,37 @@ pub fn bulk_claim_fields(
     results.into_iter().map(private_to_public).collect()
 }
 
+/// Renew the claim on a pre-claimed nice-only field as it is handed out: stamp
+/// `last_claim_time` with `NOW()` again, but only if the field is still unsearched
+/// (`check_level = 0`) and still carries the claim it was queued with
+/// (`held_claim_time`), so no one has claimed it since. `None` means the field must not
+/// be handed out: it was submitted, or claimed again, while it waited in the queue.
+///
+/// One primary-key update. The renewed claim runs its full `CLAIM_DURATION_HOURS`
+/// from the hand-out rather than from the bulk claim, however long the field waited.
+pub fn renew_niceonly_claim(
+    conn: &mut PgConnection,
+    field_id: u128,
+    held_claim_time: DateTime<Utc>,
+) -> Result<Option<FieldRecord>> {
+    use diesel::sql_query;
+    use diesel::sql_types::{BigInt, Timestamptz};
+
+    let field_id = conversions::u128_to_i64(field_id)?;
+    let result = sql_query(
+        "UPDATE fields
+         SET last_claim_time = NOW()
+         WHERE id = $1 AND last_claim_time = $2 AND check_level = 0
+         RETURNING *;",
+    )
+    .bind::<BigInt, _>(field_id)
+    .bind::<Timestamptz, _>(held_claim_time)
+    .get_result::<FieldPrivate>(conn)
+    .optional()
+    .map_err(|e| anyhow!("{e}"))?;
+    result.map(private_to_public).transpose()
+}
+
 /// Bulk claim multiple fields at once from the frontier chunk, using the
 /// `Thin` strategy. Mirrors `try_claim_field`'s `Thin` branch but claims up to `count`
 /// fields from the chosen chunk in a single statement.
