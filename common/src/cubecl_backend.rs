@@ -4513,9 +4513,10 @@ mod tests {
                     println!("{tag}: {} of {} survivors", got.len(), want.len());
                     assert_eq!(got, want, "{tag}");
                 } else {
-                    let err = got
-                        .expect_err("a dropped launch must fail the field")
-                        .to_string();
+                    let Err(err) = got else {
+                        panic!("{tag}: a dropped launch must fail the field");
+                    };
+                    let err = err.to_string();
                     println!("{tag}: {err}");
                     assert!(err.contains("did not run every launch"), "{tag}: {err}");
                 }
@@ -4552,7 +4553,9 @@ mod tests {
         assert!(ran_complete(50, &[0, 0, 0, 5], (1 << 32) + 5).is_ok());
         let dropped = ran_complete(50, &[0, 0, 0, 0], 78).unwrap_err().to_string();
         assert!(dropped.contains("finished 0 of 78 cubes"), "{dropped}");
-        let part = ran_complete(50, &[0, 0, 0, 40], 78).unwrap_err().to_string();
+        let part = ran_complete(50, &[0, 0, 0, 40], 78)
+            .unwrap_err()
+            .to_string();
         assert!(part.contains("finished 40 of 78 cubes"), "{part}");
         assert!(ran_complete(50, &[0, 0, 0], 0).is_err());
     }
