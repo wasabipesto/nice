@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## Nice v3.4.8
 
 Performance gains for nice-only, all in the overlap join:
 
@@ -18,19 +18,13 @@ Performance gains for nice-only, all in the overlap join:
 - Speed up the GPU overlap join on AMD's RDNA4 cards by halving the shared-memory stage of the join's prefilter survivors to 512 entries, so that more of its work groups run at once ([#256](https://github.com/wasabipesto/nice/pull/256)).
 - Speed up the overlap join's full check of each pair that passes the prefilter, without long division: on CPU it starts from the digits the join has already proved and computes only the ones in between, two at a time ([#253](https://github.com/wasabipesto/nice/pull/253)); on GPU it squares and cubes each survivor in two-digit limbs taken straight from its top's record ([#251](https://github.com/wasabipesto/nice/pull/251)).
 
-Make the GPU paths correct on any subgroup layout:
+Other:
 
 - Make the GPU overlap join's top stage ([#260](https://github.com/wasabipesto/nice/pull/260)) and the GPU stride walk's survivor queues ([#263](https://github.com/wasabipesto/nice/pull/263)) work on any GPU subgroup, including one that runs without its first lane, and fail the field instead of reporting it if the tops appended or survivors checked do not add up to the ones queued.
-
-Fix API server claim issues:
-
+- Re-pin the NiceMark reference rates; scores are not comparable with earlier versions ([#266](https://github.com/wasabipesto/nice/pull/266)).
 - Stop the API handing out a nice-only field twice when its queue is consumed more slowly than the claim window ([#264](https://github.com/wasabipesto/nice/pull/264)).
 - Time out API database statements after 30 seconds, so one stalled claim can no longer block detailed claims and the scheduled jobs ([#238](https://github.com/wasabipesto/nice/pull/238)).
 - Let the `Next` queue's cursor read past longer finished stretches before falling back to a full frontier search ([#238](https://github.com/wasabipesto/nice/pull/238)).
-
-Miscellaneous:
-
-- Re-pin the NiceMark reference rates; scores are not comparable with earlier versions ([#266](https://github.com/wasabipesto/nice/pull/266)).
 - Bump dependencies and the pinned Rust toolchain ([#243](https://github.com/wasabipesto/nice/pull/243), [#244](https://github.com/wasabipesto/nice/pull/244), [#245](https://github.com/wasabipesto/nice/pull/245), [#257](https://github.com/wasabipesto/nice/pull/257), [#258](https://github.com/wasabipesto/nice/pull/258)).
 - Stop logging an empty `Task failed: Any { .. }` warning when a CUDA backend is probed on a machine without NVIDIA, and name the real reason it could not start in the debug log ([#267](https://github.com/wasabipesto/nice/pull/267)).
 
