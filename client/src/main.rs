@@ -201,6 +201,7 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
@@ -367,9 +368,9 @@ fn compiled_backends() -> String {
 /// Both CUDA backends smoke-test NVRTC at init and name it in their error;
 /// cudarc's own panic payload for a missing libnvrtc ("Unable to dynamically
 /// load the \"nvrtc\" shared library") also survives `guarded_init`. A box
-/// with no NVIDIA driver fails differently ("driver library could not be
-/// loaded", or the cubecl runtime's worker dying) and is the ordinary `auto`
-/// fall-through, which stays quiet.
+/// with no NVIDIA driver fails differently (cudarc's panic for the \"cuda\"
+/// library, which `guarded_init` keeps even when it happens on cubecl's
+/// device thread) and is the ordinary `auto` fall-through, which stays quiet.
 #[cfg(any(test, feature = "cuda", feature = "cubecl-cuda"))]
 fn cuda_toolkit_missing(e: &anyhow::Error) -> bool {
     let text = format!("{e:#}").to_ascii_lowercase();
@@ -439,32 +440,123 @@ fn try_init_cuda(device: usize) -> Result<CudaContext> {
 /// backend chain kills the process, so `auto` never reaches the backend that
 /// would have worked — the whole point of having a chain.
 ///
-/// The panic hook is silenced for the duration so a routine fallback does not
-/// print somebody else's twenty-line message. GPU init runs before any of our
-/// worker threads start, so swapping the global hook here is safe.
+/// The panic hook is swapped for the duration so a routine fallback does not
+/// print somebody else's twenty-line message. Instead it keeps the first
+/// panic's message from any thread, which is the root cause: when cubecl's
+/// CUDA runtime fails, cudarc's "could not load libcuda" panic happens on
+/// cubecl's device thread, and ours only sees the `RecvError` that follows.
+/// GPU init runs before any of our worker threads start, so swapping the
+/// global hook here is safe.
+///
+/// cubecl also catches that device-thread panic itself and logs it as
+/// `Task failed: Any { .. }` at warn level, with no message. While the guard is
+/// up, [`ProbeLogger`] lowers that one record to debug; the message it could
+/// not print is in the error this returns. A panic that setup survives is
+/// still reported, as a warning from here.
 ///
 /// Note this relies on unwinding; under `panic = "abort"` the process would die
 /// as before. The workspace does not set that.
-#[cfg(any(feature = "cuda", feature = "cubecl"))]
+#[cfg(any(test, feature = "cuda", feature = "cubecl"))]
 fn guarded_init<T>(
     unknown_cause: &str,
     init: impl FnOnce() -> Result<T> + std::panic::UnwindSafe,
 ) -> Result<T> {
+    let first_panic: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
     let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    std::panic::set_hook(Box::new({
+        let first_panic = Arc::clone(&first_panic);
+        move |info| {
+            if let Ok(mut slot) = first_panic.lock()
+                && slot.is_none()
+            {
+                *slot = Some(info.payload_as_str().unwrap_or("").to_string());
+            }
+        }
+    }));
+    GPU_PROBE.store(true, Ordering::SeqCst);
     let caught = std::panic::catch_unwind(init);
+    GPU_PROBE.store(false, Ordering::SeqCst);
     std::panic::set_hook(previous);
 
-    match caught {
-        Ok(result) => result,
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or(unknown_cause);
+    let root = first_panic
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .filter(|msg| !msg.is_empty());
+    match (caught, root) {
+        (Ok(Ok(value)), None) => Ok(value),
+        (Ok(Ok(value)), Some(root)) => {
+            warn!("GPU setup continued after a panic during it: {root}");
+            Ok(value)
+        }
+        (Ok(Err(e)), None) => Err(e),
+        (Ok(Err(e)), Some(root)) => Err(e.context(root)),
+        (Err(payload), root) => {
+            let msg = root
+                .or_else(|| {
+                    payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                })
+                .unwrap_or_else(|| unknown_cause.to_string());
             Err(anyhow!("{msg}"))
         }
+    }
+}
+
+/// Set while [`guarded_init`] runs a GPU backend's setup.
+static GPU_PROBE: AtomicBool = AtomicBool::new(false);
+
+/// The target of cubecl's log line for a panic on one of its device threads.
+/// Its payload prints as `Any { .. }`, so the line says nothing on its own.
+const CUBECL_TASK_TARGET: &str = "cubecl_common::device::handle::channel::task";
+
+/// The level to log a record at: cubecl's task-failure warning becomes debug
+/// while a GPU backend is being probed, and everything else keeps its own.
+fn probe_level(target: &str, level: log::Level, probing: bool) -> log::Level {
+    if probing && level == log::Level::Warn && target == CUBECL_TASK_TARGET {
+        log::Level::Debug
+    } else {
+        level
+    }
+}
+
+/// The client's logger: `env_logger` with one record lowered while a GPU
+/// backend is probed (see [`guarded_init`]). Outside a probe it changes
+/// nothing, and `-l debug` still shows the lowered record.
+struct ProbeLogger(env_logger::Logger);
+
+impl log::Log for ProbeLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        let level = probe_level(
+            record.target(),
+            record.level(),
+            GPU_PROBE.load(Ordering::SeqCst),
+        );
+        if level == record.level() {
+            self.0.log(record);
+            return;
+        }
+        let lowered = log::Record::builder()
+            .args(*record.args())
+            .level(level)
+            .target(record.target())
+            .module_path(record.module_path())
+            .file(record.file())
+            .line(record.line())
+            .build();
+        if self.0.matches(&lowered) {
+            self.0.log(&lowered);
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
     }
 }
 
@@ -1610,7 +1702,10 @@ async fn main() -> Result<()> {
     if let Some(p) = &bar {
         builder.target(env_logger::Target::Pipe(p.log_writer()));
     }
-    builder.init();
+    let logger = builder.build();
+    let max_level = logger.filter();
+    log::set_boxed_logger(Box::new(ProbeLogger(logger))).expect("logger set once");
+    log::set_max_level(max_level);
     if let Some(p) = bar {
         nice_common::progress::install(p);
     }
@@ -1702,6 +1797,129 @@ mod tests {
     // would make clap exit the test binary outright. Testing the plain function
     // against the named defaults keeps the assertions about the shipped
     // behavior without making them hostage to the shell they run in.
+
+    /// Serialises the tests that swap the global panic hook or set the probe
+    /// flag, which the test harness would otherwise run side by side.
+    static GPU_PROBE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn guarded_init_reports_the_root_cause_of_a_failed_setup() {
+        use super::{GPU_PROBE, cuda_driver_rejected, cuda_toolkit_missing, guarded_init};
+        use std::sync::atomic::Ordering;
+        let _serial = GPU_PROBE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let no_cuda = "Unable to dynamically load the \"cuda\" shared library - searched for \
+                       library names: [\"libcuda.so\", \"libcuda.so.1\"].";
+
+        // cubecl's CUDA runtime with no driver: cudarc panics on cubecl's
+        // device thread, and ours then unwraps the dead channel. The error is
+        // the first panic, and still classifies as the quiet fall-through.
+        let e = guarded_init("unknown cause", || -> Result<()> {
+            let _ = std::thread::spawn(move || panic!("{no_cuda}")).join();
+            let (sender, receiver) = std::sync::mpsc::channel::<()>();
+            drop(sender);
+            receiver.recv().unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(format!("{e:#}"), no_cuda);
+        assert!(!cuda_toolkit_missing(&e) && !cuda_driver_rejected(&e));
+
+        // A panic on our own thread alone is reported as before.
+        let e =
+            guarded_init("unknown cause", || -> Result<()> { panic!("own panic") }).unwrap_err();
+        assert_eq!(format!("{e:#}"), "own panic");
+
+        // A payload with no text falls back to the caller's description.
+        let e = guarded_init("unknown cause", || -> Result<()> {
+            std::panic::panic_any(7_u32)
+        })
+        .unwrap_err();
+        assert_eq!(format!("{e:#}"), "unknown cause");
+
+        // An error returned after a panic elsewhere carries the panic too.
+        let e = guarded_init("unknown cause", || -> Result<()> {
+            let _ = std::thread::spawn(|| panic!("device thread died")).join();
+            Err(anyhow!("CallError"))
+        })
+        .unwrap_err();
+        assert_eq!(format!("{e:#}"), "device thread died: CallError");
+
+        // Setup that survives a panic elsewhere still succeeds.
+        let ok = guarded_init("unknown cause", || -> Result<u32> {
+            let _ = std::thread::spawn(|| panic!("side task")).join();
+            Ok(5)
+        });
+        assert_eq!(ok.unwrap(), 5);
+
+        // The probe flag is down again once setup returns.
+        assert!(!GPU_PROBE.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_probe_logger_lowers_only_cubecls_task_warning_during_a_probe() {
+        use super::{CUBECL_TASK_TARGET, GPU_PROBE, ProbeLogger, probe_level};
+        use log::{Level, Log, Record};
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+
+        /// Collects what the logger writes.
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let _serial = GPU_PROBE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert_eq!(
+            probe_level(CUBECL_TASK_TARGET, Level::Warn, true),
+            Level::Debug
+        );
+        assert_eq!(
+            probe_level(CUBECL_TASK_TARGET, Level::Warn, false),
+            Level::Warn
+        );
+        assert_eq!(
+            probe_level(CUBECL_TASK_TARGET, Level::Error, true),
+            Level::Error
+        );
+        assert_eq!(probe_level("nice_client", Level::Warn, true), Level::Warn);
+
+        // Log cubecl's warning through a logger at `filter` and return the output.
+        let emit = |filter: &str, probing: bool| {
+            let sink = Sink::default();
+            let logger = ProbeLogger(
+                env_logger::Builder::new()
+                    .parse_filters(filter)
+                    .format(|f, r| writeln!(f, "{} {}", r.level(), r.args()))
+                    .target(env_logger::Target::Pipe(Box::new(sink.clone())))
+                    .build(),
+            );
+            GPU_PROBE.store(probing, Ordering::SeqCst);
+            logger.log(
+                &Record::builder()
+                    .args(format_args!("Task failed: Any {{ .. }}"))
+                    .level(Level::Warn)
+                    .target(CUBECL_TASK_TARGET)
+                    .build(),
+            );
+            GPU_PROBE.store(false, Ordering::SeqCst);
+            String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
+        };
+        assert_eq!(emit("info", true), "");
+        assert_eq!(emit("info", false), "WARN Task failed: Any { .. }\n");
+        assert_eq!(emit("debug", true), "DEBUG Task failed: Any { .. }\n");
+    }
 
     #[test]
     fn cuda_init_failures_are_classified() {
