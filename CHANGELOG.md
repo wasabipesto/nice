@@ -2,31 +2,35 @@
 
 ## Unreleased
 
-- Make the GPU overlap join's top stage append the tops it keeps correctly on any GPU subgroup, including one that runs without its first lane, and fail the field if the tops it appends do not add up to the ones it kept ([#260](https://github.com/wasabipesto/nice/pull/260)).
-- Speed up the GPU overlap join's middle-digit prefilter on Vulkan with the SPIR-V compiler (measured on an AMD RX 9070 XT) by testing its four digits with one population count instead of six comparisons ([#259](https://github.com/wasabipesto/nice/pull/259)).
+Performance gains for nice-only, all in the overlap join:
+
+- Speed up the overlap join's top certificates by stepping each top prefix with digit-array additions, as the detailed mode does with consecutive numbers, instead of dividing its square and cube into digits every time. On GPU each prefix steps through a batch's consecutive partitions ([#240](https://github.com/wasabipesto/nice/pull/240)), at base 64 too ([#254](https://github.com/wasabipesto/nice/pull/254)), carrying the position each power's certificate starts at and its carry bound from one partition to the next and (on CUDA) running up to twice as many partitions per launch ([#250](https://github.com/wasabipesto/nice/pull/250)). On CPU each prefix steps to the next one of the same key ([#247](https://github.com/wasabipesto/nice/pull/247)).
+- Speed up the GPU overlap join's top certificates by turning only the low endpoint's powers into digits and deciding the high endpoint's from a carry test, as the CPU join does since [#204](https://github.com/wasabipesto/nice/pull/204) ([#235](https://github.com/wasabipesto/nice/pull/235)).
+- Speed up the GPU overlap join's top certificates by skipping the limbs of their long division that are known to be zero, computing the difference of the endpoints' powers from the endpoints' difference, and taking its digit count from its bit length instead of a search ([#237](https://github.com/wasabipesto/nice/pull/237)).
+- Speed up the GPU overlap join by sorting each slice's top prefixes once by the buckets they feed, while the device works on the previous slice or field, so that the tops need no bucketing pass and the join reads each bucket's tops in order ([#249](https://github.com/wasabipesto/nice/pull/249)).
+- Speed up the GPU overlap join's test of each bottom entry against each top: for large batches of tops, transpose the tops' digit masks so that an entry's test against 32 tops is one OR per digit it has, instead of a test per top ([#239](https://github.com/wasabipesto/nice/pull/239)).
+- Speed up the GPU overlap join by keeping each top's words in one 32-byte record, so that the join reads one memory sector per top instead of one from each of three arrays ([#241](https://github.com/wasabipesto/nice/pull/241)).
+- Speed up the CPU overlap join's scan of each top against its bottoms by first listing the bottoms that pass, without a branch on each test, and only then taking them through the prefilter ([#252](https://github.com/wasabipesto/nice/pull/252)).
 - Speed up the CPU overlap join by not re-testing a top prefix in the partitions where its last failed test shows it must fail again ([#262](https://github.com/wasabipesto/nice/pull/262)).
+- Speed up the overlap join's middle-digit prefilter by reading each pair's digits off a fixed-point fraction with multiplications instead of divisions, on CPU ([#248](https://github.com/wasabipesto/nice/pull/248)) and GPU ([#246](https://github.com/wasabipesto/nice/pull/246)). On Vulkan with the SPIR-V compiler (measured on an AMD RX 9070 XT), the GPU prefilter tests its four digits with one population count instead of six comparisons ([#259](https://github.com/wasabipesto/nice/pull/259)).
+- Speed up the GPU overlap join by running its middle-digit prefilter on each pair as the join finds it, in the cheaper form the CPU join uses, so that only the few pairs that pass are staged and written out ([#236](https://github.com/wasabipesto/nice/pull/236)).
+- Speed up the GPU overlap join by checking whether its survivor stage needs writing out once per batch of tops instead of after every 32 tops ([#249](https://github.com/wasabipesto/nice/pull/249)).
+- Speed up the GPU overlap join on AMD's RDNA4 cards by halving the shared-memory stage of the join's prefilter survivors to 512 entries, so that more of its work groups run at once ([#256](https://github.com/wasabipesto/nice/pull/256)).
+- Speed up the overlap join's full check of each pair that passes the prefilter, without long division: on CPU it starts from the digits the join has already proved and computes only the ones in between, two at a time ([#253](https://github.com/wasabipesto/nice/pull/253)); on GPU it squares and cubes each survivor in two-digit limbs taken straight from its top's record ([#251](https://github.com/wasabipesto/nice/pull/251)).
+
+Make the GPU paths correct on any subgroup layout:
+
+- Make the GPU overlap join's top stage ([#260](https://github.com/wasabipesto/nice/pull/260)) and the GPU stride walk's survivor queues ([#263](https://github.com/wasabipesto/nice/pull/263)) work on any GPU subgroup, including one that runs without its first lane, and fail the field instead of reporting it if the tops appended or survivors checked do not add up to the ones queued.
+
+Fix API server claim issues:
+
 - Stop the API handing out a nice-only field twice when its queue is consumed more slowly than the claim window ([#264](https://github.com/wasabipesto/nice/pull/264)).
 - Time out API database statements after 30 seconds, so one stalled claim can no longer block detailed claims and the scheduled jobs ([#238](https://github.com/wasabipesto/nice/pull/238)).
 - Let the `Next` queue's cursor read past longer finished stretches before falling back to a full frontier search ([#238](https://github.com/wasabipesto/nice/pull/238)).
-- Speed up the GPU overlap join's test of each bottom entry against each top: for large batches of tops, transpose the tops' digit masks so that an entry's test against 32 tops is one OR per digit it has, instead of a test per top ([#239](https://github.com/wasabipesto/nice/pull/239)).
-- Speed up the GPU overlap join by running its middle-digit prefilter on each pair as the join finds it, in the cheaper form the CPU join uses, so that only the few pairs that pass are staged and written out ([#236](https://github.com/wasabipesto/nice/pull/236)).
-- Speed up the GPU overlap join's top certificates by turning only the low endpoint's powers into digits and deciding the high endpoint's from a carry test, as the CPU join does since [#204](https://github.com/wasabipesto/nice/pull/204) ([#235](https://github.com/wasabipesto/nice/pull/235)).
-- Speed up the GPU overlap join's top certificates by skipping the limbs of their long division that are known to be zero, computing the difference of the endpoints' powers from the endpoints' difference, and taking its digit count from its bit length instead of a search ([#237](https://github.com/wasabipesto/nice/pull/237)).
-- Speed up the GPU overlap join's top certificates by stepping each top prefix through a batch's consecutive partitions with digit-array additions, as the detailed mode does with consecutive numbers, instead of dividing its square and cube into digits for every partition ([#240](https://github.com/wasabipesto/nice/pull/240)).
-- Speed up the CPU overlap join's top certificates by stepping from each top prefix to the next one of the same key with digit-array additions, as the GPU join does across partitions since [#240](https://github.com/wasabipesto/nice/pull/240), instead of dividing every prefix's square and cube into digits ([#247](https://github.com/wasabipesto/nice/pull/247)).
-- Speed up the GPU overlap join by keeping each top's words in one 32-byte record, so that the join reads one memory sector per top instead of one from each of three arrays ([#241](https://github.com/wasabipesto/nice/pull/241)).
-- Speed up the CPU overlap join's middle-digit prefilter by reading each pair's digits off a fixed-point fraction, with fewer multiplications and no branches ([#248](https://github.com/wasabipesto/nice/pull/248)).
-- Speed up the GPU overlap join's middle-digit prefilter by reading each pair's digits off a fixed-point fraction with multiplications instead of divisions, and testing them with fewer instructions ([#246](https://github.com/wasabipesto/nice/pull/246)).
-- Speed up the GPU overlap join by sorting each slice's top prefixes once by the buckets they feed, so that the tops need no bucketing pass and the join reads each bucket's tops in order ([#249](https://github.com/wasabipesto/nice/pull/249)).
-- Speed up the GPU overlap join by checking whether its survivor stage needs writing out once per batch of tops instead of after every 32 tops ([#249](https://github.com/wasabipesto/nice/pull/249)).
-- Speed up the GPU overlap join by sorting each slice's top prefixes while the device works on the previous slice or field, instead of between slices with the device idle ([#249](https://github.com/wasabipesto/nice/pull/249)).
-- Speed up the GPU overlap join's stepped top certificates by carrying the position each power's certificate starts at, and its carry bound, from one partition to the next, skipping work that cannot change the result, and (on CUDA) running up to twice as many partitions per launch ([#250](https://github.com/wasabipesto/nice/pull/250)).
-- Speed up the CPU overlap join's scan of each top against its bottoms by first listing the bottoms that pass, without a branch on each test, and only then taking them through the prefilter ([#252](https://github.com/wasabipesto/nice/pull/252)).
-- Speed up the CPU overlap join's full check of each pair that passes the prefilter: it starts from the digits the join has already proved and computes only the ones in between, two at a time and without long division ([#253](https://github.com/wasabipesto/nice/pull/253)).
-- Speed up the GPU overlap join at base 64 by stepping its top certificates through consecutive partitions there too, as at every other base ([#254](https://github.com/wasabipesto/nice/pull/254)).
-- Make the GPU stride walk check every survivor of its cross filter however the device fills its subgroups, and fail the field instead of reporting it if a survivor queue ever checks fewer survivors than it queued ([#263](https://github.com/wasabipesto/nice/pull/263)).
-- Speed up the GPU overlap join on AMD's RDNA4 cards by halving the shared-memory stage of the join's prefilter survivors to 512 entries, so that more of its work groups run at once ([#256](https://github.com/wasabipesto/nice/pull/256)).
-- Speed up the GPU overlap join's full check of each survivor by squaring and cubing it in two-digit limbs taken straight from its top's record, with multiplications instead of divisions ([#251](https://github.com/wasabipesto/nice/pull/251)).
+
+Miscellaneous:
+
+- Bump dependencies and the pinned Rust toolchain ([#243](https://github.com/wasabipesto/nice/pull/243), [#244](https://github.com/wasabipesto/nice/pull/244), [#245](https://github.com/wasabipesto/nice/pull/245), [#257](https://github.com/wasabipesto/nice/pull/257), [#258](https://github.com/wasabipesto/nice/pull/258)).
 
 ## Nice v3.4.7
 
