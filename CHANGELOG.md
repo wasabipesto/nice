@@ -31,7 +31,7 @@ Fix API server claim issues:
 Miscellaneous:
 
 - Bump dependencies and the pinned Rust toolchain ([#243](https://github.com/wasabipesto/nice/pull/243), [#244](https://github.com/wasabipesto/nice/pull/244), [#245](https://github.com/wasabipesto/nice/pull/245), [#257](https://github.com/wasabipesto/nice/pull/257), [#258](https://github.com/wasabipesto/nice/pull/258)).
-- Stop logging an empty `Task failed: Any { .. }` warning when a CUDA backend is probed on a machine without NVIDIA, and name the real reason it could not start in the debug log (#PR).
+- Stop logging an empty `Task failed: Any { .. }` warning when a CUDA backend is probed on a machine without NVIDIA, and name the real reason it could not start in the debug log ([#267](https://github.com/wasabipesto/nice/pull/267)).
 
 ## Nice v3.4.7
 
