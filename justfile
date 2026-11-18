@@ -14,6 +14,18 @@ update:
     git pull
     just build
 
+# Set the workspace version and bring Cargo.lock in line (does not commit)
+bump-version version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+    toml set Cargo.toml workspace.package.version "{{ version }}" > "$tmp"
+    cat "$tmp" > Cargo.toml
+    cargo update --workspace
+    echo "✓ Cargo.toml and Cargo.lock set to {{ version }}"
+    git --no-pager diff --stat -- Cargo.toml Cargo.lock
+
 # Tag and push a new release
 tag-release version:
     #!/usr/bin/env bash
@@ -45,6 +57,14 @@ tag-release version:
         exit 1
     fi
     echo "✓ Version matches Cargo.toml"
+
+    # Check that Cargo.lock matches the manifests (CI builds with --locked)
+    if ! lock_err=$(cargo metadata --locked --format-version 1 2>&1 >/dev/null); then
+        echo "$lock_err"
+        echo "Error: Cargo.lock is out of date. Run 'cargo update --workspace', then commit and push."
+        exit 1
+    fi
+    echo "✓ Cargo.lock matches Cargo.toml"
 
     # Check that version is in CHANGELOG.md
     if ! grep -q "## Nice v{{ version }}" CHANGELOG.md; then
