@@ -240,20 +240,20 @@ pub const DETAILED_SCENARIOS: &[ScenarioDef] = &[
 /// browser scoring 550 where the native client scores 1000 on the same box
 /// is information, not a bug.
 pub const SCORE_REFERENCES: &[(&str, bool, f64)] = &[
-    ("b58_msd_weak", false, 2.6e12),
-    ("b58_msd_weak_1t", false, 4.9e11),
-    ("b58_msd_strong", false, 1.5e13),
-    ("b60_msd_weak", false, 6.1e12),
-    ("b62_msd_weak", false, 7.5e12),
-    ("b40_detailed", false, 4.2e7),
-    ("b50_detailed", false, 1.7e7),
-    ("b50_detailed_1t", false, 2.8e6),
-    ("b58_msd_weak", true, 4.5e13),
-    ("b58_msd_strong", true, 2.9e14),
-    ("b60_msd_weak", true, 8.2e13),
-    ("b62_msd_weak", true, 1.0e14),
-    ("b40_detailed", true, 2.4e9),
-    ("b50_detailed", true, 1.5e9),
+    ("b58_msd_weak", false, 7.6e12),
+    ("b58_msd_weak_1t", false, 1.6e12),
+    ("b58_msd_strong", false, 4.1e13),
+    ("b60_msd_weak", false, 1.8e13),
+    ("b62_msd_weak", false, 2.0e13),
+    ("b40_detailed", false, 2.1e8),
+    ("b50_detailed", false, 1.8e8),
+    ("b50_detailed_1t", false, 4.3e7),
+    ("b58_msd_weak", true, 1.6e14),
+    ("b58_msd_strong", true, 6.1e14),
+    ("b60_msd_weak", true, 3.0e14),
+    ("b62_msd_weak", true, 3.9e14),
+    ("b40_detailed", true, 1.0e10),
+    ("b50_detailed", true, 9.1e9),
 ];
 
 /// Geometric mean of measured rate over reference rate, scaled so matching
