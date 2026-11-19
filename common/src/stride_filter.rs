@@ -147,7 +147,8 @@ impl StrideTable {
     ///
     /// # Panics
     /// If the table has no valid residue (every base `b ≡ 3 mod 4`, where no
-    /// number can be nice); the walks below return no numbers for such a
+    /// number can be nice, and bases 4 and 5, whose table is empty at k = 3
+    /// by the LSD filter); the walks below return no numbers for such a
     /// table without calling this.
     #[must_use]
     pub fn first_valid_at_or_after(&self, start: u128) -> (u128, usize) {
@@ -1520,8 +1521,8 @@ mod tests {
 
     /// A nice-only search of a base whose stride table has no valid residue
     /// finds no numbers instead of panicking: every such base with a range,
-    /// at the client's k = 3, on windows spread over the range, and base 43
-    /// on a real field of 10^9 numbers.
+    /// at the client's k = 3, on windows spread over the range (the walk runs
+    /// in those windows the MSD filter does not reject whole).
     #[test]
     fn residue_empty_bases_search_to_nothing() {
         use crate::client_process::process_range_niceonly;
@@ -1547,8 +1548,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The same on a real base-43 field of 10^9 numbers, one the MSD filter
+    /// does not reject whole, so the walk runs on it.
+    #[test]
+    fn residue_empty_base_43_field_searches_to_nothing() {
+        use crate::client_process::process_range_niceonly;
         let table = StrideTable::new(43, 3);
-        let field = FieldSize::new(40_992_418_181_959, 40_993_418_181_959);
+        let field = FieldSize::new(60_991_418_181_959, 60_992_418_181_959);
         assert_eq!(
             process_range_niceonly(&field, 43, &table).nice_numbers,
             Vec::new()
