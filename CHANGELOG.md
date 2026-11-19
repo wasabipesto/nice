@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Stop the CPU nice-only search crashing on a field of a base where no number can be nice (every base that leaves 3 when divided by 4, such as 43); it now reports the field searched with no numbers, as the GPU paths already did ([#NNN](https://github.com/wasabipesto/nice/pull/NNN)).
 - Fail a nice-only field on the GPU stride path, instead of reporting it searched and empty, when the device did not run every kernel launch, as after a failed memory allocation on CUDA ([#270](https://github.com/wasabipesto/nice/pull/270)).
 
 ## Nice v3.4.8

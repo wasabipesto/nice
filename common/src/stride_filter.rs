@@ -144,6 +144,11 @@ impl StrideTable {
     /// A tuple of `(first_valid_n, gap_index)` where:
     /// - `first_valid_n` is the smallest n >= start with n % M in `valid_residues`
     /// - `gap_index` is the index in `valid_residues`/`gap_table` for this residue
+    ///
+    /// # Panics
+    /// If the table has no valid residue (every base `b ≡ 3 mod 4`, where no
+    /// number can be nice); the walks below return no numbers for such a
+    /// table without calling this.
     #[must_use]
     pub fn first_valid_at_or_after(&self, start: u128) -> (u128, usize) {
         // The modulus fits in u32 (enforced at construction), so the residue does too.
@@ -271,6 +276,11 @@ impl StrideTable {
         use_affine: bool,
         mut check: impl FnMut(u128, u64) -> bool,
     ) -> Vec<NiceNumberSimple> {
+        // No valid residue: no candidate, so no nice number (and nothing for
+        // `first_valid_at_or_after` to return).
+        if self.valid_residues.is_empty() {
+            return Vec::new();
+        }
         if use_affine && !self.low_digit_masks.is_empty() && range.size() < (1u128 << 62) {
             return self.walk_two_phase(range, base, high_mask, check);
         }
@@ -1506,5 +1516,42 @@ mod tests {
                 "Valid residues should be sorted"
             );
         }
+    }
+
+    /// A nice-only search of a base whose stride table has no valid residue
+    /// finds no numbers instead of panicking: every such base with a range,
+    /// at the client's k = 3, on windows spread over the range, and base 43
+    /// on a real field of 10^9 numbers.
+    #[test]
+    fn residue_empty_bases_search_to_nothing() {
+        use crate::client_process::process_range_niceonly;
+        let bases = [
+            4u32, 5, 7, 15, 19, 23, 27, 35, 39, 43, 47, 55, 59, 63, 67, 75, 79, 83, 87, 95,
+        ];
+        for base in bases {
+            let r = crate::base_range::get_base_range_u128(base)
+                .unwrap()
+                .unwrap();
+            let table = StrideTable::new(base, 3);
+            assert!(table.valid_residues.is_empty(), "base {base}");
+            let span = r.end() - r.first();
+            let w = span.min(1_000_000);
+            for i in 0..16u128 {
+                let start = r.first() + (span - w) / 15 * i;
+                let range = FieldSize::new(start, start + w);
+                assert!(
+                    process_range_niceonly(&range, base, &table)
+                        .nice_numbers
+                        .is_empty(),
+                    "base {base} at {start}"
+                );
+            }
+        }
+        let table = StrideTable::new(43, 3);
+        let field = FieldSize::new(40_992_418_181_959, 40_993_418_181_959);
+        assert_eq!(
+            process_range_niceonly(&field, 43, &table).nice_numbers,
+            Vec::new()
+        );
     }
 }
