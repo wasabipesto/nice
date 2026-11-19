@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fail a nice-only field on the GPU stride path, instead of reporting it searched and empty, when the device did not run every kernel launch, as after a failed memory allocation on CUDA ([#270](https://github.com/wasabipesto/nice/pull/270)).
+
 ## Nice v3.4.8
 
 Performance gains for nice-only, all in the overlap join:

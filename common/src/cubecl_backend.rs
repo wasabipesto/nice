@@ -352,9 +352,10 @@ fn detailed_kernel(
 
 /// u32 slots per niceonly hit: n as four u32 limbs.
 pub const NICEONLY_STRIDE: u32 = 4;
-/// Words of the stride walk's count buffer: the hits written, then the
-/// survivor queues' account (see `queue_complete`).
-const NICEONLY_COUNT_WORDS: usize = 3;
+/// Words of the stride walk's count buffer: the hits written, the survivor
+/// queues' account (see `queue_complete`), then the cubes that ran (see
+/// `ran_complete`).
+const NICEONLY_COUNT_WORDS: usize = 4;
 
 /// Capacity of the niceonly output buffer (in nice numbers) per field.
 /// Genuinely nice numbers are astronomically rare; this is pure headroom.
@@ -1570,6 +1571,18 @@ fn niceonly_kernel(
             }
             r += nwarps;
         }
+    }
+    cube_ran(nice_count);
+}
+
+/// Count the cube in `nice_count[3]` once every unit of it is done (see
+/// `ran_complete`): the host's evidence that the launch ran. Every unit must
+/// reach it; one atomic add per cube, by unit 0, which every cube has.
+#[cube]
+fn cube_ran(nice_count: &mut Array<Atomic<u32>>) {
+    sync_cube();
+    if UNIT_POS_X == 0u32 {
+        nice_count[3].fetch_add(1u32);
     }
 }
 
@@ -3066,6 +3079,13 @@ struct CubeclNiceonlyRun<R: cubecl::prelude::Runtime> {
     /// [`QUEUE_SKIP_FIRST`] / [`QUEUE_DUP_FIRST`] (device tests).
     #[cfg(test)]
     test_bits: u32,
+    /// Count launches without running them, as a device that drops them
+    /// (device tests).
+    #[cfg(test)]
+    skip_launches: bool,
+    /// Cubes launched for the field, which `ran_complete` holds the kernel's
+    /// count to.
+    cubes: u64,
 }
 
 impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
@@ -3135,13 +3155,22 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
             cube_dim_override: None,
             #[cfg(test)]
             test_bits: 0,
+            #[cfg(test)]
+            skip_launches: false,
+            cubes: 0,
         })
     }
 
     /// Collect the nice numbers found across the whole field (device tests).
     #[cfg(test)]
     fn finish(&self) -> Result<Vec<NiceNumberSimple>> {
-        read_niceonly_hits(&self.client, &self.nice_count, &self.nice_out, self.base)
+        read_niceonly_hits(
+            &self.client,
+            &self.nice_count,
+            &self.nice_out,
+            self.base,
+            self.cubes,
+        )
     }
 }
 
@@ -3151,7 +3180,8 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
 /// after every launch on the client's queue.
 ///
 /// # Errors
-/// Returns an error if the kernel tried to write more hits than the buffer
+/// Returns an error if the kernels did not run every cube launched for the
+/// field (`cubes`), or if the kernel tried to write more hits than the buffer
 /// holds — which, given how rare nice numbers are, means a kernel bug rather
 /// than a genuine flood.
 fn read_niceonly_hits<R: cubecl::prelude::Runtime>(
@@ -3159,11 +3189,13 @@ fn read_niceonly_hits<R: cubecl::prelude::Runtime>(
     nice_count: &cubecl::server::Handle,
     nice_out: &cubecl::server::Handle,
     base: u32,
+    cubes: u64,
 ) -> Result<Vec<NiceNumberSimple>> {
     let bytes = client
         .read_one(nice_count.clone())
         .map_err(|e| anyhow::anyhow!("nice count read failed: {e:?}"))?;
     let counts = u32::from_bytes(&bytes);
+    ran_complete(base, counts, cubes)?;
     queue_complete(base, counts)?;
     let written = counts[0] as usize;
     ensure!(
@@ -3213,6 +3245,29 @@ fn queue_complete(base: u32, counts: &[u32]) -> Result<()> {
         "stride walk b{base}: the survivors the queues checked differ from those they queued \
          (low words differ by {} mod 2^32)",
         ds.cast_signed()
+    );
+    Ok(())
+}
+
+/// The device ran every cube launched for the field: each cube of the stride
+/// kernel adds 1 to `counts[3]` once all its units are done, and the total
+/// must equal `cubes`, the cubes the host launched (mod 2^32, which no launch
+/// of at most [`MAX_CUBES`] cubes can wrap). A launch the device dropped
+/// leaves its hits and its queue account at zero, which reads as a field
+/// searched and empty, so the field fails instead.
+///
+/// # Errors
+/// Returns an error if the count differs, or is missing.
+fn ran_complete(base: u32, counts: &[u32], cubes: u64) -> Result<()> {
+    let Some(&ran) = counts.get(3) else {
+        anyhow::bail!("stride walk b{base}: the count of cubes that ran is missing");
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let want = cubes as u32;
+    ensure!(
+        ran == want,
+        "stride walk b{base}: the device did not run every launch: its kernels finished \
+         {ran} of {cubes} cubes"
     );
     Ok(())
 }
@@ -3273,6 +3328,19 @@ impl<R: cubecl::prelude::Runtime> CubeclNiceonlyRun<R> {
         WORKGROUP_SIZE
     }
 
+    /// Whether launches are counted but not run; false outside device tests.
+    #[allow(clippy::unused_self)]
+    fn skip_launches(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.skip_launches
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     /// The kernel's test-only queue faults; 0 outside device tests.
     #[allow(clippy::unused_self)]
     fn test_bits(&self) -> u32 {
@@ -3295,6 +3363,8 @@ pub struct CubeclPendingField<R: cubecl::prelude::Runtime> {
     nice_out: cubecl::server::Handle,
     nice_count: cubecl::server::Handle,
     base: u32,
+    /// Cubes launched for the field.
+    cubes: u64,
 }
 
 impl<R: cubecl::prelude::Runtime> PendingField for CubeclPendingField<R> {
@@ -3305,6 +3375,7 @@ impl<R: cubecl::prelude::Runtime> PendingField for CubeclPendingField<R> {
                 &self.nice_count,
                 &self.nice_out,
                 self.base,
+                self.cubes,
             )?,
             // No per-submission timing on this runtime without device
             // timestamp queries.
@@ -3327,6 +3398,7 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
             nice_out: self.nice_out.clone(),
             nice_count: self.nice_count.clone(),
             base: self.base,
+            cubes: self.cubes,
         })
     }
 
@@ -3397,6 +3469,10 @@ impl<R: cubecl::prelude::Runtime> RangeSink for CubeclNiceonlyRun<R> {
             .prefilter
             .map_or((0, 0, 0), |p| (p.limbs, p.chunk_digits, p.chunk_div));
 
+        self.cubes += u64::from(cubes);
+        if self.skip_launches() {
+            return Ok(());
+        }
         #[allow(clippy::cast_possible_truncation)]
         unsafe {
             niceonly_kernel::launch_unchecked::<R>(
@@ -4394,6 +4470,114 @@ mod tests {
             unreachable!("new_cuda returns the CUDA variant");
         };
         queue_faults(client, &[true, false]);
+    }
+
+    /// A launch the device dropped fails the field through the pipeline's
+    /// own wait, with no hits and a queue account of zero, on each path of
+    /// the stride kernel (`plain`, the cube-scoped queue, and the
+    /// plane-scoped one where `plane`): every launch dropped, and the second
+    /// of two. The field is cut into ranges of 97 with one unit per range, so
+    /// each launch is several cubes and the host's count is cubes, not
+    /// launches. The same field with nothing dropped returns every survivor.
+    fn dropped_launches<R: cubecl::prelude::Runtime>(
+        client: &cubecl::prelude::ComputeClient<R>,
+        plane: bool,
+    ) {
+        let (base, mask, start, len, want) = queue_cases().swap_remove(0);
+        let offsets: Vec<u64> = (0..len).step_by(97).map(u64::from).collect();
+        let lens: Vec<u32> = (0..len).step_by(97).map(|o| 97.min(len - o)).collect();
+        let masks = vec![mask; offsets.len()];
+        let k = offsets.len() / 2;
+        let cubes_of = |n: usize| (n as u64).div_ceil(u64::from(WORKGROUP_SIZE));
+        let first = cubes_of(k);
+        let cubes = first + cubes_of(offsets.len() - k);
+        assert!(
+            first > 1 && cubes > first + 1,
+            "launches of several cubes: {first} of {cubes} in the first"
+        );
+        let mut paths = vec![(false, false), (true, false)];
+        if plane {
+            paths.push((true, true));
+        }
+        for (compact, plane_scoped) in paths {
+            for skip_from in [None, Some(0usize), Some(1)] {
+                let mut run = CubeclNiceonlyRun::new(client, base, start, false).expect("run");
+                run.probe = true;
+                run.compact_override = Some(compact);
+                run.plane_override = Some(plane_scoped);
+                run.lane_shift_override = Some(0);
+                for (i, (a, b)) in [(0, k), (k, offsets.len())].into_iter().enumerate() {
+                    run.skip_launches = skip_from.is_some_and(|j| i >= j);
+                    run.launch(0, &offsets[a..b], &lens[a..b], &masks[a..b])
+                        .expect("dispatch");
+                }
+                let tag = format!("compact={compact} plane={plane_scoped} skip_from={skip_from:?}");
+                assert_eq!(run.cubes, cubes, "{tag}: cubes launched");
+                let pending = run.end_field(0).expect("end field");
+                let got = Box::new(pending).wait();
+                if let Some(j) = skip_from {
+                    let Err(err) = got else {
+                        panic!("{tag}: a dropped launch must fail the field");
+                    };
+                    let err = err.to_string();
+                    println!("{tag}: {err}");
+                    let ran = if j == 0 { 0 } else { first };
+                    assert!(
+                        err.contains(&format!("finished {ran} of {cubes} cubes")),
+                        "{tag}: {err}"
+                    );
+                } else {
+                    let got: Vec<u128> = got
+                        .unwrap_or_else(|e| panic!("{tag}: {e:#}"))
+                        .nice_numbers
+                        .iter()
+                        .map(|n| n.number)
+                        .collect();
+                    println!(
+                        "{tag}: {} of {} survivors, {cubes} cubes",
+                        got.len(),
+                        want.len()
+                    );
+                    assert_eq!(got, want, "{tag}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu device"]
+    fn cubecl_dropped_launches_fail_the_field() {
+        let ctx = CubeclContext::new_default().expect("CubeCL init");
+        #[allow(irrefutable_let_patterns)]
+        let CubeclContext::Wgpu { client, .. } = &ctx else {
+            unreachable!("new_default returns the wgpu variant");
+        };
+        dropped_launches(client, plane_queue_runs(client, &ctx.device_name()));
+    }
+
+    #[test]
+    #[cfg(feature = "cubecl-cuda")]
+    #[ignore = "requires an NVIDIA device"]
+    fn cubecl_cuda_dropped_launches_fail_the_field() {
+        let ctx = CubeclContext::new_cuda(0).expect("CubeCL CUDA init");
+        let CubeclContext::Cuda { client, .. } = &ctx else {
+            unreachable!("new_cuda returns the CUDA variant");
+        };
+        dropped_launches(client, true);
+    }
+
+    #[test]
+    fn ran_complete_wants_every_launched_cube() {
+        assert!(ran_complete(50, &[0, 0, 0, 0], 0).is_ok());
+        assert!(ran_complete(50, &[3, 0, 0, 4096], 4096).is_ok());
+        assert!(ran_complete(50, &[0, 0, 0, 5], (1 << 32) + 5).is_ok());
+        let dropped = ran_complete(50, &[0, 0, 0, 0], 78).unwrap_err().to_string();
+        assert!(dropped.contains("finished 0 of 78 cubes"), "{dropped}");
+        let part = ran_complete(50, &[0, 0, 0, 40], 78)
+            .unwrap_err()
+            .to_string();
+        assert!(part.contains("finished 40 of 78 cubes"), "{part}");
+        assert!(ran_complete(50, &[0, 0, 0], 0).is_err());
     }
 
     #[test]
