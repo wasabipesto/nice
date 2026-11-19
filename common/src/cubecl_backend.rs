@@ -4476,13 +4476,25 @@ mod tests {
     /// own wait, with no hits and a queue account of zero, on each path of
     /// the stride kernel (`plain`, the cube-scoped queue, and the
     /// plane-scoped one where `plane`): every launch dropped, and the second
-    /// of two. The same field with nothing dropped returns every survivor.
+    /// of two. The field is cut into ranges of 97 with one unit per range, so
+    /// each launch is several cubes and the host's count is cubes, not
+    /// launches. The same field with nothing dropped returns every survivor.
     fn dropped_launches<R: cubecl::prelude::Runtime>(
         client: &cubecl::prelude::ComputeClient<R>,
         plane: bool,
     ) {
         let (base, mask, start, len, want) = queue_cases().swap_remove(0);
-        let half = len / 2;
+        let offsets: Vec<u64> = (0..len).step_by(97).map(u64::from).collect();
+        let lens: Vec<u32> = (0..len).step_by(97).map(|o| 97.min(len - o)).collect();
+        let masks = vec![mask; offsets.len()];
+        let k = offsets.len() / 2;
+        let cubes_of = |n: usize| (n as u64).div_ceil(u64::from(WORKGROUP_SIZE));
+        let first = cubes_of(k);
+        let cubes = first + cubes_of(offsets.len() - k);
+        assert!(
+            first > 1 && cubes > first + 1,
+            "launches of several cubes: {first} of {cubes} in the first"
+        );
         let mut paths = vec![(false, false), (true, false)];
         if plane {
             paths.push((true, true));
@@ -4493,32 +4505,40 @@ mod tests {
                 run.probe = true;
                 run.compact_override = Some(compact);
                 run.plane_override = Some(plane_scoped);
-                for (i, (offset, n)) in [(0u64, half), (u64::from(half), len - half)]
-                    .into_iter()
-                    .enumerate()
-                {
-                    run.skip_launches = skip_from.is_some_and(|k| i >= k);
-                    run.launch(0, &[offset], &[n], &[mask]).expect("dispatch");
+                run.lane_shift_override = Some(0);
+                for (i, (a, b)) in [(0, k), (k, offsets.len())].into_iter().enumerate() {
+                    run.skip_launches = skip_from.is_some_and(|j| i >= j);
+                    run.launch(0, &offsets[a..b], &lens[a..b], &masks[a..b])
+                        .expect("dispatch");
                 }
                 let tag = format!("compact={compact} plane={plane_scoped} skip_from={skip_from:?}");
+                assert_eq!(run.cubes, cubes, "{tag}: cubes launched");
                 let pending = run.end_field(0).expect("end field");
                 let got = Box::new(pending).wait();
-                if skip_from.is_none() {
+                if let Some(j) = skip_from {
+                    let Err(err) = got else {
+                        panic!("{tag}: a dropped launch must fail the field");
+                    };
+                    let err = err.to_string();
+                    println!("{tag}: {err}");
+                    let ran = if j == 0 { 0 } else { first };
+                    assert!(
+                        err.contains(&format!("finished {ran} of {cubes} cubes")),
+                        "{tag}: {err}"
+                    );
+                } else {
                     let got: Vec<u128> = got
                         .unwrap_or_else(|e| panic!("{tag}: {e:#}"))
                         .nice_numbers
                         .iter()
                         .map(|n| n.number)
                         .collect();
-                    println!("{tag}: {} of {} survivors", got.len(), want.len());
+                    println!(
+                        "{tag}: {} of {} survivors, {cubes} cubes",
+                        got.len(),
+                        want.len()
+                    );
                     assert_eq!(got, want, "{tag}");
-                } else {
-                    let Err(err) = got else {
-                        panic!("{tag}: a dropped launch must fail the field");
-                    };
-                    let err = err.to_string();
-                    println!("{tag}: {err}");
-                    assert!(err.contains("did not run every launch"), "{tag}: {err}");
                 }
             }
         }
