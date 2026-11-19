@@ -4371,7 +4371,10 @@ mod tests {
     /// Both queues on planes that are partly filled: every survivor is
     /// checked once, by ballot and by scan, and the host's account agrees.
     /// lavapipe runs 8-lane subgroups, so cubes of 100 and 36 units end in a
-    /// 4-lane one.
+    /// 4-lane one. The ballot form is run only where production may pick it
+    /// (`ballot_append`): on a device with 64-lane planes one ballot word
+    /// misses the upper half and production takes the scan form; forced
+    /// there, the ballot form fails (seen on an RX 9070 XT).
     #[test]
     #[ignore = "requires a wgpu device"]
     fn cubecl_queues_check_every_survivor_on_partly_filled_planes() {
@@ -4385,7 +4388,13 @@ mod tests {
         } else {
             &[false]
         };
-        let bad = queue_partial_planes(client, planes, &[true, false], &[256, 100, 48, 36]);
+        let forms: &[bool] = if ballot_append(client.properties().hardware.plane_size_max) {
+            &[true, false]
+        } else {
+            println!("planes of more than 32 lanes: the ballot form is not run here");
+            &[false]
+        };
+        let bad = queue_partial_planes(client, planes, forms, &[256, 100, 48, 36]);
         assert!(bad.is_empty(), "{} wrong runs: {bad:#?}", bad.len());
     }
 
