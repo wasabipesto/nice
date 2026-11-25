@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Stop a `--gpu` client with an error, instead of running hundreds of times slower, when the only device it finds is a software renderer such as lavapipe or llvmpipe ([#NNN](https://github.com/wasabipesto/nice/pull/NNN)).
+- Stop a `--gpu` client with an error, instead of running hundreds of times slower, when the only device it finds is a software renderer such as lavapipe or llvmpipe ([#277](https://github.com/wasabipesto/nice/pull/277)).
 - Fail a nice-only field on the GPU stride path, instead of reporting it searched and empty, when the device did not run every kernel launch, as after a failed memory allocation on CUDA ([#270](https://github.com/wasabipesto/nice/pull/270)).
 
 ## Nice v3.4.8
