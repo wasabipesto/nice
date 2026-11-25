@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Check in CI that the kernels' SPIR-V keeps every atomic operation their WGSL has, since CubeCL's SPIR-V compiler can drop a repeated atomic store ([#278](https://github.com/wasabipesto/nice/pull/278)).
 - Fail a nice-only field on the GPU stride path, instead of reporting it searched and empty, when the device did not run every kernel launch, as after a failed memory allocation on CUDA ([#270](https://github.com/wasabipesto/nice/pull/270)).
 
 ## Nice v3.4.8

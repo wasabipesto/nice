@@ -3874,6 +3874,29 @@ mod tests {
         }
     }
 
+    /// Two atomic stores of one value in one block: the pattern `CubeCL`
+    /// 0.10's SPIR-V compiler (`cubecl-spirv`) drops. Its optimizer merges
+    /// equal instructions within a block, and an atomic store keeps its
+    /// target outside what it compares, so the second store here is taken
+    /// for a repeat of the first and removed; the WGSL compiler keeps both.
+    /// No production kernel may do this (#263 lost a queue account to it).
+    /// [`wgsl_dump_for_lint`] compiles it so that
+    /// `scripts/spirv-atomic-check.py` sees one known drop: if that stops,
+    /// the check has gone blind, or `CubeCL` has fixed the pass.
+    #[cube(launch_unchecked)]
+    fn atomic_store_trap_kernel(out: &mut Array<u32>) {
+        let words = SharedMemory::<Atomic<u32>>::new(2usize);
+        if UNIT_POS_X == 0u32 {
+            words[0].store(7u32);
+            words[1].store(7u32);
+        }
+        sync_cube();
+        if UNIT_POS_X == 0u32 {
+            out[0] = words[0].load();
+            out[1] = words[1].load();
+        }
+    }
+
     /// Compiles each shader `scripts/wgsl-lint.py` checks, once: the browser
     /// kernel, the native detailed kernels (finite-difference and
     /// per-number), the stride pipeline's nice-only kernel with its low-digit
@@ -3881,6 +3904,11 @@ mod tests {
     /// `CubeCL` writes their WGSL to the file `CUBECL_DEBUG_LOG` names, which
     /// CI then lints; without that variable this does nothing. Results are
     /// left to the parity tests.
+    ///
+    /// CI runs it again under `cubecl-spirv`, and
+    /// `scripts/spirv-atomic-check.py` compares each kernel's atomic
+    /// operations in the two dumps. It also compiles
+    /// [`atomic_store_trap_kernel`], the one kernel that check must flag.
     #[test]
     #[ignore = "requires a wgpu device; dumps shaders when CUBECL_DEBUG_LOG is set"]
     fn wgsl_dump_for_lint() {
@@ -3920,6 +3948,22 @@ mod tests {
         ctx.join_sample(57, &field, &[1_000])
             .expect("device run")
             .expect("a join field");
+        #[allow(irrefutable_let_patterns)]
+        let CubeclContext::Wgpu { client, .. } = &ctx else {
+            unreachable!("new_default returns the wgpu variant");
+        };
+        let out = client.create(cubecl::bytes::Bytes::from_elems(vec![0u32; 2]));
+        unsafe {
+            atomic_store_trap_kernel::launch_unchecked::<cubecl::wgpu::WgpuRuntime>(
+                client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(32),
+                ArrayArg::from_raw_parts(out.clone(), 2),
+            );
+        }
+        // Read back so the launch has run; the words are not checked (the
+        // second is whatever workgroup memory held when its store is lost).
+        client.read_one(out).expect("trap kernel read");
     }
 
     /// The known solution, through the niceonly path: the whole pipeline (MSD
