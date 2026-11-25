@@ -320,11 +320,12 @@ pub struct Cli {
     gpu_backend: GpuBackend,
 
     /// Which wgpu adapter the `CubeCL` backend uses, in `CubeCL`'s device
-    /// spelling: `DiscreteGpu(0)`, `IntegratedGpu(1)`, `Cpu`, ... Unset picks
+    /// spelling: `DiscreteGpu(0)`, `IntegratedGpu(1)`, ... Unset picks
     /// the best adapter. This exists because --gpu-device indexes a
     /// per-backend namespace (CUDA ordinals != wgpu adapters), so on a
     /// multi-GPU box no single number is right for every
     /// backend; the chosen adapter and its graphics API are always logged.
+    /// A software renderer (`Cpu`) is refused.
     #[arg(long, env = "NICE_GPU_WGPU_DEVICE")]
     gpu_wgpu_device: Option<String>,
 
@@ -791,7 +792,9 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
             CubeclContext::new_default,
         );
         // A software renderer is refused: named, it is fatal; under `auto`
-        // the chain goes on to hand-CUDA, and the final error lists why.
+        // the chain goes on to hand-CUDA with a warning, and the final
+        // error lists why.
+        let mut refused = false;
         let attempt = attempt.and_then(|ctx| {
             match judge_wgpu_adapter(
                 &ctx.device_name(),
@@ -799,7 +802,10 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 cuda_failure.as_deref(),
             ) {
                 Ok(warning) => Ok((ctx, warning)),
-                Err(why) => Err(anyhow!(why)),
+                Err(why) => {
+                    refused = true;
+                    Err(anyhow!(why))
+                }
             }
         });
         match attempt {
@@ -819,8 +825,12 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
                 std::process::exit(1);
             }
             Err(e) => {
-                info!("CubeCL unavailable; trying the next backend");
-                debug!("  CubeCL init failed: {e:#}");
+                if refused {
+                    warn!("CubeCL wgpu device not used, trying the next backend: {e:#}");
+                } else {
+                    info!("CubeCL unavailable; trying the next backend");
+                    debug!("  CubeCL init failed: {e:#}");
+                }
                 tried.push(format!("cubecl ({e:#})"));
             }
         }

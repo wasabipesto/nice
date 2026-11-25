@@ -186,7 +186,7 @@ Options:
           [default: auto]
 
       --gpu-wgpu-device <GPU_WGPU_DEVICE>
-          Which wgpu adapter the `CubeCL` backend uses, in `CubeCL`'s device spelling: `DiscreteGpu(0)`, `IntegratedGpu(1)`, `Cpu`, ... Unset picks the best adapter. This exists because --gpu-device indexes a per-backend namespace (CUDA ordinals != wgpu adapters), so on a multi-GPU box no single number is right for every backend; the chosen adapter and its graphics API are always logged
+          Which wgpu adapter the `CubeCL` backend uses, in `CubeCL`'s device spelling: `DiscreteGpu(0)`, `IntegratedGpu(1)`, ... Unset picks the best adapter. This exists because --gpu-device indexes a per-backend namespace (CUDA ordinals != wgpu adapters), so on a multi-GPU box no single number is right for every backend; the chosen adapter and its graphics API are always logged. A software renderer (`Cpu`) is refused
 
           [env: NICE_GPU_WGPU_DEVICE=]
 
