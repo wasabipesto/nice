@@ -415,6 +415,35 @@ fn log_cuda_fallthrough(backend: &str, e: &anyhow::Error) {
     }
 }
 
+/// Decide whether `--gpu` may run on the wgpu adapter `CubeCL` came up on.
+///
+/// A software renderer (lavapipe, llvmpipe, `SwiftShader`) runs the kernels
+/// on this machine's CPU, hundreds of times slower than a GPU and well below
+/// the client's own CPU search, so it is refused with the reason: `Err`. Any
+/// other adapter is used: `Ok`, carrying a warning when it is used because a
+/// CUDA backend failed on a machine that has an NVIDIA driver
+/// (`cuda_failure`), since CUDA would have been the faster backend there.
+#[cfg(any(test, feature = "cubecl"))]
+fn judge_wgpu_adapter(
+    device: &str,
+    software: bool,
+    cuda_failure: Option<&str>,
+) -> Result<Option<String>, String> {
+    if software {
+        return Err(format!(
+            "{device} is a software renderer: it runs on the CPU, far slower than \
+             this client's CPU search. Run without --gpu to search on the CPU, or \
+             install the driver for this machine's GPU"
+        ));
+    }
+    Ok(cuda_failure.map(|why| {
+        format!(
+            "using {device} because CUDA could not start ({why}); on an NVIDIA GPU \
+             the CUDA backends are faster"
+        )
+    }))
+}
+
 /// Try to bring up CUDA, turning `cudarc`'s panics into errors.
 ///
 /// `cudarc` panics rather than returning when the CUDA shared library is absent
@@ -596,6 +625,14 @@ fn cuda_pairs_join(want: GpuBackend, mode: SearchMode) -> bool {
 /// a much slower path is a worse outcome than stopping and saying so. The
 /// join's runtime is not the named backend, so its failing to start is a
 /// warning under `cuda` as under `auto`.
+///
+/// For the same reason no backend runs on a **software renderer** (lavapipe,
+/// llvmpipe, `SwiftShader`: wgpu's adapter when a machine has no GPU driver,
+/// or when CUDA failed and no other Vulkan driver is installed). Named
+/// `cubecl`, that is fatal; under `auto` it counts as a failed backend, so
+/// the chain goes on and the final error says why each one was passed over
+/// (`judge_wgpu_adapter`). A hardware wgpu device used after a CUDA backend
+/// failed on a machine with an NVIDIA driver is logged at warning level.
 #[allow(unused_variables)]
 fn init_gpu(cli: &Cli) -> GpuCtx {
     if !cli.gpu {
@@ -605,6 +642,10 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
     // Why each backend `auto` passed over failed, for the final error.
     #[allow(unused_mut)]
     let mut tried: Vec<String> = Vec::new();
+    // Why CubeCL's CUDA runtime failed on a machine with an NVIDIA driver,
+    // so that a wgpu device used in its place says so at warning level.
+    #[allow(unused_mut)]
+    let mut cuda_failure: Option<String> = None;
 
     // Mesa prints "<driver> is not a conformant Vulkan implementation" straight
     // to stderr — driver chatter our log filter can't reach. Silence it through
@@ -651,6 +692,9 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
             }
             Err(e) => {
                 log_cuda_fallthrough("CubeCL CUDA", &e);
+                if cuda_toolkit_missing(&e) || cuda_driver_rejected(&e) {
+                    cuda_failure = Some(format!("{e:#}"));
+                }
                 tried.push(format!("cubecl-cuda ({e:#})"));
             }
         }
@@ -746,13 +790,28 @@ fn init_gpu(cli: &Cli) -> GpuCtx {
             "no adapter available for the requested wgpu backend",
             CubeclContext::new_default,
         );
+        // A software renderer is refused: named, it is fatal; under `auto`
+        // the chain goes on to hand-CUDA, and the final error lists why.
+        let attempt = attempt.and_then(|ctx| {
+            match judge_wgpu_adapter(
+                &ctx.device_name(),
+                ctx.is_software_rasterizer(),
+                cuda_failure.as_deref(),
+            ) {
+                Ok(warning) => Ok((ctx, warning)),
+                Err(why) => Err(anyhow!(why)),
+            }
+        });
         match attempt {
-            Ok(ctx) => {
+            Ok((ctx, warning)) => {
                 info!(
                     "GPU initialized: CubeCL wgpu device ({}), batch size {}",
                     ctx.device_name(),
                     CUBECL_BATCH_SIZE
                 );
+                if let Some(warning) = warning {
+                    warn!("{warning}");
+                }
                 return Some(Arc::new(GpuHandle::Cubecl(ctx)));
             }
             Err(e) if want == GpuBackend::Cubecl => {
@@ -1952,6 +2011,33 @@ mod tests {
         let e = anyhow!("Unable to dynamically load the \"nvrtc\" shared library");
         assert!(cuda_toolkit_missing(&e));
         assert!(!cuda_driver_rejected(&e));
+    }
+
+    #[test]
+    fn a_software_renderer_is_refused_and_a_gpu_after_cuda_warns() {
+        use super::judge_wgpu_adapter;
+        let lavapipe = "llvmpipe (LLVM 21.1.8, 256 bits) (Vulkan, wgpu<spirv>)";
+        let radeon = "AMD Radeon RX 9070 XT (RADV GFX1201) (Vulkan, wgpu<spirv>)";
+        let cuda = "DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")";
+        // A software renderer is never used, whatever came before it.
+        for failure in [None, Some(cuda)] {
+            let why = judge_wgpu_adapter(lavapipe, true, failure).unwrap_err();
+            assert!(
+                why.contains(lavapipe) && why.contains("without --gpu"),
+                "{why}"
+            );
+        }
+        // A hardware adapter on a machine without CUDA: used, nothing to say.
+        assert_eq!(judge_wgpu_adapter(radeon, false, None), Ok(None));
+        // The same adapter in place of a CUDA backend that failed: a warning
+        // that names both.
+        let warning = judge_wgpu_adapter(radeon, false, Some(cuda))
+            .unwrap()
+            .expect("a warning");
+        assert!(
+            warning.contains(radeon) && warning.contains(cuda),
+            "{warning}"
+        );
     }
 
     #[test]

@@ -2077,6 +2077,14 @@ impl CubeclContext {
         }))
     }
 
+    /// Whether this is a wgpu adapter that renders in software on the CPU
+    /// (lavapipe, llvmpipe, `SwiftShader`, ...), by the same name test the
+    /// kernels' own choices use (see [`is_software_rasterizer`]).
+    #[must_use]
+    pub fn is_software_rasterizer(&self) -> bool {
+        matches!(self, Self::Wgpu { .. }) && is_software_rasterizer(&self.device_name())
+    }
+
     /// The adapter/device name, for reports.
     #[must_use]
     pub fn device_name(&self) -> String {
