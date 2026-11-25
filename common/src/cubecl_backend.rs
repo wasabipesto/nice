@@ -2077,6 +2077,14 @@ impl CubeclContext {
         }))
     }
 
+    /// Whether this is a wgpu adapter that renders in software on the CPU
+    /// (lavapipe, llvmpipe, `SwiftShader`, ...), by the same name test the
+    /// kernels' own choices use (see [`is_software_rasterizer`]).
+    #[must_use]
+    pub fn is_software_rasterizer(&self) -> bool {
+        matches!(self, Self::Wgpu { .. }) && is_software_rasterizer(&self.device_name())
+    }
+
     /// The adapter/device name, for reports.
     #[must_use]
     pub fn device_name(&self) -> String {
@@ -3560,6 +3568,29 @@ mod tests {
             false,
             "Intel(R) UHD Graphics 620 (Dx12, wgpu<wgsl>)"
         ));
+    }
+
+    /// A software renderer is told from a GPU by its adapter name, and the
+    /// client refuses one under `--gpu`: no GPU's name may match.
+    #[test]
+    fn software_renderers_are_known_by_name() {
+        for name in [
+            "llvmpipe (LLVM 21.1.8, 256 bits) (Vulkan, wgpu<spirv>)",
+            "SwiftShader Device (LLVM 16.0.0) (Vulkan, wgpu<wgsl>)",
+            "Google SwiftShader (Gl, wgpu<wgsl>)",
+        ] {
+            assert!(is_software_rasterizer(name), "{name}");
+        }
+        for name in [
+            "AMD Radeon RX 9070 XT (RADV GFX1201) (Vulkan, wgpu<spirv>)",
+            "AMD RADV POLARIS10 (LLVM 12.0.0) (Vulkan, wgpu<wgsl>)",
+            "NVIDIA GeForce RTX 3080 (Vulkan, wgpu<wgsl>)",
+            "Intel(R) Arc(tm) A770 Graphics (DG2) (Vulkan, wgpu<spirv>)",
+            "Intel(R) UHD Graphics 620 (Dx12, wgpu<wgsl>)",
+            "Apple M4 (Metal, wgpu<wgsl>)",
+        ] {
+            assert!(!is_software_rasterizer(name), "{name}");
+        }
     }
 
     /// CPU/CubeCL parity on the detailed path. Runs on lavapipe:
