@@ -74,8 +74,11 @@ def fail(msg):
 def kernels(path, lang):
     """{(kernel name, compile-time arguments): {op: count}} for one dump."""
     col = 0 if lang == "spirv" else 1
-    with open(path, errors="replace") as f:
-        text = f.read()
+    try:
+        with open(path, errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        fail(f"{path}: cannot be read ({e.strerror})")
     out = {}
     blocks = re.findall(r"\[START_KERNEL_COMPILATION\](.*?)\[END_KERNEL_COMPILATION\]", text, re.S)
     for blk in blocks:
@@ -109,10 +112,11 @@ def main(argv):
     verbose = False
     it = iter(argv)
     for a in it:
-        if a == "--require":
-            require.append(next(it))
-        elif a == "--expect-dropped":
-            expect.append(next(it))
+        if a in ("--require", "--expect-dropped"):
+            name = next(it, None)
+            if name is None:
+                fail(f"{a} needs a kernel name")
+            (require if a == "--require" else expect).append(name)
         elif a == "--verbose":
             verbose = True
         else:
