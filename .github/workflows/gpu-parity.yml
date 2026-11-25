@@ -18,7 +18,9 @@
 # Apple's GPU compiler miscompiles a constant division of a half-width shift,
 # which the macOS runner's paravirtual GPU does not reproduce. The lavapipe
 # job therefore also lints the WGSL of the kernels for that pattern
-# (scripts/wgsl-lint.py).
+# (scripts/wgsl-lint.py). It also compares each kernel's atomic operations
+# in SPIR-V against WGSL (scripts/spirv-atomic-check.py), for a SPIR-V
+# optimizer trap no test on another compiler can show.
 name: GPU Device Parity
 
 on:
@@ -101,6 +103,35 @@ jobs:
               run: |
                   export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)"
                   cargo test --release --features cubecl-spirv -p nice_common -- --ignored --nocapture cubecl_
+
+            - name: Compare the kernels' atomic operations, SPIR-V against WGSL
+              # CubeCL 0.10's SPIR-V optimizer drops the second of two atomic
+              # stores of one value in a block, which WGSL, CUDA and Metal
+              # keep, so no parity test on those shows it. The same dump as
+              # the WGSL lint, through the direct SPIR-V compiler; the script
+              # fails on any kernel with fewer atomic operations in SPIR-V
+              # than in the WGSL the lint read, except the one test kernel
+              # that has the pattern on purpose. Reuses the test binary the
+              # step above built.
+              run: |
+                  export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)"
+                  export CUBECL_DEBUG_LOG="$RUNNER_TEMP/spirv.log"
+                  cargo test --release --features cubecl-spirv -p nice_common --lib -- \
+                      --ignored --exact cubecl_backend::tests::wgsl_dump_for_lint --nocapture
+                  python3 scripts/spirv-atomic-check.py "$RUNNER_TEMP/wgsl.log" "$CUBECL_DEBUG_LOG" \
+                      --expect-dropped AtomicStoreTrapKernel \
+                      --require BucketKernel --require CheckKernel --require DetailedFdKernel \
+                      --require DetailedFdKernelU32 --require DetailedKernel \
+                      --require DetailedKernelU32 --require JoinKernel --require NiceonlyKernel \
+                      --require TopFdKernel --require TopKernel
+
+            - name: Keep the SPIR-V the comparison read
+              if: failure()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: spirv-lavapipe
+                  path: ${{ runner.temp }}/spirv.log
+                  if-no-files-found: ignore
 
     metal:
         name: cubecl (Metal) on macOS
