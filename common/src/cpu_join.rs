@@ -983,6 +983,7 @@ impl CpuJoin {
     /// bottoms, so that an index fits a `u16`, and no more than `idx`
     /// holds), on the best path this CPU has: AVX-512F, AVX2 or the
     /// portable loop ([`pass1_any`]).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(clippy::unused_self))]
     fn pass1(&self, t: u64, masks: &[u64], idx: &mut [u16]) -> usize {
         debug_assert!(masks.len() <= PIECE && masks.len() <= idx.len());
         #[cfg(target_arch = "x86_64")]
@@ -2090,6 +2091,7 @@ mod tests {
         }
         let range = FieldSize::new(47, 100);
         let jp = JoinParams { t: 2, k: 1, p: 0 };
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut joins = vec![CpuJoin::new(10, &range, jp).expect("field setup")];
         #[cfg(target_arch = "x86_64")]
         for (avx512, avx2) in [(false, true), (false, false)] {
